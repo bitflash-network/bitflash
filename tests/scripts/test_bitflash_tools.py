@@ -269,8 +269,12 @@ def run_golden_fixture(update):
         run([SCRIPTS / "build-explorer.py", blk1, blk2, explorer_dir])
         compare_golden("explorer-blocks.json",
                        (explorer_dir / "blocks.json").read_bytes(), update)
-        detail = json.loads((explorer_dir / "block" / "1.json").read_text(encoding="ascii"))
-        assert_true(len(detail["txs"]) == 2,
+        # Block detail is chunked 1000 heights per file, so height 1 lives in
+        # block/0.json under its own key. The test read block/1.json until
+        # the chunking landed, and had been failing ever since.
+        chunk = json.loads((explorer_dir / "block" / "0.json").read_text(encoding="ascii"))
+        assert_true("1" in chunk, "explorer chunk is missing height 1")
+        assert_true(len(chunk["1"]["txs"]) == 2,
                     "explorer fixture block did not include the normal transaction")
 
 
