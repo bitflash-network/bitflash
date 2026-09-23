@@ -16,8 +16,7 @@ SHA256SUMS
 SHA256SUMS.asc
 
 # Runtime data / logs
-debug.log
-db.log
+*.log
 *.dat
 wallet.dat
 nostr.key
