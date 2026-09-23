@@ -4575,8 +4575,7 @@ static int RunTreasurySelfTest()
         }
     }
     SelectNetworkParams(fWasTestNet);
-    printf("%s (%d failure%s)
-", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
     return nFail == 0 ? 0 : 1;
