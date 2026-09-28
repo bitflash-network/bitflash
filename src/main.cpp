@@ -4699,6 +4699,30 @@ bool BitcoinMiner(int nThreadId)
 //
 
 
+// Why an immature coinbase is immature.
+//
+// GetBlocksToMaturity() answers with a number of blocks and nothing else, so a
+// reward that is two blocks away and a reward that lost a race five months ago
+// give the same answer: "not yet". The difference is whether the block it was
+// paid in is in the main chain, which is knowable right here.
+//
+// 0 = maturing normally, 1 = its block is not in the main chain (never coming),
+// 2 = not anchored to any block this node can connect it to.
+static int ClassifyImmatureCoinbase(const CWalletTx& wtx, int& nDepthOut)
+{
+    nDepthOut = wtx.GetDepthInMainChain();
+    if (nDepthOut > 0)
+        return 0;
+    if (wtx.hashBlock == 0 || wtx.nIndex == -1)
+        return 2;
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(wtx.hashBlock);
+    if (mi == mapBlockIndex.end() || !(*mi).second)
+        return 2;  // a block this node does not have: still syncing, most likely
+    if (!(*mi).second->IsInMainChain())
+        return 1;  // the block exists and lost: this reward is dead
+    return 2;      // in the main chain but the merkle branch does not connect
+}
+
 WalletRecoveryAudit GetWalletRecoveryAudit()
 {
     WalletRecoveryAudit audit;
@@ -4777,6 +4801,11 @@ WalletRecoveryAudit GetWalletRecoveryAudit()
                 continue;
             bool fImmature = wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0;
 
+            // Counted only over the outputs that are ours, exactly like the
+            // totals below: an immature coinbase that pays somebody else too
+            // must not inflate this.
+            int64 nMineImmature = 0;
+
             bool fTxRecoverable = false;
             bool fTxLegacy = false;
             for (int i = 0; i < (int)wtx.vout.size(); i++)
@@ -4789,6 +4818,9 @@ WalletRecoveryAudit GetWalletRecoveryAudit()
                 bool fRecoverable = false;
                 if (audit.fHaveSeed && ExtractPubKey(txout.scriptPubKey, true, vchPubKey))
                     fRecoverable = setDerivedPubKeys.count(vchPubKey) > 0;
+
+                if (fImmature)
+                    nMineImmature += txout.nValue;
 
                 if (fRecoverable)
                 {
@@ -4805,6 +4837,33 @@ WalletRecoveryAudit GetWalletRecoveryAudit()
                     else
                         audit.nLegacyCredit += txout.nValue;
                     fTxLegacy = true;
+                }
+            }
+
+            if (fImmature && nMineImmature > 0)
+            {
+                int nDepth = 0;
+                switch (ClassifyImmatureCoinbase(wtx, nDepth))
+                {
+                case 1:
+                    audit.nOrphanedImmatureCredit += nMineImmature;
+                    audit.nOrphanedImmatureTx++;
+                    break;
+                case 2:
+                    audit.nUnanchoredImmatureCredit += nMineImmature;
+                    audit.nUnanchoredImmatureTx++;
+                    break;
+                default:
+                    {
+                        int nToGo = wtx.GetBlocksToMaturity();
+                        if (audit.nSoonestMaturityBlocks < 0 ||
+                            nToGo < audit.nSoonestMaturityBlocks)
+                        {
+                            audit.nSoonestMaturityBlocks = nToGo;
+                            audit.nSoonestMaturityDepth = nDepth;
+                        }
+                    }
+                    break;
                 }
             }
 

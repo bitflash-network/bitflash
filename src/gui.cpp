@@ -1369,6 +1369,16 @@ static void DrawWalletSafetyDialog()
                     FmtMoney(g_recoveryAudit.nRecoverableImmatureCredit).c_str());
         ImGui::Text("Not phrase-backed immature mining rewards: %s BTF",
                     FmtMoney(g_recoveryAudit.nLegacyImmatureCredit).c_str());
+        // Maturity is counted in blocks, so a reward whose block lost a race
+        // stays "immature" forever and looks like a stuck balance. The
+        // transaction list already says orphaned; this panel used to not.
+        if (g_recoveryAudit.nOrphanedImmatureTx > 0)
+            ImGui::TextWrapped("Of that, %s BTF is in block(s) not in the main chain: "
+                               "those rewards will never mature.",
+                               FmtMoney(g_recoveryAudit.nOrphanedImmatureCredit).c_str());
+        else if (g_recoveryAudit.nSoonestMaturityBlocks >= 0)
+            ImGui::Text("Next reward spendable in %d block(s).",
+                        g_recoveryAudit.nSoonestMaturityBlocks);
         if (!g_recoveryAudit.fDeriveComplete)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.25f, 1.0f));
