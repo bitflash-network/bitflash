@@ -71,6 +71,42 @@ static string BtfNetTag(const char* pszBase)
     return s;
 }
 
+// ---- subscriptions ---------------------------------------------------------
+//
+// Every query gets a subscription id of its own, and reads only what comes back
+// addressed to it.
+//
+// The relay sockets are pooled and reused, and a query that stops early -- the
+// descriptor resolver returns the moment one descriptor verifies -- leaves its
+// subscription open with events still on the wire. The next question asked over
+// that same socket then reads the previous question's answer.
+//
+// That is not a theory. It was found by asking two questions in a row about the
+// same peer: resolve their descriptor, then ask for something else. The second
+// answer was the first question's leftovers, and the caller refused it as
+// malformed -- correctly, since it was an answer to a different question.
+//
+// Fixed at the root: a fresh id per query, a reader that ignores anything
+// addressed elsewhere, and a CLOSE when the query is done so the relay stops
+// sending.
+static string NewSubId(const char* pszPrefix)
+{
+    static CCriticalSection cs_subid;
+    static unsigned int nNextSub = 0;
+    unsigned int n = 0;
+    CRITICAL_BLOCK(cs_subid)
+        n = ++nNextSub;
+    return strprintf("%s-%u", pszPrefix, n);
+}
+
+// True when this relay message answers the subscription we are reading for.
+// NOTICE and OK carry something else in that slot, so they fall out here too.
+static bool SubMatches(const json& j, const string& strSub)
+{
+    return j.size() >= 2 && j[1].is_string() && j[1].get<string>() == strSub;
+}
+// CloseSub() and the publish helpers live further down, with CWebSocket.
+
 // Anonymous auto-discovery: how many peers to keep connected via .btf rendezvous
 // before we stop dialing more, and how many new dials to attempt per cycle.
 // Target outbound peer count. With ~100 known .btf peers on the network,
@@ -797,6 +833,54 @@ static RelayConn* GetRelayConn(const string& relay)
 // next caller reconnects instead of reusing a socket that may be wedged.
 // Caller must set fOk = true once its exchange with the relay completed
 // cleanly.
+// Tell the relay to stop a subscription. Sockets here are pooled and reused, so
+// a subscription left open goes on delivering into whatever the next query is
+// reading. See NewSubId above.
+static void CloseSub(CWebSocket& ws, const string& strSub)
+{
+    ws.SendText(json::array({ "CLOSE", strSub }).dump());
+}
+
+// Did the relay actually take the event? 1 = yes, 0 = it said no, -1 = it never
+// answered.
+//
+// SendText() returning true means the bytes reached the socket, and nothing
+// beyond that. A relay that refuses an event -- unknown kind, rate limit, bad
+// timestamp, too large, paid relay -- says so in an OK frame, and nobody here
+// was listening. So "no relay accepted this" was reporting on whether a write
+// succeeded, which it almost always does.
+//
+// The node publishes its own .btf descriptor this way. If every relay refused
+// it, the node would be invisible to the whole network and nothing, anywhere,
+// would say a word.
+static int WaitForRelayOk(CWebSocket& ws, const string& strEventId, string& strReasonOut)
+{
+    strReasonOut.clear();
+    // Bounded twice over: the socket carries a receive timeout, and a relay that
+    // chatters without ever answering must not hold this thread.
+    for (int i = 0; i < 20; i++)
+    {
+        string msg;
+        if (!ws.RecvText(msg))
+        {
+            strReasonOut = "no answer";
+            return -1;
+        }
+        json j;
+        try { j = json::parse(msg); } catch (...) { continue; }
+        if (!j.is_array() || j.size() < 3 || !j[0].is_string()) continue;
+        if (j[0].get<string>() != "OK") continue;
+        if (!j[1].is_string() || j[1].get<string>() != strEventId) continue;
+        if (j[2].is_boolean() && j[2].get<bool>())
+            return 1;
+        strReasonOut = (j.size() >= 4 && j[3].is_string() && !j[3].get<string>().empty())
+                           ? j[3].get<string>() : "refused";
+        return 0;
+    }
+    strReasonOut = "never said whether it took it";
+    return -1;
+}
+
 class CRelayLease
 {
 public:
@@ -856,7 +940,18 @@ static void PublishDescriptor(CWebSocket& ws, CNostrKey& key)
     if (BuildSignedEvent(key, BTF_DESC_KIND, tags, desc, ev))
     {
         json pub = json::array({ "EVENT", ev });
-        ws.SendText(pub.dump());
+        if (!ws.SendText(pub.dump()))
+            return;
+        // This is how the node tells the network it exists. A relay that refuses
+        // it -- rate limit, policy, anything -- used to be indistinguishable from
+        // one that stored it, so a node could sit there invisible, publishing
+        // into nothing, with a clean log.
+        string strWhy;
+        int n = WaitForRelayOk(ws, ev.value("id", string()), strWhy);
+        if (n == 1)
+            LogPrint("nostr", "Nostr: descriptor stored\n");
+        else
+            printf("Nostr: the relay did not store our descriptor (%s)\n", strWhy.c_str());
     }
 }
 
@@ -948,7 +1043,8 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
             filter["kinds"] = json::array({ BTF_POOL_KIND });
             filter["#d"] = json::array({ BtfNetTag(BTF_POOL_DTAG) });
             filter["limit"] = 1;
-            json req = json::array({ "REQ", "btf-pool-query", filter });
+            string strSub = NewSubId("btf-pool-query");
+            json req = json::array({ "REQ", strSub, filter });
             if (!ws.SendText(req.dump()))
                 continue;
 
@@ -960,6 +1056,7 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
                 if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
+                if (!SubMatches(j, strSub)) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                 {
@@ -996,6 +1093,7 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
                 else if (type == "EOSE")
                     break;
             }
+            CloseSub(ws, strSub);
             lease.fOk = true;
         }
         CATCH_PRINT_EXCEPTION("BtfQueryPoolAnnouncement")
@@ -1060,9 +1158,15 @@ static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
     filter["kinds"]   = json::array({ BTF_DESC_KIND });
     filter["#d"]      = json::array({ BtfNetTag(BTF_DESC_DTAG) });
     filter["limit"]   = 1;
-    json req = json::array({ "REQ", "btf-resolve", filter });
+    string strSub = NewSubId("btf-resolve");
+    json req = json::array({ "REQ", strSub, filter });
     if (!ws.SendText(req.dump()))
         return false;
+    // Stopping at the first good descriptor is right, but it used to return from
+    // here with the subscription still open on a socket that gets reused. The
+    // next question asked over it read this answer. Close it on the way out,
+    // whichever way out that is.
+    bool fFound = false;
     for (;;)
     {
         string msg;
@@ -1071,6 +1175,7 @@ static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
         json j;
         try { j = json::parse(msg); } catch (...) { continue; }
         if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
+        if (!SubMatches(j, strSub)) continue;
         string t = j[0].get<string>();
         if (t == "EVENT" && j.size() >= 3)
         {
@@ -1080,13 +1185,15 @@ static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
             {
                 if (rawOut)
                     *rawOut = ev["content"].get<string>();
-                return true;
+                fFound = true;
+                break;
             }
         }
         else if (t == "EOSE")
             break;
     }
-    return false;
+    CloseSub(ws, strSub);
+    return fFound;
 }
 
 // Resolve a `.btf` address into its rendezvous coordinates by querying the
@@ -1182,7 +1289,8 @@ bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
             filter["kinds"]   = json::array({ BTF_DESC_KIND });
             filter["#d"]      = json::array({ BtfNetTag(BTF_DESC_DTAG) });
             filter["limit"]   = (int)authors.size();
-            json req = json::array({ "REQ", "btf-resolve-many", filter });
+            string strSub = NewSubId("btf-resolve-many");
+            json req = json::array({ "REQ", strSub, filter });
             if (!ws.SendText(req.dump()))
                 continue;
 
@@ -1194,6 +1302,7 @@ bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
                 if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
+                if (!SubMatches(j, strSub)) continue;
                 string t = j[0].get<string>();
                 if (t == "EVENT" && j.size() >= 3)
                 {
@@ -1226,6 +1335,7 @@ bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
                 else if (t == "EOSE")
                     break;
             }
+            CloseSub(ws, strSub);
             lease.fOk = true;
         }
         CATCH_PRINT_EXCEPTION("BtfResolveMany")
@@ -1326,7 +1436,8 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
         dfilter["kinds"] = json::array({ BTF_DESC_KIND });
         dfilter["#d"]    = json::array({ BtfNetTag(BTF_DESC_DTAG) });
         dfilter["limit"] = 200;
-        json dreq = json::array({ "REQ", "btf-disc", dfilter });
+        string strSub = NewSubId("btf-disc");
+        json dreq = json::array({ "REQ", strSub, dfilter });
         int nPeers = 0;
         if (ws.SendText(dreq.dump()))
         {
@@ -1338,6 +1449,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
                 if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
+                if (!SubMatches(j, strSub)) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                 {
@@ -1364,21 +1476,21 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     break;
             }
         }
+        // Onion-only: there are no rendezvous relays to discover. Just close the
+        // descriptor subscription opened above -- and close it here, before the
+        // next question goes out over this same socket, not after.
+        CloseSub(ws, strSub);
     }
-
-    // Onion-only: there are no rendezvous relays to discover. Just close the
-    // descriptor subscription opened above.
-    ws.SendText(json::array({ "CLOSE", "btf-disc" }).dump());
 
     // Discover live pool announcements. These are expiring status beacons, not
     // permanent directory entries, so the GUI can show only fresh pools.
-    ws.SendText(json::array({ "CLOSE", "btf-pools" }).dump());
     {
         json pfilter = json::object();
         pfilter["kinds"] = json::array({ BTF_POOL_KIND });
         pfilter["#d"]    = json::array({ BtfNetTag(BTF_POOL_DTAG) });
         pfilter["limit"]  = 200;
-        json preq = json::array({ "REQ", "btf-pools", pfilter });
+        string strSub = NewSubId("btf-pools");
+        json preq = json::array({ "REQ", strSub, pfilter });
         if (ws.SendText(preq.dump()))
         {
             for (;;)
@@ -1389,12 +1501,14 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
                 if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
+                if (!SubMatches(j, strSub)) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                     HandlePoolAnnouncement(j[2]);
                 else if (type == "EOSE")
                     break;
             }
+            CloseSub(ws, strSub);
         }
     }
     lease.fOk = true;
