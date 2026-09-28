@@ -556,6 +556,24 @@ void DrawConversation()
         ImGui::TextWrapped("%s", log[i].text.c_str());
         ImGui::PopStyleColor();
     }
+
+    // What is still waiting, below the conversation and visibly not part of it.
+    //
+    // These have NOT been delivered. Drawing them like sent messages would be
+    // the one lie this program must not tell, so they carry the word and the
+    // dim colour, and they move up into the conversation on the day they
+    // actually leave.
+    std::vector<btfchat::Pending> waiting;
+    btfchat::ChatPendingFor(g_selected, waiting);
+    for (size_t i = 0; i < waiting.size(); i++)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::TextUnformatted(FmtWhen(waiting[i].sent).c_str());
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s   [waiting -- they are not online]", waiting[i].text.c_str());
+        ImGui::PopStyleColor();
+    }
+
     // Keep the newest line in view, but only when the user is already at the
     // bottom: yanking the view while somebody is reading history is rude.
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)

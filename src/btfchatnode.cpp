@@ -73,6 +73,12 @@ static Identity           g_id;
 static Roster             g_roster;
 static ReplayGuard        g_replay;
 static History            g_history;
+// What could not be sent yet. Sealed with the rest of the store, never anywhere
+// else: this is the whole of "offline delivery" in this build.
+static Outbox             g_outbox;
+// Set when something makes it worth trying the queue right away -- today, the
+// peer writing to us, which proves they are online.
+static volatile bool      g_fFlushOutbox = false;
 static AutoLock           g_lock;
 static secp256k1_context* g_secp = NULL;
 
@@ -147,17 +153,30 @@ static bool LoadStore()
         return false;
     }
 
-    // The two halves are stored as one object so a single seal covers both.
+    // The halves are stored as one object so a single seal covers all of them.
     std::string err;
     size_t nSplit = plain.find('\n');
     if (nSplit == std::string::npos)
         return false;
     std::string strRoster = plain.substr(0, nSplit);
-    std::string strHistory = plain.substr(nSplit + 1);
+    std::string strRest = plain.substr(nSplit + 1);
+    // The outbox is the third line and arrived later than the other two. A store
+    // written before it existed has two lines and must still load: an upgrade
+    // that cannot read yesterday's file is an upgrade that erases a history.
+    std::string strHistory = strRest;
+    std::string strOutbox;
+    size_t nSplit2 = strRest.find('\n');
+    if (nSplit2 != std::string::npos)
+    {
+        strHistory = strRest.substr(0, nSplit2);
+        strOutbox  = strRest.substr(nSplit2 + 1);
+    }
     if (!g_roster.FromJson(strRoster, err))
         printf("btfchat: the roster in the store did not load: %s\n", err.c_str());
     if (!strHistory.empty() && !g_history.FromJson(strHistory, err))
         printf("btfchat: the history in the store did not load: %s\n", err.c_str());
+    if (!strOutbox.empty() && !g_outbox.FromJson(strOutbox, err))
+        printf("btfchat: the outbox in the store did not load: %s\n", err.c_str());
     return true;
 }
 
@@ -167,7 +186,8 @@ static bool SaveStore()
         return false;
     // One line of roster, then the history: newline-separated because neither
     // half's JSON contains a raw newline, and it keeps the seal to one blob.
-    std::string plain = g_roster.ToJson() + "\n" + g_history.ToJson();
+    std::string plain = g_roster.ToJson() + "\n" + g_history.ToJson()
+                      + "\n" + g_outbox.ToJson();
     std::vector<unsigned char> sealed;
     if (!SealStore(g_id, plain, sealed))
         return false;
@@ -212,6 +232,7 @@ bool ChatUnlock(const std::string& password, std::string& errOut)
         g_fUnlocked = true;
         g_roster = Roster();
         g_history = History();
+        g_outbox.Wipe();
         g_lock.Unlock(GetTime());
         LoadStore();
         // Epoch keys are random and kept, never derived, so they have to exist
@@ -236,6 +257,10 @@ void ChatLock()
         IdentityClear(g_id);
         g_roster = Roster();
         g_history = History();
+        // The queue is sealed on disk and reloaded at the next unlock, so
+        // dropping it from memory loses nothing and keeps a locked session with
+        // no plaintext in it.
+        g_outbox.Wipe();
         // The epoch secrets go with the session. An envelope sealed to them is
         // unreadable afterwards by anybody, us included: that is the forward
         // secrecy, and keeping them would quietly throw it away.
@@ -683,6 +708,7 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
         return false;
     }
     bool fOk = SendOneFrame(peerAddr, js, errOut);
+    bool fQueued = false;
     if (!fOk)
     {
         // Offline, unreachable, or Tor having a bad minute. Leave it where they
@@ -697,12 +723,36 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
             errOut.clear();
         }
         else
-            errOut = "could not connect (" + strLive + ") and could not leave a message (" + strBox + ")";
+        {
+            // Nobody else will hold it, so we hold it. The frame is already
+            // signed, so what goes in the queue is exactly what would have gone
+            // on the wire -- retrying is sending the same message, not writing a
+            // new one with a new timestamp.
+            Pending p;
+            p.peer      = peerAddr;
+            p.frameJson = js;
+            p.id        = f.id;
+            p.text      = text;
+            p.sent      = f.sent;
+
+            std::string strQueue;
+            CRITICAL_BLOCK(cs_chat)
+                fQueued = g_outbox.Add(p, strQueue);
+
+            if (fQueued)
+                errOut = "they are not reachable -- kept here and sent when they come back "
+                         "(within a day, after that it expires)";
+            else
+                errOut = "could not connect (" + strLive + "), could not leave a message ("
+                         + strBox + "), and could not keep it here (" + strQueue + ")";
+        }
     }
     IdentityClear(id);
 
     // Only recorded once it is actually gone. A line in the history that never
-    // left is a lie the user acts on.
+    // left is a lie the user acts on -- which is why a queued message does NOT
+    // go in here. It is shown from the queue, marked as still waiting, and moves
+    // into the history on the day it actually leaves.
     if (fOk)
         CRITICAL_BLOCK(cs_chat)
         {
@@ -710,7 +760,107 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
             g_history.Append(f, peerAddr, true, e);
             SaveStore();
         }
+    else if (fQueued)
+    {
+        CRITICAL_BLOCK(cs_chat)
+            SaveStore();
+        // Queued counts as taken. The caller's false would put the text back in
+        // the box for the user to send again, and they would be sending a second
+        // copy of something already waiting to go.
+        return true;
+    }
     return fOk;
+}
+
+// Send what is waiting for one peer, oldest first.
+//
+// Direct only: the mailbox was already tried once when the message was written,
+// and retrying it here would mean every queued message costs a round of relay
+// connections every couple of minutes. The queue exists for the case where no
+// third party will hold anything, so it delivers the way this build delivers --
+// their onion, our connection.
+//
+// Stops at the first failure, so what arrives arrives in the order it was
+// written. Returns how many went.
+static int FlushOutboxFor(const std::string& peerAddr)
+{
+    std::vector<Pending> waiting;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_fUnlocked)
+            return 0;
+        g_outbox.For(peerAddr, waiting);
+    }
+    if (waiting.empty())
+        return 0;
+
+    int nSent = 0;
+    for (size_t i = 0; i < waiting.size() && !fShutdown; i++)
+    {
+        std::string err;
+        if (!SendOneFrame(peerAddr, waiting[i].frameJson, err))
+            break;
+
+        Frame f;
+        std::string e;
+        // Re-read our own frame rather than trusting what we stored: the store
+        // is a file, and a file is something else could have edited.
+        if (!OpenFrame(g_secp, waiting[i].frameJson, f, e))
+        {
+            CRITICAL_BLOCK(cs_chat)
+                g_outbox.Remove(waiting[i].id);
+            continue;
+        }
+        CRITICAL_BLOCK(cs_chat)
+        {
+            g_history.Append(f, peerAddr, true, e);
+            g_outbox.Remove(waiting[i].id);
+        }
+        nSent++;
+    }
+
+    if (nSent > 0)
+        CRITICAL_BLOCK(cs_chat)
+            SaveStore();
+    return nSent;
+}
+
+// Everything waiting, for everybody, plus the ones that can no longer arrive.
+static int FlushOutbox()
+{
+    std::vector<std::string> peers;
+    int nExpired = 0;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_fUnlocked)
+            return 0;
+        nExpired = g_outbox.Expire(GetTime());
+        g_outbox.Peers(peers);
+    }
+    if (nExpired > 0)
+    {
+        printf("btfchat: %d queued message(s) expired undelivered (older than a day)\n", nExpired);
+        CRITICAL_BLOCK(cs_chat)
+            SaveStore();
+    }
+
+    int nSent = 0;
+    for (size_t i = 0; i < peers.size() && !fShutdown; i++)
+        nSent += FlushOutboxFor(peers[i]);
+    return nSent;
+}
+
+bool ChatPendingFor(const std::string& peerAddr, std::vector<Pending>& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_fUnlocked)
+            return false;
+        g_outbox.For(peerAddr, out);
+        return true;
+    }
+    return false;
 }
 
 // ---- inbound ---------------------------------------------------------------
@@ -808,7 +958,15 @@ static void ThreadChatServe(void* parg)
             }
 
             if (fDelivered)
+            {
                 printf("btfchat: delivered a frame from %s\n", f.from.c_str());
+                // They just wrote to us, so they are up right now. If we are
+                // holding anything for them, this is the moment -- not two
+                // minutes from now. Flagged rather than sent from here: dialling
+                // out from the thread that is serving an inbound connection
+                // would hold that connection open for the length of a circuit.
+                g_fFlushOutbox = true;
+            }
 
             if (!fDelivered)
             {
@@ -1023,13 +1181,32 @@ static void ThreadChatMailbox(void* parg)
                 int n = ChatPollMailboxes(err);
                 if (n > 0)
                     printf("btfchat: %d message(s) collected from the mailbox\n", n);
+
+                g_fFlushOutbox = false;
+                int nOut = FlushOutbox();
+                if (nOut > 0)
+                    printf("btfchat: %d message(s) sent from the outbox\n", nOut);
             }
 
-            // Two minutes. Polling harder buys latency for somebody who is
-            // offline anyway, and every poll is a Tor circuit to a relay --
-            // which is traffic a watcher can count.
+            // Two minutes between full rounds. Polling harder buys latency for
+            // somebody who is offline anyway, and every poll is a Tor circuit to
+            // a relay -- which is traffic a watcher can count.
+            //
+            // The queue is different: it costs one connection to somebody we
+            // already know is up, and waiting two minutes to answer a person who
+            // is typing at us right now would feel broken. So the wait is
+            // interruptible, and only for the queue.
             for (int i = 0; i < 120 && !fShutdown; i++)
+            {
                 Sleep(1000);
+                if (g_fFlushOutbox && ChatUnlocked())
+                {
+                    g_fFlushOutbox = false;
+                    int nNow = FlushOutbox();
+                    if (nNow > 0)
+                        printf("btfchat: %d message(s) sent from the outbox\n", nNow);
+                }
+            }
         }
     }
     catch (std::exception& e) { PrintException(&e, "ThreadChatMailbox()"); }

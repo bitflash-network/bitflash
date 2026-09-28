@@ -285,6 +285,101 @@ int main()
               "the round trip through the seal is lossless");
     }
 
+    // ---- the outbox --------------------------------------------------------
+    {
+        printf("\n-- the outbox --\n");
+        const int64_t NOW = 1800000000;
+        std::string err;
+
+        btfchat::Outbox ob;
+        btfchat::Pending p;
+        p.peer = "bpeer1.btf"; p.id = IdOf(9001); p.text = "oi"; p.sent = NOW;
+        p.frameJson = "{\"fake\":\"frame\"}";
+        CHECK(ob.Add(p, err), "a message that could not be sent is kept");
+        CHECK(!ob.Add(p, err), "the same frame is not queued twice");
+        CHECK(ob.Size() == 1 && ob.CountFor("bpeer1.btf") == 1, "and it is counted once");
+
+        btfchat::Pending bad = p;
+        bad.id = IdOf(9002);
+        bad.frameJson.clear();
+        CHECK(!ob.Add(bad, err), "a message with no frame is refused");
+        bad = p; bad.id = "short";
+        CHECK(!ob.Add(bad, err), "a malformed id is refused");
+
+        btfchat::Pending q = p;
+        q.id = IdOf(9003); q.text = "segunda"; q.sent = NOW + 10;
+        CHECK(ob.Add(q, err), "a second one queues behind it");
+        std::vector<btfchat::Pending> got;
+        ob.For("bpeer1.btf", got);
+        CHECK(got.size() == 2 && got[0].id == IdOf(9001) && got[1].id == IdOf(9003),
+              "and they come back in the order they were written");
+
+        std::vector<std::string> peers;
+        ob.Peers(peers);
+        CHECK(peers.size() == 1 && peers[0] == "bpeer1.btf", "one peer is waiting");
+
+        ob.Remove(IdOf(9001));
+        ob.For("bpeer1.btf", got);
+        CHECK(got.size() == 1 && got[0].id == IdOf(9003), "a delivered one leaves the queue");
+        // Removing frees the id, because the message is gone for good and a
+        // later message could legitimately reuse nothing -- but the id check
+        // must not keep refusing it forever either.
+        CHECK(ob.Add(p, err), "and its slot is free again");
+        ob.Remove(IdOf(9001));
+
+        // The ceiling refuses rather than dropping. A log drops its oldest line
+        // because a log is a record; a queue must not, because its contents have
+        // NOT happened yet.
+        btfchat::Outbox full;
+        for (size_t i = 0; i < btfchat::MAX_OUTBOX_PER_PEER; i++)
+        {
+            btfchat::Pending f;
+            f.peer = "bfull.btf"; f.id = IdOf((unsigned)(20000 + i));
+            f.text = "x"; f.sent = NOW; f.frameJson = "{}";
+            if (!full.Add(f, err)) { CHECK(false, "the queue filled early"); break; }
+        }
+        btfchat::Pending over;
+        over.peer = "bfull.btf"; over.id = IdOf(29999); over.text = "x";
+        over.sent = NOW; over.frameJson = "{}";
+        CHECK(!full.Add(over, err), "a full queue refuses instead of dropping the oldest");
+        std::vector<btfchat::Pending> stillThere;
+        full.For("bfull.btf", stillThere);
+        CHECK(stillThere.size() == btfchat::MAX_OUTBOX_PER_PEER &&
+              stillThere[0].id == IdOf(20000),
+              "and the first thing the user said is still the first thing waiting");
+
+        // Expiry is not a preference: past FRAME_MAX_AGE the receiving side
+        // refuses the frame, so holding it is holding something that can no
+        // longer arrive.
+        btfchat::Outbox aging;
+        btfchat::Pending fresh, stale;
+        fresh.peer = "bage.btf"; fresh.id = IdOf(31001); fresh.text = "nova";
+        fresh.sent = NOW; fresh.frameJson = "{}";
+        stale.peer = "bage.btf"; stale.id = IdOf(31002); stale.text = "velha";
+        stale.sent = NOW - btfchat::FRAME_MAX_AGE; stale.frameJson = "{}";
+        CHECK(aging.Add(fresh, err) && aging.Add(stale, err), "one fresh, one at the limit");
+        CHECK(aging.Expire(NOW) == 1, "the one the other side would refuse is dropped");
+        aging.For("bage.btf", got);
+        CHECK(got.size() == 1 && got[0].id == IdOf(31001), "and the deliverable one stays");
+
+        // A store is a file, and a file is something else could have edited.
+        btfchat::Outbox loaded;
+        CHECK(loaded.FromJson(full.ToJson(), err), "the queue reloads from its sealed form");
+        CHECK(loaded.CountFor("bfull.btf") == btfchat::MAX_OUTBOX_PER_PEER,
+              "with everything that was in it");
+        std::string strOversized = full.ToJson();
+        // Same queue claimed twice over: FromJson must not end up holding more
+        // than Add() would ever have allowed.
+        CHECK(loaded.FromJson(strOversized, err) &&
+              loaded.CountFor("bfull.btf") <= btfchat::MAX_OUTBOX_PER_PEER,
+              "and a store that grew past the ceiling elsewhere does not get past it here");
+
+        btfchat::Outbox forget;
+        CHECK(forget.Add(p, err), "one queued");
+        forget.ForgetPeer("bpeer1.btf");
+        CHECK(forget.Size() == 0, "forgetting a peer drops what was waiting for them");
+    }
+
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);
     secp256k1_context_destroy(ctx);
     return g_fail == 0 ? 0 : 1;

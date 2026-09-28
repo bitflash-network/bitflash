@@ -145,6 +145,10 @@ int ChatPollMailboxes(std::string& errOut);
 void ChatPendingInvites(std::vector<Invite>& out);
 void ChatContacts(std::vector<std::string>& out);          // accepted, sorted
 void ChatConversation(const std::string& peerAddr, std::vector<LogEntry>& out);
+// What is still waiting to go to that address, oldest first. Kept apart from the
+// conversation on purpose: these have not been delivered, and showing them as if
+// they had would be the one lie this program must not tell.
+bool ChatPendingFor(const std::string& peerAddr, std::vector<Pending>& out);
 PeerState ChatPeerState(const std::string& peerAddr);
 
 // Where the sealed roster and history live, so the interface can say so.

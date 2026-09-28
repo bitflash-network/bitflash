@@ -101,6 +101,73 @@ private:
                   const std::string& key, const LogEntry& e, std::string& errOut);
 };
 
+// ---- the outbox ------------------------------------------------------------
+//
+// What to do with a message for somebody who is not there.
+//
+// Nothing leaves this machine. The signed frame is kept here, under the same
+// seal as the history, and sent when that person is reachable again. No relay
+// stores it, no node is asked to hold it, nobody has to be trusted with it --
+// which is the entire point, and the reason this exists instead of a mailbox
+// somewhere.
+//
+// The honest cost, said out loud: WE have to be running when they come back.
+// A message to somebody in another timezone may simply never go. The user is
+// told this, because a queue that quietly never delivers is worse than an error.
+//
+// HOW LONG IT LIVES IS NOT A PREFERENCE. ReplayGuard refuses any frame older
+// than FRAME_MAX_AGE -- one day -- so a message delivered after that is refused
+// on arrival and vanishes without a trace. The queue therefore stops at the same
+// line and says the message expired. Widening the window instead would widen the
+// replay window, which is trading a security property for a convenience, and
+// this is not a trade worth making.
+static const size_t MAX_OUTBOX_PER_PEER = 200;
+static const size_t MAX_OUTBOX_TOTAL    = 1000;
+
+struct Pending
+{
+    std::string peer;      // who it is for
+    std::string frameJson; // signed at the moment it was written, not at delivery
+    std::string id;        // the frame id, which is what identifies it everywhere
+    std::string text;      // for showing the user what is still waiting
+    int64_t     sent;      // the clock it was signed under
+
+    Pending() : sent(0) {}
+};
+
+class Outbox
+{
+public:
+    Outbox() {}
+
+    // Refuses a duplicate id, a full queue, and a message for nobody.
+    bool Add(const Pending& p, std::string& errOut);
+
+    // Everything still waiting for this peer, oldest first.
+    void For(const std::string& peer, std::vector<Pending>& out) const;
+    // Every peer with something waiting.
+    void Peers(std::vector<std::string>& out) const;
+
+    // Gone because it was delivered.
+    void Remove(const std::string& id);
+    // Gone because it can no longer be delivered to anybody: past FRAME_MAX_AGE
+    // the receiving side refuses it. Returns how many were dropped, so the
+    // caller can say so rather than letting them disappear quietly.
+    int  Expire(int64_t nNow);
+
+    size_t Size() const;
+    size_t CountFor(const std::string& peer) const;
+    void   ForgetPeer(const std::string& peer);
+    void   Wipe();
+
+    std::string ToJson() const;
+    bool        FromJson(const std::string& jsonStr, std::string& errOut);
+
+private:
+    std::map<std::string, std::vector<Pending> > mapQueued; // peer -> in order
+    std::map<std::string, bool>                  mapIds;
+};
+
 } // namespace btfchat
 
 #endif

@@ -262,4 +262,205 @@ bool History::FromJson(const std::string& jsonStr, std::string& errOut)
     return true;
 }
 
+// ---- the outbox ------------------------------------------------------------
+
+bool Outbox::Add(const Pending& p, std::string& errOut)
+{
+    errOut.clear();
+    if (p.peer.empty() || p.frameJson.empty() || p.id.size() != 32)
+    {
+        errOut = "that message cannot be queued";
+        return false;
+    }
+    if (mapIds.count(p.id))
+    {
+        // Queuing the same frame twice would deliver it twice if the receiving
+        // side's replay table had rotated in between.
+        errOut = "that message is already waiting";
+        return false;
+    }
+    if (Size() >= MAX_OUTBOX_TOTAL)
+    {
+        errOut = "there are too many messages waiting to be sent";
+        return false;
+    }
+    if (CountFor(p.peer) >= MAX_OUTBOX_PER_PEER)
+    {
+        // Refusing is the honest answer. Dropping the oldest would mean the user
+        // keeps typing while the thing they said first silently disappears --
+        // and unlike a log, this is a queue of things that have NOT happened.
+        errOut = "too many messages are already waiting for that address";
+        return false;
+    }
+
+    mapQueued[p.peer].push_back(p);
+    mapIds[p.id] = true;
+    return true;
+}
+
+void Outbox::For(const std::string& peer, std::vector<Pending>& out) const
+{
+    out.clear();
+    std::map<std::string, std::vector<Pending> >::const_iterator it = mapQueued.find(peer);
+    if (it != mapQueued.end())
+        out = it->second;
+}
+
+void Outbox::Peers(std::vector<std::string>& out) const
+{
+    out.clear();
+    for (std::map<std::string, std::vector<Pending> >::const_iterator it = mapQueued.begin();
+         it != mapQueued.end(); ++it)
+        if (!it->second.empty())
+            out.push_back(it->first);
+}
+
+void Outbox::Remove(const std::string& id)
+{
+    for (std::map<std::string, std::vector<Pending> >::iterator it = mapQueued.begin();
+         it != mapQueued.end(); )
+    {
+        for (size_t i = 0; i < it->second.size(); i++)
+            if (it->second[i].id == id)
+            {
+                it->second.erase(it->second.begin() + i);
+                break;
+            }
+        if (it->second.empty())
+            mapQueued.erase(it++);
+        else
+            ++it;
+    }
+    mapIds.erase(id);
+}
+
+int Outbox::Expire(int64_t nNow)
+{
+    int nDropped = 0;
+    for (std::map<std::string, std::vector<Pending> >::iterator it = mapQueued.begin();
+         it != mapQueued.end(); )
+    {
+        std::vector<Pending> keep;
+        for (size_t i = 0; i < it->second.size(); i++)
+        {
+            // The receiving side refuses anything older than this, so holding it
+            // any longer is holding something that can no longer arrive.
+            if (nNow - it->second[i].sent >= FRAME_MAX_AGE)
+            {
+                mapIds.erase(it->second[i].id);
+                nDropped++;
+            }
+            else
+                keep.push_back(it->second[i]);
+        }
+        it->second = keep;
+        if (it->second.empty())
+            mapQueued.erase(it++);
+        else
+            ++it;
+    }
+    return nDropped;
+}
+
+size_t Outbox::Size() const
+{
+    size_t n = 0;
+    for (std::map<std::string, std::vector<Pending> >::const_iterator it = mapQueued.begin();
+         it != mapQueued.end(); ++it)
+        n += it->second.size();
+    return n;
+}
+
+size_t Outbox::CountFor(const std::string& peer) const
+{
+    std::map<std::string, std::vector<Pending> >::const_iterator it = mapQueued.find(peer);
+    return it == mapQueued.end() ? 0 : it->second.size();
+}
+
+void Outbox::ForgetPeer(const std::string& peer)
+{
+    std::map<std::string, std::vector<Pending> >::iterator it = mapQueued.find(peer);
+    if (it == mapQueued.end())
+        return;
+    for (size_t i = 0; i < it->second.size(); i++)
+        mapIds.erase(it->second[i].id);
+    mapQueued.erase(it);
+}
+
+void Outbox::Wipe()
+{
+    mapQueued.clear();
+    mapIds.clear();
+}
+
+std::string Outbox::ToJson() const
+{
+    json j;
+    j["v"] = 1;
+    json q = json::object();
+    for (std::map<std::string, std::vector<Pending> >::const_iterator it = mapQueued.begin();
+         it != mapQueued.end(); ++it)
+    {
+        json a = json::array();
+        for (size_t i = 0; i < it->second.size(); i++)
+        {
+            json e = json::object();
+            e["t"] = it->second[i].sent;
+            e["i"] = it->second[i].id;
+            e["x"] = it->second[i].text;
+            e["m"] = it->second[i].frameJson;
+            a.push_back(e);
+        }
+        q[it->first] = a;
+    }
+    j["queued"] = q;
+    return j.dump();
+}
+
+bool Outbox::FromJson(const std::string& jsonStr, std::string& errOut)
+{
+    errOut.clear();
+    json j;
+    try { j = json::parse(jsonStr); }
+    catch (...) { errOut = "the outbox is not valid JSON"; return false; }
+    if (!j.is_object()) { errOut = "the outbox is not an object"; return false; }
+
+    Outbox o;
+    try
+    {
+        if (j.count("queued") && j["queued"].is_object())
+        {
+            for (json::const_iterator it = j["queued"].begin(); it != j["queued"].end(); ++it)
+            {
+                const json& a = it.value();
+                if (!a.is_array())
+                    continue;
+                for (size_t i = 0; i < a.size(); i++)
+                {
+                    if (!a[i].is_object())
+                        continue;
+                    Pending p;
+                    p.peer      = it.key();
+                    p.sent      = a[i].value("t", (int64_t)0);
+                    p.id        = a[i].value("i", std::string());
+                    p.text      = a[i].value("x", std::string());
+                    p.frameJson = a[i].value("m", std::string());
+                    std::string e;
+                    // Add() carries every bound and every refusal, so a store
+                    // that grew past them elsewhere cannot get past them here.
+                    o.Add(p, e);
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        errOut = "the outbox has a field of the wrong type";
+        return false;
+    }
+
+    *this = o;
+    return true;
+}
+
 } // namespace btfchat
