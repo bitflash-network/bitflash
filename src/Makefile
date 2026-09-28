@@ -178,13 +178,19 @@ fuzz-script-smoke: fuzz-script
 	./fuzz-script -runs=128 ../work/fuzz-corpus/script
 
 clean:
-	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32
+	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto
 
-tests: test_bip32 bitflash-node
+# The .btf address tests existed as a file you had to compile by hand, which is
+# the same as not having them: they did not run here and they did not run in CI.
+test_btfaddr: test_btfaddr.cpp btfaddr.cpp btfaddr.h
+	$(CXX) $(CXXFLAGS) -o $@ test_btfaddr.cpp btfaddr.cpp $(LIBS)
+
+tests: test_bip32 test_btfaddr bitflash-node
 	./test_bip32
+	./test_btfaddr
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
