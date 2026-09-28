@@ -15,7 +15,9 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstring>
+#include <cctype>   // toupper
 #include <string>
+#include <vector>
 
 using json = nlohmann::json;
 
