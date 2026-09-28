@@ -326,6 +326,22 @@ struct WalletRecoveryAudit
     int64 nLegacyCredit;
     int64 nRecoverableImmatureCredit;
     int64 nLegacyImmatureCredit;
+    // Why the immature total is what it is.
+    //
+    // "Immature" is computed from depth alone, so a coinbase whose block lost a
+    // race has depth 0 forever and is reported, forever, exactly like one that
+    // is two blocks from spendable. A miner watched 50 BTF sit there for days
+    // and reasonably concluded the maturity rule was broken. It was not: that
+    // reward was never coming. The transaction list already said so; the audit
+    // did not, and the audit is what people run when they want a number.
+    //
+    // The totals above are unchanged -- this only says what is inside them.
+    int64 nOrphanedImmatureCredit;   // block known, not in the main chain: dead
+    int   nOrphanedImmatureTx;
+    int64 nUnanchoredImmatureCredit; // no block, or a block this node does not have
+    int   nUnanchoredImmatureTx;
+    int   nSoonestMaturityBlocks;    // blocks to go for the nearest live one, -1 if none
+    int   nSoonestMaturityDepth;
     string strDeriveError;
 
     WalletRecoveryAudit()
@@ -346,6 +362,12 @@ struct WalletRecoveryAudit
         nLegacyCredit = 0;
         nRecoverableImmatureCredit = 0;
         nLegacyImmatureCredit = 0;
+        nOrphanedImmatureCredit = 0;
+        nOrphanedImmatureTx = 0;
+        nUnanchoredImmatureCredit = 0;
+        nUnanchoredImmatureTx = 0;
+        nSoonestMaturityBlocks = -1;
+        nSoonestMaturityDepth = 0;
     }
 };
 WalletRecoveryAudit GetWalletRecoveryAudit();

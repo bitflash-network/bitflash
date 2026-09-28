@@ -438,6 +438,31 @@ int CmdRecoveryAudit()
     printf("    not phrase-backed immature: %s BTF (%d transaction(s))\n",
            FormatMoney(audit.nLegacyImmatureCredit).c_str(),
            audit.nLegacyImmatureTx);
+    // Immaturity is measured in blocks, not in days, and a reward whose block
+    // lost a race never stops being immature. Without these lines the two look
+    // identical, and the number just sits there looking broken.
+    if (audit.nOrphanedImmatureTx > 0)
+        printf("    orphaned, never matures:    %s BTF (%d transaction(s)) -- the block is not in the main chain\n",
+               FormatMoney(audit.nOrphanedImmatureCredit).c_str(),
+               audit.nOrphanedImmatureTx);
+    if (audit.nUnanchoredImmatureTx > 0)
+        printf("    in no block this node has:  %s BTF (%d transaction(s)) -- still syncing, or the block is unknown here\n",
+               FormatMoney(audit.nUnanchoredImmatureCredit).c_str(),
+               audit.nUnanchoredImmatureTx);
+    if (audit.nSoonestMaturityBlocks >= 0)
+        printf("    next one spendable in:      %d block(s) (%d confirmation(s) so far, %d needed)\n",
+               audit.nSoonestMaturityBlocks, audit.nSoonestMaturityDepth,
+               COINBASE_MATURITY + 20);
+
+    // Said in words, and said before any of the early returns below, because
+    // this is the line somebody is looking for when the number will not move.
+    if (audit.nOrphanedImmatureTx > 0)
+    {
+        printf("\n");
+        printf("Note: %s BTF of the immature total is in block(s) that are not in the main chain.\n",
+               FormatMoney(audit.nOrphanedImmatureCredit).c_str());
+        printf("Those rewards lost a race and will never mature. Nothing is wrong with this wallet.\n");
+    }
 
     if (!audit.fHaveSeed)
     {

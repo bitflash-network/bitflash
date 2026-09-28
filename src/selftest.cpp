@@ -602,6 +602,46 @@ static int RunWalletHDSelfTest()
         nFail += Check(audit.nLegacyImmatureTx == 1,
                        "the recovery audit counts wallet.dat-only immature mining rewards") ? 0 : 1;
 
+        // A coinbase whose block lost a race. Maturity is measured in depth, and
+        // an orphan sits at depth 0 forever, so the audit reported it exactly
+        // like a reward two blocks from spendable. A miner watched 50 BTF sit
+        // there for days and reported the maturity rule as broken; the rule was
+        // fine, the reward was dead, and nothing said so.
+        {
+            CWalletTx wtxOrphanCoinbase;
+            wtxOrphanCoinbase.vin.push_back(CTxIn());
+            wtxOrphanCoinbase.vout.push_back(
+                CTxOut(50 * COIN, CScript() << keyAuditDerived.GetPubKey() << OP_CHECKSIG));
+            // Anchored to a block this node knows and has NOT built on: pnext is
+            // null and it is not pindexBest, so IsInMainChain() is false.
+            uint256 hashOrphanBlock = wtxOrphanCoinbase.GetHash();
+            wtxOrphanCoinbase.hashBlock = hashOrphanBlock;
+            wtxOrphanCoinbase.nIndex = 0;
+            CBlockIndex* pindexOrphan = new CBlockIndex();
+            mapBlockIndex[hashOrphanBlock] = pindexOrphan;
+
+            uint256 hashOrphanTx = wtxOrphanCoinbase.GetHash();
+            CRITICAL_BLOCK(cs_mapWallet)
+                mapWallet[hashOrphanTx] = wtxOrphanCoinbase;
+
+            WalletRecoveryAudit orphanAudit = GetWalletRecoveryAudit();
+            nFail += Check(orphanAudit.nOrphanedImmatureCredit == 50 * COIN &&
+                           orphanAudit.nOrphanedImmatureTx == 1,
+                           "the audit separates a coinbase whose block is not in the main chain") ? 0 : 1;
+            nFail += Check(orphanAudit.nRecoverableImmatureCredit == 50 * COIN,
+                           "an orphaned coinbase still counts in the immature total it belongs to") ? 0 : 1;
+            nFail += Check(orphanAudit.nUnanchoredImmatureCredit == 11 * COIN &&
+                           orphanAudit.nUnanchoredImmatureTx == 1,
+                           "a coinbase in no known block is reported apart from an orphaned one") ? 0 : 1;
+            nFail += Check(orphanAudit.nSoonestMaturityBlocks == -1,
+                           "nothing is reported as on its way to maturity when nothing is") ? 0 : 1;
+
+            CRITICAL_BLOCK(cs_mapWallet)
+                mapWallet.erase(hashOrphanTx);
+            mapBlockIndex.erase(hashOrphanBlock);
+            delete pindexOrphan;
+        }
+
         CKey keyLegacyHD11;
         nSchemaForLegacyAudit = nHDKeySchema;
         nHDKeySchema = HD_SCHEMA_LEGACY;
