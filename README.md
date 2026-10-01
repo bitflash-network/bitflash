@@ -12,7 +12,7 @@ CPU-only cryptocurrency. A revival of Bitcoin 0.1.0 with RandomX proof of work a
 ![Fair Launch](https://img.shields.io/badge/premine-none-2ea44f?style=for-the-badge)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge)](https://discord.gg/n7B2Eamn3)
 
-**[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/n7B2Eamn3)**
+**[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/xsYYM3WsdV)**
 
 </div>
 
