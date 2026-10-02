@@ -240,7 +240,22 @@ def build_explorer(raw_blocks, out_dir):
         }, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
-    (out / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+    # The asset URLs carry a hash of what they contain.
+    #
+    # Without it a returning visitor keeps whatever explorer.js their browser
+    # cached, forever: the deploy that added the hashrate line went out with a
+    # fresh index.html and a fresh blocks.json, and the page still ran the old
+    # script, so the new element sat there empty. Measured on the live site, not
+    # guessed -- showEstimate was undefined in a page whose HTML had the span.
+    #
+    # The hash only changes when the file does, so this costs nothing per deploy
+    # and makes a stale asset impossible rather than unlikely.
+    js_tag = hashlib.sha256(EXPLORER_JS.encode("utf-8")).hexdigest()[:8]
+    css_tag = hashlib.sha256(STYLE_CSS.encode("utf-8")).hexdigest()[:8]
+    index = (INDEX_HTML
+             .replace('href="style.css"', 'href="style.css?v=%s"' % css_tag)
+             .replace('src="explorer.js"', 'src="explorer.js?v=%s"' % js_tag))
+    (out / "index.html").write_text(index, encoding="utf-8")
     (out / "style.css").write_text(STYLE_CSS, encoding="utf-8")
     (out / "explorer.js").write_text(EXPLORER_JS, encoding="utf-8")
     logo = Path(__file__).resolve().parents[1] / "docs" / "logo.png"
