@@ -197,7 +197,17 @@ bool ParseAddressVersion(const std::string& addr, unsigned char pubkeyOut[32],
 bool ParseAddress(const std::string& addr, unsigned char pubkeyOut[32])
 {
     int nVersion = 0;
-    return ParseAddressVersion(addr, pubkeyOut, nVersion);
+    if (!ParseAddressVersion(addr, pubkeyOut, nVersion))
+        return false;
+    // Version 1 only, and deliberately.
+    //
+    // This signature has nowhere to report a version, so every caller of it is
+    // by definition a caller that cannot act on one -- and handing back 32
+    // bytes from a version it has never heard of means that key gets read as a
+    // secp256k1 x-only key by code that will never know it guessed. The whole
+    // reason for reserving the byte is that the identity key may stop being
+    // one. A caller that needs more asks ParseAddressVersion and decides.
+    return nVersion == ADDR_VERSION_XONLY;
 }
 
 

@@ -191,7 +191,18 @@ int main()
         std::string mangled = v2;
         size_t nLabel = mangled.size() - strlen(btf::TLD);
         mangled[nLabel - 1] = (mangled[nLabel - 1] == 'a') ? 'b' : 'a';
-        CHECK(!btf::ParseAddress(mangled, out), "editing the version byte breaks the checksum");
+        CHECK(!btf::ParseAddressVersion(mangled, out, nVer),
+              "editing the version byte breaks the checksum");
+
+        // ParseAddress has nowhere to report a version, so it must refuse the
+        // ones it cannot report. Otherwise a future scheme's key is handed to
+        // every old call site in the node and read as a secp256k1 x-only key,
+        // silently -- which is the exact failure reserving the byte exists to
+        // prevent. The versioned call still reads it.
+        CHECK(!btf::ParseAddress(v2, out),
+              "the version-blind parser refuses a version it cannot report");
+        CHECK(btf::ParseAddressVersion(v2, out, nVer) && nVer == 2,
+              "and the versioned one still reads it");
     }
 
     printf("address_has_exactly_one_spelling\n");
