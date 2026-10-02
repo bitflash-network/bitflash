@@ -278,9 +278,67 @@ def run_golden_fixture(update):
                     "explorer fixture block did not include the normal transaction")
 
 
+def load_explorer_module():
+    """build-explorer.py has a hyphen in it, so it needs importlib by hand."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_explorer", SCRIPTS / "build-explorer.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_hashrate_estimate():
+    """The hashrate estimate, over a window where the target changes.
+
+    This is the part that is easy to get wrong and impossible to see wrong: the
+    difficulty retargets every 30 blocks, so charging a 144-block window at the
+    tip's target overstates the number after a rise and understates it after a
+    fall. Both answers look perfectly reasonable on the page.
+
+    Measured on a real stretch of chain, the two methods differed by 27%.
+    """
+    mod = load_explorer_module()
+
+    # Two targets exactly 4x apart -- one retarget's worth of clamp -- half the
+    # window each. Power-of-two mantissas so the ratio is exact.
+    easy, hard = "0x1f100000", "0x1f040000"
+    t_easy = mod.target_from_bits(int(easy, 16))
+    t_hard = mod.target_from_bits(int(hard, 16))
+    assert_true(t_easy == 4 * t_hard, "the test's two targets are not 4x apart")
+
+    w_easy = (1 << 256) // (t_easy + 1)
+    w_hard = (1 << 256) // (t_hard + 1)
+
+    blocks = []
+    for i in range(21):
+        blocks.append({"time": 1000 + i * 100, "bits": easy if i < 11 else hard})
+    est = mod.network_estimate(blocks)
+
+    # Ten blocks mined at the easy target, ten at the hard one, over 2000 s.
+    expected = (10 * w_easy + 10 * w_hard) / 2000.0
+    assert_true(abs(est["hashrate"] - expected) < 1e-6,
+                "hashrate is not the sum of each block's own work: got %r, want %r"
+                % (est["hashrate"], expected))
+    # And emphatically not the tip's target repeated across the window, which is
+    # what it used to be and is 1.6x too high here.
+    assert_true(abs(est["hashrate"] - (20 * w_hard / 2000.0)) > 1.0,
+                "hashrate is still being charged at the tip's target")
+
+    # Timestamps are a miner's claim and only loosely ordered. A window that
+    # goes backwards says nothing, so it must report nothing rather than a
+    # number somebody would read as measured.
+    backwards = [{"time": 5000, "bits": easy}, {"time": 4000, "bits": easy}]
+    est2 = mod.network_estimate(backwards)
+    assert_true("hashrate" not in est2,
+                "a backwards window still produced a hashrate")
+    assert_true(mod.network_estimate([]) is None, "an empty chain produced an estimate")
+
+
 def main():
     update = "--update-goldens" in sys.argv[1:]
     run_genesis_smoke()
+    run_hashrate_estimate()
     run_golden_fixture(update)
     print("Bitflash script tool regressions passed")
     return 0

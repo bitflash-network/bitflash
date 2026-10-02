@@ -162,11 +162,10 @@ def network_estimate(blocks):
     if target <= 0:
         return None
 
-    work = (1 << 256) // (target + 1)
     out = {
         "bits": "0x%08x" % bits,
         "targetSpacing": TARGET_SPACING,
-        "hashesPerBlock": work,
+        "hashesPerBlock": (1 << 256) // (target + 1),
     }
 
     n = min(HASHRATE_WINDOW, len(blocks) - 1)
@@ -177,9 +176,26 @@ def network_estimate(blocks):
         # says nothing about hashrate, so this says nothing rather than
         # printing a number that would be read as one.
         if elapsed > 0:
-            out["window"] = n
-            out["intervalSec"] = elapsed / float(n)
-            out["hashrate"] = work * n / float(elapsed)
+            # Each block's own target, not the tip's repeated n times.
+            #
+            # Difficulty retargets every 30 blocks here, clamped to 4x and 1/4,
+            # so a 144-block window can span five of them. Charging the whole
+            # window at today's target would credit work to blocks that were
+            # never that hard -- overstating the number after a rise and
+            # understating it after a fall, which is exactly when somebody is
+            # most likely to be reading it. Summing the real work per block is
+            # what chainwork is, and what getnetworkhashps does with it.
+            total = 0
+            for b in blocks[-n:]:
+                t = target_from_bits(int(b["bits"], 16))
+                if t <= 0:
+                    total = 0
+                    break
+                total += (1 << 256) // (t + 1)
+            if total > 0:
+                out["window"] = n
+                out["intervalSec"] = elapsed / float(n)
+                out["hashrate"] = total / float(elapsed)
     return out
 
 
