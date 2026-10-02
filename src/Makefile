@@ -178,7 +178,7 @@ fuzz-script-smoke: fuzz-script
 	./fuzz-script -runs=128 ../work/fuzz-corpus/script
 
 clean:
-	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr
+	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto
@@ -188,9 +188,15 @@ test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 test_btfaddr: test_btfaddr.cpp btfaddr.cpp btfaddr.h
 	$(CXX) $(CXXFLAGS) -o $@ test_btfaddr.cpp btfaddr.cpp $(LIBS)
 
-tests: test_bip32 test_btfaddr bitflash-node
+# The encrypted channel every .btf connection runs through. Same story as the
+# address tests: the file was here, nothing ran it.
+test_btfchan: test_btfchan.cpp btfchan.cpp btfchan.h
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp -lsodium
+
+tests: test_bip32 test_btfaddr test_btfchan bitflash-node
 	./test_bip32
 	./test_btfaddr
+	./test_btfchan
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
