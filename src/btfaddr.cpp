@@ -92,26 +92,55 @@ static std::string ToLowerTrim(const std::string& in)
     return s;
 }
 
-// Two-byte checksum, domain-separated so it can't collide with any other hash use.
-static void Checksum(const unsigned char pubkey[32], unsigned char out[2])
+// Two-byte checksum, domain-separated so it can't collide with any other hash
+// use. Version 1 hashes the key alone and its bytes are frozen: changing what
+// it feeds the hash would invalidate every address already published. From
+// version 2 the version byte is hashed too, so it cannot be edited in flight
+// to make one key answer at two addresses.
+static void Checksum(const unsigned char pubkey[32], int nVersion, unsigned char out[2])
 {
-    static const char* DS = ".btf-checksum-v1";
+    static const char* DS1 = ".btf-checksum-v1";
+    static const char* DS2 = ".btf-checksum-v2";
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
-    SHA256_Update(&ctx, (const unsigned char*)DS, strlen(DS));
-    SHA256_Update(&ctx, pubkey, 32);
+    if (nVersion <= ADDR_VERSION_XONLY)
+    {
+        SHA256_Update(&ctx, (const unsigned char*)DS1, strlen(DS1));
+        SHA256_Update(&ctx, pubkey, 32);
+    }
+    else
+    {
+        unsigned char v = (unsigned char)nVersion;
+        SHA256_Update(&ctx, (const unsigned char*)DS2, strlen(DS2));
+        SHA256_Update(&ctx, pubkey, 32);
+        SHA256_Update(&ctx, &v, 1);
+    }
     unsigned char d[32];
     SHA256_Final(d, &ctx);
     out[0] = d[0];
     out[1] = d[1];
 }
 
+std::string AddressVersioned(const unsigned char pubkey[32], int nVersion)
+{
+    if (nVersion <= ADDR_VERSION_XONLY)
+    {
+        unsigned char raw[34];
+        memcpy(raw, pubkey, 32);
+        Checksum(pubkey, ADDR_VERSION_XONLY, raw + 32);
+        return Base32Encode(raw, 34) + TLD;
+    }
+
+    unsigned char raw[35];
+    memcpy(raw, pubkey, 32);
+    Checksum(pubkey, nVersion, raw + 32);
+    raw[34] = (unsigned char)nVersion;
+    return Base32Encode(raw, 35) + TLD;
+}
+
 std::string Address(const unsigned char pubkey[32])
 {
-    unsigned char raw[34];
-    memcpy(raw, pubkey, 32);
-    Checksum(pubkey, raw + 32);
-    return Base32Encode(raw, 34) + TLD;
+    return AddressVersioned(pubkey, ADDR_VERSION_XONLY);
 }
 
 bool IsBtf(const std::string& host)
@@ -122,8 +151,11 @@ bool IsBtf(const std::string& host)
     return s.compare(s.size() - tld.size(), tld.size(), tld) == 0;
 }
 
-bool ParseAddress(const std::string& addr, unsigned char pubkeyOut[32])
+bool ParseAddressVersion(const std::string& addr, unsigned char pubkeyOut[32],
+                         int& nVersionOut)
 {
+    nVersionOut = 0;
+
     std::string s = ToLowerTrim(addr);
     std::string tld = TLD;
     if (s.size() < tld.size()) return false;
@@ -132,16 +164,50 @@ bool ParseAddress(const std::string& addr, unsigned char pubkeyOut[32])
 
     std::vector<unsigned char> raw;
     if (!Base32Decode(label, raw)) return false;
-    if (raw.size() < 34) return false;
+
+    // Exactly 34 or exactly 35. This used to accept anything from 34 bytes up
+    // and ignore the rest, which meant a key answered to unboundedly many
+    // addresses: append base32 characters and the label looks different while
+    // resolving to the same service. That is the raw material for passing off
+    // one service as another, and no honest address is ever longer.
+    int nVersion;
+    if (raw.size() == 34)
+        nVersion = ADDR_VERSION_XONLY;
+    else if (raw.size() == 35)
+    {
+        nVersion = raw[34];
+        // A 35-byte payload claiming version 1 would be a second spelling of an
+        // address that already has one. One address, one form.
+        if (nVersion <= ADDR_VERSION_XONLY) return false;
+    }
+    else
+        return false;
 
     unsigned char pk[32];
     memcpy(pk, &raw[0], 32);
     unsigned char sum[2];
-    Checksum(pk, sum);
+    Checksum(pk, nVersion, sum);
     if (raw[32] != sum[0] || raw[33] != sum[1]) return false;
 
     memcpy(pubkeyOut, pk, 32);
+    nVersionOut = nVersion;
     return true;
+}
+
+bool ParseAddress(const std::string& addr, unsigned char pubkeyOut[32])
+{
+    int nVersion = 0;
+    if (!ParseAddressVersion(addr, pubkeyOut, nVersion))
+        return false;
+    // Version 1 only, and deliberately.
+    //
+    // This signature has nowhere to report a version, so every caller of it is
+    // by definition a caller that cannot act on one -- and handing back 32
+    // bytes from a version it has never heard of means that key gets read as a
+    // secp256k1 x-only key by code that will never know it guessed. The whole
+    // reason for reserving the byte is that the identity key may stop being
+    // one. A caller that needs more asks ParseAddressVersion and decides.
+    return nVersion == ADDR_VERSION_XONLY;
 }
 
 

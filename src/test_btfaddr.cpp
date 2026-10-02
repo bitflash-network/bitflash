@@ -5,14 +5,19 @@
 
 #include "btfaddr.h"
 #include <openssl/rand.h>
+// Guarded: the makefile defines it too, and a bare #define warns on every build.
+#ifndef SECP256K1_STATIC
 #define SECP256K1_STATIC
+#endif
 #include <secp256k1.h>
 #include <secp256k1_schnorrsig.h>
 #include <secp256k1_extrakeys.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstring>
+#include <cctype>   // toupper
 #include <string>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -152,10 +157,79 @@ int main()
         CHECK(btf::VerifyDescriptor(ctx, d, resolved, o), "descriptor verifies under resolved key");
     }
 
+    printf("address_versioning\n");
+    {
+        unsigned char sk[32], pk[32]; newKey(sk, pk);
+
+        // Version 1 is the frozen form. If this ever changes, every address
+        // already published stops resolving -- so the test is here to make
+        // that impossible to do by accident.
+        std::string v1 = btf::Address(pk);
+        CHECK(v1 == btf::AddressVersioned(pk, btf::ADDR_VERSION_XONLY),
+              "Address() is exactly version 1");
+        CHECK(v1.size() == 55 + strlen(btf::TLD),
+              "a version 1 label is 55 base32 characters");
+
+        unsigned char out[32];
+        int nVer = 0;
+        CHECK(btf::ParseAddressVersion(v1, out, nVer) && memcmp(out, pk, 32) == 0,
+              "version 1 round trips to the same key");
+        CHECK(nVer == btf::ADDR_VERSION_XONLY, "and reports version 1");
+
+        // A future version: one byte longer, different address, same key.
+        std::string v2 = btf::AddressVersioned(pk, 2);
+        CHECK(v2 != v1, "version 2 of the same key is a different address");
+        // 34 bytes pack into 55 base32 characters, 35 into 56: the version byte
+        // costs one character, which is also how the two forms are told apart.
+        CHECK(v2.size() == v1.size() + 1, "the version byte costs one base32 character");
+        CHECK(btf::ParseAddressVersion(v2, out, nVer) && memcmp(out, pk, 32) == 0,
+              "version 2 round trips to the same key");
+        CHECK(nVer == 2, "and reports version 2");
+
+        // The version is inside the checksum, so it cannot be edited in flight
+        // to make one key answer somewhere it never published.
+        std::string mangled = v2;
+        size_t nLabel = mangled.size() - strlen(btf::TLD);
+        mangled[nLabel - 1] = (mangled[nLabel - 1] == 'a') ? 'b' : 'a';
+        CHECK(!btf::ParseAddressVersion(mangled, out, nVer),
+              "editing the version byte breaks the checksum");
+
+        // ParseAddress has nowhere to report a version, so it must refuse the
+        // ones it cannot report. Otherwise a future scheme's key is handed to
+        // every old call site in the node and read as a secp256k1 x-only key,
+        // silently -- which is the exact failure reserving the byte exists to
+        // prevent. The versioned call still reads it.
+        CHECK(!btf::ParseAddress(v2, out),
+              "the version-blind parser refuses a version it cannot report");
+        CHECK(btf::ParseAddressVersion(v2, out, nVer) && nVer == 2,
+              "and the versioned one still reads it");
+    }
+
+    printf("address_has_exactly_one_spelling\n");
+    {
+        unsigned char sk[32], pk[32]; newKey(sk, pk);
+        std::string a = btf::Address(pk);
+        unsigned char out[32];
+
+        // The parser used to accept 34 bytes OR MORE and ignore the surplus, so
+        // a key answered to unboundedly many addresses: append base32 and the
+        // label reads differently while resolving to the same service. That is
+        // exactly how one service gets passed off as another.
+        std::string padded = a.substr(0, a.size() - strlen(btf::TLD)) + "aaaaaaaa" + btf::TLD;
+        CHECK(!btf::ParseAddress(padded, out), "trailing characters are refused");
+
+        std::string truncated = a.substr(0, a.size() - strlen(btf::TLD) - 2) + btf::TLD;
+        CHECK(!btf::ParseAddress(truncated, out), "a short label is refused");
+
+        CHECK(btf::ParseAddress(a, out) && memcmp(out, pk, 32) == 0,
+              "the one honest spelling still resolves");
+    }
+
     // Show a sample address so we can eyeball the format
     {
         unsigned char sk[32], pk[32]; newKey(sk, pk);
         printf("\nsample .btf address:\n  %s\n", btf::Address(pk).c_str());
+        printf("sample version 2 form:\n  %s\n", btf::AddressVersioned(pk, 2).c_str());
     }
 
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);

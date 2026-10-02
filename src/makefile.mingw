@@ -97,14 +97,21 @@ bitflash.exe: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 	@echo "Built: bitflash.exe"
 
 clean:
-	rm -rf obj bitflash.exe test_bip32.exe
+	rm -rf obj bitflash.exe test_bip32.exe test_btfaddr.exe
 
 test_bip32.exe: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto -lcrypt32
 	@echo "Built: test_bip32.exe"
 
-tests: test_bip32.exe bitflash.exe
+# The .btf address tests existed as a file you had to compile by hand, which is
+# the same as not having them: they did not run here and they did not run in CI.
+test_btfaddr.exe: test_btfaddr.cpp btfaddr.cpp btfaddr.h
+	$(CXX) $(CXXFLAGS) -o $@ test_btfaddr.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfaddr.exe"
+
+tests: test_bip32.exe test_btfaddr.exe bitflash.exe
 	./test_bip32.exe
+	./test_btfaddr.exe
 	./bitflash.exe -selftest=wallet-keypool
 	./bitflash.exe -selftest=wallet-hd
 	./bitflash.exe -selftest=wallet-format

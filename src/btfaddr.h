@@ -27,15 +27,40 @@ extern const char* TLD; // ".btf"
 std::string Base32Encode(const unsigned char* data, size_t n);
 bool        Base32Decode(const std::string& s, std::vector<unsigned char>& out);
 
-// Derive the `.btf` address for a 32-byte x-only public key.
+// Address versions.
+//
+// Version 1 is the original form -- key(32) || checksum(2), no version byte --
+// and it is what Address() still emits. Every `.btf` in the wild is one and
+// none of them change.
+//
+// From version 2 on the payload carries the version LAST, the way Tor v3 does
+// it: key(32) || checksum(2) || version(1). That one byte is what lets the
+// identity key stop being a secp256k1 x-only key some day -- a post-quantum
+// signature scheme, say -- without retiring every address that exists, because
+// old and new are told apart by length and both stay resolvable. Reserving it
+// now costs nothing; needing it later without having reserved it costs a fork.
+static const int ADDR_VERSION_XONLY = 1;
+
+// Derive the `.btf` address for a 32-byte x-only public key (version 1).
 std::string Address(const unsigned char pubkey[32]);
+
+// Same, at an explicit version. Version 1 produces exactly what Address() does.
+std::string AddressVersioned(const unsigned char pubkey[32], int nVersion);
 
 // True if a hostname is a `.btf` address (case-insensitive, optional trailing dot).
 bool IsBtf(const std::string& host);
 
 // Parse a `.btf` address back to its 32-byte public key, verifying the checksum.
-// Returns false if the label isn't valid base32, is too short, or checksum fails.
+// Returns false if the label isn't valid base32, is the wrong length, or the
+// checksum fails. Accepts any known version; use ParseAddressVersion when the
+// caller has to act on which one it was.
 bool ParseAddress(const std::string& addr, unsigned char pubkeyOut[32]);
+
+// As above, and reports the version. A caller that cannot handle a version it
+// does not know must refuse the address rather than treat it as version 1:
+// two schemes answering to the same name is how an impostor gets in.
+bool ParseAddressVersion(const std::string& addr, unsigned char pubkeyOut[32],
+                         int& nVersionOut);
 
 
 // ---- Service descriptor (published later on Nostr) -------------------------
