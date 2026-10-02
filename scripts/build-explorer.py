@@ -119,6 +119,86 @@ def load_blocks(args):
     return chain.read_blocks_from_files(args.block_files, args.max_blocks)
 
 
+# Consensus target spacing, seconds. Here only to be shown next to the measured
+# interval, so a reader can see how far the chain is from where it aims.
+TARGET_SPACING = 120
+
+# How many blocks the hashrate estimate looks back over. Long enough to survive
+# one lucky or one slow block, short enough to still be about now: at two
+# minutes a block this is a little under five hours.
+HASHRATE_WINDOW = 144
+
+
+def target_from_bits(bits):
+    """The compact form, expanded. Same rule as CBigNum::SetCompact."""
+    exponent = bits >> 24
+    mantissa = bits & 0x007FFFFF
+    if exponent <= 3:
+        return mantissa >> (8 * (3 - exponent))
+    return mantissa << (8 * (exponent - 3))
+
+
+def network_estimate(blocks):
+    """Estimated network hashrate.
+
+    The first question anyone asks before mining a coin is how much hashrate is
+    already pointed at it, and this explorer could not answer it. It can: the
+    answer is in the blocks it already parses.
+
+    Expected hashes per block is 2^256 / (target+1) -- a property of the target
+    alone, true for any hash-against-a-target proof of work, RandomX included.
+    Divide by how many seconds a block actually took and the result is hashes
+    per second.
+
+    It is an estimate and it is labelled as one. Finding a block is a Poisson
+    process: a quiet half hour and a lucky one both move this number without
+    anybody's hardware changing.
+    """
+    if not blocks:
+        return None
+    tip = blocks[-1]
+    bits = int(tip["bits"], 16)
+    target = target_from_bits(bits)
+    if target <= 0:
+        return None
+
+    out = {
+        "bits": "0x%08x" % bits,
+        "targetSpacing": TARGET_SPACING,
+        "hashesPerBlock": (1 << 256) // (target + 1),
+    }
+
+    n = min(HASHRATE_WINDOW, len(blocks) - 1)
+    if n > 0:
+        elapsed = tip["time"] - blocks[-1 - n]["time"]
+        # A block timestamp is the miner's claim, not a clock, and the rules
+        # only order them loosely. A window that comes out zero or negative
+        # says nothing about hashrate, so this says nothing rather than
+        # printing a number that would be read as one.
+        if elapsed > 0:
+            # Each block's own target, not the tip's repeated n times.
+            #
+            # Difficulty retargets every 30 blocks here, clamped to 4x and 1/4,
+            # so a 144-block window can span five of them. Charging the whole
+            # window at today's target would credit work to blocks that were
+            # never that hard -- overstating the number after a rise and
+            # understating it after a fall, which is exactly when somebody is
+            # most likely to be reading it. Summing the real work per block is
+            # what chainwork is, and what getnetworkhashps does with it.
+            total = 0
+            for b in blocks[-n:]:
+                t = target_from_bits(int(b["bits"], 16))
+                if t <= 0:
+                    total = 0
+                    break
+                total += (1 << 256) // (t + 1)
+            if total > 0:
+                out["window"] = n
+                out["intervalSec"] = elapsed / float(n)
+                out["hashrate"] = total / float(elapsed)
+    return out
+
+
 def build_explorer(raw_blocks, out_dir):
     try:
         blocks = chain.select_main_chain(raw_blocks)
@@ -171,11 +251,27 @@ def build_explorer(raw_blocks, out_dir):
             "network": "bitflash",
             "tipHeight": len(blocks) - 1,
             "count": len(blocks),
+            "estimate": network_estimate(blocks),
             "blocks": summaries,
         }, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
-    (out / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+    # The asset URLs carry a hash of what they contain.
+    #
+    # Without it a returning visitor keeps whatever explorer.js their browser
+    # cached, forever: the deploy that added the hashrate line went out with a
+    # fresh index.html and a fresh blocks.json, and the page still ran the old
+    # script, so the new element sat there empty. Measured on the live site, not
+    # guessed -- showEstimate was undefined in a page whose HTML had the span.
+    #
+    # The hash only changes when the file does, so this costs nothing per deploy
+    # and makes a stale asset impossible rather than unlikely.
+    js_tag = hashlib.sha256(EXPLORER_JS.encode("utf-8")).hexdigest()[:8]
+    css_tag = hashlib.sha256(STYLE_CSS.encode("utf-8")).hexdigest()[:8]
+    index = (INDEX_HTML
+             .replace('href="style.css"', 'href="style.css?v=%s"' % css_tag)
+             .replace('src="explorer.js"', 'src="explorer.js?v=%s"' % js_tag))
+    (out / "index.html").write_text(index, encoding="utf-8")
     (out / "style.css").write_text(STYLE_CSS, encoding="utf-8")
     (out / "explorer.js").write_text(EXPLORER_JS, encoding="utf-8")
     logo = Path(__file__).resolve().parents[1] / "docs" / "logo.png"
@@ -218,10 +314,12 @@ INDEX_HTML = r"""<!doctype html>
     <a href="https://faucet.bitflash.network/">faucet</a>
   </nav>
   <span class="meta" id="tip"></span>
+  <span class="meta" id="net"></span>
 </header>
 <div class="wrap">
   <h1>Block explorer <button class="link" id="home" hidden>back to blocks</button></h1>
   <p class="note">Read-only view of the main chain: blocks, their transactions, and the coinbase payout. There is no mempool and no per-address history here.</p>
+  <p class="note" id="netnote" hidden></p>
   <div id="listview">
     <input id="q" placeholder="Search by height or block hash">
     <div class="scroll"><table>
@@ -404,8 +502,27 @@ function openFromHash(){
 }
 window.addEventListener('hashchange', openFromHash);
 document.getElementById('q').oninput=function(){ renderList(this.value); };
+function fmtHashrate(h){
+  var u=['H/s','kH/s','MH/s','GH/s','TH/s','PH/s'], i=0;
+  while(h>=1000 && i<u.length-1){ h/=1000; i++; }
+  return (h>=100?h.toFixed(0):h.toFixed(2))+' '+u[i];
+}
+function showEstimate(e){
+  if(!e || !e.hashrate) return;
+  var mins = e.intervalSec/60;
+  document.getElementById('net').textContent =
+    '~' + fmtHashrate(e.hashrate) + ' - a block every ' + mins.toFixed(1) + ' min';
+  var note = document.getElementById('netnote');
+  note.textContent =
+    'Network hashrate is estimated, not measured: expected hashes per block is 2^256/(target+1), ' +
+    'divided by how long blocks actually took over the last ' + e.window + ' blocks. Target ' + e.bits +
+    ', aiming at a block every ' + (e.targetSpacing/60) + ' min. Finding a block is a Poisson process, ' +
+    'so a quiet stretch and a lucky one both move this number without anyone\'s hardware changing.';
+  note.hidden = false;
+}
 fetch('blocks.json').then(function(r){return r.json();}).then(function(d){
   SUM=d.blocks; document.getElementById('tip').textContent='tip height '+d.tipHeight+' - '+d.count+' blocks';
+  showEstimate(d.estimate);
   renderList('');
   openFromHash();
 });
