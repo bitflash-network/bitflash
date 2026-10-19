@@ -4,6 +4,7 @@
 #include "nostr.h"
 #include "proxy.h"
 #include "selftest.h"
+#include "btfchatnode.h"
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -17,6 +18,13 @@
 // so the binary does not need libGL present just to start. See headless.cpp.
 #ifndef BITFLASH_NO_GUI
 int RunGUI(int argc, char* argv[]);
+#endif
+
+// btfchat.exe runs this instead of RunGUI: its own window, nothing but the
+// chat. Declared rather than including gui_chat.h so this file stays free of
+// ImGui in the headless build.
+#ifdef BITFLASH_CHAT_APP
+int RunChatGUI(int argc, char* argv[]);
 #endif
 
 // Global definitions (were in ui.cpp, now here)
@@ -107,6 +115,55 @@ static bool ReadPassphraseArgument(const string& strArg, string& strPassphraseRe
 
 static void PrintUsage()
 {
+#ifdef BITFLASH_CHAT_APP
+    // btfchat gets its own page. Printing the miner's would advertise /gen,
+    // /operator and the pool options -- every one of which this binary refuses --
+    // and help that lists flags the program rejects is worse than no help: it
+    // sends the user to try them.
+    printf("btfchat -- the Bitflash chat, as its own program\n");
+    printf("\n");
+    printf("It carries no chain and runs no peer-to-peer node. It reaches the network\n");
+    printf("through two doors, both over Tor: the discovery relays, to look an address\n");
+    printf("up, and the other person's onion service, to talk. Its data directory,\n");
+    printf("wallet, keys and onion address are its own -- never the miner's.\n");
+    printf("\n");
+    printf("General:\n");
+    printf("  /help, -help, --help, /?\n");
+    printf("  /datadir=PATH              (default: %%APPDATA%%\\Bitflash-chat)\n");
+    printf("  /chatport=N                (local port Tor forwards the chat service to,\n");
+    printf("                              default 8533; it is never reachable directly)\n");
+    printf("  /debug\n");
+    printf("\n");
+    printf("The identity:\n");
+    printf("  The chat identity comes from this data directory's recovery phrase plus a\n");
+    printf("  session password you type on the unlock screen. A fresh data directory has\n");
+    printf("  no phrase, so install one first:\n");
+    printf("\n");
+    printf("      btfchat -newphrase\n");
+    printf("\n");
+    printf("  Use a phrase of its own here. The point of a separate program is that this\n");
+    printf("  identity does not lead back to the wallet you mine with.\n");
+    printf("\n");
+    printf("  A wrong session password does not fail: it opens a different, empty\n");
+    printf("  identity. The address is shown after unlocking so you can recognise it.\n");
+    printf("  There is nothing stored to compare a password against, which is also why\n");
+    printf("  it cannot be recovered.\n");
+    printf("\n");
+    printf("  /newphrase                 (create a recovery phrase in this data directory)\n");
+    printf("  /restorephrase=\"...\"       (restore one)\n");
+    printf("  /phrasepassword[=@FILE]    (BIP39 passphrase, read from stdin or a file)\n");
+    printf("\n");
+    printf("Tor (required -- there is no clearnet fallback, by design):\n");
+    printf("  /managedtor[=PATH]         (start the bundled Tor and create the chat's\n");
+    printf("                              own onion service)\n");
+    printf("  /tor[=HOST:PORT]           (use a Tor already running; default 127.0.0.1:9050)\n");
+    printf("  /torbridges                (reach Tor where it is blocked, via Snowflake)\n");
+    printf("  /torbridge=LINE            (a bridge line of your own)\n");
+    printf("  /notorfallback             (do not fall back to bridges on its own)\n");
+    printf("\n");
+    printf("Mining options are refused here. Mine with bitflash, chat with btfchat.\n");
+    return;
+#else
     printf("Bitflash command-line options\n");
     printf("\n");
     printf("General:\n");
@@ -121,7 +178,12 @@ static void PrintUsage()
     printf("            net-message,\n");
     printf("            consensus-limits, pool-stratum,\n");
     printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, network-params, socks5-proxy,\n");
-    printf("            or managed-tor\n");
+    // This list had drifted behind the dispatch table in selftest.cpp: several
+    // suites that exist were not named here, so nobody could find them without
+    // reading the source. Kept in step now; a suite that cannot be discovered is
+    // a suite that stops being run.
+    printf("            wallet-sqlite-encrypt, wallet-backend-default, wallet-convert,\n");
+    printf("            managed-tor, treasury, chat-link, or chat-identity\n");
     printf("\n");
     printf("Mining mode:\n");
     printf("  /operator\n");
@@ -191,6 +253,10 @@ static void PrintUsage()
     printf("                              the chain for its coins, then exit)\n");
     printf("  /restoredepth=N            (with /restorephrase: derive at least N\n");
     printf("                              addresses before giving up)\n");
+    printf("  /phrasepassword[=@FILE]    (with /newphrase or /restorephrase: an\n");
+    printf("                              extra word mixed into the seed. The words\n");
+    printf("                              alone then rebuild nothing. A wrong one\n");
+    printf("                              opens an empty wallet without an error)\n");
     printf("  /showderived=N             (list the first N addresses a phrase\n");
     printf("                              installed in this wallet derives)\n");
     printf("  /recoveryaudit             (show how much spendable balance is\n");
@@ -217,6 +283,7 @@ static void PrintUsage()
     printf("                              but never recorded, then exit)\n");
     printf("\n");
     printf("Each option also accepts '-' instead of '/'.\n");
+#endif
 }
 
 #define printf OutputDebugStringF
@@ -390,6 +457,34 @@ static void ParseStartupArguments(int argc, char* argv[])
             addrLocalHost.port = nListenPort;
         }
     }
+
+    // btfchat's port has to be settled BEFORE managed Tor starts: its hidden
+    // service is a block in the torrc, which is written once. Asking for the chat
+    // later would mean restarting Tor and rotating the onion, so the flag is read
+    // here and the port is reserved before anything else happens.
+#ifdef BITFLASH_CHAT_APP
+    {
+        for (int i = 1; i < argc; i++)
+        {
+            std::string a = argv[i] ? argv[i] : "";
+            if (a == "/gen" || a == "-gen" || a == "/operator" || a == "-operator" ||
+                a == "/solomine" || a == "-solomine" ||
+                a.compare(0, 13, "/participant=") == 0 || a.compare(0, 13, "-participant=") == 0)
+                StartupRefuse(strprintf("btfchat does not mine, so %s is refused", a.c_str()),
+                              "Mine with bitflash, chat with btfchat. They keep separate data\n"
+                              "directories, separate wallets and separate onion addresses on purpose:\n"
+                              "a chat identity that leads back to a miner is the thing this split exists\n"
+                              "to prevent.");
+        }
+        string strChatPort = argval2(argc, argv, "/chatport", "-chatport");
+        long nChatPort = strChatPort.empty() ? 8533 : atol(strChatPort.c_str());
+        if (nChatPort <= 1024 || nChatPort > 65535)
+            StartupRefuse(strprintf("/chatport=%s is not a usable port", strChatPort.c_str()),
+                          "Pick a port between 1025 and 65535, or leave it out for 8533.");
+        btfchat::ChatSetPort((unsigned short)nChatPort);
+        fprintf(stderr, "btfchat on 127.0.0.1:%ld, with its own onion service\n", nChatPort);
+    }
+#endif
 
     string onionService = argval2(argc, argv, "/onionservice", "-onionservice");
     if (!onionService.empty())
@@ -619,6 +714,15 @@ static void ParseStartupArguments(int argc, char* argv[])
 // its output goes to stderr and the log as before.
 static void FatalStartupError(bool fHeadless, const string& strWhat, const string& strDetail)
 {
+    // Managed Tor may already be up: it starts early, and every caller here
+    // returns 1 straight afterwards. Without this the Tor we launched outlives
+    // the program that owns it, holding a SOCKS port and an onion service for a
+    // process that is gone -- and the next start picks new ports and launches
+    // another one beside it. Found by hitting a fatal startup error and then
+    // finding tor.exe still running with the dead process's torrc on its command
+    // line.
+    BtfStopManagedTor();
+
     printf("FATAL: %s\n", strWhat.c_str());
     if (!strDetail.empty())
         printf("FATAL: %s\n", strDetail.c_str());
@@ -692,6 +796,35 @@ int main(int argc, char* argv[])
         PrintUsage();
         return 0;
     }
+
+#if defined(BITFLASH_CHAT_APP) && defined(_WIN32)
+    // Winsock, for the life of the process.
+    //
+    // The node gets this from StartNode(), which btfchat does not call -- it has
+    // no peer-to-peer node. What was left was the WSAStartup/WSACleanup pair
+    // inside PickLocalPort, which exists only to pick Tor's ports and undoes
+    // itself immediately. After it, every socket call in the process fails: the
+    // chat listener never binds and no outgoing dial connects.
+    //
+    // It cost an afternoon to see because the failure is quiet. The listener
+    // logged "listening on 127.0.0.1:8533" and netstat showed nothing bound,
+    // which is the shape of a program that believes it is serving and is not.
+    //
+    // Never paired with WSACleanup, deliberately: WSAStartup is reference
+    // counted, and this reference has to outlive every transient pair that
+    // other code makes and unmakes around it.
+    {
+        WSADATA wsadata;
+        int nWsa = WSAStartup(MAKEWORD(2, 2), &wsadata);
+        if (nWsa != 0)
+        {
+            AttachTerminal();
+            fprintf(stderr, "btfchat cannot start: the TCP/IP socket library failed "
+                            "to start (WSAStartup returned %d)\n", nWsa);
+            return 1;
+        }
+    }
+#endif
 
     ParseStartupArguments(argc, argv);
 
@@ -830,6 +963,23 @@ int main(int argc, char* argv[])
 #endif
 
     string strErrors;
+#ifdef BITFLASH_CHAT_APP
+    // btfchat carries no chain, and that is a decision, not an omission.
+    //
+    // Nothing the chat does needs a block: the identity comes from the wallet
+    // seed, an address is resolved on the Nostr relays over Tor, and a
+    // conversation is a direct onion connection. Loading the index would mean a
+    // second copy of the chain on disk, a second sync over Tor, and a chat that
+    // cannot say hello until it finishes -- all to show a balance.
+    //
+    // Staying out of it is also what keeps this process out of the miner's
+    // Berkeley DB environment. In this tree blkindex.dat shares an environment
+    // with wallet.dat, and that environment is opened with DB_RECOVER, which
+    // requires exclusivity: a second process opening it while the first runs
+    // rebuilds the regions underneath it. That is how a wallet.dat in this
+    // project became unopenable.
+    printf("btfchat: no block index -- the chat needs no chain\n");
+#else
     printf("Loading block index...\n");
     try
     {
@@ -848,6 +998,7 @@ int main(int argc, char* argv[])
                           "but never delete wallet.dat, which holds your keys.");
         return 1;
     }
+#endif
 
     printf("Loading wallet...\n");
     try
@@ -1013,11 +1164,23 @@ int main(int argc, char* argv[])
             }
         }
 
+#ifdef BITFLASH_CHAT_APP
+        // Skipped, and it has to be: this walks the block index to correct spent
+        // flags, and btfchat has no block index. Left in, it opened blkindex.dat
+        // in a data directory that has none and threw "Db::open: No such file or
+        // directory" -- which the catch below reported as an unreadable
+        // wallet.dat, a wallet that was in fact perfectly fine.
+        //
+        // Nothing is lost by skipping it. There is no chain here to compare the
+        // wallet against, and this program never spends: the chat's wallet exists
+        // for the seed its identity comes from.
+#else
         // After the block index, so there is a chain to compare the wallet
         // against, and before anything reports a balance. Works on either
         // backend: RescanSpentFlags writes corrected flags through CWalletDB,
         // which routes to SQLite when that backend is active.
         RescanSpentFlags();
+#endif
     }
     catch (const std::exception& e)
     {
@@ -1172,9 +1335,28 @@ int main(int argc, char* argv[])
         return nRet;
     }
 
+    // -phrasepassword is BIP39's extra word for /newphrase and /restorephrase.
+    // It is read the same way as the wallet passphrase -- stdin, or @FILE --
+    // and for the same reason: a secret typed on the command line survives in
+    // the shell history, and this one cannot be changed once coins depend on it.
+    bool fWantPhrasePassword = arg(argc, argv, "/phrasepassword") ||
+                               arg(argc, argv, "-phrasepassword");
+    string strPhrasePassword;
+    if (fWantPhrasePassword)
+    {
+        string strArg = argval2(argc, argv, "/phrasepassword", "-phrasepassword");
+        string strErr;
+        if (!ReadPassphraseArgument(strArg, strPhrasePassword, strErr))
+        {
+            AttachTerminal();
+            fprintf(stderr, "%s\n", strErr.c_str());
+            return 1;
+        }
+    }
+
     if (arg(argc,argv,"/newphrase") || arg(argc,argv,"-newphrase"))
     {
-        int nRet = CmdNewPhrase();
+        int nRet = CmdNewPhrase(strPhrasePassword);
         DBFlush(true);
         return nRet;
     }
@@ -1184,7 +1366,7 @@ int main(int argc, char* argv[])
     {
         string strDepth = argval2(argc, argv, "/restoredepth", "-restoredepth");
         int nMinDepth = strDepth.empty() ? 0 : atoi(strDepth.c_str());
-        int nRet = CmdRestorePhrase(strRestore, nMinDepth);
+        int nRet = CmdRestorePhrase(strRestore, strPhrasePassword, nMinDepth);
         DBFlush(true);
         return nRet;
     }
@@ -1214,6 +1396,16 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+#ifdef BITFLASH_CHAT_APP
+    // No P2P node either: with no chain there is nothing to download, nothing to
+    // relay and nothing to announce. btfchat reaches the network through exactly
+    // two doors, both over Tor -- the Nostr relays, to look an address up, and
+    // the other person's onion, to talk. Fewer doors is the point.
+    //
+    // ReacceptWalletTransactions is skipped for the same reason: it walks the
+    // chain to re-announce our own transactions, and there is no chain to walk.
+    printf("btfchat: no peer-to-peer node -- relays over Tor to resolve, onion to talk\n");
+#else
     ReacceptWalletTransactions();
 
     if (!StartNode(strErrors))
@@ -1222,6 +1414,7 @@ int main(int argc, char* argv[])
         BtfStopManagedTor();
         return 1;
     }
+#endif
 
     if (nMineMode == MINE_OPERATOR) {
         gPoolServerRunning = true;
@@ -1237,8 +1430,17 @@ int main(int argc, char* argv[])
         if (_beginthread(ThreadJsonRpcServer, 0, NULL) == (uintptr_t)-1)
             printf("Error: _beginthread(ThreadJsonRpcServer) failed\n");
     }
+#ifdef BITFLASH_CHAT_APP
+    // btfchat never mines. It carries the chain so it validates on its own
+    // rather than trusting a server, and it carries a wallet so its address can
+    // receive -- but the whole point of a separate binary is that the chat
+    // identity does not lead back to a miner, and a chat that mines is a chat
+    // that leads back to one.
+    fGenerateBitcoins = false;
+#else
     if (fGenerateBitcoins)
         StartMinerThreads();
+#endif
 
 #ifdef BITFLASH_NO_GUI
     // Nothing else this binary can do; /nogui is accepted and redundant.
@@ -1278,6 +1480,17 @@ int main(int argc, char* argv[])
 
 #ifdef BITFLASH_NO_GUI
     return 0;   // unreachable: fHeadless is always true in this build
+#elif defined(BITFLASH_CHAT_APP)
+    int ret = RunChatGUI(argc, argv);
+    fShutdown = true;
+    // StopNode() is deliberately not called: there is no node. It waits for
+    // node thread slots that never ran, and it calls WSACleanup() -- which would
+    // tear down the one Winsock reference this build depends on, while the Tor
+    // shutdown below still needs a socket to ask Tor politely to stop.
+    BtfStopManagedTor();
+    DBFlush(true);
+    WalletSQLiteRuntimeClose();
+    return ret;
 #else
     int ret = RunGUI(argc, argv);
     fShutdown = true;

@@ -26,6 +26,7 @@ linux: deps-linux
 	strip src/bitflash
 	$(MAKE) -f Makefile appimage
 	$(MAKE) -f Makefile linux-node
+	$(MAKE) -f Makefile btfchat-appimage
 
 # Headless node, no ImGui/GLFW/OpenGL. The GUI build needs libGL present at load
 # time even when started with -nogui -- the dynamic loader resolves everything
@@ -141,6 +142,61 @@ import shutil; shutil.copy('/tmp/bitflash.AppDir/bitflash.png', \
 appimage-tor: gui
 	$(MAKE) -f Makefile appimage WITH_TOR=1
 
+
+# ---- btfchat (Linux) -------------------------------------------------------
+#
+# A separate AppImage, not a second binary inside the miner's. Its own icon and
+# its own desktop entry, because it is its own program: separate process,
+# separate data directory (~/.bitflash-chat), separate wallet, separate onion
+# address, no chain and no peer-to-peer node.
+btfchat-linux: deps-linux
+	$(MAKE) -C src -f Makefile btfchat -j$(NPROC)
+	strip src/btfchat
+	@echo "Built: src/btfchat"
+
+btfchat-appimage: btfchat-linux
+	@echo "==> building the btfchat AppImage"
+	@if [ ! -x /tmp/appimagetool ]; then \
+	  wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
+	    -O /tmp/appimagetool && chmod +x /tmp/appimagetool; \
+	fi
+	@rm -rf /tmp/btfchat.AppDir
+	@mkdir -p /tmp/btfchat.AppDir/usr/bin \
+	          /tmp/btfchat.AppDir/usr/lib \
+	          /tmp/btfchat.AppDir/usr/share/applications \
+	          /tmp/btfchat.AppDir/usr/share/icons/hicolor/256x256/apps
+	@cp src/btfchat /tmp/btfchat.AppDir/usr/bin/btfchat
+	@printf '#!/bin/sh\nHERE="$$(dirname "$$(readlink -f "$$0")")"\nexport LD_LIBRARY_PATH="$$HERE/usr/lib:$$LD_LIBRARY_PATH"\nexec "$$HERE/usr/bin/btfchat" "$$@"\n' \
+	  > /tmp/btfchat.AppDir/AppRun && chmod +x /tmp/btfchat.AppDir/AppRun
+	@printf '[Desktop Entry]\nName=btfchat\nExec=btfchat\nIcon=btfchat\nType=Application\nCategories=Network;InstantMessaging;\n' \
+	  > /tmp/btfchat.AppDir/btfchat.desktop
+	@cp /tmp/btfchat.AppDir/btfchat.desktop /tmp/btfchat.AppDir/usr/share/applications/
+	@python3 -c "\
+from PIL import Image; \
+ico = Image.open('src/rc/bitcoin.ico'); \
+img = ico.convert('RGBA'); \
+img.save('/tmp/btfchat.AppDir/btfchat.png'); \
+import shutil; shutil.copy('/tmp/btfchat.AppDir/btfchat.png', \
+'/tmp/btfchat.AppDir/usr/share/icons/hicolor/256x256/apps/btfchat.png')"
+	@for lib in libsodium.so.23 libdb_cxx-5.3.so libsqlite3.so.0 libglfw.so.3; do \
+	  path=$$(ldconfig -p | grep " $$lib " | awk '{print $$NF}' | head -1); \
+	  [ -z "$$path" ] && path=$$(find /usr/lib /lib -name "$$lib" 2>/dev/null | head -1); \
+	  [ -n "$$path" ] && cp -L "$$path" /tmp/btfchat.AppDir/usr/lib/ && echo "  bundled $$lib" || echo "  missing $$lib"; \
+	done
+	@if [ -n "$(WITH_TOR)" ]; then \
+	  echo "==> bundling Tor into the btfchat AppImage"; \
+	  ./scripts/bundle-tor-linux.sh /tmp/btfchat.AppDir/usr/bin; \
+	fi
+	@ARCH=x86_64 /tmp/appimagetool --no-appstream /tmp/btfchat.AppDir \
+	  $(ROOT)/BtfChat-$(VERSION)-x86_64.AppImage 2>&1 | grep -E "^Built|^Error" || true
+	@echo "Built: BtfChat-$(VERSION)-x86_64.AppImage"
+
+# The shipping one: managed Tor and the pluggable transports bundled in. btfchat
+# without Tor is not a degraded chat, it is no chat at all -- it refuses to dial
+# anything but an onion -- so the release artifact always carries it.
+btfchat-appimage-tor: btfchat-linux
+	$(MAKE) -f Makefile btfchat-appimage WITH_TOR=1
+
 # ---- Windows (MSYS2 UCRT64) -----------------------------------------------
 
 deps-windows:
@@ -193,10 +249,14 @@ deps-windows:
 
 windows: deps-windows
 	cd src && make -f makefile.mingw
+	cd src && make -f makefile.mingw btfchat.exe
 	@rm -rf Bitflash-$(VERSION)-windows
 	@mkdir -p Bitflash-$(VERSION)-windows
 	@cp src/bitflash.exe Bitflash-$(VERSION)-windows/Bitflash.exe
+	@cp src/btfchat.exe Bitflash-$(VERSION)-windows/BtfChat.exe
 	@ldd src/bitflash.exe | grep ucrt64 | awk '{print $$3}' | \
+	  xargs -I{} cp {} Bitflash-$(VERSION)-windows/ 2>/dev/null || true
+	@ldd src/btfchat.exe | grep ucrt64 | awk '{print $$3}' | \
 	  xargs -I{} cp {} Bitflash-$(VERSION)-windows/ 2>/dev/null || true
 	@zip -r Bitflash-$(VERSION)-windows.zip Bitflash-$(VERSION)-windows/
 	@echo "Built: Bitflash-$(VERSION)-windows.zip"

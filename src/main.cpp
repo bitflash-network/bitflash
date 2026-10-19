@@ -869,14 +869,22 @@ bool DeriveHDChangeKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
     return true;
 }
 
-bool SetHDSeedFromMnemonic(const string& strMnemonic, string& strErrorRet)
+// strPassphrase is BIP39's optional extra word. It is NOT a lock on the file:
+// it goes into the key derivation, so the same twelve words with two different
+// passphrases are two different wallets, both valid, neither an error. That is
+// the whole point -- the words alone are not enough to spend -- and also the
+// whole danger: a wrong passphrase opens an empty wallet instead of refusing.
+// Callers pass "" when the user did not ask for one, and every call site says
+// so explicitly rather than relying on a default nobody reads.
+bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphrase,
+                           string& strErrorRet)
 {
     string strNormalized;
     if (!bitflash::BIP39ValidateMnemonic(strMnemonic, strNormalized, strErrorRet))
         return false;
 
     vector<unsigned char> vchSeed;
-    if (!bitflash::BIP39MnemonicToSeed(strNormalized, "", vchSeed, strErrorRet))
+    if (!bitflash::BIP39MnemonicToSeed(strNormalized, strPassphrase, vchSeed, strErrorRet))
         return false;
 
     bitflash::BIP32PrivateNode master;
@@ -2681,6 +2689,24 @@ bool ScanMessageStart(Stream& s)
     }
 }
 
+// The data directory's name, and the one thing that keeps btfchat's wallet,
+// chain and keys away from the miner's by default.
+//
+// A compile-time choice rather than a variable somebody sets at startup: with a
+// variable, any code that touched GetAppDir() before it was set would silently
+// open the wrong directory -- and "the wrong directory" here means the chat app
+// reading the wallet that holds the coins. There is no initialization order to
+// get wrong this way.
+//
+// Both binaries still honour /datadir=PATH, which overrides this entirely.
+#ifdef BITFLASH_CHAT_APP
+static const char* APPDIR_WIN   = "Bitflash-chat";
+static const char* APPDIR_POSIX = ".bitflash-chat";
+#else
+static const char* APPDIR_WIN   = "Bitflash";
+static const char* APPDIR_POSIX = ".bitflash";
+#endif
+
 string GetAppDir()
 {
     string strDir;
@@ -2691,7 +2717,7 @@ string GetAppDir()
 #ifdef _WIN32
     else if (getenv("APPDATA"))
     {
-        strDir = strprintf("%s\\Bitflash", getenv("APPDATA"));
+        strDir = strprintf("%s\\%s", getenv("APPDATA"), APPDIR_WIN);
     }
     else if (getenv("USERPROFILE"))
     {
@@ -2702,12 +2728,12 @@ string GetAppDir()
             fMkdirDone = true;
             _mkdir(strAppData.c_str());
         }
-        strDir = strprintf("%s\\Bitflash", strAppData.c_str());
+        strDir = strprintf("%s\\%s", strAppData.c_str(), APPDIR_WIN);
     }
 #else
     else if (getenv("HOME"))
     {
-        strDir = strprintf("%s/.bitflash", getenv("HOME"));
+        strDir = strprintf("%s/%s", getenv("HOME"), APPDIR_POSIX);
     }
 #endif
     else

@@ -1075,7 +1075,7 @@ static void RestoreThread(std::string strPhrase)
 {
     std::string strError;
     int nRecovered = 0, nDerived = 0;
-    bool fOk = RestoreFromPhrase(strPhrase, 0, RestoreProgress, NULL,
+    bool fOk = RestoreFromPhrase(strPhrase, "", 0, RestoreProgress, NULL,
                                  strError, nRecovered, nDerived);
     {
         std::lock_guard<std::mutex> lock(g_restoreResultMutex);
@@ -1143,7 +1143,7 @@ static void DrawCreatePhraseDialog()
         if (ImGui::Button("Finish", ImVec2(120.0f, 0.0f)))
         {
             std::string strError;
-            if (SetHDSeedFromMnemonic(g_pendingMnemonic, strError))
+            if (SetHDSeedFromMnemonic(g_pendingMnemonic, "", strError))
             {
                 TopUpKeyPool();
                 g_recoveryAuditTime = 0;

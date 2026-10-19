@@ -2,7 +2,14 @@
 # Called by: make linux (root Makefile)
 
 CXX ?= g++
+CC  ?= gcc
 FUZZ_CXX ?= clang++
+
+# ML-KEM-1024 (mlkem-native, vendored under mlkem/). It is C99, not C++, and the
+# parameter set is fixed at compile time, so it gets its own flags and its own
+# rule. Its randomness never comes from itself: btfchan feeds the _derand entry
+# points from libsodium, so none of its platform RNG code is compiled in.
+MLKEMFLAGS = -std=c99 -O2 -Wall -Wextra -Imlkem -DMLK_CONFIG_PARAMETER_SET=1024
 
 SECP_INC    ?= /usr/local/include
 SECP_LIB    ?= /usr/local/lib
@@ -53,7 +60,9 @@ LIBS = -L$(SECP_LIB) -lsecp256k1 \
 HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
-          selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h proxy.h tor.h treasury.h font_roboto.h
+          selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h \
+          proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
@@ -62,7 +71,10 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/market.o obj/sha.o obj/nostr.o obj/randomx_pow.o \
             obj/btfaddr.o obj/btfchan.o obj/rpc.o \
             obj/selftest.o obj/bip32.o obj/walletcmd.o obj/wallet_sqlite.o \
-            obj/proxy.o obj/tor.o obj/jsonrpc.o obj/treasury.o
+            obj/proxy.o obj/tor.o obj/jsonrpc.o obj/treasury.o \
+            obj/mlkem.o \
+            obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
+            obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
 
@@ -75,6 +87,10 @@ obj/%.o: %.cpp $(HEADERS)
 obj/sha.o: sha.cpp sha.h
 	@mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
+
+obj/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 obj/imgui.o:              $(IMGUI_DIR)/imgui.cpp
 	@mkdir -p obj
@@ -103,6 +119,35 @@ obj/imgui_impl_opengl3.o: $(IMGUI_DIR)/imgui_impl_opengl3.cpp
 bitflash: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: bitflash"
+
+
+# ---- btfchat ---------------------------------------------------------------
+#
+# See the long note in makefile.mingw: same modules, separate process, separate
+# data directory (~/.bitflash-chat), separate wallet, separate onion. gui.o is
+# deliberately absent.
+
+CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
+
+CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
+            obj-chat/gui_chat.o obj-chat/main_gui.o \
+            $(IMGUI_OBJS)
+
+obj-chat/%.o: %.cpp $(HEADERS)
+	@mkdir -p obj-chat
+	$(CXX) -c $(CHATFLAGS) -o $@ $<
+
+obj-chat/sha.o: sha.cpp sha.h
+	@mkdir -p obj-chat
+	$(CXX) -c $(CHATFLAGS) -O3 -o $@ $<
+
+obj-chat/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj-chat
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
+btfchat: $(CHAT_OBJS)
+	$(CXX) $(CHATFLAGS) -o $@ $^ $(LIBS)
+	@echo "Built: btfchat"
 
 # ---- headless node ---------------------------------------------------------
 #
@@ -190,13 +235,39 @@ test_btfaddr: test_btfaddr.cpp btfaddr.cpp btfaddr.h
 
 # The encrypted channel every .btf connection runs through. Same story as the
 # address tests: the file was here, nothing ran it.
-test_btfchan: test_btfchan.cpp btfchan.cpp btfchan.h
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp -lsodium
+test_btfchan: test_btfchan.cpp btfchan.cpp btfchan.h obj/mlkem.o
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o -lsodium
 
-tests: test_bip32 test_btfaddr test_btfchan bitflash-node
+# See the note in makefile.mingw: bip32 for the phrase, btfaddr for the address,
+# no ML-KEM object.
+test_btfchat: test_btfchat.cpp btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchat.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+
+# The frame layer: signing, the group admin proof, the replay guard.
+test_btfchatmsg: test_btfchatmsg.cpp btfchatmsg.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+
+# See the note in makefile.mingw.
+test_btfchatbox: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+
+# The sealed history.
+test_btfchatlog: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+
+# See the note in makefile.mingw.
+test_btfchatlink: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink bitflash-node
 	./test_bip32
-	./test_btfaddr
 	./test_btfchan
+	./test_btfaddr
+	./test_btfchat
+	./test_btfchatmsg
+	./test_btfchatbox
+	./test_btfchatlog
+	./test_btfchatlink
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
@@ -219,5 +290,7 @@ tests: test_bip32 test_btfaddr test_btfchan bitflash-node
 	./bitflash-node -selftest=socks5-proxy
 	./bitflash-node -selftest=managed-tor
 	./bitflash-node -selftest=treasury
+	./bitflash-node -selftest=chat-link
+	./bitflash-node -selftest=chat-identity
 
 .PHONY: tests fuzz-net-message-smoke fuzz-script-smoke

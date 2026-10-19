@@ -30,6 +30,10 @@ static std::string g_managedTorPath;
 static std::string g_managedTorDataDir;
 static std::string g_managedTorHiddenServiceDir;
 static std::string g_managedTorOnion;
+// The chat's separate hidden service. Requested only when a port is set.
+static unsigned short g_managedTorChatPort = 0;
+static std::string g_managedTorChatHiddenServiceDir;
+static std::string g_managedTorChatOnion;
 static std::string g_managedTorStatus;
 static std::vector<std::string> g_torBridges;              // bridge lines
 int nTorBridgeFallbackSecs = 4 * 60;
@@ -38,6 +42,9 @@ static int64 g_managedTorStartedAt = 0;
 static std::string g_torMode = "direct";     // "direct", "user", or a rung name
 static bool g_fTorLadderExhausted = false;
 static bool g_fTorFirstPeerSeen = false;
+// Set by BtfTorNoteNetworkReached(). Read by the watchdog in the chat build,
+// where there are no peers to count.
+static bool g_fTorNetworkReached = false;
 static int g_torBootstrapPct = -1;           // -1: not polled yet
 static std::string g_torBootstrapLine;
 static std::map<std::string, std::string> g_torPtExec;     // transport -> PT binary
@@ -1062,13 +1069,41 @@ std::vector<std::string> BtfDefaultBridges()
     return b;
 }
 
+void BtfSetManagedTorChatPort(unsigned short port)
+{
+    CRITICAL_BLOCK(cs_managedTor)
+        g_managedTorChatPort = port;
+}
+
+unsigned short BtfManagedTorChatPort()
+{
+    CRITICAL_BLOCK(cs_managedTor)
+        return g_managedTorChatPort;
+    return 0;
+}
+
+void BtfTorNoteNetworkReached()
+{
+    CRITICAL_BLOCK(cs_managedTor)
+        g_fTorNetworkReached = true;
+}
+
+std::string BtfManagedTorChatOnion()
+{
+    CRITICAL_BLOCK(cs_managedTor)
+        return g_managedTorChatOnion;
+    return std::string();
+}
+
 std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
                                         const std::string& hiddenServiceDir,
                                         unsigned short socksPort,
                                         unsigned short controlPort,
                                         unsigned short p2pPort,
                                         const std::vector<std::string>& bridges,
-                                        const std::map<std::string, std::string>& ptExecByTransport)
+                                        const std::map<std::string, std::string>& ptExecByTransport,
+                                        const std::string& chatHiddenServiceDir,
+                                        unsigned short chatPort)
 {
     std::string torData = NormalizeTorrcPath(dataDir);
     std::string hsDir = NormalizeTorrcPath(hiddenServiceDir);
@@ -1079,6 +1114,11 @@ std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
                    (unsigned)socksPort);
     s += strprintf("ControlPort 127.0.0.1:%u\n", (unsigned)controlPort);
     s += "CookieAuthentication 1\n";
+    // p2pPort 0 means "no node here": btfchat has no peer-to-peer listener, so
+    // it gets no P2P onion. An onion that exists and refuses every connection is
+    // still an onion that announces a Bitflash node at that address.
+    if (p2pPort != 0)
+    {
     s += "HiddenServiceDir " + QuoteTorrcPath(hsDir) + "\n";
     s += "HiddenServiceVersion 3\n";
     s += strprintf("HiddenServicePort %u 127.0.0.1:%u\n",
@@ -1094,6 +1134,19 @@ std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
     if (p2pPort < 65535)
         s += strprintf("HiddenServicePort %u 127.0.0.1:%u\n",
                        (unsigned)(p2pPort + 1), (unsigned)(p2pPort + 1));
+    }
+    // btfchat's own service: its own directory, so its own .onion, so the chat
+    // address does not spell out which node mines. In a torrc every
+    // HiddenServicePort belongs to the HiddenServiceDir above it, which is
+    // exactly why this block has to come after the P2P ports and open with a
+    // Dir line of its own.
+    if (chatPort != 0 && !chatHiddenServiceDir.empty())
+    {
+        s += "HiddenServiceDir " + QuoteTorrcPath(NormalizeTorrcPath(chatHiddenServiceDir)) + "\n";
+        s += "HiddenServiceVersion 3\n";
+        s += strprintf("HiddenServicePort %u 127.0.0.1:%u\n",
+                       (unsigned)chatPort, (unsigned)chatPort);
+    }
     // Pluggable transports for reaching Tor where it is blocked, without our
     // rendezvous relays. Emit one ClientTransportPlugin per PT binary, listing
     // every transport it serves that we actually have a bridge for, then the
@@ -1374,8 +1427,17 @@ static void ThreadManagedTorWatchdog(void*)
         }
 
         bool fAnyPeer = false;
+#ifdef BITFLASH_CHAT_APP
+        // No peer-to-peer node here: counting peers would count zero forever and
+        // send this watchdog up the bridge ladder on a network where Tor is
+        // perfectly fine. What proves Tor works for the chat is a discovery relay
+        // answering over it.
+        CRITICAL_BLOCK(cs_managedTor)
+            fAnyPeer = g_fTorNetworkReached;
+#else
         CRITICAL_BLOCK(cs_vNodes)
             fAnyPeer = !vNodes.empty();
+#endif
         std::string mode = BtfTorTransportMode();
 
         if (fAnyPeer)
@@ -1445,16 +1507,73 @@ static void ThreadManagedTorHostname(void*)
 {
     std::string hostnamePath;
     unsigned short p2pPort = 0;
+    std::string chatHostnamePath;
+    unsigned short chatPort = 0;
     CRITICAL_BLOCK(cs_managedTor)
     {
         hostnamePath = PathJoin(g_managedTorHiddenServiceDir, "hostname");
         p2pPort = g_managedTorP2PPort;
+        if (g_managedTorChatPort != 0 && !g_managedTorChatHiddenServiceDir.empty())
+        {
+            chatHostnamePath = PathJoin(g_managedTorChatHiddenServiceDir, "hostname");
+            chatPort = g_managedTorChatPort;
+        }
     }
 
     for (int i = 0; i < 90 && !fShutdown; i++)
     {
+#ifdef BITFLASH_CHAT_APP
+        // No P2P service exists in this build, so the loop's only job is the
+        // chat's hostname. Without this it would spend ninety seconds waiting
+        // for a file Tor was never asked to create.
+        if (chatPort != 0 && !BtfManagedTorChatOnion().empty())
+            return;
+#endif
+        // The chat's service comes up on its own schedule. Picked up in this loop
+        // rather than in a second thread, and deliberately never allowed to hold
+        // up the node's own endpoint below -- nor to be held up by it.
+        if (chatPort != 0 && BtfManagedTorChatOnion().empty())
+        {
+            std::string chatOnion;
+            if (ReadOneLine(chatHostnamePath, chatOnion) && !chatOnion.empty())
+            {
+                CRITICAL_BLOCK(cs_managedTor)
+                {
+                    g_managedTorChatOnion = strprintf("%s:%u", chatOnion.c_str(),
+                                                      (unsigned)chatPort);
+#ifdef BITFLASH_CHAT_APP
+                    // Otherwise the status line says "starting" forever: the only
+                    // place that writes "running" is the P2P endpoint path, and
+                    // this build has no P2P endpoint.
+                    g_managedTorStatus = strprintf("running, SOCKS5 127.0.0.1:%u, chat onion %s",
+                                                   (unsigned)g_managedTorSocksPort,
+                                                   g_managedTorChatOnion.c_str());
+#endif
+                }
+                printf("Managed Tor chat service ready: %s\n",
+                       BtfManagedTorChatOnion().c_str());
+                // Tor just created a hidden service. That does not happen on a
+                // Tor that cannot reach the network, so it is proof -- and it
+                // arrives in well under a minute, where waiting for a discovery
+                // relay to answer can take longer than the watchdog's patience.
+                //
+                // Without this the watchdog declared "Tor is blocked" at 241 s on
+                // a machine whose Tor had just published an onion service, and
+                // restarted it onto bridges -- which is what made the relays
+                // unreachable, which kept the watchdog convinced. Measured, not
+                // theorised: the restart lands exactly 241 s after startup.
+                BtfTorNoteNetworkReached();
+            }
+        }
+
         std::string onion;
+#ifdef BITFLASH_CHAT_APP
+        // Never advertise a P2P endpoint from the chat: there is no listener
+        // behind it and no node to find.
+        if (false)
+#else
         if (ReadOneLine(hostnamePath, onion))
+#endif
         {
             std::string endpoint = strprintf("%s:%u", onion.c_str(), (unsigned)p2pPort);
             std::string err;
@@ -1508,6 +1627,15 @@ bool BtfStartManagedTor(const std::string& torPathOpt, std::string& errOut)
     if (!EnsureDir(root, errOut) || !EnsureDir(dataDir, errOut) || !EnsureDir(hsDir, errOut))
         return false;
 
+    unsigned short chatPort = BtfManagedTorChatPort();
+    std::string chatHsDir;
+    if (chatPort != 0)
+    {
+        chatHsDir = PathJoin(root, "chat-onion-service");
+        if (!EnsureDir(chatHsDir, errOut))
+            return false;
+    }
+
     unsigned short socksPort = 0;
     if (!PickLocalPort(socksPort, errOut))
         return false;
@@ -1515,11 +1643,17 @@ bool BtfStartManagedTor(const std::string& torPathOpt, std::string& errOut)
     if (!PickLocalPort(controlPort, errOut))
         return false;
 
+#ifdef BITFLASH_CHAT_APP
+    // btfchat runs no node, so it asks Tor for no node service -- only the chat's.
+    unsigned short p2pPort = 0;
+#else
     unsigned short p2pPort = ntohs(nListenPort);
+#endif
     KillStaleManagedTor(torrcPath);
     std::string torrc = BtfBuildManagedTorrcForTest(dataDir, hsDir, socksPort,
                                                    controlPort, p2pPort,
-                                                   g_torBridges, g_torPtExec);
+                                                   g_torBridges, g_torPtExec,
+                                                   chatHsDir, chatPort);
     if (!WriteTextFile(torrcPath, torrc, errOut))
         return false;
 
@@ -1532,6 +1666,8 @@ bool BtfStartManagedTor(const std::string& torPathOpt, std::string& errOut)
             g_managedTorPath = torPath;
             g_managedTorDataDir = dataDir;
             g_managedTorHiddenServiceDir = hsDir;
+            g_managedTorChatHiddenServiceDir = chatHsDir;
+            g_managedTorChatOnion.clear();
             g_managedTorSocksPort = socksPort;
             g_managedTorControlPort = controlPort;
             g_managedTorP2PPort = p2pPort;

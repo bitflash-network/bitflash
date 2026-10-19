@@ -73,6 +73,20 @@ std::string BtfTorTransportMode();
 // directory ("" when nothing is remembered). Cleared when direct works.
 std::string BtfLastWorkingTransport();
 void BtfForgetLastWorkingTransport();
+// Tell the Tor watchdog that the network was actually reached.
+//
+// The watchdog decides whether Tor is being blocked by asking whether any peer
+// connected. btfchat has no peer-to-peer node, so that answer is always "no" and
+// the watchdog concluded, every four minutes, that Tor was blocked -- restarting
+// it with bridges forever, which is exactly what stops the discovery relays from
+// being reachable. Measured on a working machine: "no peer after 244 s (Tor
+// bootstrap 100% Done)".
+//
+// A successful connection to a discovery relay over Tor proves Tor works, which
+// is the only thing the watchdog is trying to establish. This is how the chat
+// says so.
+void BtfTorNoteNetworkReached();
+
 // Tor's own bootstrap, as last polled by the watchdog: percent and a line
 // such as "25% Asking for networkstatus consensus".
 int BtfManagedTorBootstrapPercent();
@@ -85,6 +99,27 @@ bool BtfTryBridgesNow(std::string& errOut);
 bool BtfTorFallbackDisabledByFile();
 void BtfSetTorFallbackEnabled(bool fEnabled);
 
+// --- The chat's own onion service ------------------------------------
+// btfchat listens on a SECOND hidden service, with its own HiddenServiceDir and
+// therefore its own .onion name. Not a second virtual port on the node's onion
+// the way the mining pool does it: that would make the chat address and the P2P
+// address the same string, and anyone who could reach you to talk would know
+// which node you mine on. The whole point of a separate chat identity is that it
+// does not lead back there.
+//
+// What this does NOT hide, and cannot: both services are served by the same Tor
+// process, so somebody who can watch that process -- on this machine, with this
+// user's access -- sees both. The alternative is a second Tor, a second
+// bootstrap and a second thing to go wrong, against an attacker who is already
+// inside the machine. Not worth it; written down instead of pretended away.
+//
+// Set the port before BtfStartManagedTor. 0 (the default) means the chat service
+// is not requested at all and the torrc gets no second block.
+void BtfSetManagedTorChatPort(unsigned short port);
+unsigned short BtfManagedTorChatPort();
+// "host.onion:port" once Tor has created the service, "" until then.
+std::string BtfManagedTorChatOnion();
+
 std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
                                         const std::string& hiddenServiceDir,
                                         unsigned short socksPort,
@@ -93,6 +128,8 @@ std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
                                         const std::vector<std::string>& bridges =
                                             std::vector<std::string>(),
                                         const std::map<std::string, std::string>& ptExecByTransport =
-                                            std::map<std::string, std::string>());
+                                            std::map<std::string, std::string>(),
+                                        const std::string& chatHiddenServiceDir = std::string(),
+                                        unsigned short chatPort = 0);
 
 #endif

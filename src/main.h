@@ -244,7 +244,8 @@ std::vector<unsigned int> HDBIP44Path(unsigned int nCoinType,
 // default receiving key is derived immediately, so the next visible address is
 // covered by the phrase. Writes to wallet.dat. Returns false and leaves the
 // wallet untouched if the phrase is not valid.
-bool SetHDSeedFromMnemonic(const string& strMnemonic, string& strErrorRet);
+bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphrase,
+                           string& strErrorRet);
 
 // Derive the receiving child at nIndex for the wallet's active schema and
 // return it as a key. Legacy seeded wallets use m/index'. BIP44 wallets use

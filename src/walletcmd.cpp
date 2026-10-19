@@ -86,7 +86,7 @@ unsigned int WalletLastUsedPubKeyIndexNext(
     return nNext;
 }
 
-int CmdNewPhrase()
+int CmdNewPhrase(const std::string& strPassphrase)
 {
     AttachTerminal();
 
@@ -106,7 +106,7 @@ int CmdNewPhrase()
         return 1;
     }
 
-    if (!SetHDSeedFromMnemonic(strMnemonic, strError))
+    if (!SetHDSeedFromMnemonic(strMnemonic, strPassphrase, strError))
     {
         fprintf(stderr, "Could not install the seed: %s\n", strError.c_str());
         return 1;
@@ -126,11 +126,25 @@ int CmdNewPhrase()
     printf("\n");
     printf("Keys already in this wallet are NOT covered by the phrase -- they existed\n");
     printf("before it did. Keep your file backups as well.\n");
+
+    if (!strPassphrase.empty())
+    {
+        // Said plainly because the failure mode is silent: a wrong passphrase
+        // does not report anything, it rebuilds a different, empty wallet. The
+        // words on their own will look like they stopped working.
+        printf("\n");
+        printf("This wallet also has a passphrase. The words above rebuild it ONLY\n");
+        printf("together with that exact passphrase -- write it down too, apart from\n");
+        printf("the words. A wrong one does not fail: it opens an empty wallet, and\n");
+        printf("nobody, this program included, can tell you which one was right.\n");
+    }
+
     fflush(stdout);
     return 0;
 }
 
 bool RestoreFromPhrase(const std::string& strMnemonic,
+                       const std::string& strPassphrase,
                        int nMinDepth,
                        RestoreProgressFn fnProgress,
                        void* pArg,
@@ -158,7 +172,7 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
     CRITICAL_BLOCK(cs_mapWallet)
         nWalletStart = mapWallet.size();
 
-    if (!SetHDSeedFromMnemonic(strMnemonic, strErrorRet))
+    if (!SetHDSeedFromMnemonic(strMnemonic, strPassphrase, strErrorRet))
         return false;
 
     // Derive forward in batches, scanning after each, until a whole batch turns
@@ -316,7 +330,7 @@ static void PrintRestoreProgress(void*, int nDerived, int nRecovered)
     fflush(stdout);
 }
 
-int CmdRestorePhrase(const std::string& strMnemonic, int nMinDepth)
+int CmdRestorePhrase(const std::string& strMnemonic, const std::string& strPassphrase, int nMinDepth)
 {
     AttachTerminal();
 
@@ -325,7 +339,7 @@ int CmdRestorePhrase(const std::string& strMnemonic, int nMinDepth)
 
     std::string strError;
     int nRecovered = 0, nDerived = 0;
-    if (!RestoreFromPhrase(strMnemonic, nMinDepth, PrintRestoreProgress, NULL,
+    if (!RestoreFromPhrase(strMnemonic, strPassphrase, nMinDepth, PrintRestoreProgress, NULL,
                            strError, nRecovered, nDerived))
     {
         fprintf(stderr, "Cannot restore: %s\n", strError.c_str());

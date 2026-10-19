@@ -14,6 +14,12 @@
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
 #include "sockcount.h"
+#include "btfchatnode.h"
+#include "btfchatsock.h"
+// The chat test signs frames, so it needs a secp256k1 context of its own. Not
+// the node identity from nostr.h: asking for that would generate and persist a
+// node key, and a self-test has no business creating one.
+#include <secp256k1.h>
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -362,7 +368,7 @@ static int RunWalletHDSelfTest()
         std::vector<unsigned char> vchPreSeedKey = keyUser.GetPubKey();
         std::string strPreSeedAddr = PubKeyToAddress(keyUser.GetPubKey());
 
-        nFail += Check(SetHDSeedFromMnemonic(strPhraseA, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strPhraseA, "", strError),
                        "a valid phrase installs a seed") ? 0 : 1;
         nFail += Check(HaveHDSeed(), "the wallet reports having a seed") ? 0 : 1;
         nFail += Check(nHDKeySchema == HD_SCHEMA_BIP44,
@@ -445,7 +451,7 @@ static int RunWalletHDSelfTest()
         std::vector<unsigned char> vchBefore = vchHDMaster;
         int nSchemaBefore = nHDKeySchema;
         unsigned int nCoinTypeBefore = nHDCoinType;
-        nFail += Check(!SetHDSeedFromMnemonic("not a mnemonic at all", strError),
+        nFail += Check(!SetHDSeedFromMnemonic("not a mnemonic at all", "", strError),
                        "an invalid phrase is refused") ? 0 : 1;
         nFail += Check(vchHDMaster == vchBefore,
                        "a refused phrase leaves the existing seed alone") ? 0 : 1;
@@ -465,7 +471,7 @@ static int RunWalletHDSelfTest()
             first.push_back(HexStrLocal(key.GetPubKey()));
         }
 
-        SetHDSeedFromMnemonic(strPhraseA, strError);
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
         std::vector<std::string> again;
         for (unsigned int i = 0; i < 5; i++)
         {
@@ -477,7 +483,7 @@ static int RunWalletHDSelfTest()
         nFail += Check(first == again,
                        "the same phrase derives the same keys in the same order") ? 0 : 1;
 
-        SetHDSeedFromMnemonic(strPhraseB, strError);
+        SetHDSeedFromMnemonic(strPhraseB, "", strError);
         std::vector<std::string> other;
         for (unsigned int i = 0; i < 5; i++)
         {
@@ -488,13 +494,57 @@ static int RunWalletHDSelfTest()
         }
         nFail += Check(first != other, "a different phrase derives different keys") ? 0 : 1;
 
+        // The BIP39 passphrase has to reach the seed, not merely be accepted.
+        // If the plumbing dropped it the wallet would look identical and the
+        // user would believe coins were protected by something that was never
+        // applied -- so this compares derived keys, not return codes.
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystaple", strError);
+        std::vector<std::string> withPass;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            withPass.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(first != withPass,
+                       "the same phrase with a passphrase derives different keys") ? 0 : 1;
+
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystaple", strError);
+        std::vector<std::string> withPassAgain;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            withPassAgain.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(withPass == withPassAgain,
+                       "the same phrase and passphrase derive the same keys") ? 0 : 1;
+
+        // One character off is a different wallet, silently. This is the shape
+        // of the mistake that loses coins, so it is worth a test of its own.
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystapl", strError);
+        std::vector<std::string> nearMiss;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            nearMiss.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(withPass != nearMiss,
+                       "a passphrase off by one character is a different wallet") ? 0 : 1;
+
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
+
         std::set<std::string> distinct(first.begin(), first.end());
         nFail += Check(distinct.size() == first.size(),
                        "consecutive indices give distinct keys") ? 0 : 1;
 
         // With a seed installed the pool must be derived from it, and the
         // counter must move exactly once per key.
-        SetHDSeedFromMnemonic(strPhraseA, strError);
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
         unsigned int nReceiveNextBefore = nHDReceiveNext;
         TopUpKeyPool();
 
@@ -2198,7 +2248,7 @@ static int RunWalletEncryptSelfTest()
         string strError;
         const string strMnemonic =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, "", strError),
                        "a phrase can be installed before encryption") ? 0 : 1;
         TopUpKeyPool();
 
@@ -2382,7 +2432,7 @@ static int RunWalletSQLiteEncryptSelfTest()
         string strError;
         const string strMnemonic =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, "", strError),
                        "a phrase can be installed before encryption") ? 0 : 1;
         TopUpKeyPool();
 
@@ -2756,7 +2806,7 @@ static int RunWalletConvertSelfTest()
         string strError;
         nFail += Check(SetHDSeedFromMnemonic(
                            "abandon abandon abandon abandon abandon abandon abandon "
-                           "abandon abandon abandon abandon about", strError),
+                           "abandon abandon abandon abandon about", "", strError),
                        "a phrase can be installed before conversion") ? 0 : 1;
         TopUpKeyPool();
 
@@ -4621,6 +4671,350 @@ static int RunTreasurySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The chat over real sockets.
+//
+// btfchatlink is tested on its own over an in-memory pipe, so the protocol is
+// already covered. What this covers is the socket glue: that SocketStream moves
+// the bytes a Link needs, over a loopback pair, with the endpoint accepting the
+// way the Tor-forwarded listener will. Loopback, not Tor, because the point is
+// the glue -- Tor in the path would make the test measure Tor.
+static int RunChatLinkSelfTest()
+{
+    printf("chat-link self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock winsock;
+    nFail += Check(winsock.fStarted, "Winsock started") ? 0 : 1;
+#endif
+
+    secp256k1_context* ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    nFail += Check(ctx != NULL, "secp256k1 context created") ? 0 : 1;
+    if (!ctx)
+        return nFail;
+    {
+        unsigned char rnd[32];
+        RAND_bytes(rnd, sizeof(rnd));
+        secp256k1_context_randomize(ctx, rnd);
+    }
+
+    // Two identities from fixed seeds. The chat key comes from the recovery
+    // phrase and the session password, and neither is anywhere near this test.
+    std::string err;
+    btfchat::Identity alice, bob;
+    {
+        std::vector<unsigned char> seed(64, 0xA1);
+        nFail += Check(btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", alice, err),
+                       "a chat identity derives") ? 0 : 1;
+        seed.assign(64, 0xB2);
+        nFail += Check(btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", bob, err),
+                       "and a second one") ? 0 : 1;
+    }
+    nFail += Check(alice.address != bob.address, "two different .btf addresses") ? 0 : 1;
+
+    // A loopback pair standing in for Tor forwarding its hidden service to the
+    // chat listener.
+    SOCKET listener = INVALID_SOCKET;
+    nFail += Check(btfchat::ChatListen(0, listener, err) == false,
+                   "a chat listener refuses port 0") ? 0 : 1;
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    bool fUp = listener != INVALID_SOCKET
+        && bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && listen(listener, 1) == 0;
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    fUp = fUp && getsockname(listener, (struct sockaddr*)&addr, &addrLen) == 0;
+    nFail += Check(fUp, "loopback chat listener up") ? 0 : 1;
+
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    bool fConn = fUp && client != INVALID_SOCKET
+        && connect(client, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    SOCKET server = fConn ? accept(listener, NULL, NULL) : INVALID_SOCKET;
+    nFail += Check(fConn && server != INVALID_SOCKET, "dialled and accepted") ? 0 : 1;
+
+    if (fConn && server != INVALID_SOCKET)
+    {
+        // The handshake needs both sides at once, so the endpoint runs in a
+        // thread, exactly as the listener thread will.
+        btfchat::SocketStream sClient(client, 20);
+        btfchat::SocketStream sServer(server, 20);
+        btfchat::Link linkClient, linkServer;
+
+        struct Arg
+        {
+            btfchat::Link*         link;
+            btfchat::SocketStream* stream;
+            const unsigned char*   sk;
+            bool                   fOk;
+            std::string            err;
+        };
+        Arg arg;
+        arg.link = &linkServer; arg.stream = &sServer; arg.sk = bob.chan_sk; arg.fOk = false;
+
+        struct Runner
+        {
+            static void Accept(void* p)
+            {
+                Arg* a = (Arg*)p;
+                a->fOk = a->link->AcceptAsEndpoint(*a->stream, a->sk, a->err);
+            }
+        };
+        bool fThread = _beginthread(Runner::Accept, 0, &arg) != -1;
+        nFail += Check(fThread, "endpoint thread started") ? 0 : 1;
+
+        bool fCl = linkClient.ConnectAsClient(sClient, bob.chan_pk, err);
+        nFail += Check(fCl, "the client handshake completed over a socket") ? 0 : 1;
+        if (!fCl)
+            printf("       (%s)\n", err.c_str());
+
+        // Wait for the endpoint side rather than guessing.
+        for (int i = 0; i < 200 && !arg.fOk; i++)
+            Sleep(50);
+        nFail += Check(arg.fOk, "and so did the endpoint") ? 0 : 1;
+        if (!arg.fOk && !arg.err.empty())
+            printf("       (%s)\n", arg.err.c_str());
+
+        if (fCl && arg.fOk)
+        {
+            // A real frame, signed, over the socket, through the whole inbound
+            // path on the receiving side.
+            btfchat::Roster roster;
+            btfchat::ReplayGuard replay;
+            btfchat::History history;
+            btfchat::Inbox inbox;
+            inbox.secpctx = ctx;
+            inbox.myAddress = bob.address;
+            inbox.roster = &roster;
+            inbox.replay = &replay;
+            inbox.history = &history;
+
+            int64 nNow = GetTime();
+
+            btfchat::Frame inv;
+            inv.kind = btfchat::MSG_INVITE;
+            inv.sent = nNow;
+            inv.text = "primeiro contato";
+            std::string jsInv;
+            nFail += Check(btfchat::SignFrame(ctx, alice, inv, jsInv, err),
+                           "alice signs an invite") ? 0 : 1;
+            nFail += Check(linkClient.SendFrame(sClient, jsInv, err),
+                           "it goes out over the socket") ? 0 : 1;
+
+            std::string got;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err) && got == jsInv,
+                           "and arrives byte for byte") ? 0 : 1;
+
+            btfchat::Frame opened;
+            nFail += Check(inbox.Deliver(got, alice.address, nNow, opened, err),
+                           "the inbound path accepts it") ? 0 : 1;
+            nFail += Check(roster.State(alice.address) == btfchat::PEER_INVITE_IN,
+                           "and it lands as a pending invite") ? 0 : 1;
+
+            // Before bob accepts, a message is refused -- over a real socket the
+            // same as over the pipe.
+            btfchat::Frame msg;
+            msg.kind = btfchat::MSG_TEXT;
+            msg.sent = nNow;
+            msg.text = "posso falar antes de aceitar?";
+            std::string jsMsg;
+            btfchat::SignFrame(ctx, alice, msg, jsMsg, err);
+            nFail += Check(linkClient.SendFrame(sClient, jsMsg, err), "a message is sent") ? 0 : 1;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err), "and received") ? 0 : 1;
+            nFail += Check(!inbox.Deliver(got, alice.address, nNow, opened, err),
+                           "and refused: nothing before the accept") ? 0 : 1;
+            nFail += Check(history.MessageCount() == 0, "nothing was filed") ? 0 : 1;
+
+            nFail += Check(roster.AcceptInvite(alice.address, err), "bob accepts") ? 0 : 1;
+            btfchat::Frame msg2;
+            msg2.kind = btfchat::MSG_TEXT;
+            msg2.sent = nNow;
+            msg2.text = "agora sim";
+            std::string jsMsg2;
+            btfchat::SignFrame(ctx, alice, msg2, jsMsg2, err);
+            nFail += Check(linkClient.SendFrame(sClient, jsMsg2, err), "she writes again") ? 0 : 1;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err), "it arrives") ? 0 : 1;
+            nFail += Check(inbox.Deliver(got, alice.address, nNow, opened, err) &&
+                           history.MessageCount() == 1,
+                           "and this one is filed") ? 0 : 1;
+
+            // The reply direction, so both ratchets are exercised over sockets.
+            btfchat::Frame rep;
+            rep.kind = btfchat::MSG_TEXT;
+            rep.sent = nNow;
+            rep.text = "recebido";
+            std::string jsRep;
+            btfchat::SignFrame(ctx, bob, rep, jsRep, err);
+            nFail += Check(linkServer.SendFrame(sServer, jsRep, err), "bob answers") ? 0 : 1;
+            nFail += Check(linkClient.RecvFrame(sClient, got, err) && got == jsRep,
+                           "and alice reads it") ? 0 : 1;
+        }
+
+        linkClient.Close();
+        linkServer.Close();
+    }
+
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (server != INVALID_SOCKET) closesocket(server);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+
+    // Outbound is onion-only, with no clearnet fallback. Checked here because it
+    // is a policy, not an implementation detail: a fallback that works when Tor
+    // is down leaks the user's address at the worst possible moment.
+    SOCKET s = INVALID_SOCKET;
+    nFail += Check(!btfchat::ChatDialOnion("127.0.0.1:8533", 5, s, err) &&
+                   err.find("onion") != std::string::npos,
+                   "dialling a clearnet address is refused") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("example.com:8533", 5, s, err),
+                   "and so is a hostname") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("noport.onion", 5, s, err),
+                   "an endpoint with no port is refused") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("abc.onion:notanumber", 5, s, err),
+                   "and one with a junk port") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("abc.onion:99999", 5, s, err),
+                   "and one out of range") ? 0 : 1;
+    // With a well-formed onion and no Tor configured, it must refuse rather than
+    // find another way out.
+    nFail += Check(!BtfTorProxyEnabled(), "no Tor proxy in a self-test") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion(
+                       "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:8533",
+                       5, s, err) && err.find("Tor") != std::string::npos,
+                   "and with no Tor it refuses instead of falling back") ? 0 : 1;
+
+    secp256k1_context_destroy(ctx);
+
+    printf("%s (%d failures)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail);
+    return nFail == 0 ? 0 : 1;
+}
+
+// Where the chat identity comes from.
+//
+// The point being protected here is that the twelve words never reach the chat.
+// The wallet keeps the BIP32 master key and chain code, not the BIP39 seed, and
+// those two are a deterministic function of the seed -- so the same phrase gives
+// the same chat identity on any machine while the phrase itself stays out of this
+// process. A phrase that is not in memory cannot be screenshotted or logged.
+static int RunChatIdentitySelfTest()
+{
+    printf("chat-identity self-test\n");
+    int nFail = 0;
+
+    // SetHDSeedFromMnemonic writes to wallet.dat, so this runs in a datadir of
+    // its own and takes nothing real with it.
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    printf("  temp datadir: %s\n", tmp.c_str());
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+
+    std::string err;
+    std::vector<unsigned char> seed;
+
+    // A wallet with no phrase installed hands out nothing, and says so rather
+    // than handing back something derived from whatever happened to be in the
+    // globals.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(!btfchat::ChatSeedFromWallet(seed, err) && seed.empty(),
+                   "a wallet with no recovery phrase yields no chat seed") ? 0 : 1;
+    btfchat::Identity none;
+    nFail += Check(!btfchat::UnlockIdentity("senha-bem-comprida", none, err),
+                   "and no identity can be unlocked from it") ? 0 : 1;
+
+    // Install a phrase the way -restorephrase does, then check the chat seed is
+    // exactly master || chain code.
+    const char* PHRASE =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "a phrase installs") ? 0 : 1;
+    nFail += Check(HaveHDSeed(), "and the wallet has an HD seed") ? 0 : 1;
+
+    nFail += Check(btfchat::ChatSeedFromWallet(seed, err) && seed.size() == 64,
+                   "the chat seed is 64 bytes") ? 0 : 1;
+    if (seed.size() == 64 && vchHDMaster.size() == 32 && vchHDChainCode.size() == 32)
+    {
+        nFail += Check(memcmp(&seed[0], &vchHDMaster[0], 32) == 0 &&
+                       memcmp(&seed[32], &vchHDChainCode[0], 32) == 0,
+                       "and it is the master key followed by the chain code") ? 0 : 1;
+    }
+    else
+        nFail++;
+
+    // The identity, and the properties the whole design rests on.
+    btfchat::Identity id1, id2, idOther;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", id1, err),
+                   "an identity unlocks with a session password") ? 0 : 1;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", id2, err) &&
+                   id1.address == id2.address,
+                   "the same password gives the same .btf address") ? 0 : 1;
+    nFail += Check(btfchat::UnlockIdentity("outra-senha-comprida", idOther, err) &&
+                   idOther.address != id1.address,
+                   "another password gives a DIFFERENT identity, not an error") ? 0 : 1;
+    nFail += Check(!btfchat::UnlockIdentity("curta", none, err),
+                   "a password under 12 characters is refused") ? 0 : 1;
+
+    // The chat key is not the wallet key. If this ever fails, being reachable
+    // for a conversation would be publishing spending material.
+    CKey walletKey;
+    if (DeriveHDKey(0, walletKey, err))
+    {
+        // GetPrivKey returns a secure_allocator vector, so it is copied byte by
+        // byte rather than assigned to a plain one.
+        CPrivKey vchWalletPriv = walletKey.GetPrivKey();
+        std::string strWallet((const char*)&vchWalletPriv[0], vchWalletPriv.size());
+        std::string strChatSign((const char*)id1.sign_sk, 32);
+        std::string strChatChan((const char*)id1.chan_sk, 32);
+        nFail += Check(strWallet.find(strChatSign) == std::string::npos,
+                       "the chat signing key is not the wallet's first key") ? 0 : 1;
+        nFail += Check(strWallet.find(strChatChan) == std::string::npos,
+                       "nor is the chat channel key") ? 0 : 1;
+    }
+    else
+        nFail++;
+    nFail += Check(memcmp(id1.sign_sk, &vchHDMaster[0], 32) != 0,
+                   "and neither is the wallet master key itself") ? 0 : 1;
+
+    // Reinstalling the same phrase rebuilds the same chat identity: this is what
+    // makes the chat survive moving to another machine with the words alone.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "the phrase installs again") ? 0 : 1;
+    btfchat::Identity idAgain;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", idAgain, err) &&
+                   idAgain.address == id1.address,
+                   "and the chat identity comes back identical") ? 0 : 1;
+
+    // A BIP39 passphrase makes a different wallet, so a different chat identity.
+    // Stated in a test because it is the kind of thing a user discovers the hard
+    // way otherwise.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "vigesima-quinta-palavra", err),
+                   "the same phrase with a 25th word installs") ? 0 : 1;
+    btfchat::Identity idPass;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", idPass, err) &&
+                   idPass.address != id1.address,
+                   "and gives a different chat identity, as it must") ? 0 : 1;
+
+    printf("%s (%d failures)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail);
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunManagedTorSelfTest()
 {
     printf("managed-tor self-test\n");
@@ -4651,6 +5045,85 @@ static int RunManagedTorSelfTest()
                    "maps a second port (p2p+1) for the mining pool over onion") ? 0 : 1;
     nFail += Check(torrc.find("UseBridges") == std::string::npos,
                    "no bridge config when none is requested") ? 0 : 1;
+
+    // btfchat's hidden service. Not requested unless a port is set, and when it
+    // is, it gets its OWN HiddenServiceDir -- a second virtual port on the node's
+    // onion would make the chat address and the P2P address the same string, and
+    // being reachable for a conversation would publish which node you mine on.
+    nFail += Check(torrc.find("chat-onion") == std::string::npos,
+                   "no chat onion service unless one is asked for") ? 0 : 1;
+    nFail += Check(BtfManagedTorChatPort() == 0,
+                   "the chat service is off by default") ? 0 : 1;
+    nFail += Check(BtfManagedTorChatOnion().empty(),
+                   "and has no onion until Tor makes one") ? 0 : 1;
+
+    std::string torrcC = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 8533);
+    nFail += Check(torrcC.find("HiddenServiceDir \"C:/mt/chat-onion-service\"") != std::string::npos,
+                   "the chat service gets its own hidden service directory") ? 0 : 1;
+    nFail += Check(torrcC.find("HiddenServicePort 8533 127.0.0.1:8533") != std::string::npos,
+                   "mapped to the chat listener") ? 0 : 1;
+    // Order is not cosmetic here: in a torrc a HiddenServicePort belongs to the
+    // HiddenServiceDir above it, so the chat's Dir line has to come after the
+    // node's ports or the chat port would be added to the node's onion instead.
+    nFail += Check(torrcC.find("C:/mt/chat-onion-service") >
+                   torrcC.find("HiddenServicePort 8434 127.0.0.1:8434"),
+                   "and declared after the node ports, so the two do not merge") ? 0 : 1;
+    nFail += Check(torrcC.find("HiddenServiceDir \"C:/mt/onion-service\"") != std::string::npos,
+                   "while the node keeps its own service") ? 0 : 1;
+    // Two Dir lines, two services, two .onion names.
+    {
+        size_t nDirs = 0, at = 0;
+        while ((at = torrcC.find("HiddenServiceDir ", at)) != std::string::npos)
+        { nDirs++; at += 1; }
+        nFail += Check(nDirs == 2, "exactly two hidden services, so two onion names") ? 0 : 1;
+    }
+    // A port with no directory, or a directory with no port, asks for nothing:
+    // half a service in a torrc is a Tor that refuses to start.
+    std::string torrcD = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    std::string(), 8533);
+    nFail += Check(torrcD.find("8533") == std::string::npos,
+                   "a chat port with no directory is ignored") ? 0 : 1;
+    std::string torrcE = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 0);
+    nFail += Check(torrcE.find("chat-onion") == std::string::npos,
+                   "and a directory with no port is ignored too") ? 0 : 1;
+
+    // btfchat runs no peer-to-peer node, so it asks for no node service: a P2P
+    // port of 0 means "nothing listens here". An onion that exists and refuses
+    // every connection still announces a Bitflash node at that address, which is
+    // precisely what a chat identity must not do.
+    std::string torrcF = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 0,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 8533);
+    nFail += Check(torrcF.find("C:/mt/onion-service") == std::string::npos,
+                   "a P2P port of 0 asks for no node onion service") ? 0 : 1;
+    nFail += Check(torrcF.find("HiddenServicePort 8433") == std::string::npos &&
+                   torrcF.find("HiddenServicePort 8434") == std::string::npos,
+                   "and maps neither the P2P port nor the pool port") ? 0 : 1;
+    nFail += Check(torrcF.find("HiddenServiceDir \"C:/mt/chat-onion-service\"") != std::string::npos &&
+                   torrcF.find("HiddenServicePort 8533 127.0.0.1:8533") != std::string::npos,
+                   "while the chat still gets its own service") ? 0 : 1;
+    {
+        size_t nDirs = 0, at = 0;
+        while ((at = torrcF.find("HiddenServiceDir ", at)) != std::string::npos)
+        { nDirs++; at += 1; }
+        nFail += Check(nDirs == 1, "exactly one hidden service: the chat's") ? 0 : 1;
+    }
+    // And SOCKS is still there, because that is how the chat dials out at all.
+    nFail += Check(torrcF.find("SocksPort 127.0.0.1:19050") != std::string::npos,
+                   "with SOCKS still bound, which is how it dials out") ? 0 : 1;
 
     // With PT binaries and bridges, the torrc must wire both transports: one
     // ClientTransportPlugin per binary, then every Bridge line.
@@ -4837,8 +5310,12 @@ int RunSelfTest(const std::string& name)
         return RunManagedTorSelfTest();
     if (name == "treasury")
         return RunTreasurySelfTest();
+    if (name == "chat-link")
+        return RunChatLinkSelfTest();
+    if (name == "chat-identity")
+        return RunChatIdentitySelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity\n");
     return 1;
 }
