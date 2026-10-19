@@ -3,7 +3,9 @@
 Two people who do not trust each other trade BTF for BTC (or LTC, or any coin
 with the same script) without an exchange, an escrow, a server or a custodian.
 Either both get paid, or both get their coins back. Needs rules v3, which make
-pay-to-script-hash and `OP_CHECKLOCKTIMEVERIFY` live (see `consensus.h`).
+pay-to-script-hash and `OP_CHECKLOCKTIMEVERIFY` live: on testnet from
+2026-10-20 01:00 UTC, on mainnet from **2026-11-21 12:00 UTC** (see
+`consensus.h`).
 
 ## Why it works
 

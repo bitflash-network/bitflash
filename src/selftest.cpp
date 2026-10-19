@@ -4451,8 +4451,10 @@ static int RunMultisigSelfTest()
         std::string strKeyAddr = PubKeyToAddress(keyA.GetPubKey());
         nFail += Check(DecodeAnyAddress(strKeyAddr, h, fScript) && !fScript && h == Hash160(keyA.GetPubKey()),
                        "a B address decodes as a key hash") ? 0 : 1;
-        nFail += Check(!RulesV3Active(GetAdjustedTime()) && RulesV3Time() == 0,
-                       "rules v3 are not scheduled: pay-to-script-hash is not live") ? 0 : 1;
+        nFail += Check(RulesV3Time() == RULES_V3_TIME_MAINNET && RulesV3Time() == 1795262400 &&
+                       RulesV3Active(GetAdjustedTime()) == ((unsigned int)GetAdjustedTime() >= RulesV3Time()),
+                       "rules v3 on mainnet switch on at 2026-11-21 12:00 UTC, not before") ? 0 : 1;
+        bool fV3Now = RulesV3Active(GetAdjustedTime());
 
         // ---- IsMine and relay policy
         nFail += Check(!IsMine(ms), "2-of-3 with one key elsewhere is not 'mine': the wallet cannot spend it alone... " ) ? 0 : 1;
@@ -4475,7 +4477,7 @@ static int RunMultisigSelfTest()
         txStd.vout[0].scriptPubKey = ms4;
         nFail += Check(!txStd.IsStandard(), "four keys is not (relay policy, not validity)") ? 0 : 1;
         txStd.vout[0].scriptPubKey = p2sh;
-        nFail += Check(!txStd.IsStandard(), "a pay-to-script-hash output is not relayed before rules v3") ? 0 : 1;
+        nFail += Check(txStd.IsStandard() == fV3Now, "a pay-to-script-hash output is relayed only once rules v3 are live") ? 0 : 1;
         txStd.vout[0].scriptPubKey = p2pkh;
         txStd.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(72, 1) << std::vector<unsigned char>(72, 2) << std::vector<unsigned char>(72, 3);
         nFail += Check(txStd.IsStandard(), "a scriptSig with three signatures fits the relay limit") ? 0 : 1;

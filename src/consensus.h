@@ -36,13 +36,16 @@ unsigned int RulesV2Time();
 bool RulesV2Active(unsigned int nBlockTime);
 
 // Rules v3 -- pay-to-script-hash (BIP16), OP_CHECKLOCKTIMEVERIFY (BIP65),
-// OP_CHECKSEQUENCEVERIFY with relative lock-time and median-time-past
-// (BIP68/112/113), and sigops counted inside redeem scripts. Not scheduled:
-// a time of 0 means "never, so far". The wallet already understands the
-// shapes (1.2.28) so that the tools exist before the rule does; it refuses to
-// pay to a script hash while this reads 0, because until the rule is live
-// such an output belongs to whoever spends it first.
-static const unsigned int RULES_V3_TIME_MAINNET = 0;
+// lock-time finality against median-time-past (BIP113), and sigops counted
+// inside redeem scripts. No CHECKSEQUENCEVERIFY: a swap needs only an
+// absolute lock. A time of 0 would mean "never". The wallet refuses to pay to
+// a script hash before the switch, because until the rule is live such an
+// output belongs to whoever spends it first.
+//
+// Mainnet: 2026-11-21 12:00 UTC, a month after testnet. The rules only
+// tighten what a block may hold, so a 1.2.28 node keeps following the chain;
+// what has to upgrade before the date is the hashrate.
+static const unsigned int RULES_V3_TIME_MAINNET = 1795262400;
 // Testnet first, as with PoW v2: 2026-10-20 01:00 UTC, so a real swap can be
 // made on a real chain before anything is scheduled where coins are worth
 // something.
