@@ -272,6 +272,16 @@ bool ChatRecordVerifySigned(void* secpctx, const ChatRecord& r, int64_t nNow,
             whyOut = "the descriptor names no onion to reach it at";
             return false;
         }
+        // The channel key a sender will authenticate the handshake against.
+        // Signed garbage is still garbage, and every node would otherwise hold
+        // and hand out a descriptor nobody can open a channel to.
+        unsigned char enc[32];
+        if (d.enc.size() != 64 ||
+            sodium_hex2bin(enc, sizeof(enc), d.enc.c_str(), d.enc.size(), NULL, NULL, NULL) != 0)
+        {
+            whyOut = "the descriptor's channel key is malformed";
+            return false;
+        }
         // The signed time IS the record time. Otherwise anybody could rewrap an
         // old, validly signed descriptor with a later record time and make it
         // win over the owner's current one.

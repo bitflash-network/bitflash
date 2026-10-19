@@ -341,6 +341,23 @@ int main()
               "a descriptor with nowhere to reach is refused");
         CHECK(err.find("no onion") != std::string::npos, "  because it names no onion");
 
+        // Signed, but with a channel key nobody could handshake against -- the
+        // shape 0.1.0's HexStr gives by default, spaces between the bytes.
+        {
+            ChatRecord bad;
+            bad.kind = CHATREC_DESC;
+            bad.key = d1.key;
+            bad.nTime = NOW - 55;
+            std::string spaced;
+            for (int i = 0; i < 32; i++) spaced += (i ? " ab" : "ab");
+            std::string d = btf::SignDescriptor(ctx, alice.sign_sk, spaced, "", (uint64_t)bad.nTime, ONION);
+            bad.payload.assign(d.begin(), d.end());
+            ChatRecordMine(bad, 0, TEST_BITS);
+            CHECK(st.Accept(ctx, bad, NOW, err, id) == ChatStore::REJECTED &&
+                  err.find("channel key is malformed") != std::string::npos,
+                  "a signed descriptor whose channel key is not 32 bytes of hex is refused");
+        }
+
         ChatRecord d2 = Desc(ctx, alice, NOW - 60, ONION);
         CHECK(st.Accept(ctx, d2, NOW, err, id) == ChatStore::ACCEPTED, "a newer one is kept");
         std::vector<ChatRecord> q;

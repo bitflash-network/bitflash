@@ -19,13 +19,18 @@
 // That is not a workaround: it is what makes the password impossible to check
 // offline by anybody, including whoever steals the file.
 
+// imgui.h first, as in gui.cpp: util.h defines printf as a macro, and on Linux
+// imgui marks its formatting functions __attribute__((format(printf, ...))) --
+// after the macro that reads format(OutputDebugStringF, ...), which GCC
+// rejects. MinGW takes imgui's gnu_printf branch instead, which is why only
+// the Linux build ever saw it.
+#include "imgui.h"
+
 #include "headers.h"
 #include "gui_chat.h"
 #include "btfchatnode.h"
 #include "btfchatnet.h"
 #include "tor.h"
-
-#include "imgui.h"
 
 #include <algorithm>
 #include <string>

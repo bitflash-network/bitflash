@@ -780,7 +780,13 @@ bool NetFetchEnvelopes(const std::vector<std::pair<std::string, int64_t> >& vTag
     {
         unsigned char tag[CHATREC_TAG_KEY_BYTES];
         if (!TagFromHex(vTagSince[i].first, tag))
-            continue;
+        {
+            // Not skipped. Skipping made a call with only bad tags return
+            // "answered" without asking any node -- which reads exactly like an
+            // empty mailbox, and is how chat-live first caught it.
+            errOut = "malformed mailbox tag";
+            return false;
+        }
         q.push_back(Question(CHATREC_ENVELOPE, tag, CHATREC_TAG_KEY_BYTES,
                              vTagSince[i].second, (int)CHATREC_MAX_QUERY));
         vTag.push_back(vTagSince[i].first);

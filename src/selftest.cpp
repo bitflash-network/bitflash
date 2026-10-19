@@ -5134,7 +5134,7 @@ static int RunChatRelaySelfTest()
         std::vector<unsigned char> seed(64, 0x77);
         btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", alice, err);
         secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        std::string encHex = HexStr(alice.chan_pk, alice.chan_pk + 32);
+        std::string encHex = HexStr(alice.chan_pk, alice.chan_pk + 32, false);   // no spaces: the default has them
         int64 nCreated = GetTime();
         std::string onion = "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8533";
         std::string desc = btf::SignDescriptor(ctx, alice.sign_sk, encHex, "", (uint64_t)nCreated, onion);
@@ -5252,14 +5252,25 @@ static int RunChatLiveSelfTest()
 
     unsigned char tag[16];
     RAND_bytes(tag, sizeof(tag));
-    std::string tagHex = HexStr(tag, tag + 16);
+    std::string tagHex = HexStr(tag, tag + 16, false);   // no spaces: the default has them
 
     std::vector<std::pair<std::string, int64_t> > ask(1, std::make_pair(tagHex, (int64_t)0));
     std::map<std::string, std::vector<std::vector<unsigned char> > > got;
+    // "Bootstrapped 100%" is not yet "can find an onion": right after it Tor
+    // may still lack the directory servers that hold onion descriptors, and a
+    // dial then fails at once. The chat app simply asks again next round; this
+    // does the same, a few times, past the client's own back-off.
+    bool fAsked = false;
+    for (int nTry = 1; nTry <= 4 && !fAsked; nTry++)
+    {
+        int64 t0 = GetTime();
+        fAsked = btfchat::NetFetchEnvelopes(ask, got, err);
+        printf("  first question, try %d: %s in %d s%s%s\n", nTry, fAsked ? "answered" : "NOT answered",
+               (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+        if (!fAsked && nTry < 4)
+            Sleep(70 * 1000);
+    }
     int64 t0 = GetTime();
-    bool fAsked = btfchat::NetFetchEnvelopes(ask, got, err);
-    printf("  first question: %s in %d s%s%s\n", fAsked ? "answered" : "NOT answered",
-           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
     nFail += Check(fAsked && got[tagHex].empty(),
                    "a node of this network answers, and has nothing under a tag nobody used") ? 0 : 1;
 
