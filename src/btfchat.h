@@ -131,6 +131,12 @@ enum MsgKind
     MSG_TEXT,            // a message
     MSG_GROUP_INVITE,    // "join <group>", signed by the group admin
     MSG_GROUP_TEXT,      // a message inside a group
+    // Money in the conversation. The chat holds no coins: the person's own
+    // Bitflash wallet pays and receives (btfchatwallet.h). What the chat adds
+    // is that the address you pay was signed by the person you are talking to,
+    // so a payment cannot be redirected by anything between you.
+    MSG_PAY_ADDRESS,     // "pay me here": a B address of the sender's wallet
+    MSG_PAYMENT,         // "I paid you": txid, amount, the address it went to
 };
 
 struct Invite

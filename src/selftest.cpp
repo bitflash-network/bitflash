@@ -20,6 +20,8 @@
 #include "chatrelay.h"
 #include "chatstore.h"
 #include "swap.h"
+#include "btfchatwallet.h"
+#include "jsonrpc.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
 // node key, and a self-test has no business creating one.
@@ -4609,6 +4611,96 @@ static int RunMultisigSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The chat's link to a wallet (btfchatwallet.h) against the real RPC server:
+// a wallet started the -chatwallet way, a cookie on disk, and the chat's client
+// asking it for its balance and an address -- over 127.0.0.1, as in use.
+static int RunChatWalletSelfTest()
+{
+    printf("chat-wallet self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock wsa;
+#endif
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+
+    int nPort = 30000 + (int)(GetTime() % 20000);
+    nFail += Check(JsonRpcConfigureCookie(strprintf("%d", nPort)), "-chatwallet configures the RPC with a cookie") ? 0 : 1;
+    std::string cookiePath = GetAppDir() + "/.cookie";
+    std::string cookie;
+    {
+        FILE* f = fopen(cookiePath.c_str(), "rb");
+        char buf[200] = {0};
+        if (f) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
+        cookie = buf;
+    }
+    nFail += Check(cookie.compare(0, 11, "__cookie__:") == 0 && cookie.size() >= 11 + 64,
+                   "the cookie is a user and a 64-character random password") ? 0 : 1;
+
+    if (_beginthread(ThreadJsonRpcServer, 0, NULL) == -1)
+    {
+        printf("could not start the RPC server\n");
+        return 1;
+    }
+    Sleep(500);
+
+    btfchat::WalletLinkConfigure(tmp, nPort);
+    std::string st, err;
+    bool fLinked = btfchat::WalletLinked(st);
+    nFail += Check(fLinked && st.find("wallet linked") != std::string::npos,
+                   "the chat reaches the wallet with the cookie") ? 0 : 1;
+    if (!fLinked) printf("       %s\n", st.c_str());
+
+    std::string addr;
+    bool fGot = btfchat::WalletNewAddress(addr, err);
+    bool fOurs = false;
+    {
+        uint160 h;
+        bool fScript = false;
+        if (fGot && DecodeAnyAddress(addr, h, fScript) && !fScript)
+            CRITICAL_BLOCK(cs_mapKeys)
+                fOurs = mapPubKeys.count(h) != 0;
+    }
+    nFail += Check(fGot && fOurs, "and gets a fresh address that is the wallet's own") ? 0 : 1;
+
+    std::string txid;
+    nFail += Check(!btfchat::WalletPay(addr, COIN, txid, err) && !err.empty(),
+                   "paying from an empty wallet fails, and says why") ? 0 : 1;
+    int64 nRecv = 0;
+    int nConf = 0;
+    nFail += Check(!btfchat::WalletLookup(std::string(64, '1'), nRecv, nConf, err),
+                   "a transaction the wallet never saw is not reported as received") ? 0 : 1;
+
+    // A stale or wrong cookie -- the wallet restarted, or somebody guessed.
+    {
+        FILE* f = fopen(cookiePath.c_str(), "wb");
+        if (f) { fputs("__cookie__:0000000000000000000000000000000000000000000000000000000000000000\n", f); fclose(f); }
+    }
+    fLinked = btfchat::WalletLinked(st);
+    nFail += Check(!fLinked && st.find("refused the cookie") != std::string::npos,
+                   "a wrong cookie is refused, and the chat says so") ? 0 : 1;
+
+    btfchat::WalletLinkConfigure(tmp, nPort == 65535 ? 1 : nPort + 1);
+    fLinked = btfchat::WalletLinked(st);
+    nFail += Check(!fLinked && st.find("not answering") != std::string::npos,
+                   "no wallet on the port: the chat says it is not answering") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // One signature by `key` over input nIn of tx, against scriptCode, SIGHASH_ALL.
 static std::vector<unsigned char> SelfTestSign(CKey& key, const CScript& scriptCode,
                                                const CTransaction& tx, unsigned int nIn)
@@ -6044,6 +6136,8 @@ int RunSelfTest(const std::string& name)
         return RunChatIdentitySelfTest();
     if (name == "chat-relay")
         return RunChatRelaySelfTest();
+    if (name == "chat-wallet")
+        return RunChatWalletSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
     if (name == "chat-live")

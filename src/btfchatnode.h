@@ -136,6 +136,22 @@ bool ChatBlock(const std::string& peerAddr, std::string& errOut);
 bool ChatSendText(const std::string& peerAddr, const std::string& text,
                   bool& fLeftInMailboxOut, std::string& errOut);
 
+// ---- money in the conversation (btfchatwallet.h) ----------------------------
+//
+// Send them a fresh address of our own wallet to pay us at, optionally asking
+// for an amount (satoshis, 0 for "any").
+bool ChatShareAddress(const std::string& peerAddr, int64_t nRequested, const std::string& note,
+                      bool& fLeftInMailboxOut, std::string& errOut);
+
+// The newest address they signed for us to pay them at, and what they asked.
+bool ChatPeerPayAddress(const std::string& peerAddr, std::string& addrOut, int64_t& nRequestedOut);
+
+// Pay them from our wallet, at the address they signed, and tell them so.
+// True once the money has moved, even if the note could not be delivered --
+// `errOut` then says so.
+bool ChatPay(const std::string& peerAddr, int64_t nAmount, const std::string& note,
+             std::string& txidOut, bool& fLeftInMailboxOut, std::string& errOut);
+
 // Collect and deliver whatever was left in our mailboxes. Called by the poll
 // thread; exposed so the interface can offer a "check now".
 int ChatPollMailboxes(std::string& errOut);

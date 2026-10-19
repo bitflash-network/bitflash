@@ -285,6 +285,43 @@ int main()
               "the round trip through the seal is lossless");
     }
 
+    printf("payment_lines_are_kept_and_survive_a_reload\n");
+    {
+        btfchat::History h;
+        btfchat::Frame pa;
+        pa.kind = btfchat::MSG_PAY_ADDRESS;
+        pa.sent = 3000;
+        pa.payTo = "BSdf5xY8s8u8gRtP6ZoSjcPnUBGSMM2N5u";
+        pa.amount = 250000000;
+        std::string js, e;
+        CHECK(btfchat::SignFrame(ctx, alice, pa, js, e), "alice signs an address with no note");
+        CHECK(h.Append(pa, alice.address, false, err), "a payment line with no note is recorded");
+
+        btfchat::Frame p;
+        p.kind = btfchat::MSG_PAYMENT;
+        p.sent = 3001;
+        p.payTo = pa.payTo;
+        p.amount = 250000000;
+        p.txid = std::string(64, 'd');
+        p.text = "done";
+        CHECK(btfchat::SignFrame(ctx, me, p, js, e) && h.Append(p, alice.address, true, err),
+              "so is the payment we made");
+
+        btfchat::History h2;
+        CHECK(h2.FromJson(h.ToJson(), err), "the history reloads");
+        std::vector<btfchat::LogEntry> v;
+        h2.Conversation(alice.address, v);
+        CHECK(v.size() == 2 && v[0].kind == btfchat::MSG_PAY_ADDRESS && v[0].payTo == pa.payTo &&
+              v[0].amount == 250000000 && !v[0].outgoing, "the address line comes back whole");
+        CHECK(v.size() == 2 && v[1].kind == btfchat::MSG_PAYMENT && v[1].txid == p.txid &&
+              v[1].amount == 250000000 && v[1].outgoing, "and so does the payment, txid included");
+
+        btfchat::Frame forged = p;
+        forged.id = std::string(32, 'e');
+        CHECK(!h.Append(forged, me.address, true, err),
+              "our own payment is never filed as a conversation with ourselves");
+    }
+
     // ---- the outbox --------------------------------------------------------
     {
         printf("\n-- the outbox --\n");

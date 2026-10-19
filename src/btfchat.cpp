@@ -360,6 +360,16 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
         errOut = "not accepted";
         return false;
 
+    case MSG_PAY_ADDRESS:
+    case MSG_PAYMENT:
+        // Only from somebody we agreed to talk to. A stranger's "pay me here"
+        // is the oldest scam there is, and it does not get to sit in the list
+        // of people this wallet might pay.
+        if (st == PEER_ACCEPTED)
+            return true;
+        errOut = "not accepted";
+        return false;
+
     case MSG_GROUP_INVITE:
         // May come from someone we do not know -- that is what an invite is for.
         // Blocked was already refused above, which is the property that matters.

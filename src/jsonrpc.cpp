@@ -74,6 +74,32 @@ bool JsonRpcConfigure(const string& strUser, const string& strPassword, const st
     return true;
 }
 
+bool JsonRpcConfigureCookie(const string& strPort)
+{
+    // A fresh random password every start, in a file only this user can read,
+    // for the chat (btfchatwallet.h) or any other local tool. Bitcoin's .cookie,
+    // same shape, so a tool written for that reads this.
+    unsigned char rnd[32];
+    RAND_bytes(rnd, sizeof(rnd));
+    string strPass = HexStr(rnd, rnd + sizeof(rnd), false);
+    OPENSSL_cleanse(rnd, sizeof(rnd));
+
+    string path = GetAppDir() + "/.cookie";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        fprintf(stderr, "-chatwallet: could not write %s\n", path.c_str());
+        return false;
+    }
+#ifndef _WIN32
+    chmod(path.c_str(), 0600);
+#endif
+    string line = "__cookie__:" + strPass + "\n";
+    fwrite(line.data(), 1, line.size(), f);
+    fclose(f);
+    return JsonRpcConfigure("__cookie__", strPass, strPort);
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 
@@ -1197,6 +1223,22 @@ static json ContractJson(const swap::Contract& c, const CScript& contract)
     return j;
 }
 
+// The lock, in blocks from now: the standard one, or on testnet only a shorter
+// one given as the last parameter -- so a refund can be tried in minutes, not a
+// day. On mainnet a short lock is how a participant loses their coins (the
+// initiator waits it out, refunds, and redeems the other side), so there it
+// is not even accepted.
+static int LockBlocksParam(const json& p, size_t nIndex, int nDefault)
+{
+    if (p.size() <= nIndex)
+        return nDefault;
+    if (!IsTestNet())
+        throw runtime_error("the lock length is fixed on mainnet");
+    if (!p[nIndex].is_number_integer() || p[nIndex].get<int>() < 1 || p[nIndex].get<int>() > nDefault)
+        throw runtime_error(strprintf("lock blocks: 1 to %d", nDefault));
+    return p[nIndex].get<int>();
+}
+
 // Fund a contract from this wallet and say where it went.
 static json FundContract(const swap::Contract& c, int64 nValue, const char* pszComment)
 {
@@ -1231,7 +1273,7 @@ static void LogSwap(const json& j)
 static json rpc_swapinitiate(const json& p)
 {
     if (p.size() < 2 || !p[0].is_string())
-        throw runtime_error("swapinitiate <participant address> <amount>");
+        throw runtime_error("swapinitiate <participant address> <amount> [lock blocks, testnet only]");
     RequireRulesV3();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
@@ -1248,7 +1290,7 @@ static json rpc_swapinitiate(const json& p)
     RAND_bytes(&secret[0], (int)secret.size());
     c.secretHash.resize(32);
     SHA256(&secret[0], secret.size(), &c.secretHash[0]);
-    c.nLockTime = nBestHeight + swap::INITIATOR_LOCK_BLOCKS;
+    c.nLockTime = nBestHeight + LockBlocksParam(p, 2, swap::INITIATOR_LOCK_BLOCKS);
 
     json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: initiated");
     j["secret"] = HexStr(secret.begin(), secret.end(), false);
@@ -1262,7 +1304,7 @@ static json rpc_swapinitiate(const json& p)
 static json rpc_swapparticipate(const json& p)
 {
     if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
-        throw runtime_error("swapparticipate <initiator address> <amount> <secret hash>");
+        throw runtime_error("swapparticipate <initiator address> <amount> <secret hash> [lock blocks, testnet only]");
     RequireRulesV3();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
@@ -1278,7 +1320,7 @@ static json rpc_swapparticipate(const json& p)
         throw runtime_error("could not draw a key from the wallet");
     uint160 hRefund = Hash160(vchRefund);
     c.refundPkh.assign(hRefund.begin(), hRefund.end());
-    c.nLockTime = nBestHeight + swap::PARTICIPANT_LOCK_BLOCKS;
+    c.nLockTime = nBestHeight + LockBlocksParam(p, 3, swap::PARTICIPANT_LOCK_BLOCKS);
 
     json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: participated");
     j["role"] = "participant";

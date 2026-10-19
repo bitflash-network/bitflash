@@ -30,9 +30,12 @@
 #include "gui_chat.h"
 #include "btfchatnode.h"
 #include "btfchatnet.h"
+#include "btfchatwallet.h"
 #include "tor.h"
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -52,6 +55,8 @@ enum ActionKind
     ACT_DECLINE,
     ACT_BLOCK,
     ACT_SEND,
+    ACT_REQUEST,   // share an address of our wallet, maybe asking for an amount
+    ACT_PAY,       // pay them from our wallet at the address they signed
 };
 
 CCriticalSection cs_ui;
@@ -80,6 +85,8 @@ const char* ActionLabel(ActionKind k)
     case ACT_DECLINE: return "declining";
     case ACT_BLOCK:   return "blocking";
     case ACT_SEND:    return "sending over Tor";
+    case ACT_REQUEST: return "asking your wallet for an address and sending it";
+    case ACT_PAY:     return "paying from your wallet";
     default:          return "";
     }
 }
@@ -139,6 +146,32 @@ void ThreadChatUiWorker(void*)
                 // come online would be the kind of small lie a user plans around.
                 if (fOk && fMailbox)
                     err = "they are not online -- left in their mailbox, they get it when they open the chat";
+                break;
+            }
+            case ACT_REQUEST:
+            case ACT_PAY:
+            {
+                // text is "<amount>\n<note>"; the amount was parsed when queued.
+                size_t nl = text.find('\n');
+                int64 nAmount = 0;
+                ParseMoney(text.substr(0, nl).c_str(), nAmount);
+                std::string note = nl == std::string::npos ? std::string() : text.substr(nl + 1);
+                bool fMailbox = false;
+                if (k == ACT_REQUEST)
+                {
+                    fOk = btfchat::ChatShareAddress(addr, nAmount, note, fMailbox, err);
+                    if (fOk && err.empty())
+                        err = fMailbox ? "address left in their mailbox" : "address sent";
+                }
+                else
+                {
+                    std::string txid;
+                    fOk = btfchat::ChatPay(addr, nAmount, note, txid, fMailbox, err);
+                    if (fOk && err.empty())
+                        err = strprintf("paid %s BTF (%s...)%s", FormatMoney(nAmount).c_str(),
+                                        txid.substr(0, 12).c_str(),
+                                        fMailbox ? " -- they will see the note when they come online" : "");
+                }
                 break;
             }
             default: break;
@@ -206,6 +239,68 @@ std::string Message()
     CRITICAL_BLOCK(cs_ui)
         return g_message;
     return std::string();
+}
+
+// ---- money: what our own wallet says ------------------------------------------
+//
+// The window never calls the wallet itself -- a wallet that hangs would freeze
+// the chat. A thread asks, every few seconds, about the payments the window
+// has on screen, and the window reads the answers.
+
+struct PayStatus
+{
+    bool    fKnown;     // our wallet has seen the transaction
+    int64   nReceived;  // what of it came to us
+    int     nConf;
+    PayStatus() : fKnown(false), nReceived(0), nConf(0) {}
+};
+std::map<std::string, PayStatus> g_payStatus;   // txid -> what the wallet said
+std::set<std::string> g_payWanted;              // txids the window wants news of
+std::string g_walletStatus = "wallet: checking";
+bool g_fWalletLinked = false;
+bool g_fPayThreadAlive = false;
+
+void ThreadPaymentStatus(void*)
+{
+    IMPLEMENT_RANDOMIZE_STACK(ThreadPaymentStatus(NULL));
+    try
+    {
+        while (!fShutdown)
+        {
+            std::string st;
+            bool fLinked = btfchat::WalletLinked(st);
+            std::vector<std::string> want;
+            CRITICAL_BLOCK(cs_ui)
+            {
+                g_walletStatus = st;
+                g_fWalletLinked = fLinked;
+                want.assign(g_payWanted.begin(), g_payWanted.end());
+            }
+            for (size_t i = 0; fLinked && i < want.size() && !fShutdown; i++)
+            {
+                PayStatus ps;
+                std::string err;
+                ps.fKnown = btfchat::WalletLookup(want[i], ps.nReceived, ps.nConf, err);
+                CRITICAL_BLOCK(cs_ui)
+                    g_payStatus[want[i]] = ps;
+            }
+            for (int s = 0; s < 10 && !fShutdown; s++)
+                Sleep(1000);
+        }
+    }
+    catch (std::exception& e) { PrintException(&e, "ThreadPaymentStatus()"); }
+    catch (...)               { PrintException(NULL, "ThreadPaymentStatus()"); }
+}
+
+void EnsurePaymentThread()
+{
+    CRITICAL_BLOCK(cs_ui)
+    {
+        if (g_fPayThreadAlive)
+            return;
+        if (_beginthread(ThreadPaymentStatus, 0, NULL) != -1)
+            g_fPayThreadAlive = true;
+    }
 }
 
 // MessageColour() is defined with the palette, further down.
@@ -283,6 +378,8 @@ char g_passwordBuf[128]   = {0};
 char g_inviteAddrBuf[128] = {0};
 char g_inviteNoteBuf[200] = {0};
 char g_msgBuf[1024]       = {0};
+char g_payAmountBuf[32]   = {0};   // BTF, for "ask" and "pay"
+bool g_fConfirmPay        = false; // second press of "pay" -- money does not move on one click
 std::string g_selected;               // which conversation is open
 bool g_fShowInvite = false;           // the "add someone" panel
 bool g_fConfirmAddress = false;       // showing the just-unlocked address
@@ -548,18 +645,68 @@ void DrawConversation()
         return;
     }
 
-    const float inputH = 58.0f;
+    const float inputH = 92.0f;
     ImGui::BeginChild("##chatlog", ImVec2(0.0f, -inputH), false);
     std::vector<btfchat::LogEntry> log;
     btfchat::ChatConversation(g_selected, log);
     for (size_t i = 0; i < log.size(); i++)
     {
+        const btfchat::LogEntry& e = log[i];
         ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-        ImGui::TextUnformatted(FmtWhen(log[i].sent).c_str());
+        ImGui::TextUnformatted(FmtWhen(e.sent).c_str());
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, log[i].outgoing ? COL_MINE : COL_TEXT);
-        ImGui::TextWrapped("%s", log[i].text.c_str());
+        if (e.kind == btfchat::MSG_PAY_ADDRESS)
+        {
+            std::string what = e.amount > 0
+                ? strprintf("%s %s BTF", e.outgoing ? "you asked for" : "they ask for", FormatMoney(e.amount).c_str())
+                : std::string(e.outgoing ? "you shared an address to be paid at" : "they shared an address to be paid at");
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_WARN);
+            ImGui::TextWrapped("[BTF] %s%s%s", what.c_str(), e.text.empty() ? "" : " -- ", e.text.c_str());
+            ImGui::PopStyleColor();
+            continue;
+        }
+        if (e.kind == btfchat::MSG_PAYMENT)
+        {
+            std::string status;
+            ImVec4 col = COL_OK;
+            if (e.outgoing)
+                status = "sent from your wallet";
+            else
+            {
+                // What THEIR note says is a claim. What OUR wallet sees is the fact.
+                PayStatus ps;
+                CRITICAL_BLOCK(cs_ui)
+                {
+                    g_payWanted.insert(e.txid);
+                    std::map<std::string, PayStatus>::const_iterator it = g_payStatus.find(e.txid);
+                    if (it != g_payStatus.end())
+                        ps = it->second;
+                }
+                if (!ps.fKnown)
+                {
+                    status = "not seen by your wallet yet";
+                    col = COL_WARN;
+                }
+                else if (ps.nReceived < e.amount)
+                {
+                    status = strprintf("your wallet sees only %s BTF of it", FormatMoney(ps.nReceived).c_str());
+                    col = COL_BAD;
+                }
+                else
+                    status = strprintf("in your wallet, %d confirmation%s", ps.nConf, ps.nConf == 1 ? "" : "s");
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextWrapped("[BTF] %s %s BTF  (%s)%s%s", e.outgoing ? "you paid" : "they paid you",
+                               FormatMoney(e.amount).c_str(), status.c_str(),
+                               e.text.empty() ? "" : " -- ", e.text.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("txid %s\nto %s", e.txid.c_str(), e.payTo.c_str());
+            continue;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, e.outgoing ? COL_MINE : COL_TEXT);
+        ImGui::TextWrapped("%s", e.text.c_str());
         ImGui::PopStyleColor();
     }
 
@@ -600,6 +747,70 @@ void DrawConversation()
         Queue(ACT_SEND, g_selected, g_msgBuf, "");
         memset(g_msgBuf, 0, sizeof(g_msgBuf));
     }
+
+    // Money. The chat holds none: these ask the person's own wallet, through
+    // -chatwallet, and the address paid is only ever one the contact signed.
+    EnsurePaymentThread();
+    bool fLinked = false;
+    std::string walletStatus;
+    CRITICAL_BLOCK(cs_ui)
+    {
+        fLinked = g_fWalletLinked;
+        walletStatus = g_walletStatus;
+    }
+    std::string theirAddr;
+    int64 nAsked = 0;
+    bool fCanPay = btfchat::ChatPeerPayAddress(g_selected, theirAddr, nAsked);
+    if (nAsked > 0 && g_payAmountBuf[0] == 0)
+        snprintf(g_payAmountBuf, sizeof(g_payAmountBuf), "%s", FormatMoney(nAsked).c_str());
+
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::InputTextWithHint("##payamt", "amount BTF", g_payAmountBuf, sizeof(g_payAmountBuf),
+                             ImGuiInputTextFlags_CharsDecimal);
+    int64 nAmount = 0;
+    bool fAmountOk = g_payAmountBuf[0] && ParseMoney(g_payAmountBuf, nAmount) && nAmount > 0;
+    ImGui::SameLine();
+    bool fReqOk = fLinked && !Busy();
+    if (!fReqOk) ImGui::BeginDisabled();
+    if (ImGui::Button("ask to be paid"))
+    {
+        // An empty amount is "pay me, whatever you like".
+        Queue(ACT_REQUEST, g_selected, strprintf("%s\n", fAmountOk ? g_payAmountBuf : "0"), "");
+        g_fConfirmPay = false;
+    }
+    if (!fReqOk) ImGui::EndDisabled();
+    ImGui::SameLine();
+    bool fPayOk = fLinked && fCanPay && fAmountOk && !Busy();
+    if (!fPayOk) ImGui::BeginDisabled();
+    if (!g_fConfirmPay)
+    {
+        if (ImGui::Button("pay"))
+            g_fConfirmPay = true;
+    }
+    else
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.25f, 0.05f, 1.0f));
+        if (ImGui::Button(strprintf("confirm: pay %s BTF", g_payAmountBuf).c_str()))
+        {
+            Queue(ACT_PAY, g_selected, strprintf("%s\n", g_payAmountBuf), "");
+            g_fConfirmPay = false;
+            memset(g_payAmountBuf, 0, sizeof(g_payAmountBuf));
+        }
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("cancel##pay"))
+            g_fConfirmPay = false;
+    }
+    if (!fPayOk) ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, fLinked ? COL_DIM : COL_WARN);
+    if (!fLinked)
+        ImGui::TextWrapped("%s", walletStatus.c_str());
+    else if (!fCanPay)
+        ImGui::TextWrapped("%s -- they have not shared an address yet", walletStatus.c_str());
+    else
+        ImGui::TextWrapped("%s -- pays %s", walletStatus.c_str(), theirAddr.c_str());
+    ImGui::PopStyleColor();
 
     ImGui::EndChild();
 }

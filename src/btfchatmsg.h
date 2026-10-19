@@ -79,9 +79,15 @@ struct Frame
     std::string group;  // group id, group frames only
     std::string text;   // invite note, message body, or group name
     std::string proof;  // group invites: the admin's signature, 128 hex
+    std::string payTo;  // payment frames: the B address
+    int64_t     amount; // MSG_PAYMENT: satoshis paid
+    std::string txid;   // MSG_PAYMENT: 64 hex characters
 
-    Frame() : version(FRAME_VERSION), kind(MSG_TEXT), sent(0) {}
+    Frame() : version(FRAME_VERSION), kind(MSG_TEXT), sent(0), amount(0) {}
 };
+
+// A payment note is a short paragraph, not a letter.
+static const size_t MAX_PAY_NOTE = 280;
 
 // Sign and serialize. Fills in `from`, `version`, and `id` when it is empty.
 // `secpctx` is a secp256k1_context* (void* to keep this header free of secp).

@@ -49,8 +49,13 @@ struct LogEntry
     std::string id;       // frame id, which is also what makes a line unique
     std::string text;
     bool        outgoing; // we wrote it
+    // Payment lines (MSG_PAY_ADDRESS, MSG_PAYMENT); a plain message is MSG_TEXT.
+    int         kind;
+    std::string payTo;
+    int64_t     amount;
+    std::string txid;
 
-    LogEntry() : sent(0), outgoing(false) {}
+    LogEntry() : sent(0), outgoing(false), kind(MSG_TEXT), amount(0) {}
 };
 
 // One identity's history. Direct conversations are keyed by the other party's

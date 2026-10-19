@@ -5,6 +5,7 @@
 #include "proxy.h"
 #include "selftest.h"
 #include "btfchatnode.h"
+#include "btfchatwallet.h"
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -133,6 +134,10 @@ static void PrintUsage()
     printf("  /datadir=PATH              (default: %%APPDATA%%\\Bitflash-chat)\n");
     printf("  /chatport=N                (local port Tor forwards the chat service to,\n");
     printf("                              default 8533; it is never reachable directly)\n");
+    printf("  /wallet=PATH               (the Bitflash wallet that pays and receives in the chat;\n");
+    printf("                              default: the usual Bitflash data directory. Start that\n");
+    printf("                              wallet with /chatwallet)\n");
+    printf("  /walletport=N              (its RPC port, if not the default 8432 / testnet 18432)\n");
     printf("  /debug\n");
     printf("\n");
     printf("The identity:\n");
@@ -220,6 +225,8 @@ static void PrintUsage()
     printf("  /rpcuser=U /rpcpassword=P  (start JSON-RPC on 127.0.0.1 -- both required;\n");
     printf("                              this is what an exchange integrates against)\n");
     printf("  /rpcport=N                 (JSON-RPC port, default 8432; testnet 18432)\n");
+    printf("  /chatwallet                (let btfchat on this machine pay and receive with this\n");
+    printf("                              wallet: RPC on 127.0.0.1, password in <datadir>/.cookie)\n");
     printf("  /bindaddr=IP               (listen on this address instead of loopback;\n");
     printf("                              only for a Tor running on another machine --\n");
     printf("                              a reachable plain port exposes this node's onion)\n");
@@ -485,6 +492,12 @@ static void ParseStartupArguments(int argc, char* argv[])
                           "Pick a port between 1025 and 65535, or leave it out for 8533.");
         btfchat::ChatSetPort((unsigned short)nChatPort);
         fprintf(stderr, "btfchat on 127.0.0.1:%ld, with its own onion service\n", nChatPort);
+
+        // The wallet that pays and receives for this chat: its data directory
+        // and RPC port, when they are not the defaults. See btfchatwallet.h.
+        string strWalletPort = argval2(argc, argv, "/walletport", "-walletport");
+        btfchat::WalletLinkConfigure(argval2(argc, argv, "/wallet", "-wallet"),
+                                     strWalletPort.empty() ? 0 : atoi(strWalletPort.c_str()));
     }
 #endif
 
@@ -522,6 +535,17 @@ static void ParseStartupArguments(int argc, char* argv[])
     fJsonRpc = JsonRpcConfigure(argval2(argc, argv, "/rpcuser", "-rpcuser"),
                                 strRpcPassword,
                                 argval2(argc, argv, "/rpcport", "-rpcport"));
+#ifndef BITFLASH_CHAT_APP
+    // -chatwallet: let btfchat on this machine pay and receive through this
+    // wallet. Off by default -- whatever runs as this user can read the cookie.
+    // Given rpcuser/rpcpassword win; the cookie is for when there are none.
+    if (!fJsonRpc && (arg(argc, argv, "/chatwallet") || arg(argc, argv, "-chatwallet")))
+    {
+        fJsonRpc = JsonRpcConfigureCookie(argval2(argc, argv, "/rpcport", "-rpcport"));
+        if (fJsonRpc)
+            fprintf(stderr, "-chatwallet: btfchat on this machine can use this wallet (cookie in the data directory)\n");
+    }
+#endif
 
     // Commands that do their work and exit have no use for Tor, and starting it
     // for them costs more than the wasted seconds: the child outlives the parent

@@ -412,6 +412,81 @@ int main()
         CHECK(!rg.Accept(g, NOW, err), "second is a replay");
     }
 
+    // ---- money in the conversation -------------------------------------------
+
+    printf("payment_frames_sign_what_matters\n");
+    {
+        const std::string ADDR = "BSdf5xY8s8u8gRtP6ZoSjcPnUBGSMM2N5u";
+        const std::string TXID = std::string(64, 'a');
+
+        btfchat::Frame pa;
+        pa.kind = btfchat::MSG_PAY_ADDRESS;
+        pa.sent = 2000;
+        pa.payTo = ADDR;
+        pa.amount = 150000000;
+        pa.text = "for the coffee";
+        std::string js, e;
+        CHECK(btfchat::SignFrame(ctx, bob, pa, js, err), "bob signs an address to be paid at");
+        btfchat::Frame g;
+        CHECK(btfchat::OpenFrame(ctx, js, g, err) && g.payTo == ADDR && g.amount == 150000000 &&
+              g.kind == btfchat::MSG_PAY_ADDRESS, "it opens with the address and the amount");
+
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "pay", "BE39QRszEZSeqHnGEHqsZZV2hu5d8GCQAw"), g, err),
+              "an address swapped in transit breaks the signature");
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "amt", 1), g, err),
+              "so does a changed amount");
+
+        btfchat::Frame p;
+        p.kind = btfchat::MSG_PAYMENT;
+        p.sent = 2001;
+        p.payTo = ADDR;
+        p.amount = 150000000;
+        p.txid = TXID;
+        CHECK(btfchat::SignFrame(ctx, alice, p, js, err) && btfchat::OpenFrame(ctx, js, g, err) &&
+              g.txid == TXID && g.amount == 150000000, "a payment note round-trips with its txid");
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "txid", std::string(64, 'b')), g, err),
+              "and its txid cannot be swapped");
+
+        // Riders: payment fields on a kind whose signature does not cover them.
+        btfchat::Frame t;
+        t.kind = btfchat::MSG_TEXT;
+        t.sent = 2002;
+        t.text = "hello";
+        CHECK(btfchat::SignFrame(ctx, alice, t, js, err), "a plain message signs");
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "pay", ADDR), g, err),
+              "an address stapled onto a plain message is refused");
+        t.payTo = ADDR;
+        CHECK(!btfchat::SignFrame(ctx, alice, t, js, err), "and cannot be signed onto one either");
+
+        btfchat::Frame bad = pa;
+        bad.payTo = "not-an-address";
+        CHECK(!btfchat::SignFrame(ctx, bob, bad, js, err), "a malformed address is refused");
+        bad = p;
+        bad.amount = 0;
+        CHECK(!btfchat::SignFrame(ctx, alice, bad, js, err), "a payment of nothing is refused");
+        bad = p;
+        bad.amount = (int64_t)21000001 * 100000000;
+        CHECK(!btfchat::SignFrame(ctx, alice, bad, js, err), "a payment past the money supply is refused");
+        bad = p;
+        bad.txid = "abc";
+        CHECK(!btfchat::SignFrame(ctx, alice, bad, js, err), "a payment without a real txid is refused");
+        bad = pa;
+        bad.group = std::string(64, 'c');
+        CHECK(!btfchat::SignFrame(ctx, bob, bad, js, err), "payment frames are never group frames");
+
+        // The gate: only from an accepted contact.
+        btfchat::Roster r;
+        CHECK(!r.MayDeliver(bob.address, btfchat::MSG_PAY_ADDRESS, err),
+              "a stranger's 'pay me here' does not get through");
+        CHECK(!r.MayDeliver(bob.address, btfchat::MSG_PAYMENT, err),
+              "nor a stranger's 'I paid you'");
+        CHECK(r.NoteIncomingInvite(bob.address, "hi", 1, err) && r.AcceptInvite(bob.address, err),
+              "bob becomes a contact");
+        CHECK(r.MayDeliver(bob.address, btfchat::MSG_PAY_ADDRESS, err) &&
+              r.MayDeliver(bob.address, btfchat::MSG_PAYMENT, err),
+              "and then both are delivered");
+    }
+
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);
     secp256k1_context_destroy(ctx);
     return g_fail == 0 ? 0 : 1;

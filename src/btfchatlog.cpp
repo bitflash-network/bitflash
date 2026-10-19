@@ -51,7 +51,9 @@ bool History::Append(const Frame& f, const std::string& peer, bool fOutgoing,
     errOut.clear();
     if (f.id.size() != 32)  { errOut = "the frame has no usable id"; return false; }
     if (f.from.empty())     { errOut = "the frame has no sender"; return false; }
-    if (f.text.empty())     { errOut = "there is nothing to record"; return false; }
+    bool fPay = f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT;
+    // A payment line may come without a note; what it records is the address.
+    if (fPay ? f.payTo.empty() : f.text.empty()) { errOut = "there is nothing to record"; return false; }
     if (mapSeenIds.count(f.id))
     {
         // Belt and braces with the replay guard: even if a frame reaches here
@@ -66,6 +68,10 @@ bool History::Append(const Frame& f, const std::string& peer, bool fOutgoing,
     e.id       = f.id;
     e.text     = f.text;
     e.outgoing = fOutgoing;
+    e.kind     = (int)f.kind;
+    e.payTo    = f.payTo;
+    e.amount   = f.amount;
+    e.txid     = f.txid;
 
     bool fOk = false;
     if (f.kind == MSG_GROUP_TEXT)
@@ -73,8 +79,10 @@ bool History::Append(const Frame& f, const std::string& peer, bool fOutgoing,
         if (f.group.empty()) { errOut = "a group message with no group"; return false; }
         fOk = PushInto(mapGroup, f.group, e, errOut);
     }
-    else if (f.kind == MSG_TEXT)
+    else if (f.kind == MSG_TEXT || f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT)
     {
+        // A payment line belongs to the conversation it happened in, under the
+        // same rules as a message: filed under its sender, never under us.
         if (peer.empty()) { errOut = "a direct message needs the other party"; return false; }
         if (!fOutgoing && peer != f.from)
         {
@@ -166,6 +174,13 @@ static json EntriesToJson(const std::vector<LogEntry>& v)
         e["i"] = v[i].id;
         e["x"] = v[i].text;
         e["o"] = v[i].outgoing;
+        if (v[i].kind != MSG_TEXT)
+        {
+            e["k"] = v[i].kind;
+            e["p"] = v[i].payTo;
+            e["a"] = v[i].amount;
+            if (!v[i].txid.empty()) e["h"] = v[i].txid;
+        }
         a.push_back(e);
     }
     return a;
@@ -206,9 +221,20 @@ static bool EntriesFromJson(const json& a, std::vector<LogEntry>& out,
         le.id       = e.value("i", std::string());
         le.text     = e.value("x", std::string());
         le.outgoing = e.value("o", false);
+        le.kind     = e.value("k", (int)MSG_TEXT);
+        le.payTo    = e.value("p", std::string());
+        le.amount   = e.value("a", (int64_t)0);
+        le.txid     = e.value("h", std::string());
+        bool fPay = le.kind == MSG_PAY_ADDRESS || le.kind == MSG_PAYMENT;
+        // Group lines carry their kind too -- dropping every kind that was not
+        // a plain or payment message emptied every group on reload, which the
+        // round-trip test caught.
+        if (le.kind != MSG_TEXT && le.kind != MSG_GROUP_TEXT && !fPay)
+            continue;
         // A line with no sender or no id is not a line we can reason about, and
-        // one whose id repeats would defeat the duplicate check on reload.
-        if (le.from.empty() || le.id.size() != 32 || le.text.empty())
+        // one whose id repeats would defeat the duplicate check on reload. A
+        // payment line may have no note; it must have its address.
+        if (le.from.empty() || le.id.size() != 32 || (fPay ? le.payTo.empty() : le.text.empty()))
             continue;
         if (ids.count(le.id))
             continue;

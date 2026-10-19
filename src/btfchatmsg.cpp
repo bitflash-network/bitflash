@@ -100,7 +100,31 @@ static void FrameDigest(const Frame& f, unsigned char out[32])
     // The admin proof is signed over too: without it, a member could strip the
     // proof off an invite and the frame would still look authentic.
     UpdateLenPrefixed(ctx, f.proof);
+    // Payment fields only for payment frames, so the digest of every other
+    // kind is what it always was. Signed for the same reason as the proof: an
+    // address or an amount that could be edited in transit would be the whole
+    // attack.
+    if (f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT)
+    {
+        UpdateLenPrefixed(ctx, f.payTo);
+        UpdateU64(ctx, (uint64_t)f.amount);
+        UpdateLenPrefixed(ctx, f.txid);
+    }
     SHA256_Final(out, &ctx);
+}
+
+// A B address: base58, 25..35 characters, the shape only -- the wallet that
+// pays it checks the checksum. Kept here so a frame carrying anything else is
+// refused before it reaches the wallet at all.
+static bool LooksLikeCoinAddress(const std::string& s)
+{
+    static const char* b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if (s.size() < 25 || s.size() > 35 || s[0] != 'B')
+        return false;
+    for (size_t i = 0; i < s.size(); i++)
+        if (!strchr(b58, s[i]))
+            return false;
+    return true;
 }
 
 static void GroupInviteDigest(const std::string& adminAddr, const std::string& groupId,
@@ -130,6 +154,16 @@ static bool CheckFields(const Frame& f, std::string& errOut)
     unsigned char idbytes[16];
     if (!HexDecode(f.id, idbytes, 16)) { errOut = "the frame id is not hex"; return false; }
     if (f.sent < 0)                 { errOut = "negative timestamp"; return false; }
+
+    // The payment fields are only signed over for payment frames. On any other
+    // kind they would be riders the signature does not cover -- an address
+    // anybody could staple onto somebody's message -- so they are refused.
+    if (f.kind != MSG_PAY_ADDRESS && f.kind != MSG_PAYMENT &&
+        (!f.payTo.empty() || f.amount != 0 || !f.txid.empty()))
+    {
+        errOut = "payment fields on a frame that is not a payment";
+        return false;
+    }
 
     switch (f.kind)
     {
@@ -166,6 +200,28 @@ static bool CheckFields(const Frame& f, std::string& errOut)
         if (f.text.empty())    { errOut = "an empty message is not a message"; return false; }
         if (f.text.size() > MAX_TEXT_BYTES) { errOut = "the message is too long"; return false; }
         if (!f.proof.empty())  { errOut = "a group message carries no admin proof"; return false; }
+        return true;
+    }
+
+    // Payment frames: direct only, never in a group -- an address offered to a
+    // whole group is one any member could ask to be paid in somebody's name.
+    if (f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT)
+    {
+        if (!f.group.empty())  { errOut = "a payment frame carries no group"; return false; }
+        if (!f.proof.empty())  { errOut = "a payment frame carries no admin proof"; return false; }
+        if (f.text.size() > MAX_PAY_NOTE) { errOut = "the payment note is too long"; return false; }
+        if (!LooksLikeCoinAddress(f.payTo)) { errOut = "the payment address is malformed"; return false; }
+        // 21 million BTF, in satoshis: an amount past the money supply is a lie.
+        const int64_t MAX_AMOUNT = (int64_t)21000000 * 100000000;
+        if (f.kind == MSG_PAY_ADDRESS)
+        {
+            if (!f.txid.empty()) { errOut = "an address frame carries no txid"; return false; }
+            if (f.amount < 0 || f.amount > MAX_AMOUNT) { errOut = "the requested amount is out of range"; return false; }
+            return true;
+        }
+        if (f.amount <= 0 || f.amount > MAX_AMOUNT) { errOut = "the paid amount is out of range"; return false; }
+        unsigned char tx[32];
+        if (!HexDecode(f.txid, tx, 32)) { errOut = "the txid is not 64 hex characters"; return false; }
         return true;
     }
 
@@ -224,6 +280,9 @@ bool SignFrame(void* secpctx, const Identity& id, Frame& f,
     if (!f.group.empty()) v["g"]     = f.group;
     if (!f.text.empty())  v["text"]  = f.text;
     if (!f.proof.empty()) v["proof"] = f.proof;
+    if (!f.payTo.empty()) v["pay"]   = f.payTo;
+    if (f.amount != 0)    v["amt"]   = f.amount;
+    if (!f.txid.empty())  v["txid"]  = f.txid;
     v["sig"]   = HexEncode(sig, 64);
 
     outJson = v.dump();
@@ -259,7 +318,7 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
     {
         f.version = j.value("v", 0);
         int nKind = j.value("k", -1);
-        if (nKind < MSG_INVITE || nKind > MSG_GROUP_TEXT)
+        if (nKind < MSG_INVITE || nKind > MSG_PAYMENT)
         {
             errOut = "unknown frame kind";
             return false;
@@ -271,6 +330,9 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
         f.group = j.value("g", std::string());
         f.text  = j.value("text", std::string());
         f.proof = j.value("proof", std::string());
+        f.payTo = j.value("pay", std::string());
+        f.amount = j.value("amt", (int64_t)0);
+        f.txid  = j.value("txid", std::string());
         sigHex  = j.value("sig", std::string());
     }
     catch (...)

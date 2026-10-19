@@ -262,6 +262,8 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
         return roster->NoteGroupInvite(f.group, f.text, f.from, f.from, f.sent, errOut);
 
     case MSG_TEXT:
+    case MSG_PAY_ADDRESS:
+    case MSG_PAYMENT:
         return history->Append(f, f.from, false, errOut);
 
     case MSG_GROUP_TEXT:

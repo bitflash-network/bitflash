@@ -7,6 +7,7 @@
 #include "btfchatbox.h"
 #include "btfaddr.h"
 #include "btfchatnet.h"
+#include "btfchatwallet.h"
 #include "tor.h"
 
 #include <sodium.h>
@@ -676,14 +677,16 @@ static bool LeaveInMailbox(const std::string& peerAddr, const Identity& id,
     return NetPostEnvelope(tag, env, errOut);
 }
 
-bool ChatSendText(const std::string& peerAddr, const std::string& text,
-                  bool& fLeftInMailboxOut, std::string& errOut)
+// Sign one frame and get it to the peer: directly, else their mailbox, else
+// our own queue. Shared by every kind a person sends in a conversation, so a
+// payment note travels exactly the way a message does. `text` is what the
+// queue shows while it waits.
+static bool SendInConversation(const std::string& peerAddr, Frame& f, const std::string& text,
+                               bool& fLeftInMailboxOut, std::string& errOut)
 {
     fLeftInMailboxOut = false;
     errOut.clear();
     if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
-    if (text.empty()) { errOut = "nothing to send"; return false; }
-    if (text.size() > MAX_TEXT_BYTES) { errOut = "that message is too long"; return false; }
 
     Identity id;
     CRITICAL_BLOCK(cs_chat)
@@ -696,10 +699,7 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
         id = g_id;
     }
 
-    Frame f;
-    f.kind = MSG_TEXT;
     f.sent = GetTime();
-    f.text = text;
     std::string js;
     if (!SignFrame(g_secp, id, f, js, errOut))
     {
@@ -769,6 +769,97 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
         return true;
     }
     return fOk;
+}
+
+bool ChatSendText(const std::string& peerAddr, const std::string& text,
+                  bool& fLeftInMailboxOut, std::string& errOut)
+{
+    fLeftInMailboxOut = false;
+    errOut.clear();
+    if (text.empty()) { errOut = "nothing to send"; return false; }
+    if (text.size() > MAX_TEXT_BYTES) { errOut = "that message is too long"; return false; }
+    Frame f;
+    f.kind = MSG_TEXT;
+    f.text = text;
+    return SendInConversation(peerAddr, f, text, fLeftInMailboxOut, errOut);
+}
+
+bool ChatShareAddress(const std::string& peerAddr, int64_t nRequested, const std::string& note,
+                      bool& fLeftInMailboxOut, std::string& errOut)
+{
+    fLeftInMailboxOut = false;
+    errOut.clear();
+    if (note.size() > MAX_PAY_NOTE) { errOut = "that note is too long"; return false; }
+    // A fresh address from the person's own wallet each time: one per request
+    // keeps their payments from being linked to each other on the chain.
+    std::string addr;
+    if (!WalletNewAddress(addr, errOut))
+        return false;
+    Frame f;
+    f.kind = MSG_PAY_ADDRESS;
+    f.payTo = addr;
+    f.amount = nRequested;
+    f.text = note;
+    std::string shown = nRequested > 0
+        ? strprintf("asked for %s BTF", FormatMoney(nRequested).c_str())
+        : std::string("shared an address to be paid at");
+    return SendInConversation(peerAddr, f, shown, fLeftInMailboxOut, errOut);
+}
+
+bool ChatPeerPayAddress(const std::string& peerAddr, std::string& addrOut, int64_t& nRequestedOut)
+{
+    addrOut.clear();
+    nRequestedOut = 0;
+    std::vector<LogEntry> v;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_fUnlocked)
+            return false;
+        g_history.Conversation(peerAddr, v);
+    }
+    // The newest address THEY signed. Never one of ours, never one typed in:
+    // the signature on the frame is the whole reason this is safe to pay.
+    for (size_t i = v.size(); i-- > 0; )
+        if (v[i].kind == MSG_PAY_ADDRESS && !v[i].outgoing && v[i].from == peerAddr && !v[i].payTo.empty())
+        {
+            addrOut = v[i].payTo;
+            nRequestedOut = v[i].amount;
+            return true;
+        }
+    return false;
+}
+
+bool ChatPay(const std::string& peerAddr, int64_t nAmount, const std::string& note,
+             std::string& txidOut, bool& fLeftInMailboxOut, std::string& errOut)
+{
+    txidOut.clear();
+    fLeftInMailboxOut = false;
+    errOut.clear();
+    if (nAmount <= 0) { errOut = "nothing to pay"; return false; }
+    if (note.size() > MAX_PAY_NOTE) { errOut = "that note is too long"; return false; }
+    std::string addr;
+    int64_t nRequested = 0;
+    if (!ChatPeerPayAddress(peerAddr, addr, nRequested))
+    {
+        errOut = "they have not shared an address to be paid at yet -- ask them to";
+        return false;
+    }
+    if (!WalletPay(addr, nAmount, txidOut, errOut))
+        return false;
+
+    // The money has moved. Telling them is a courtesy now, not the payment:
+    // if this note never arrives, the coins are still theirs on the chain.
+    Frame f;
+    f.kind = MSG_PAYMENT;
+    f.payTo = addr;
+    f.amount = nAmount;
+    f.txid = txidOut;
+    f.text = note;
+    std::string err2;
+    if (!SendInConversation(peerAddr, f, strprintf("paid %s BTF", FormatMoney(nAmount).c_str()),
+                            fLeftInMailboxOut, err2))
+        errOut = "paid (" + txidOut + "), but could not tell them: " + err2;
+    return true;
 }
 
 // Send what is waiting for one peer, oldest first.
