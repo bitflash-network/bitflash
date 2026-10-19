@@ -6,6 +6,7 @@
 #include "headers.h"
 #include "chatrelay.h"
 #include "chatstore.h"
+#include "chatdir.h"
 
 #ifndef SECP256K1_STATIC
 #define SECP256K1_STATIC
@@ -148,7 +149,8 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
     // own client (btfchatnet.cpp), not through this.
     (void)pfrom; (void)vRecv;
     return strCommand == "chatrec" || strCommand == "chatput" ||
-           strCommand == "chatget" || strCommand == "getchatinv";
+           strCommand == "chatget" || strCommand == "getchatinv" ||
+           strCommand == "getchatdir";
 #else
     int64 nNow = GetTime();
 
@@ -231,6 +233,24 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
             }
         }
         pfrom->PushMessage("chatrecs", nReq, vAnswer);
+        return true;
+    }
+
+    if (strCommand == "getchatdir")
+    {
+        // The public community directory as this node has read it off the
+        // chain (chatdir.h). Public data; rationed like any question.
+        unsigned int nReq = 0;
+        vRecv >> nReq;
+        Ration(pfrom, nNow);
+        std::vector<CChatListing> v;
+        if (++pfrom->nChatQueriesInWindow <= CHAT_QUERIES_PER_MINUTE)
+        {
+            ChatDirectoryListings(v);
+            if (v.size() > CHAT_DIRECTORY_MAX)
+                v.erase(v.begin(), v.end() - CHAT_DIRECTORY_MAX);   // the newest
+        }
+        pfrom->PushMessage("chatdir", nReq, ChatDirectoryHeight(), v);
         return true;
     }
 

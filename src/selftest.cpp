@@ -21,6 +21,8 @@
 #include "chatstore.h"
 #include "swap.h"
 #include "btfchatwallet.h"
+#include "chatdir.h"
+#include "community.h"
 #include "jsonrpc.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
@@ -5375,6 +5377,13 @@ static int RunChatRelaySelfTest()
     printf("chat-relay self-test\n");
     int nFail = 0;
     std::string err, why;
+    // A datadir of its own: the community directory reads and writes a file in
+    // it, and a self-test has no business touching the real one.
+    {
+        std::string tmp;
+        if (MakeTempDir(tmp))
+            strSetDataDir = tmp;
+    }
 
     // A peer that holds chat records, to watch what the node relays to it, and
     // one that does not, to make sure it is never offered any.
@@ -5588,6 +5597,35 @@ static int RunChatRelaySelfTest()
                        why.find("slow down") != std::string::npos,
                        "past sixty records a minute, even a good one is turned away") ? 0 : 1;
         delete greedy;
+    }
+
+    // ---- the public community directory: a listing in a block, read by the
+    // node, asked for by the app
+    {
+        unsigned char ckey[32];
+        RAND_bytes(ckey, 32);
+        std::vector<unsigned char> data = community::ListingData(ckey, "selftest-room");
+        CBlock block;
+        CTransaction tx;
+        tx.vin.resize(1);
+        tx.vout.push_back(CTxOut(community::MIN_BURN, CScript() << OP_RETURN << data));
+        CTransaction cheap = tx;
+        cheap.vout[0].nValue = community::MIN_BURN - 1;
+        cheap.vout[0].scriptPubKey = CScript() << OP_RETURN << community::ListingData(ckey, "cheap-room");
+        block.vtx.push_back(tx);
+        block.vtx.push_back(cheap);
+        nFail += Check(ChatDirectoryScanBlock(block, 4242) == 1,
+                       "the node reads a listing out of a block, and not one that burned too little") ? 0 : 1;
+        std::vector<CChatListing> dir;
+        int nHeight = -1;
+        nFail += Check(link.GetDirectory(dir, nHeight, err), "the app asks the node for the directory") ? 0 : 1;
+        bool fFound = false;
+        for (size_t i = 0; i < dir.size(); i++)
+            if (dir[i].name == "selftest-room" && dir[i].nHeight == 4242 &&
+                dir[i].key == std::vector<unsigned char>(ckey, ckey + 32))
+                fFound = true;
+        nFail += Check(fFound, "and gets the listing back, key, name and block") ? 0 : 1;
+        nFail += Check(ChatDirectoryScanBlock(block, 4243) == 0, "a listing seen once is not listed twice") ? 0 : 1;
     }
 
     // ---- the client will not use a node that does not hold chat records

@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include "btfaddr.h"
 #include "proxy.h"
+#include "chatdir.h"
 #include "tor.h"
 
 void ThreadReconnectCachedBtfPeers(void* parg);
@@ -2342,6 +2343,11 @@ bool StartNode(string& strError)
     // Peer discovery over Nostr relays (replaces the old IRC seed)
     if (_beginthread(ThreadNostrSeed, 0, NULL) == -1)
         printf("Error: _beginthread(ThreadNostrSeed) failed\n");
+
+    // The public community directory, read off the chain for the chat apps
+    // that ask (chatdir.h).
+    if (_beginthread(ThreadChatDirectory, 0, NULL) == -1)
+        printf("Error: _beginthread(ThreadChatDirectory) failed\n");
 
     // Anonymous inbound is the Tor hidden service now, not a rendezvous relay:
     // Tor forwards onion connections to our local listener, which accepts them

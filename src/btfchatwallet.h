@@ -39,6 +39,10 @@ bool WalletNewAddress(std::string& addrOut, std::string& errOut);
 // Pay `amount` satoshis to `addr`. The wallet's own fee rule applies.
 bool WalletPay(const std::string& addr, int64_t amount, std::string& txidOut, std::string& errOut);
 
+// Burn `amount` satoshis into an OP_RETURN carrying `dataHex` (a public
+// community listing).
+bool WalletBurn(int64_t amount, const std::string& dataHex, std::string& txidOut, std::string& errOut);
+
 // What the wallet knows of a transaction: how much of it reached us and with
 // how many confirmations. False when the wallet has never seen it.
 bool WalletLookup(const std::string& txid, int64_t& receivedOut, int& confirmationsOut,

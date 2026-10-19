@@ -250,6 +250,21 @@ bool WalletPay(const std::string& addr, int64_t amount, std::string& txidOut, st
     return true;
 }
 
+bool WalletBurn(int64_t amount, const std::string& dataHex, std::string& txidOut, std::string& errOut)
+{
+    std::string strAmount = strprintf("%lld.%08lld", (long long)(amount / COIN), (long long)(amount % COIN));
+    json r;
+    if (!Call("sendburn", json::array({ strAmount, dataHex }), r, errOut))
+        return false;
+    if (!r.is_string() || r.get<std::string>().size() != 64)
+    {
+        errOut = "the wallet did not return a transaction id";
+        return false;
+    }
+    txidOut = r.get<std::string>();
+    return true;
+}
+
 bool WalletLookup(const std::string& txid, int64_t& receivedOut, int& confirmationsOut,
                   std::string& errOut)
 {

@@ -61,7 +61,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h community.h chatdir.h \
           proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -75,7 +75,8 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/mlkem.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
-            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o \
+            obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
 
@@ -275,7 +276,11 @@ test_btfchatlink: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.
 test_chatstore: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
 	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 
-tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore bitflash-node
+# See the note in makefile.mingw.
+test_community: test_community.cpp community.cpp community.h
+	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community bitflash-node
 	./test_bip32
 	./test_btfchan
 	./test_btfaddr
@@ -285,6 +290,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./test_btfchatlog
 	./test_btfchatlink
 	./test_chatstore
+	./test_community
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format

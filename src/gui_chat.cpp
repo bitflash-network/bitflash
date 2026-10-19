@@ -31,6 +31,8 @@
 #include "btfchatnode.h"
 #include "btfchatnet.h"
 #include "btfchatwallet.h"
+#include "chatdir.h"
+#include "community.h"
 #include "tor.h"
 
 #include <algorithm>
@@ -57,6 +59,9 @@ enum ActionKind
     ACT_SEND,
     ACT_REQUEST,   // share an address of our wallet, maybe asking for an amount
     ACT_PAY,       // pay them from our wallet at the address they signed
+    ACT_DIRECTORY, // fetch the public community directory from the nodes
+    ACT_CREATE,    // list a public community on the chain (burns 0.01 BTF)
+    ACT_POST,      // post in a community
 };
 
 CCriticalSection cs_ui;
@@ -66,6 +71,7 @@ std::string g_argAddr;
 std::string g_argText;
 std::string g_argPassword;
 std::string g_message;              // shown to the user: progress or the last error
+std::vector<CChatListing> g_directory;  // the last public directory the nodes sent
 // Whether that message is bad news. One string carried both "this failed" and
 // "this worked, with something you should know", and everything came out in the
 // error colour -- so being told the message was safely left in the recipient's
@@ -87,6 +93,9 @@ const char* ActionLabel(ActionKind k)
     case ACT_SEND:    return "sending over Tor";
     case ACT_REQUEST: return "asking your wallet for an address and sending it";
     case ACT_PAY:     return "paying from your wallet";
+    case ACT_DIRECTORY: return "asking the nodes for the public directory";
+    case ACT_CREATE:  return "listing the community on the chain (burns 0.01 BTF)";
+    case ACT_POST:    return "posting";
     default:          return "";
     }
 }
@@ -148,6 +157,31 @@ void ThreadChatUiWorker(void*)
                     err = "they are not online -- left in their mailbox, they get it when they open the chat";
                 break;
             }
+            case ACT_DIRECTORY:
+            {
+                std::vector<CChatListing> v;
+                fOk = btfchat::ChatCommunityDirectory(v, err);
+                if (fOk)
+                {
+                    CRITICAL_BLOCK(cs_ui)
+                        g_directory = v;
+                    err = strprintf("%u public communit%s on the chain", (unsigned)v.size(),
+                                    v.size() == 1 ? "y" : "ies");
+                }
+                break;
+            }
+            case ACT_CREATE:
+            {
+                std::string txid, id;
+                fOk = btfchat::ChatCommunityCreatePublic(text, txid, id, err);
+                if (fOk)
+                    err = strprintf("#%s listed (%s...): public and permanent once it is in a block",
+                                    text.c_str(), txid.substr(0, 12).c_str());
+                break;
+            }
+            case ACT_POST:
+                fOk = btfchat::ChatCommunityPost(addr, text, err);
+                break;
             case ACT_REQUEST:
             case ACT_PAY:
             {
@@ -381,6 +415,10 @@ char g_msgBuf[1024]       = {0};
 char g_payAmountBuf[32]   = {0};   // BTF, for "ask" and "pay"
 bool g_fConfirmPay        = false; // second press of "pay" -- money does not move on one click
 std::string g_selected;               // which conversation is open
+std::string g_selectedCommunity;      // or which community (its id); one or the other
+bool g_fShowDirectory = false;
+char g_communityNameBuf[40] = {0};
+char g_postBuf[1024] = {0};
 bool g_fShowInvite = false;           // the "add someone" panel
 bool g_fConfirmAddress = false;       // showing the just-unlocked address
 
@@ -603,9 +641,179 @@ void DrawSidebar(float width)
     {
         bool fSel = contacts[i] == g_selected;
         if (ImGui::Selectable(ShortAddr(contacts[i]).c_str(), fSel))
+        {
             g_selected = contacts[i];
+            g_selectedCommunity.clear();
+        }
     }
 
+    // Public communities: rooms whose directory is the chain (community.h).
+    Hairline();
+    std::vector<std::pair<std::string, std::string> > rooms;
+    btfchat::ChatCommunities(rooms);
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    ImGui::Text("communities (%d)", (int)rooms.size());
+    ImGui::PopStyleColor();
+    for (size_t i = 0; i < rooms.size(); i++)
+    {
+        ImGui::PushID((int)(1000 + i));
+        bool fSel = rooms[i].first == g_selectedCommunity;
+        if (ImGui::Selectable(("#" + rooms[i].second).c_str(), fSel))
+        {
+            g_selectedCommunity = rooms[i].first;
+            g_selected.clear();
+        }
+        ImGui::PopID();
+    }
+    bool fBusy = Busy();
+    if (fBusy) ImGui::BeginDisabled();
+    if (ImGui::SmallButton(g_fShowDirectory ? "hide directory" : "public directory"))
+    {
+        g_fShowDirectory = !g_fShowDirectory;
+        if (g_fShowDirectory)
+            Queue(ACT_DIRECTORY, "", "", "");
+    }
+    if (fBusy) ImGui::EndDisabled();
+
+    if (g_fShowDirectory)
+    {
+        std::vector<CChatListing> dir;
+        CRITICAL_BLOCK(cs_ui)
+            dir = g_directory;
+        std::map<std::string, bool> joined;
+        for (size_t i = 0; i < rooms.size(); i++)
+            joined[rooms[i].first] = true;
+        if (dir.empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+            ImGui::TextWrapped("Nothing listed yet -- or the nodes have not answered.");
+            ImGui::PopStyleColor();
+        }
+        for (size_t i = 0; i < dir.size(); i++)
+        {
+            ImGui::PushID((int)(5000 + i));
+            std::string id = community::IdHex(&dir[i].key[0]);
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
+            ImGui::Text("#%s", dir[i].name.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("id %s\nlisted in block %d, burned %s BTF",
+                                  id.substr(0, 16).c_str(), dir[i].nHeight, FormatMoney(dir[i].nBurn).c_str());
+            ImGui::SameLine();
+            if (joined.count(id))
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+                ImGui::TextUnformatted("joined");
+                ImGui::PopStyleColor();
+            }
+            else if (ImGui::SmallButton("join"))
+            {
+                std::string newId, err;
+                // Local only: the key is already in the block, joining is
+                // remembering it. No network, so no worker.
+                if (btfchat::ChatCommunityJoin(HexStr(dir[i].key.begin(), dir[i].key.end(), false),
+                                               dir[i].name, newId, err))
+                {
+                    g_selectedCommunity = newId;
+                    g_selected.clear();
+                }
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::SetNextItemWidth(width - 70.0f);
+        ImGui::InputTextWithHint("##newcommunity", "new public name", g_communityNameBuf, sizeof(g_communityNameBuf));
+        ImGui::SameLine();
+        bool fNameOk = community::NameOk(g_communityNameBuf) && !Busy();
+        if (!fNameOk) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("create"))
+        {
+            Queue(ACT_CREATE, "", g_communityNameBuf, "");
+            memset(g_communityNameBuf, 0, sizeof(g_communityNameBuf));
+        }
+        if (!fNameOk) ImGui::EndDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::TextWrapped("Creating one burns 0.01 BTF from your linked wallet. It is listed in "
+                           "a block for good: nobody can take it down, you included.");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndChild();
+}
+
+void DrawCommunity()
+{
+    ImGui::BeginChild("##community", ImVec2(0.0f, 0.0f), false);
+    std::vector<std::pair<std::string, std::string> > rooms;
+    btfchat::ChatCommunities(rooms);
+    std::string name;
+    for (size_t i = 0; i < rooms.size(); i++)
+        if (rooms[i].first == g_selectedCommunity)
+            name = rooms[i].second;
+    if (name.empty())
+    {
+        g_selectedCommunity.clear();
+        ImGui::EndChild();
+        return;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
+    ImGui::Text("#%s", name.c_str());
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    ImGui::Text("public -- anybody with the key reads it, and the key is on the chain");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("leave##community"))
+    {
+        std::string err;
+        btfchat::ChatCommunityLeave(g_selectedCommunity, err);
+        g_selectedCommunity.clear();
+        ImGui::EndChild();
+        return;
+    }
+    Hairline();
+
+    const float inputH = 58.0f;
+    ImGui::BeginChild("##communitylog", ImVec2(0.0f, -inputH), false);
+    std::vector<btfchat::LogEntry> log;
+    btfchat::ChatCommunityLog(g_selectedCommunity, log);
+    if (log.empty())
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::TextWrapped("No posts in the last day yet. Posts are collected every two minutes.");
+        ImGui::PopStyleColor();
+    }
+    for (size_t i = 0; i < log.size(); i++)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::TextUnformatted(FmtWhen(log[i].sent).c_str());
+        ImGui::SameLine();
+        ImGui::TextUnformatted(ShortAddr(log[i].from).c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, log[i].outgoing ? COL_MINE : COL_TEXT);
+        ImGui::TextWrapped("%s", log[i].text.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)
+        ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+
+    Hairline();
+    ImGui::SetNextItemWidth(-90.0f);
+    bool fEnter = ImGui::InputText("##postinput", g_postBuf, sizeof(g_postBuf),
+                                   ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    bool fCan = strlen(g_postBuf) > 0 && !Busy();
+    if (!fCan) ImGui::BeginDisabled();
+    bool fPost = ImGui::Button(" post ");
+    if (!fCan) ImGui::EndDisabled();
+    if ((fPost || fEnter) && fCan)
+    {
+        Queue(ACT_POST, g_selectedCommunity, g_postBuf, "");
+        memset(g_postBuf, 0, sizeof(g_postBuf));
+    }
     ImGui::EndChild();
 }
 
@@ -920,7 +1128,7 @@ void DrawChatWindow()
             const float sideW = 230.0f;
             DrawSidebar(sideW);
             ImGui::SameLine();
-            DrawConversation();
+            if (!g_selectedCommunity.empty()) DrawCommunity(); else DrawConversation();
         }
     }
     ImGui::End();
@@ -1105,7 +1313,7 @@ void DrawChatFullWindow()
         const float sideW = 250.0f;
         DrawSidebar(sideW);
         ImGui::SameLine();
-        DrawConversation();
+        if (!g_selectedCommunity.empty()) DrawCommunity(); else DrawConversation();
     }
 
     ImGui::End();

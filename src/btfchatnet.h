@@ -33,6 +33,7 @@
 #include <vector>
 
 class CChatQuery;
+class CChatListing;
 
 namespace btfchat
 {
@@ -54,6 +55,11 @@ public:
     // Ask several questions at once. `out` has one entry per question.
     bool Get(const std::vector<CChatQuery>& vQuery,
              std::vector<std::vector<ChatRecord> >& out, std::string& errOut);
+
+    // The public community directory as this node read it off the chain:
+    // (key hex, name, height) for each listing. `nHeightOut` is how far the
+    // node has read.
+    bool GetDirectory(std::vector<CChatListing>& out, int& nHeightOut, std::string& errOut);
 
     // Descriptors of other nodes this one handed us on the way.
     const std::vector<std::string>& PeerDescriptors() const { return vPex; }
@@ -118,6 +124,11 @@ bool NetPublishDescriptor(const unsigned char sign_sk[32], const std::string& en
                           const std::string& onion, std::string& errOut);
 bool NetPublishEpochKeys(const std::string& chatAddr, const std::string& annJson,
                          int64_t nEpoch, std::string& errOut);
+
+// The public community directory, from the nodes: the union of what up to two
+// of them have read off the chain, by key. Each listing is re-parsed here
+// before it is believed.
+bool NetDirectory(std::vector<CChatListing>& out, std::string& errOut);
 
 // For the status line: nodes known, and how many answered lately.
 void NetNodeCounts(size_t& nKnown, size_t& nGood);

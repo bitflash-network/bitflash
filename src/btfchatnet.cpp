@@ -8,6 +8,8 @@
 #include "btfchatsock.h"
 #include "btfchatbox.h"
 #include "chatrelay.h"
+#include "chatdir.h"
+#include "community.h"
 #include "btfaddr.h"
 #include "tor.h"
 
@@ -330,6 +332,38 @@ bool NodeLink::Get(const std::vector<CChatQuery>& vQuery,
             }
             out.push_back(recs);
         }
+    }
+    return true;
+}
+
+bool NodeLink::GetDirectory(std::vector<CChatListing>& out, int& nHeightOut, std::string& errOut)
+{
+    out.clear();
+    nHeightOut = -1;
+    unsigned int nReq = nNextReq++;
+    CDataStream p(SER_NETWORK, nFraming);
+    p << nReq;
+    if (!Send("getchatdir", Bytes(p)))
+    {
+        errOut = "could not send to the node";
+        return false;
+    }
+    std::vector<unsigned char> pay;
+    if (!Await("chatdir", nReq, pay, errOut))
+        return false;
+    try
+    {
+        CDataStream a(pay, SER_NETWORK, nFraming);
+        unsigned int nEcho = 0;
+        std::vector<CChatListing> v;
+        a >> nEcho >> nHeightOut >> v;
+        for (size_t i = 0; i < v.size() && out.size() < CHAT_DIRECTORY_MAX; i++)
+            out.push_back(v[i]);
+    }
+    catch (std::exception&)
+    {
+        errOut = "the node's answer did not parse";
+        return false;
     }
     return true;
 }
@@ -692,6 +726,47 @@ bool NetQuery(const std::vector<CChatQuery>& vQuery,
     errOut = strLastErr.empty() ? "no Bitflash node could be reached"
                                 : "no Bitflash node could be reached: " + strLastErr;
     return false;
+}
+
+bool NetDirectory(std::vector<CChatListing>& out, std::string& errOut)
+{
+    errOut.clear();
+    out.clear();
+    std::map<std::vector<unsigned char>, CChatListing> byKey;
+    std::string strLastErr;
+    int nAnswered = WithNodes(QUERY_ANSWERS,
+        [&](NodeLink& link, const std::string&, std::string& err) -> int
+        {
+            std::vector<CChatListing> v;
+            int nHeight = -1;
+            if (!link.GetDirectory(v, nHeight, err))
+                return -1;
+            for (size_t i = 0; i < v.size(); i++)
+            {
+                // A node says what it read; the name and key must still be a
+                // listing's, or it is not shown.
+                if (v[i].key.size() != community::KEY_BYTES || !community::NameOk(v[i].name) ||
+                    v[i].nBurn < community::MIN_BURN)
+                    continue;
+                std::map<std::vector<unsigned char>, CChatListing>::iterator it = byKey.find(v[i].key);
+                // Two nodes disagreeing about the block: keep the earliest.
+                if (it == byKey.end() || (v[i].nHeight >= 0 && v[i].nHeight < it->second.nHeight))
+                    byKey[v[i].key] = v[i];
+            }
+            return 1;
+        }, strLastErr);
+    if (nAnswered == 0)
+    {
+        errOut = strLastErr.empty() ? "no Bitflash node could be reached"
+                                    : "no Bitflash node could be reached: " + strLastErr;
+        return false;
+    }
+    for (std::map<std::vector<unsigned char>, CChatListing>::const_iterator it = byKey.begin();
+         it != byKey.end(); ++it)
+        out.push_back(it->second);
+    std::sort(out.begin(), out.end(),
+              [](const CChatListing& a, const CChatListing& b) { return a.nHeight < b.nHeight; });
+    return true;
 }
 
 // ---- what the chat asks for ----------------------------------------------------

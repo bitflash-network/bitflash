@@ -8,6 +8,12 @@
 #include "btfaddr.h"
 #include "btfchatnet.h"
 #include "btfchatwallet.h"
+#include "community.h"
+#include "chatdir.h"
+#ifdef snprintf
+#undef snprintf
+#endif
+#include <nlohmann/json.hpp>
 #include "tor.h"
 
 #include <sodium.h>
@@ -99,6 +105,55 @@ static btf_socket_t   g_listener = INVALID_SOCKET;
 // session has to close the live channels, and locking is defined first.
 static void CloseAllOutLinks();
 
+// The public communities we joined (community.h): id -> key and name. In the
+// sealed store with everything else -- which rooms a person reads is as
+// private as who they talk to. Read and written holding cs_chat.
+struct JoinedCommunity
+{
+    std::vector<unsigned char> key;
+    std::string name;
+};
+static std::map<std::string, JoinedCommunity> g_communities;
+
+static std::string CommunitiesToJson()
+{
+    nlohmann::json a = nlohmann::json::array();
+    for (std::map<std::string, JoinedCommunity>::const_iterator it = g_communities.begin();
+         it != g_communities.end(); ++it)
+    {
+        nlohmann::json e;
+        e["k"] = HexStr(it->second.key.begin(), it->second.key.end(), false);
+        e["n"] = it->second.name;
+        a.push_back(e);
+    }
+    return a.dump();
+}
+
+static void CommunitiesFromJson(const std::string& s)
+{
+    g_communities.clear();
+    if (s.empty())
+        return;
+    try
+    {
+        nlohmann::json a = nlohmann::json::parse(s);
+        if (!a.is_array())
+            return;
+        for (size_t i = 0; i < a.size() && i < 256; i++)
+        {
+            std::string k = a[i].value("k", std::string());
+            std::string n = a[i].value("n", std::string());
+            if (k.size() != 64 || !IsHex(k) || !community::NameOk(n))
+                continue;
+            JoinedCommunity c;
+            c.key = ParseHex(k);
+            c.name = n;
+            g_communities[community::IdHex(&c.key[0])] = c;
+        }
+    }
+    catch (...) {}
+}
+
 std::string ChatStorePath() { return GetAppDir() + "/btfchat.dat"; }
 
 static bool EnsureSecp()
@@ -168,12 +223,21 @@ static bool LoadStore()
     // that cannot read yesterday's file is an upgrade that erases a history.
     std::string strHistory = strRest;
     std::string strOutbox;
+    std::string strCommunities;
     size_t nSplit2 = strRest.find('\n');
     if (nSplit2 != std::string::npos)
     {
         strHistory = strRest.substr(0, nSplit2);
         strOutbox  = strRest.substr(nSplit2 + 1);
+        // And the communities joined, fourth, for the same reason.
+        size_t nSplit3 = strOutbox.find('\n');
+        if (nSplit3 != std::string::npos)
+        {
+            strCommunities = strOutbox.substr(nSplit3 + 1);
+            strOutbox = strOutbox.substr(0, nSplit3);
+        }
     }
+    CommunitiesFromJson(strCommunities);
     if (!g_roster.FromJson(strRoster, err))
         printf("btfchat: the roster in the store did not load: %s\n", err.c_str());
     if (!strHistory.empty() && !g_history.FromJson(strHistory, err))
@@ -190,7 +254,7 @@ static bool SaveStore()
     // One line of roster, then the history: newline-separated because neither
     // half's JSON contains a raw newline, and it keeps the seal to one blob.
     std::string plain = g_roster.ToJson() + "\n" + g_history.ToJson()
-                      + "\n" + g_outbox.ToJson();
+                      + "\n" + g_outbox.ToJson() + "\n" + CommunitiesToJson();
     std::vector<unsigned char> sealed;
     if (!SealStore(g_id, plain, sealed))
         return false;
@@ -236,6 +300,7 @@ bool ChatUnlock(const std::string& password, std::string& errOut)
         g_roster = Roster();
         g_history = History();
         g_outbox.Wipe();
+        g_communities.clear();
         g_lock.Unlock(GetTime());
         LoadStore();
         // Epoch keys are random and kept, never derived, so they have to exist
@@ -264,6 +329,7 @@ void ChatLock()
         // dropping it from memory loses nothing and keeps a locked session with
         // no plaintext in it.
         g_outbox.Wipe();
+        g_communities.clear();
         // The epoch secrets go with the session. An envelope sealed to them is
         // unreadable afterwards by anybody, us included: that is the forward
         // secrecy, and keeping them would quietly throw it away.
@@ -829,6 +895,128 @@ bool ChatPeerPayAddress(const std::string& peerAddr, std::string& addrOut, int64
     return false;
 }
 
+// ---- public communities ---------------------------------------------------------
+
+bool ChatCommunityJoin(const std::string& keyHex, const std::string& name, std::string& idOut,
+                       std::string& errOut)
+{
+    errOut.clear();
+    idOut.clear();
+    if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
+    if (keyHex.size() != 64 || !IsHex(keyHex)) { errOut = "a community key is 64 hex characters"; return false; }
+    if (!community::NameOk(name)) { errOut = "a community name is 1 to 32 letters, digits, - or _"; return false; }
+    JoinedCommunity c;
+    c.key = ParseHex(keyHex);
+    c.name = name;
+    idOut = community::IdHex(&c.key[0]);
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (g_communities.size() >= 256 && !g_communities.count(idOut))
+        {
+            errOut = "you are in 256 communities already";
+            return false;
+        }
+        g_communities[idOut] = c;
+        SaveStore();
+    }
+    return true;
+}
+
+bool ChatCommunityLeave(const std::string& id, std::string& errOut)
+{
+    errOut.clear();
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_communities.erase(id))
+        {
+            errOut = "you are not in that community";
+            return false;
+        }
+        SaveStore();
+    }
+    return true;
+}
+
+bool ChatCommunityCreatePublic(const std::string& name, std::string& txidOut, std::string& idOut,
+                               std::string& errOut)
+{
+    errOut.clear();
+    txidOut.clear();
+    if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
+    if (!community::NameOk(name)) { errOut = "a community name is 1 to 32 letters, digits, - or _"; return false; }
+    unsigned char key[community::KEY_BYTES];
+    randombytes_buf(key, sizeof(key));
+    std::vector<unsigned char> data = community::ListingData(key, name);
+    // The listing is permanent and public from here: name and key in a block,
+    // paid for from the person's own wallet.
+    if (!WalletBurn(community::MIN_BURN, HexStr(data.begin(), data.end(), false), txidOut, errOut))
+        return false;
+    return ChatCommunityJoin(HexStr(key, key + sizeof(key), false), name, idOut, errOut);
+}
+
+void ChatCommunities(std::vector<std::pair<std::string, std::string> >& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_chat)
+        for (std::map<std::string, JoinedCommunity>::const_iterator it = g_communities.begin();
+             it != g_communities.end(); ++it)
+            out.push_back(std::make_pair(it->first, it->second.name));
+}
+
+bool ChatCommunityPost(const std::string& id, const std::string& text, std::string& errOut)
+{
+    errOut.clear();
+    if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
+    if (text.empty() || text.size() > MAX_TEXT_BYTES) { errOut = "a post is 1 to 4096 bytes"; return false; }
+    JoinedCommunity c;
+    Identity me;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        std::map<std::string, JoinedCommunity>::const_iterator it = g_communities.find(id);
+        if (it == g_communities.end()) { errOut = "you are not in that community"; return false; }
+        c = it->second;
+        me = g_id;
+    }
+    Frame f;
+    f.kind = MSG_GROUP_TEXT;
+    f.group = id;
+    f.sent = GetTime();
+    f.text = text;
+    std::string js;
+    bool fSigned = SignFrame(g_secp, me, f, js, errOut);
+    IdentityClear(me);
+    if (!fSigned)
+        return false;
+    std::vector<unsigned char> env;
+    if (!community::Seal(&c.key[0], js, env))
+    {
+        errOut = "sealing the post failed";
+        return false;
+    }
+    if (!NetPostEnvelope(community::TagHex(&c.key[0], MailboxEpoch(f.sent)), env, errOut))
+        return false;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        std::string e;
+        g_history.Append(f, std::string(), true, e);
+        SaveStore();
+    }
+    return true;
+}
+
+void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_chat)
+        if (g_fUnlocked)
+            g_history.GroupLog(id, out);
+}
+
+bool ChatCommunityDirectory(std::vector<CChatListing>& out, std::string& errOut)
+{
+    return NetDirectory(out, errOut);
+}
+
 bool ChatPay(const std::string& peerAddr, int64_t nAmount, const std::string& note,
              std::string& txidOut, bool& fLeftInMailboxOut, std::string& errOut)
 {
@@ -1152,6 +1340,45 @@ static bool FirstSightOfEnvelope(const std::vector<unsigned char>& env)
     return true;
 }
 
+// Open and record community posts collected under one community's tag. A post
+// is a group frame whose group is the community id, signed by whoever wrote
+// it; it is refused if the signature fails, if it names another community, if
+// its author is somebody we blocked, or if it is a replay.
+static int DeliverCommunityPosts(const std::vector<unsigned char>& key,
+                                 const std::vector<std::vector<unsigned char> >& envs, int64_t nNow)
+{
+    std::string id = community::IdHex(&key[0]);
+    int n = 0;
+    for (size_t k = 0; k < envs.size(); k++)
+    {
+        if (!FirstSightOfEnvelope(envs[k]))
+            continue;
+        std::string js;
+        if (!community::Open(&key[0], envs[k], js))
+            continue;
+        Frame f;
+        std::string err;
+        if (!OpenFrame(g_secp, js, f, err))
+            continue;
+        if (f.kind != MSG_GROUP_TEXT || f.group != id)
+            continue;
+        CRITICAL_BLOCK(cs_chat)
+        {
+            if (!g_fUnlocked || g_roster.IsBlocked(f.from))
+                break;
+            if (!g_replay.Accept(f, nNow, err))
+                break;
+            // Our own posts come back too; the history knows the id already.
+            if (g_history.Append(f, std::string(), f.from == g_id.address, err))
+            {
+                n++;
+                SaveStore();
+            }
+        }
+    }
+    return n;
+}
+
 int ChatPollMailboxes(std::string& errOut)
 {
     errOut.clear();
@@ -1209,6 +1436,24 @@ int ChatPollMailboxes(std::string& errOut)
         }
     }
 
+    // The communities we joined ride in the same round: their tags are
+    // computed from the key, today's and yesterday's, and their posts are
+    // opened with the key instead of our mailbox keys.
+    std::map<std::string, std::vector<unsigned char> > mapCommunityTag;   // tag -> key
+    CRITICAL_BLOCK(cs_chat)
+        for (std::map<std::string, JoinedCommunity>::const_iterator it = g_communities.begin();
+             it != g_communities.end(); ++it)
+            for (int back = 0; back < 2; back++)
+            {
+                std::string tag = community::TagHex(&it->second.key[0], nEpochNow - back);
+                int64_t nSince = 0;
+                std::map<std::string, int64_t>::const_iterator p = g_mapPolledUntil.find(tag);
+                if (p != g_mapPolledUntil.end())
+                    nSince = p->second;
+                vTagSince.push_back(std::make_pair(tag, nSince));
+                mapCommunityTag[tag] = it->second.key;
+            }
+
     std::map<std::string, std::vector<std::vector<unsigned char> > > mapEnvs;
     std::string errFetch;
     if (vTagSince.empty() || !NetFetchEnvelopes(vTagSince, mapEnvs, errFetch))
@@ -1222,6 +1467,14 @@ int ChatPollMailboxes(std::string& errOut)
     for (size_t t = 0; t < vTagSince.size() && !fShutdown; t++)
     {
         const std::string& tag = vTagSince[t].first;
+        std::map<std::string, std::vector<unsigned char> >::const_iterator ck = mapCommunityTag.find(tag);
+        if (ck != mapCommunityTag.end())
+        {
+            nDelivered += DeliverCommunityPosts(ck->second, mapEnvs[tag], nNow);
+            CRITICAL_BLOCK(cs_chat)
+                g_mapPolledUntil[tag] = nNow - MAILBOX_REPOLL_WINDOW;
+            continue;
+        }
         {
             const std::vector<std::vector<unsigned char> >& envs = mapEnvs[tag];
             for (size_t k = 0; k < envs.size(); k++)

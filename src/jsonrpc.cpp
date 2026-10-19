@@ -574,6 +574,28 @@ static json rpc_sendtoaddress(const json& p)
     return wtx.GetHash().GetHex();
 }
 
+// sendburn <amount> <data hex>: burn `amount` into an OP_RETURN carrying the
+// data -- provably unspendable, gone from the supply. What a public community
+// listing is (community.h); 80 bytes of data at most, the relay limit.
+static json rpc_sendburn(const json& p)
+{
+    if (p.size() < 2 || !p[1].is_string() || !IsHex(p[1].get<string>()))
+        throw runtime_error("sendburn <amount> <data hex>");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    vector<unsigned char> data = ParseHex(p[1].get<string>());
+    if (data.empty() || data.size() > MAX_OP_RETURN_RELAY)
+        throw runtime_error(strprintf("the data is 1 to %u bytes", MAX_OP_RETURN_RELAY));
+    CScript scriptPubKey;
+    scriptPubKey << OP_RETURN << data;
+    int64 nValue = AmountFromValue(p[0]);
+    CWalletTx wtx;
+    wtx.mapValue["comment"] = "Burned";
+    if (!SendMoney(scriptPubKey, nValue, wtx))
+        throw runtime_error("send failed: insufficient balance once the fee is counted");
+    return wtx.GetHash().GetHex();
+}
+
 // donate <amount>: pay the treasury. Exactly sendtoaddress treasury <amount>,
 // under the name people will look for.
 static json rpc_donate(const json& p)
@@ -1545,7 +1567,7 @@ static json rpc_help(const json&)
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
            "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret "
-           "gettorinfo settorbridges gettreasuryinfo donate help";
+           "gettorinfo settorbridges gettreasuryinfo donate sendburn help";
 }
 
 struct RpcEntry { const char* name; RpcMethod fn; };
@@ -1561,6 +1583,7 @@ static const RpcEntry kMethods[] = {
     { "getbalance",       rpc_getbalance },
     { "sendtoaddress",    rpc_sendtoaddress },
     { "donate",           rpc_donate },
+    { "sendburn",         rpc_sendburn },
     { "gettreasuryinfo",  rpc_gettreasuryinfo },
     { "gettransaction",   rpc_gettransaction },
     { "listtransactions", rpc_listtransactions },

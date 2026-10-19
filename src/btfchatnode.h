@@ -47,6 +47,8 @@
 #include <string>
 #include <vector>
 
+class CChatListing;   // chatdir.h
+
 namespace btfchat
 {
 
@@ -151,6 +153,24 @@ bool ChatPeerPayAddress(const std::string& peerAddr, std::string& addrOut, int64
 // `errOut` then says so.
 bool ChatPay(const std::string& peerAddr, int64_t nAmount, const std::string& note,
              std::string& txidOut, bool& fLeftInMailboxOut, std::string& errOut);
+
+// ---- public communities (community.h) ---------------------------------------
+//
+// Join by key and name (from the directory, or from somebody who shared it).
+bool ChatCommunityJoin(const std::string& keyHex, const std::string& name, std::string& idOut,
+                       std::string& errOut);
+bool ChatCommunityLeave(const std::string& id, std::string& errOut);
+// Create one and list it on the chain: burns 0.01 BTF from the linked wallet.
+bool ChatCommunityCreatePublic(const std::string& name, std::string& txidOut, std::string& idOut,
+                               std::string& errOut);
+// The ones we are in: (id, name).
+void ChatCommunities(std::vector<std::pair<std::string, std::string> >& out);
+// Post, signed by our identity, sealed with the community key, left with the
+// nodes. Blocks on the network: call it from a worker.
+bool ChatCommunityPost(const std::string& id, const std::string& text, std::string& errOut);
+void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out);
+// The public directory, from the nodes. Blocks on the network.
+bool ChatCommunityDirectory(std::vector<CChatListing>& out, std::string& errOut);
 
 // Collect and deliver whatever was left in our mailboxes. Called by the poll
 // thread; exposed so the interface can offer a "check now".
