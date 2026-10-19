@@ -340,7 +340,7 @@ void ChatStore::Insert(const ChatRecord& r, const std::string& id)
     Entry e;
     e.rec = r;
     e.id = id;
-    e.nBytes = r.payload.size() + r.key.size() + 64;
+    e.nBytes = EntryBytes(r);
     std::string k(r.key.begin(), r.key.end());
     mapByKey[std::make_pair(r.kind, k)].insert(std::make_pair(r.nTime, id));
     mapByAge[r.kind].insert(std::make_pair(r.nTime, id));
@@ -412,49 +412,69 @@ ChatStore::Result ChatStore::Accept(void* secpctx, const ChatRecord& r, int64_t 
         // we already have.
         std::map<std::pair<uint8_t, std::string>,
                  std::set<std::pair<int64_t, std::string> > >::iterator bk = mapByKey.find(k);
+        std::vector<std::string> old;
+        size_t nFreed = 0;
         if (bk != mapByKey.end() && !bk->second.empty())
         {
             const std::pair<int64_t, std::string>& cur = *bk->second.rbegin();
             if (cur.first >= r.nTime)
                 return DUPLICATE;
-            std::vector<std::string> old;
             for (std::set<std::pair<int64_t, std::string> >::const_iterator it = bk->second.begin();
                  it != bk->second.end(); ++it)
-                old.push_back(it->second);
-            for (size_t i = 0; i < old.size(); i++)
-                Remove(old[i]);
-        }
-        Insert(r, id);
-    }
-    else
-    {
-        std::map<std::pair<uint8_t, std::string>,
-                 std::set<std::pair<int64_t, std::string> > >::iterator bk = mapByKey.find(k);
-        if (bk != mapByKey.end() && bk->second.size() >= CHATREC_MAX_PER_TAG)
-        {
-            // The tag is full. Keep the newest; if this one is older than all
-            // of them it goes, not one of theirs.
-            if (r.nTime <= bk->second.begin()->first)
             {
-                whyOut = "too many envelopes under that tag";
-                return REJECTED;
+                old.push_back(it->second);
+                nFreed += mapRec[it->second].nBytes;
             }
-            Remove(bk->second.begin()->second);
         }
-        Insert(r, id);
-    }
-
-    // Over budget: the oldest of this kind goes first, however it got here.
-    while (Bytes(r.kind) > BudgetFor(r.kind) && !mapByAge[r.kind].empty())
-    {
-        std::string victim = mapByAge[r.kind].begin()->second;
-        Remove(victim);
-        if (victim == id)
+        // Replacing an identity's own record always fits in the room the old
+        // one leaves, give or take; a NEW identity needs room of its own. See
+        // the note on the budget below.
+        if (Bytes(r.kind) - nFreed + EntryBytes(r) > BudgetFor(r.kind))
         {
-            whyOut = "no room for a record that old";
+            whyOut = "this node's chat store is full; try again later";
             return REJECTED;
         }
+        for (size_t i = 0; i < old.size(); i++)
+            Remove(old[i]);
+        Insert(r, id);
+        return ACCEPTED;
     }
+
+    std::map<std::pair<uint8_t, std::string>,
+             std::set<std::pair<int64_t, std::string> > >::iterator bk = mapByKey.find(k);
+    bool fDropOldest = false;
+    if (bk != mapByKey.end() && bk->second.size() >= CHATREC_MAX_PER_TAG)
+    {
+        // The tag is full. Keep the newest; if this one is older than all of
+        // them it goes, not one of theirs. Only the two people who share a tag
+        // can compute it, so nobody else can push anything out of it.
+        if (r.nTime <= bk->second.begin()->first)
+        {
+            whyOut = "too many envelopes under that tag";
+            return REJECTED;
+        }
+        fDropOldest = true;
+    }
+
+    // Over budget, the NEW record is refused -- nothing already held is pushed
+    // out to make room. The other way round looked kinder and was the dangerous
+    // one: the work here is SHA-256, which a graphics card does a million times
+    // faster than a laptop, so anybody with one could fill the budget in
+    // seconds and, by evicting, quietly erase messages whose senders had
+    // already been told "left in their mailbox". Refusing instead means a flood
+    // can block NEW offline messages until records expire, and the sender is
+    // told at the moment it happens -- the message stays in their outbox and
+    // goes direct when the other side is seen. A refusal is visible; an
+    // eviction is a silent loss.
+    size_t nFreed = fDropOldest ? mapRec[bk->second.begin()->second].nBytes : 0;
+    if (Bytes(r.kind) - nFreed + EntryBytes(r) > BudgetFor(r.kind))
+    {
+        whyOut = "this node's chat store is full; try again later";
+        return REJECTED;
+    }
+    if (fDropOldest)
+        Remove(bk->second.begin()->second);
+    Insert(r, id);
     return ACCEPTED;
 }
 

@@ -31,9 +31,12 @@
 // money. Each record costs about a second of one CPU core to make, scaled up
 // with its size, and a fraction of a millisecond to check. That is nothing to a
 // person sending a message and real money to somebody filling the network's
-// memory. It is a speed bump, not a wall: the caps below are what actually
-// bound the damage, and a stamp paid in coin is the later answer
-// (docs/btfchat.md, phase 3).
+// memory with a CPU. It is a speed bump, not a wall -- SHA-256 is what graphics
+// cards are best at, and one of those pays it a million times over. What
+// bounds the damage is that a full store refuses new records instead of
+// evicting old ones, so a flood can delay offline delivery but never erase a
+// message already held. A stamp paid in coin is the real answer
+// (docs/btfchat.md, phase 1).
 //
 // MEMORY ONLY. Nothing here touches the disk. A node that restarts forgets, and
 // gets the records back from its peers; a message that every node forgot was
@@ -96,7 +99,9 @@ static const int64_t CHATREC_EPOCH_LIFETIME    = 3 * 24 * 60 * 60;
 static const int64_t CHATREC_MAX_FUTURE = 2 * 60 * 60;
 
 // The memory a node gives the chat, per kind. Together about 64 MB at worst,
-// which a machine that runs RandomX's 2 GB dataset does not notice.
+// which a machine that runs RandomX's 2 GB dataset does not notice. When a
+// kind is full, new records of it are refused; nothing held is evicted to make
+// room (see ChatStore::Accept for why that matters).
 static const size_t CHATREC_ENVELOPE_BUDGET = 32 * 1024 * 1024;
 static const size_t CHATREC_EPOCH_BUDGET    = 24 * 1024 * 1024;
 static const size_t CHATREC_DESC_BUDGET     =  8 * 1024 * 1024;
@@ -213,6 +218,8 @@ private:
     void Insert(const ChatRecord& r, const std::string& id);
     static size_t BudgetFor(uint8_t kind);
     static int64_t LifetimeFor(uint8_t kind);
+    // What one record counts against its kind's budget.
+    static size_t EntryBytes(const ChatRecord& r) { return r.payload.size() + r.key.size() + 64; }
 };
 
 } // namespace btfchat

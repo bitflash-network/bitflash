@@ -16,6 +16,9 @@
 #include "sockcount.h"
 #include "btfchatnode.h"
 #include "btfchatsock.h"
+#include "btfchatnet.h"
+#include "chatrelay.h"
+#include "chatstore.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
 // node key, and a self-test has no business creating one.
@@ -4902,6 +4905,391 @@ static int RunChatLinkSelfTest()
 // those two are a deterministic function of the seed -- so the same phrase gives
 // the same chat identity on any machine while the phrase itself stays out of this
 // process. A phrase that is not in memory cannot be screenshotted or logged.
+// A Stream whose far end is a node's own message handler: what the client
+// writes goes into the node's receive buffer and through ProcessMessages, what
+// the node pushed is what the client reads. The real node code against the real
+// chat client, with no socket and no Tor in between.
+class HandlerStream : public btfchat::Stream
+{
+public:
+    explicit HandlerStream(CNode* p) : pnode(p) {}
+    bool Write(const unsigned char* p, size_t n)
+    {
+        pnode->vRecv.insert(pnode->vRecv.end(), (const char*)p, (const char*)p + n);
+        ProcessMessages(pnode);
+        return !pnode->fDisconnect;
+    }
+    bool Read(unsigned char* p, size_t n)
+    {
+        if (pnode->vSend.size() < n)
+            return false;
+        memcpy(p, &pnode->vSend.begin()[0], n);
+        pnode->vSend.ignore((int)n);
+        return true;
+    }
+private:
+    CNode* pnode;
+};
+
+// Pull every complete message out of a node's send buffer.
+static void DrainMessages(CNode& node, std::vector<std::pair<std::string, std::vector<char> > >& out)
+{
+    out.clear();
+    unsigned int nHdr = CMessageHeader::SizeOnWire(node.vSend.GetVersion());
+    while (node.vSend.size() >= nHdr)
+    {
+        CDataStream h(node.vSend.begin(), node.vSend.begin() + nHdr, SER_NETWORK, node.vSend.GetVersion());
+        CMessageHeader hdr;
+        h >> hdr;
+        if (node.vSend.size() < nHdr + hdr.nMessageSize)
+            break;
+        std::vector<char> pay(node.vSend.begin() + nHdr, node.vSend.begin() + nHdr + hdr.nMessageSize);
+        out.push_back(std::make_pair(hdr.GetCommand(), pay));
+        node.vSend.ignore((int)(nHdr + hdr.nMessageSize));
+    }
+}
+
+static btfchat::ChatRecord SelfTestEnvelope(const std::vector<unsigned char>& tag, size_t nPayload)
+{
+    btfchat::ChatRecord r;
+    r.kind = btfchat::CHATREC_ENVELOPE;
+    r.key = tag;
+    r.nTime = GetTime();
+    r.payload.resize(nPayload);
+    RAND_bytes(&r.payload[0], (int)nPayload);
+    btfchat::ChatRecordMine(r);
+    return r;
+}
+
+static int RunChatRelaySelfTest()
+{
+    printf("chat-relay self-test\n");
+    int nFail = 0;
+    std::string err, why;
+
+    // A peer that holds chat records, to watch what the node relays to it, and
+    // one that does not, to make sure it is never offered any.
+    CNode* peerChat = new CNode(INVALID_SOCKET, CAddress());
+    peerChat->nVersion = VERSION;
+    peerChat->nServices = NODE_NETWORK | NODE_CHAT;
+    peerChat->vSend.SetVersion(VERSION);
+    peerChat->vRecv.SetVersion(VERSION);
+    CNode* peerOld = new CNode(INVALID_SOCKET, CAddress());
+    peerOld->nVersion = VERSION;
+    peerOld->nServices = NODE_NETWORK;
+    CRITICAL_BLOCK(cs_vNodes)
+    {
+        vNodes.push_back(peerChat);
+        vNodes.push_back(peerOld);
+    }
+
+    // ---- the chat app, connected to this node
+    CNode* app = new CNode(INVALID_SOCKET, CAddress(), true);
+    HandlerStream st(app);
+    btfchat::NodeLink link(st);
+    nFail += Check(link.Handshake(err), "the chat client completes a handshake with the real node handler") ? 0 : 1;
+    if (!err.empty()) printf("       %s\n", err.c_str());
+    nFail += Check((link.Services() & NODE_CHAT) != 0, "and the node says it holds chat records") ? 0 : 1;
+    nFail += Check(app->nVersion == VERSION && app->fClient,
+                   "the node sees a client, not a node: no chain asked of it") ? 0 : 1;
+
+    std::vector<unsigned char> tag(16);
+    RAND_bytes(&tag[0], 16);
+    btfchat::ChatRecord env = SelfTestEnvelope(tag, 700);
+    int nResult = -1;
+    nFail += Check(link.Put(env, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                   "an envelope left by the app is kept, and the app is told so") ? 0 : 1;
+    nResult = -1;
+    nFail += Check(link.Put(env, nResult, why, err) && nResult == btfchat::ChatStore::DUPLICATE,
+                   "the same envelope again is a duplicate, not an error") ? 0 : 1;
+
+    btfchat::ChatRecord lazy = env;
+    lazy.payload[0] ^= 1;
+    while (btfchat::ChatRecordHasWork(lazy))
+        lazy.nNonce++;
+    nResult = -1;
+    nFail += Check(link.Put(lazy, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED &&
+                   why.find("proof of work") != std::string::npos,
+                   "one without the work is refused, and the app is told why") ? 0 : 1;
+
+    // ---- asking
+    {
+        std::vector<unsigned char> other(16);
+        RAND_bytes(&other[0], 16);
+        std::vector<CChatQuery> q(2);
+        q[0].kind = btfchat::CHATREC_ENVELOPE; q[0].key = tag;   q[0].nSince = 0; q[0].nMax = 64;
+        q[1].kind = btfchat::CHATREC_ENVELOPE; q[1].key = other; q[1].nSince = 0; q[1].nMax = 64;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 2,
+                       "two questions in one request get two answers") ? 0 : 1;
+        nFail += Check(ans.size() == 2 && ans[0].size() == 1 && ans[0][0].IdHex() == env.IdHex(),
+                       "the first is the envelope left under that tag") ? 0 : 1;
+        nFail += Check(ans.size() == 2 && ans[1].empty(), "the second, under a tag nobody used, is empty") ? 0 : 1;
+
+        q.resize(1);
+        q[0].nSince = GetTime() + 60;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].empty(),
+                       "'since' after it leaves it out") ? 0 : 1;
+    }
+
+    // ---- relayed to the node that holds chat records, never to the old one
+    CInv invEnv;
+    {
+        unsigned char id[32];
+        env.Id(id);
+        uint256 h;
+        memcpy(h.begin(), id, 32);
+        invEnv = CInv(MSG_CHATREC, h);
+    }
+    bool fOffered = false, fOfferedOld = false, fOfferedApp = false;
+    CNode* who[3] = { peerChat, peerOld, app };
+    bool* flag[3] = { &fOffered, &fOfferedOld, &fOfferedApp };
+    for (int w = 0; w < 3; w++)
+        CRITICAL_BLOCK(who[w]->cs_inventory)
+            for (size_t i = 0; i < who[w]->vInventoryToSend.size(); i++)
+                if (who[w]->vInventoryToSend[i].type == invEnv.type &&
+                    who[w]->vInventoryToSend[i].hash == invEnv.hash)
+                    *flag[w] = true;
+    nFail += Check(fOffered, "a kept record is offered to the peer that holds chat records") ? 0 : 1;
+    nFail += Check(!fOfferedOld, "and never to a node from before the chat") ? 0 : 1;
+    nFail += Check(!fOfferedApp, "nor back to where it came from") ? 0 : 1;
+    nFail += Check(ChatRelayAlreadyHave(invEnv), "and the node answers 'have' for it") ? 0 : 1;
+
+    // ---- the peer asks for it, the node sends it
+    std::vector<std::pair<std::string, std::vector<char> > > msgs;
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("getdata", std::vector<CInv>(1, invEnv));
+        peerChat->vSend.clear();
+        peerChat->vRecv.insert(peerChat->vRecv.end(), wire.vSend.begin(), wire.vSend.end());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        bool fGot = false;
+        for (size_t i = 0; i < msgs.size(); i++)
+            if (msgs[i].first == "chatrec")
+            {
+                CDataStream ss(msgs[i].second, SER_NETWORK, VERSION);
+                std::vector<unsigned char> blob;
+                ss >> blob;
+                btfchat::ChatRecord back;
+                fGot = !blob.empty() && back.Parse(&blob[0], blob.size()) && back.IdHex() == env.IdHex();
+            }
+        nFail += Check(fGot, "getdata from a peer is answered with the record itself") ? 0 : 1;
+    }
+
+    // ---- a record relayed by another node is taken, and the app can find it
+    std::vector<unsigned char> tag2(16);
+    RAND_bytes(&tag2[0], 16);
+    btfchat::ChatRecord relayed = SelfTestEnvelope(tag2, 300);
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("chatrec", relayed.Serialize());
+        peerChat->vRecv.insert(peerChat->vRecv.end(), wire.vSend.begin(), wire.vSend.end());
+        ProcessMessages(peerChat);
+        std::vector<CChatQuery> q(1);
+        q[0].kind = btfchat::CHATREC_ENVELOPE; q[0].key = tag2; q[0].nSince = 0; q[0].nMax = 64;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].size() == 1 &&
+                       ans[0][0].IdHex() == relayed.IdHex(),
+                       "a record another node relays is kept and served to the app") ? 0 : 1;
+    }
+
+    // ---- a peer that just connected can ask for everything we hold, once in a while
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("getchatinv");
+        std::vector<char> once(wire.vSend.begin(), wire.vSend.end());
+        peerChat->vSend.clear();
+        peerChat->vRecv.insert(peerChat->vRecv.end(), &once[0], &once[0] + once.size());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        size_t nOffered = 0;
+        for (size_t i = 0; i < msgs.size(); i++)
+            if (msgs[i].first == "inv")
+            {
+                CDataStream ss(msgs[i].second, SER_NETWORK, VERSION);
+                std::vector<CInv> v;
+                ss >> v;
+                for (size_t k = 0; k < v.size(); k++)
+                    if (v[k].type == MSG_CHATREC)
+                        nOffered++;
+            }
+        nFail += Check(nOffered == 2, "getchatinv is answered with the ids of every record held") ? 0 : 1;
+
+        peerChat->vRecv.insert(peerChat->vRecv.end(), &once[0], &once[0] + once.size());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        nFail += Check(msgs.empty(), "and asking again straight away gets nothing") ? 0 : 1;
+    }
+
+    // ---- descriptors: published by one identity, resolved and verified by the client rules
+    {
+        btfchat::Identity alice;
+        std::vector<unsigned char> seed(64, 0x77);
+        btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", alice, err);
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        std::string encHex = HexStr(alice.chan_pk, alice.chan_pk + 32);
+        int64 nCreated = GetTime();
+        std::string onion = "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8533";
+        std::string desc = btf::SignDescriptor(ctx, alice.sign_sk, encHex, "", (uint64_t)nCreated, onion);
+        btfchat::ChatRecord d;
+        d.kind = btfchat::CHATREC_DESC;
+        unsigned char pk[32];
+        btf::ParseAddress(alice.address, pk);
+        d.key.assign(pk, pk + 32);
+        d.nTime = nCreated;
+        d.payload.assign(desc.begin(), desc.end());
+        btfchat::ChatRecordMine(d);
+        nResult = -1;
+        nFail += Check(link.Put(d, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                       "a signed chat descriptor is kept") ? 0 : 1;
+
+        std::vector<CChatQuery> q(1);
+        q[0].kind = btfchat::CHATREC_DESC; q[0].key = d.key; q[0].nSince = 0; q[0].nMax = 1;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        bool fOk = link.Get(q, ans, err) && ans.size() == 1 && ans[0].size() == 1;
+        nFail += Check(fOk && btfchat::ChatRecordVerifySigned(ctx, ans[0][0], GetTime(), why),
+                       "and what the node answers verifies against the address asked for") ? 0 : 1;
+        secp256k1_context_destroy(ctx);
+        btfchat::IdentityClear(alice);
+    }
+
+    // ---- the ration: a chat app may not fill the node by itself
+    {
+        CNode* greedy = new CNode(INVALID_SOCKET, CAddress(), true);
+        HandlerStream gs(greedy);
+        btfchat::NodeLink gl(gs);
+        gl.Handshake(err);
+        btfchat::ChatRecord junk;
+        junk.kind = btfchat::CHATREC_ENVELOPE;
+        junk.key.assign(16, 0);
+        junk.nTime = GetTime();
+        junk.payload.assign(10, 1);
+        for (int i = 0; i < 60; i++)
+            gl.Put(junk, nResult, why, err);
+        btfchat::ChatRecord fine = SelfTestEnvelope(tag, 100);
+        nResult = -1;
+        nFail += Check(gl.Put(fine, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED &&
+                       why.find("slow down") != std::string::npos,
+                       "past sixty records a minute, even a good one is turned away") ? 0 : 1;
+        delete greedy;
+    }
+
+    // ---- the client will not use a node that does not hold chat records
+    {
+        uint64 nSaved = nLocalServices;
+        nLocalServices = NODE_NETWORK;            // what a 1.2.28 node says
+        CNode* old = new CNode(INVALID_SOCKET, CAddress(), true);
+        nLocalServices = nSaved;
+        HandlerStream os(old);
+        btfchat::NodeLink ol(os);
+        bool fShook = ol.Handshake(err);
+        nFail += Check(!fShook && err.find("older release") != std::string::npos,
+                       "a node from before the chat is recognised and not used") ? 0 : 1;
+        delete old;
+    }
+
+    CRITICAL_BLOCK(cs_vNodes)
+    {
+        vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peerChat));
+        vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peerOld));
+    }
+    delete peerChat;
+    delete peerOld;
+    delete app;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// Not part of `make tests`: it needs Tor and the live network. It is the bench
+// proof that the offline mailbox works against real nodes over real Tor, which
+// chat-relay cannot be -- that one runs the node handler in-process.
+//
+// Starts its own Tor in a temp datadir (the bundled one beside the exe, or the
+// tor.exe named by BITFLASH_TOR), then: asks the network for a tag nobody uses,
+// leaves an envelope under a fresh tag, and collects it back. Prints what it
+// reached and why it failed, so a failure says which half broke.
+static int RunChatLiveSelfTest()
+{
+    printf("chat-live self-test (%s, needs Tor and the network)\n", IsTestNet() ? "testnet" : "mainnet");
+    int nFail = 0;
+
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+
+    std::string torPath, err;
+    const char* pszTor = getenv("BITFLASH_TOR");
+    if (pszTor && *pszTor)
+        torPath = pszTor;
+    else if (!BtfBundledTorPath(torPath))
+    {
+        printf("no Tor: put tor/ beside the exe or set BITFLASH_TOR to tor.exe\n");
+        return 1;
+    }
+    if (!BtfStartManagedTor(torPath, err))
+    {
+        printf("Tor did not start: %s\n", err.c_str());
+        return 1;
+    }
+    int64 nStart = GetTime();
+    while (BtfManagedTorBootstrapPercent() < 100 && GetTime() - nStart < 240)
+        Sleep(1000);
+    printf("  Tor bootstrap %d%% after %d s\n", BtfManagedTorBootstrapPercent(), (int)(GetTime() - nStart));
+
+    unsigned char tag[16];
+    RAND_bytes(tag, sizeof(tag));
+    std::string tagHex = HexStr(tag, tag + 16);
+
+    std::vector<std::pair<std::string, int64_t> > ask(1, std::make_pair(tagHex, (int64_t)0));
+    std::map<std::string, std::vector<std::vector<unsigned char> > > got;
+    int64 t0 = GetTime();
+    bool fAsked = btfchat::NetFetchEnvelopes(ask, got, err);
+    printf("  first question: %s in %d s%s%s\n", fAsked ? "answered" : "NOT answered",
+           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+    nFail += Check(fAsked && got[tagHex].empty(),
+                   "a node of this network answers, and has nothing under a tag nobody used") ? 0 : 1;
+
+    std::vector<unsigned char> env(600);
+    RAND_bytes(&env[0], (int)env.size());
+    t0 = GetTime();
+    bool fLeft = btfchat::NetPostEnvelope(tagHex, env, err);
+    printf("  leaving an envelope: %s in %d s%s%s\n", fLeft ? "kept" : "NOT kept",
+           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+    nFail += Check(fLeft, "an envelope is kept by at least one node") ? 0 : 1;
+
+    got.clear();
+    t0 = GetTime();
+    bool fBack = btfchat::NetFetchEnvelopes(ask, got, err) && got[tagHex].size() == 1 &&
+                 got[tagHex][0] == env;
+    printf("  collecting it: %s in %d s%s%s\n", fBack ? "found" : "NOT found",
+           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+    nFail += Check(fBack, "and comes back, byte for byte, from the network") ? 0 : 1;
+
+    size_t nKnown = 0, nGood = 0;
+    btfchat::NetNodeCounts(nKnown, nGood);
+    printf("  nodes known %u, answering %u\n", (unsigned)nKnown, (unsigned)nGood);
+
+    BtfStopManagedTor();
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunChatIdentitySelfTest()
 {
     printf("chat-identity self-test\n");
@@ -5314,8 +5702,12 @@ int RunSelfTest(const std::string& name)
         return RunChatLinkSelfTest();
     if (name == "chat-identity")
         return RunChatIdentitySelfTest();
+    if (name == "chat-relay")
+        return RunChatRelaySelfTest();
+    if (name == "chat-live")
+        return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

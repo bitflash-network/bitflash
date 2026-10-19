@@ -11,6 +11,7 @@
 #endif
 #include "headers.h"
 #include "treasury.h"
+#include "chatrelay.h"  // the chat's records: held, relayed and served here
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -3060,6 +3061,7 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
     case MSG_BLOCK:     return mapBlockIndex.count(inv.hash) || mapOrphanBlocks.count(inv.hash);
     case MSG_REVIEW:    return true;
     case MSG_PRODUCT:   return mapProducts.count(inv.hash);
+    case MSG_CHATREC:   return ChatRelayAlreadyHave(inv);
     }
     // Don't know what it is, just say we already got one
     return true;
@@ -3277,6 +3279,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (!vPexOut.empty())
             pfrom->PushMessage("btfpeers", vPexOut);
 
+        ChatRelayOnVersion(pfrom);
+
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);
     }
 
@@ -3356,6 +3360,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                     block.ReadFromDisk((*mi).second, !pfrom->fClient);
                     pfrom->PushMessage("block", block);
                 }
+            }
+            else if (inv.type == MSG_CHATREC)
+            {
+                // From the chat store, not the relay memory: records live for a
+                // day, the relay memory for fifteen minutes.
+                ChatRelayServeGetData(pfrom, inv);
             }
             else if (inv.IsKnownType())
             {
@@ -3552,6 +3562,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Deliberately no reply. A node old enough not to know "ping" ignores
         // it as an unknown command and would never answer one, so a scheme
         // that required an answer would read every such peer as dead.
+    }
+
+
+    else if (ChatRelayProcessMessage(pfrom, strCommand, vRecv))
+    {
+        // chatrec, chatput, chatget, getchatinv -- see chatrelay.h.
     }
 
 

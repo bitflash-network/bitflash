@@ -1,7 +1,37 @@
 # btfchat — messaging that burns
 
-*Design document, 2026-09-18. Nothing here is implemented yet; the parts that
-exist in the tree are named where they do. Status of each phase is at the end.*
+*Design document, 2026-09-18. The first section says what 1.2.29 actually
+ships; everything after it is the design the shipped part grows into. Status of
+each phase is at the end.*
+
+## What 1.2.29 ships
+
+- **`btfchat`, a program of its own.** No chain, no wallet balance, no mining:
+  a chat that happens to share the coin's network. Its identity is a `.btf`
+  address grown from the same recovery phrase as the wallet, and its onion
+  service is its own, never the node's.
+- **Live messages go straight to the other person**, over Tor, to their chat
+  onion, in a channel keyed by X25519 and ML-KEM together (`btfchan.cpp`) with
+  a key that moves forward on every message.
+- **Offline messages wait in the Bitflash nodes.** Sealed to the recipient's
+  epoch keys (also X25519 + ML-KEM, rotated daily and destroyed after two
+  days), filed under a tag only the two people can compute, held by every
+  node running 1.2.29 or later for about a day (`chatstore.h`,
+  `chatrelay.h`). If no node can take it, the message stays in the sender's
+  own outbox and goes direct the moment the other side is seen online.
+- **Finding someone needs no server.** A chat identity's signed descriptor
+  (its onion and channel key) is held by the same nodes. The chat app reaches
+  them the way a node does: the onion seeds pinned in the binary, then the
+  signed peer lists every node hands out (`btfchatnet.h`). No Nostr relay, no
+  VPS, nothing of ours or anybody's that has to stay up.
+- **Spam costs work, not yet coin.** Every record a node stores carries about
+  a second of proof of work, more for bigger ones; nodes ration each
+  connection and cap the memory the chat may use. The burn stamp below is the
+  real answer and has not shipped.
+
+Not in 1.2.29, all described below: burn stamps, fixed-size envelopes, cover
+traffic, ephemeral onions per conversation, the chain-anchored handshake,
+money inside messages, groups.
 
 ## What it is
 
@@ -174,14 +204,15 @@ and the coin are the same program on a network that only speaks Tor.
 
 ## Phases
 
-| phase | scope | depends on |
-|---|---|---|
-| 0 | `OP_RETURN` standard in relay policy; burn stamp format; `docs` | 1.2.28 (relay policy only, no consensus) |
-| 1 | one-to-one: PQXDH + ratchet + MAC auth, sealed sender, fixed size, burn stamp, chain-anchored handshake, money in messages; wallet tab + RPC | rules v3 shipped; ~3 weeks after |
-| 2 | communities: channels, join/post burns, paid reading, reputation | phase 1 |
-| 3 | cover traffic, ephemeral onions per conversation, node storage market | phase 1 |
-| 4 | groups (MLS, multisig admins) | phase 1; OpenMLS or an equivalent integrated |
-| 5 | Android client | the native app |
+| phase | scope | depends on | status |
+|---|---|---|---|
+| 0 | `OP_RETURN` standard in relay policy; burn stamp format; `docs` | 1.2.28 (relay policy only, no consensus) | shipped in 1.2.28 |
+| 1a | one-to-one over onion; hybrid post-quantum channel; sealed offline envelopes held by the nodes, paid in work; local outbox | 1.2.29 nodes for the offline half | **1.2.29** |
+| 1 | the rest of one-to-one: fixed size, burn stamp, chain-anchored handshake, money in messages; wallet tab + RPC | rules v3 shipped | design |
+| 2 | communities: channels, join/post burns, paid reading, reputation | phase 1 | design |
+| 3 | cover traffic, ephemeral onions per conversation, node storage market | phase 1 | design |
+| 4 | groups (MLS, multisig admins) | phase 1; OpenMLS or an equivalent integrated | design |
+| 5 | Android client | the native app | design |
 
 ## Open questions
 

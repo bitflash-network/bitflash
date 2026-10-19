@@ -6,7 +6,7 @@
 #include "btfchatsock.h"
 #include "btfchatbox.h"
 #include "btfaddr.h"
-#include "nostr.h"
+#include "btfchatnet.h"
 #include "tor.h"
 
 #include <sodium.h>
@@ -16,6 +16,8 @@
 #include <secp256k1.h>
 
 #include <algorithm>
+#include <deque>
+#include <set>
 
 namespace btfchat
 {
@@ -440,13 +442,15 @@ static OutLink* DialPeer(const std::string& peerAddr, std::string& errOut)
         return NULL;
     }
 
-    std::string meeting, onion;
+    std::string onion;
     unsigned char encPub[32];
-    if (!BtfResolve(peerAddr, meeting, encPub, &onion) || onion.empty())
+    if (!NetResolve(peerAddr, onion, encPub, errOut) || onion.empty())
     {
-        // Either nothing is published for that address or it has no onion. From
-        // here the two are the same thing: no way to reach them right now.
-        errOut = "could not find that address on the discovery relays";
+        // Either nothing is published for that address or no node could be
+        // asked. From here the two are the same thing: no way to reach them
+        // right now. NetResolve's reason says which.
+        if (errOut.empty())
+            errOut = "could not find that address on the Bitflash network";
         return NULL;
     }
 
@@ -624,13 +628,8 @@ static bool ResolvePeerStaticChanKey(const std::string& peerAddr,
                                      unsigned char out[btf::CHAN_KEYBYTES],
                                      std::string& errOut)
 {
-    std::string meeting, onion;
-    if (!BtfResolve(peerAddr, meeting, out, &onion))
-    {
-        errOut = "could not find that address on the discovery relays";
-        return false;
-    }
-    return true;
+    std::string onion;
+    return NetResolve(peerAddr, onion, out, errOut);
 }
 
 static bool LeaveInMailbox(const std::string& peerAddr, const Identity& id,
@@ -639,14 +638,14 @@ static bool LeaveInMailbox(const std::string& peerAddr, const Identity& id,
     errOut.clear();
 
     std::string ann;
-    if (!BtfQueryChatEpochKeys(peerAddr, ann, errOut))
+    if (!NetQueryEpochKeys(peerAddr, ann, errOut))
         return false;
 
     int64_t nEpoch = 0;
     unsigned char their_x[btf::CHAN_KEYBYTES];
     unsigned char their_kem[btf::CHAN_KEM_PUBBYTES];
     // Verified against the address we asked for, not the one the answer claims:
-    // otherwise a relay hands back somebody else's valid announcement and the
+    // otherwise a node hands back somebody else's valid announcement and the
     // conversation gets sealed to a stranger.
     if (!VerifyEpochKeys(g_secp, peerAddr, ann, GetTime(), nEpoch, their_x, their_kem, errOut))
         return false;
@@ -674,7 +673,7 @@ static bool LeaveInMailbox(const std::string& peerAddr, const Identity& id,
         errOut = "could not derive the mailbox tag";
         return false;
     }
-    return BtfPostChatEnvelope(tag, env, errOut);
+    return NetPostEnvelope(tag, env, errOut);
 }
 
 bool ChatSendText(const std::string& peerAddr, const std::string& text,
@@ -775,8 +774,8 @@ bool ChatSendText(const std::string& peerAddr, const std::string& text,
 // Send what is waiting for one peer, oldest first.
 //
 // Direct only: the mailbox was already tried once when the message was written,
-// and retrying it here would mean every queued message costs a round of relay
-// connections every couple of minutes. The queue exists for the case where no
+// and retrying it here would mean every queued message costs a round of node
+// connections, and a second of work, every couple of minutes. The queue exists for the case where no
 // third party will hold anything, so it delivers the way this build delivers --
 // their onion, our connection.
 //
@@ -1028,9 +1027,40 @@ static void ThreadChatListener(void* parg)
     printf("btfchat: listener stopped\n");
 }
 
-// Publishes the chat's descriptor on the discovery relays and keeps it fresh.
-// Separate from the node's own publisher, and signed by the chat key, so nothing
-// on a relay ties the two identities together.
+// How far back each poll asks again. See where g_mapPolledUntil is updated.
+static const int64_t MAILBOX_REPOLL_WINDOW = 30 * 60;
+
+// How often our own epoch keys and descriptor go out again when nothing has
+// changed. Nodes keep them for days and hand them to each other; this only
+// covers the ones that restarted in the meantime.
+static const int64_t EPOCH_REPUBLISH_SECS = 6 * 60 * 60;
+static const int DESCRIPTOR_REPUBLISH_SECS = 6 * 60 * 60;
+
+// True the first time a given envelope is seen. Bounded: past the cap the
+// oldest memory goes, and the worst that does is open one envelope twice --
+// which the replay guard then refuses.
+static bool FirstSightOfEnvelope(const std::vector<unsigned char>& env)
+{
+    static CCriticalSection cs_seen;
+    static std::set<std::string> setSeen;
+    static std::deque<std::string> qSeen;
+    unsigned char h[32];
+    crypto_hash_sha256(h, env.empty() ? NULL : &env[0], env.size());
+    std::string k((const char*)h, 32);
+    CRITICAL_BLOCK(cs_seen)
+    {
+        if (!setSeen.insert(k).second)
+            return false;
+        qSeen.push_back(k);
+        while (qSeen.size() > 4096)
+        {
+            setSeen.erase(qSeen.front());
+            qSeen.pop_front();
+        }
+    }
+    return true;
+}
+
 int ChatPollMailboxes(std::string& errOut)
 {
     errOut.clear();
@@ -1057,12 +1087,16 @@ int ChatPollMailboxes(std::string& errOut)
     int64_t nEpochNow = MailboxEpoch(nNow);
     int nDelivered = 0;
 
+    // Every tag we share with every contact, this epoch and the previous one --
+    // a message left at 23:59 is collected at 00:01, and MAILBOX_KEEP_EPOCHS is
+    // what makes both openable. All of them go to the network in one round:
+    // each round is a Tor circuit to a node, and asking per tag would be a
+    // circuit per contact per epoch, which is both slow and countable.
+    std::vector<std::pair<std::string, int64_t> > vTagSince;
     for (size_t i = 0; i < contacts.size() && !fShutdown; i++)
     {
-        // This epoch and the previous one: a message left at 23:59 is collected
-        // at 00:01, and MAILBOX_KEEP_EPOCHS is what makes both openable.
-        // Resolved once per contact, not once per epoch: it is a relay round
-        // trip over Tor, and the answer is the same both times through.
+        // The static key comes from the contact's descriptor, and is cached:
+        // asking the network again every two minutes would teach it nothing.
         unsigned char their_pub[btf::CHAN_KEYBYTES];
         std::string errResolve;
         if (!ResolvePeerStaticChanKey(contacts[i], their_pub, errResolve))
@@ -1070,10 +1104,9 @@ int ChatPollMailboxes(std::string& errOut)
 
         for (int back = 0; back < (int)MAILBOX_KEEP_EPOCHS; back++)
         {
-            std::string tag, err;
+            std::string tag;
             if (!MailboxTag(id.chan_sk, their_pub, nEpochNow - back, tag))
                 break;
-
             int64_t nSince = 0;
             CRITICAL_BLOCK(cs_chat)
             {
@@ -1081,13 +1114,32 @@ int ChatPollMailboxes(std::string& errOut)
                 if (it != g_mapPolledUntil.end())
                     nSince = it->second;
             }
+            vTagSince.push_back(std::make_pair(tag, nSince));
+        }
+    }
 
-            std::vector<std::vector<unsigned char> > envs;
-            if (!BtfFetchChatEnvelopes(tag, nSince, envs, err))
-                continue;
+    std::map<std::string, std::vector<std::vector<unsigned char> > > mapEnvs;
+    std::string errFetch;
+    if (vTagSince.empty() || !NetFetchEnvelopes(vTagSince, mapEnvs, errFetch))
+    {
+        if (!errFetch.empty())
+            LogPrint("btfchat", "btfchat: mailbox not collected: %s\n", errFetch.c_str());
+        IdentityClear(id);
+        return 0;
+    }
 
+    for (size_t t = 0; t < vTagSince.size() && !fShutdown; t++)
+    {
+        const std::string& tag = vTagSince[t].first;
+        {
+            const std::vector<std::vector<unsigned char> >& envs = mapEnvs[tag];
             for (size_t k = 0; k < envs.size(); k++)
             {
+                // Each envelope is asked for again for a while after it
+                // arrives (see the window below); open it once.
+                if (!FirstSightOfEnvelope(envs[k]))
+                    continue;
+
                 std::vector<unsigned char> plain;
                 std::string e2;
                 // Our own posts under the shared tag fail to open, which is
@@ -1123,8 +1175,12 @@ int ChatPollMailboxes(std::string& errOut)
                     LogPrint("btfchat", "btfchat: mailbox frame refused: %s\n", reason.c_str());
             }
 
+            // Not "until now": an envelope carries its sender's clock, and it
+            // may reach the node we ask after we asked. Asking again for the
+            // last half hour costs a few duplicates, which FirstSightOfEnvelope
+            // drops, instead of a message nobody ever collects.
             CRITICAL_BLOCK(cs_chat)
-                g_mapPolledUntil[tag] = nNow;
+                g_mapPolledUntil[tag] = nNow - MAILBOX_REPOLL_WINDOW;
         }
     }
 
@@ -1150,25 +1206,41 @@ static void ThreadChatMailbox(void* parg)
                     if (g_fUnlocked)
                         g_mailbox.Rotate(GetTime(), err);
 
+                // Published when the epoch turns, and again every few hours in
+                // case the nodes holding it restarted and forgot. Not every
+                // round: each publish costs a second of work, and the nodes
+                // already pass it to each other.
+                static int64_t nPublishedEpoch = -1;
+                static int64_t nPublishedAt = 0;
+                int64_t nEpochNow = MailboxEpoch(GetTime());
+                bool fDue = (nEpochNow != nPublishedEpoch) ||
+                            (GetTime() - nPublishedAt > EPOCH_REPUBLISH_SECS);
+
                 EpochKeys pub;
                 Identity id;
                 bool fHave = false;
-                CRITICAL_BLOCK(cs_chat)
-                    if (g_fUnlocked)
-                    {
-                        pub.epoch = MailboxEpoch(GetTime());
-                        if (g_mailbox.PublicFor(pub.epoch, pub.x_pk, pub.kem_pk))
+                if (fDue)
+                    CRITICAL_BLOCK(cs_chat)
+                        if (g_fUnlocked)
                         {
-                            id = g_id;
-                            fHave = true;
+                            pub.epoch = nEpochNow;
+                            if (g_mailbox.PublicFor(pub.epoch, pub.x_pk, pub.kem_pk))
+                            {
+                                id = g_id;
+                                fHave = true;
+                            }
                         }
-                    }
                 if (fHave)
                 {
                     std::string ann;
                     if (SignEpochKeys(g_secp, id, pub, ann, err))
                     {
-                        if (!BtfPublishChatEpochKeys(id.sign_sk, ann, err))
+                        if (NetPublishEpochKeys(id.address, ann, pub.epoch, err))
+                        {
+                            nPublishedEpoch = pub.epoch;
+                            nPublishedAt = GetTime();
+                        }
+                        else
                             LogPrint("btfchat", "btfchat: epoch keys not published: %s\n",
                                      err.c_str());
                     }
@@ -1190,7 +1262,7 @@ static void ThreadChatMailbox(void* parg)
 
             // Two minutes between full rounds. Polling harder buys latency for
             // somebody who is offline anyway, and every poll is a Tor circuit to
-            // a relay -- which is traffic a watcher can count.
+            // a node -- which is traffic a watcher can count.
             //
             // The queue is different: it costs one connection to somebody we
             // already know is up, and waiting two minutes to answer a person who
@@ -1213,12 +1285,16 @@ static void ThreadChatMailbox(void* parg)
     catch (...)               { PrintException(NULL, "ThreadChatMailbox()"); }
 }
 
+// Publishes the chat's descriptor on the Bitflash network and keeps it fresh.
+// Signed by the chat key, never the node's, and sent over Tor like everything
+// else the chat does, so nothing a node holds ties the two identities together.
 static void ThreadChatPublish(void* parg)
 {
     IMPLEMENT_RANDOMIZE_STACK(ThreadChatPublish(parg));
     try
     {
         bool fEverPublished = false;
+        bool fLastFailed = false;
         while (!fShutdown)
         {
             std::string onion = BtfManagedTorChatOnion();
@@ -1241,14 +1317,16 @@ static void ThreadChatPublish(void* parg)
                     for (int i = 0; i < 32; i++)
                     { hex += h[encpub[i] >> 4]; hex += h[encpub[i] & 0x0f]; }
 
-                    if (BtfPublishChatDescriptor(sk, hex, onion, err))
+                    if (NetPublishDescriptor(sk, hex, onion, err))
                     {
                         fEverPublished = true;
+                        fLastFailed = false;
                         CRITICAL_BLOCK(cs_chat)
                             g_status = "reachable at " + onion;
                     }
                     else
                     {
+                        fLastFailed = true;
                         CRITICAL_BLOCK(cs_chat)
                             g_status = "listening, not yet published: " + err;
                     }
@@ -1261,13 +1339,17 @@ static void ThreadChatPublish(void* parg)
                     g_status = "waiting for the chat onion service";
             }
 
-            // Twenty minutes once it is out there -- the descriptor is a
-            // replaceable event and relays forget. Ten seconds until then: on a
-            // fresh start the chat's onion service does not exist yet, and
-            // waiting twenty minutes to discover that it now does would leave the
-            // user sitting in front of a chat nobody can reach, with nothing on
-            // screen explaining the wait.
-            int nWait = fEverPublished ? 20 * 60 : 10;
+            // Hours once it is out there: the nodes keep a descriptor for a week
+            // and pass it to each other, so this only covers nodes that
+            // restarted. Ten seconds while the onion service does not exist yet
+            // -- on a fresh start it takes a moment, and waiting long to notice
+            // it now does would leave the user in front of a chat nobody can
+            // reach with nothing on screen explaining why. A minute after a
+            // failed publish: each try costs a second of work and a few Tor
+            // circuits, and no node answering is not fixed by asking faster.
+            int nWait = !fEverPublished && !fLastFailed ? 10
+                      : fLastFailed                     ? 60
+                      :                                   DESCRIPTOR_REPUBLISH_SECS;
             for (int i = 0; i < nWait && !fShutdown; i++)
                 Sleep(1000);
         }

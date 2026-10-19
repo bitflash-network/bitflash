@@ -14,6 +14,7 @@
 #define SECP256K1_STATIC
 #endif
 #include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
 
 #include <cstdio>
 #include <cstring>
@@ -241,25 +242,78 @@ int main()
         CHECK(st.Count() == 0 && st.Bytes(CHATREC_ENVELOPE) == 0, "and accounts the memory back");
     }
 
-    printf("the_memory_budget_drops_the_oldest\n");
+    printf("a_full_store_refuses_new_records_and_keeps_what_it_holds\n");
     {
         ChatStore st(TEST_BITS);
         size_t nEach = CHATREC_MAX_PAYLOAD;
         size_t n = CHATREC_ENVELOPE_BUDGET / nEach + 8;
+        size_t nKept = 0, nRefusedFull = 0;
         for (size_t i = 0; i < n; i++)
         {
             std::vector<unsigned char> tag = Bytes(16, 0);
             tag[0] = (unsigned char)i; tag[1] = (unsigned char)(i >> 8);
-            st.Accept(ctx, Envelope(tag, NOW - 10000 + (int64_t)i, nEach, (unsigned char)i), NOW, err, id);
+            ChatStore::Result res = st.Accept(ctx, Envelope(tag, NOW - 10000 + (int64_t)i, nEach, (unsigned char)i),
+                                              NOW, err, id);
+            if (res == ChatStore::ACCEPTED) nKept++;
+            else if (err.find("full") != std::string::npos) nRefusedFull++;
         }
         CHECK(st.Bytes(CHATREC_ENVELOPE) <= CHATREC_ENVELOPE_BUDGET, "the store never goes over budget");
+        CHECK(nKept > 0 && nRefusedFull > 0 && nKept + nRefusedFull == n,
+              "once full, every further record is refused as 'full' -- none is silently dropped");
         std::vector<unsigned char> first = Bytes(16, 0), last = Bytes(16, 0);
         last[0] = (unsigned char)(n - 1); last[1] = (unsigned char)((n - 1) >> 8);
         std::vector<ChatRecord> q;
         st.Query(CHATREC_ENVELOPE, first, 0, 64, q);
-        CHECK(q.empty(), "the oldest went first");
+        CHECK(q.size() == 1, "the first envelope held is still held: a flood erases nothing");
         st.Query(CHATREC_ENVELOPE, last, 0, 64, q);
-        CHECK(q.size() == 1, "and the newest is still there");
+        CHECK(q.empty(), "the one that did not fit was the one refused");
+
+        // Expiry is what makes room again.
+        st.Expire(NOW + CHATREC_ENVELOPE_LIFETIME - 10000 + 5);
+        CHECK(st.Accept(ctx, Envelope(last, NOW + CHATREC_ENVELOPE_LIFETIME - 9000, 100, 1),
+                        NOW + CHATREC_ENVELOPE_LIFETIME - 9000, err, id) == ChatStore::ACCEPTED,
+              "and once the oldest expire, new records fit again");
+    }
+
+    printf("a_full_identity_store_still_lets_an_identity_replace_its_own\n");
+    {
+        // A flood of new identities must not stop an existing one from
+        // publishing its next descriptor: replacing frees the old one's room.
+        ChatStore st(TEST_BITS);
+        ChatRecord d1 = Desc(ctx, alice, NOW - 3600, ONION);
+        CHECK(st.Accept(ctx, d1, NOW, err, id) == ChatStore::ACCEPTED, "alice is held");
+        // Throwaway identities straight from random keys: deriving them from a
+        // phrase stretches a password each time, and thousands of those would
+        // take minutes to test one rule.
+        size_t nFill = 0;
+        ChatStore::Result res = ChatStore::ACCEPTED;
+        for (int i = 0; i < 50000 && res != ChatStore::REJECTED; i++)
+        {
+            unsigned char sk[32];
+            do { randombytes_buf(sk, 32); } while (!secp256k1_ec_seckey_verify(ctx, sk));
+            secp256k1_keypair kp;
+            secp256k1_xonly_pubkey xp;
+            unsigned char pk[32];
+            secp256k1_keypair_create(ctx, &kp, sk);
+            secp256k1_keypair_xonly_pub(ctx, &xp, NULL, &kp);
+            secp256k1_xonly_pubkey_serialize(ctx, pk, &xp);
+            ChatRecord r;
+            r.kind = CHATREC_DESC;
+            r.key.assign(pk, pk + 32);
+            r.nTime = NOW - 100;
+            std::string d = btf::SignDescriptor(ctx, sk, std::string(64, 'a'), "", (uint64_t)r.nTime, ONION);
+            r.payload.assign(d.begin(), d.end());
+            ChatRecordMine(r, 0, TEST_BITS);
+            res = st.Accept(ctx, r, NOW, err, id);
+            if (res == ChatStore::ACCEPTED)
+                nFill++;
+        }
+        CHECK(res == ChatStore::REJECTED && err.find("full") != std::string::npos,
+              "with the budget spent, a new identity is refused");
+        ChatRecord d2 = Desc(ctx, alice, NOW - 60, ONION);
+        CHECK(st.Accept(ctx, d2, NOW, err, id) == ChatStore::ACCEPTED,
+              "but alice can still replace her own descriptor");
+        printf("       (%u descriptors to fill %u bytes)\n", (unsigned)nFill, (unsigned)CHATREC_DESC_BUDGET);
     }
 
     printf("descriptors_must_be_signed_by_their_key_and_newest_wins\n");

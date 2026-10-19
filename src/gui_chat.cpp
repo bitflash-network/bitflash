@@ -22,6 +22,7 @@
 #include "headers.h"
 #include "gui_chat.h"
 #include "btfchatnode.h"
+#include "btfchatnet.h"
 #include "tor.h"
 
 #include "imgui.h"
@@ -779,7 +780,12 @@ void DrawChainStrip()
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     // Said plainly, because a chat with no chain is the kind of thing a user
     // should be told rather than left to infer from a missing number.
-    ImGui::TextUnformatted("no chain - relays and onion only");
+    {
+        size_t nKnown = 0, nGood = 0;
+        btfchat::NetNodeCounts(nKnown, nGood);
+        ImGui::Text("no chain - %u node%s answering, onion only",
+                    (unsigned)nGood, nGood == 1 ? "" : "s");
+    }
     ImGui::PopStyleColor();
 
     ImGui::End();

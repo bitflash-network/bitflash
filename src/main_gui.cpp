@@ -123,9 +123,10 @@ static void PrintUsage()
     printf("btfchat -- the Bitflash chat, as its own program\n");
     printf("\n");
     printf("It carries no chain and runs no peer-to-peer node. It reaches the network\n");
-    printf("through two doors, both over Tor: the discovery relays, to look an address\n");
-    printf("up, and the other person's onion service, to talk. Its data directory,\n");
-    printf("wallet, keys and onion address are its own -- never the miner's.\n");
+    printf("through two doors, both over Tor: the Bitflash nodes, to look an address up\n");
+    printf("and to leave messages for people who are offline, and the other person's\n");
+    printf("onion service, to talk. No server of anybody's is involved. Its data\n");
+    printf("directory, wallet, keys and onion address are its own -- never the miner's.\n");
     printf("\n");
     printf("General:\n");
     printf("  /help, -help, --help, /?\n");
@@ -183,7 +184,8 @@ static void PrintUsage()
     // reading the source. Kept in step now; a suite that cannot be discovered is
     // a suite that stops being run.
     printf("            wallet-sqlite-encrypt, wallet-backend-default, wallet-convert,\n");
-    printf("            managed-tor, treasury, chat-link, or chat-identity\n");
+    printf("            managed-tor, treasury, chat-link, chat-identity, chat-relay,\n");
+    printf("            or chat-live (needs Tor and the network; not run by `make tests`)\n");
     printf("\n");
     printf("Mining mode:\n");
     printf("  /operator\n");
@@ -1399,12 +1401,13 @@ int main(int argc, char* argv[])
 #ifdef BITFLASH_CHAT_APP
     // No P2P node either: with no chain there is nothing to download, nothing to
     // relay and nothing to announce. btfchat reaches the network through exactly
-    // two doors, both over Tor -- the Nostr relays, to look an address up, and
-    // the other person's onion, to talk. Fewer doors is the point.
+    // two doors, both over Tor -- the Bitflash nodes' onions, to look an address
+    // up and use the mailbox (btfchatnet.h), and the other person's onion, to
+    // talk. Fewer doors is the point.
     //
     // ReacceptWalletTransactions is skipped for the same reason: it walks the
     // chain to re-announce our own transactions, and there is no chain to walk.
-    printf("btfchat: no peer-to-peer node -- relays over Tor to resolve, onion to talk\n");
+    printf("btfchat: no peer-to-peer node -- Bitflash nodes over Tor to resolve, onion to talk\n");
 #else
     ReacceptWalletTransactions();
 

@@ -97,63 +97,6 @@ std::string BtfLocalDescriptor();
 // void* to keep headers free of secp). NULL if the identity failed to load.
 void* BtfSecpContext();
 
-// ---- btfchat: epoch keys and the offline mailbox ----------------------------
-//
-// NOTHING BELOW TRUSTS THE RELAY, and none of it verifies the Nostr event
-// signature either -- deliberately, following the descriptor's pattern. What is
-// checked is the CONTENT: an epoch-keys announcement carries its own signature
-// from the chat identity, and an envelope is sealed to the recipient's epoch
-// keys. A relay that forges, edits or injects produces something that fails to
-// verify or fails to open. That is what makes the relay a dumb pipe instead of a
-// party you have to trust.
-
-// Publish this chat identity's current epoch keys, so people can seal offline
-// messages to it. `annJson` is what btfchat::SignEpochKeys produced: already
-// signed, and verified by the reader against the address it asked for.
-// Parameterized-replaceable, so each identity has exactly one current set.
-bool BtfPublishChatEpochKeys(const unsigned char sign_sk[32],
-                             const std::string& annJson,
-                             std::string& errOut);
-
-// Fetch the epoch-keys announcement for a chat address. The caller passes it to
-// btfchat::VerifyEpochKeys, which is where it is actually checked.
-bool BtfQueryChatEpochKeys(const std::string& chatAddr,
-                           std::string& annJsonOut,
-                           std::string& errOut);
-
-// Leave a sealed envelope under a mailbox tag.
-//
-// Signed by a FRESH key generated for this one post and thrown away. The relay
-// sees an author it has never seen before and will never see again, so nothing
-// links one post to another, or to the identity that made it. Who wrote the
-// message is inside the envelope, signed, for the recipient alone.
-bool BtfPostChatEnvelope(const std::string& tagHex,
-                         const std::vector<unsigned char>& envelope,
-                         std::string& errOut);
-
-// Collect envelopes left under a tag. `nSince` bounds how far back to ask, and
-// the count is capped: this is a stranger's answer to a query, so it is not
-// allowed to decide how much memory to spend.
-bool BtfFetchChatEnvelopes(const std::string& tagHex, int64 nSince,
-                           std::vector<std::vector<unsigned char> >& out,
-                           std::string& errOut);
-
-// Publish a .btf descriptor for an identity that is NOT this node's -- the
-// chat's. The chat has its own key, its own address and its own onion service
-// precisely so that being reachable for a conversation does not say which node
-// mines, so its descriptor cannot be signed by the node key: a relay could then
-// tie the two together from the signature alone, which is the whole thing being
-// avoided.
-//
-// The event is the same kind and `d` tag as a node descriptor. Nostr keys
-// replaceable events by (pubkey, kind, d), and this is a different pubkey, so
-// the two never overwrite each other -- and BtfResolve, which looks descriptors
-// up by author, finds this one with no change at all.
-bool BtfPublishChatDescriptor(const unsigned char sign_sk[32],
-                              const std::string& encPubHex,
-                              const std::string& onionEndpoint,
-                              std::string& errOut);
-
 // Resolve a .btf address via the public discovery relays: fetch the owner's
 // self-certified descriptor and return its meeting node ("host:port") and
 // x25519 public key for the end-to-end channel.
