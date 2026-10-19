@@ -32,7 +32,7 @@ namespace community
 {
 
 static const size_t KEY_BYTES = 32;
-static const size_t NAME_MAX  = 32;
+static const size_t MAX_NAME_LEN  = 32;
 
 // What a listing must burn to be shown: 0.01 BTF.
 static const int64_t MIN_BURN = 1000000;

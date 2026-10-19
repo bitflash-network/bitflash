@@ -27,7 +27,7 @@ static std::string Hex(const unsigned char* p, size_t n)
 
 bool NameOk(const std::string& name)
 {
-    if (name.empty() || name.size() > NAME_MAX)
+    if (name.empty() || name.size() > MAX_NAME_LEN)
         return false;
     for (size_t i = 0; i < name.size(); i++)
     {
@@ -60,7 +60,7 @@ bool ParseListing(const std::vector<unsigned char>& s, unsigned char keyOut[KEY_
     if (n < 1 || n > 75 || s.size() != 2 + n)
         return false;
     const unsigned char* d = &s[2];
-    if (n < 38 + 1 || n > 38 + NAME_MAX)
+    if (n < 38 + 1 || n > 38 + MAX_NAME_LEN)
         return false;
     if (memcmp(d, MAGIC, 4) != 0 || d[4] != VERSION || d[5] != PURPOSE_PUBLIC_COMMUNITY)
         return false;

@@ -284,7 +284,7 @@ std::string Message()
 struct PayStatus
 {
     bool    fKnown;     // our wallet has seen the transaction
-    int64   nReceived;  // what of it came to us
+    int64_t nReceived;  // what of it came to us
     int     nConf;
     PayStatus() : fKnown(false), nReceived(0), nConf(0) {}
 };
@@ -967,7 +967,7 @@ void DrawConversation()
         walletStatus = g_walletStatus;
     }
     std::string theirAddr;
-    int64 nAsked = 0;
+    int64_t nAsked = 0;
     bool fCanPay = btfchat::ChatPeerPayAddress(g_selected, theirAddr, nAsked);
     if (nAsked > 0 && g_payAmountBuf[0] == 0)
         snprintf(g_payAmountBuf, sizeof(g_payAmountBuf), "%s", FormatMoney(nAsked).c_str());

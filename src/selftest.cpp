@@ -4678,7 +4678,7 @@ static int RunChatWalletSelfTest()
     std::string txid;
     nFail += Check(!btfchat::WalletPay(addr, COIN, txid, err) && !err.empty(),
                    "paying from an empty wallet fails, and says why") ? 0 : 1;
-    int64 nRecv = 0;
+    int64_t nRecv = 0;
     int nConf = 0;
     nFail += Check(!btfchat::WalletLookup(std::string(64, '1'), nRecv, nConf, err),
                    "a transaction the wallet never saw is not reported as received") ? 0 : 1;
