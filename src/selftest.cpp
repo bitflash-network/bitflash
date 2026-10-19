@@ -4608,6 +4608,255 @@ static int RunMultisigSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// One signature by `key` over input nIn of tx, against scriptCode, SIGHASH_ALL.
+static std::vector<unsigned char> SelfTestSign(CKey& key, const CScript& scriptCode,
+                                               const CTransaction& tx, unsigned int nIn)
+{
+    uint256 hash = SignatureHash(scriptCode, tx, nIn, SIGHASH_ALL);
+    std::vector<unsigned char> sig;
+    key.Sign(hash, sig);
+    sig.push_back((unsigned char)SIGHASH_ALL);
+    return sig;
+}
+
+// Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
+// enforced, and the hash-time-locked script an atomic swap is made of. The
+// rules are driven here through their flags, not the activation time, so the
+// suite checks the rule itself whatever date consensus.h holds.
+static int RunRulesV3SelfTest()
+{
+    printf("rules-v3 self-test\n");
+    int nFail = 0;
+
+    CKey keyA, keyB;
+    keyA.MakeNewKey();
+    keyB.MakeNewKey();
+
+    // ---- the opcode
+    nFail += Check(std::string(GetOpName(OP_CHECKLOCKTIMEVERIFY)) == "OP_CHECKLOCKTIMEVERIFY" &&
+                   OP_CHECKLOCKTIMEVERIFY == 0xb1,
+                   "OP_CHECKLOCKTIMEVERIFY is 0xb1, the byte Bitcoin uses") ? 0 : 1;
+
+    // A bare lock script: <lock> CLTV DROP <A> CHECKSIG
+    const int64 LOCK = 1000;
+    CScript lockScript;
+    lockScript << LOCK << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+    CScript p2shLock;
+    p2shLock.SetPayToScriptHash(lockScript);
+
+    CTransaction txFrom;
+    txFrom.vout.push_back(CTxOut(5 * COIN, p2shLock));
+    CTransaction t;
+    t.vin.resize(1);
+    t.vin[0].prevout = COutPoint(txFrom.GetHash(), 0);
+    t.vin[0].nSequence = 0;
+    t.vout.push_back(CTxOut(5 * COIN - CENT, CScript() << keyA.GetPubKey() << OP_CHECKSIG));
+
+    struct Spend
+    {
+        static bool Ok(CKey& key, const CScript& redeem, const CTransaction& from, CTransaction tx,
+                       bool fV3)
+        {
+            tx.vin[0].scriptSig = CScript();
+            std::vector<unsigned char> sig = SelfTestSign(key, redeem, tx, 0);
+            tx.vin[0].scriptSig << sig << static_cast<std::vector<unsigned char> >(redeem);
+            return VerifySignature(from, tx, 0, 0, true, fV3);
+        }
+    };
+
+    t.nLockTime = LOCK;
+    nFail += Check(Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a spend whose nLockTime reaches the lock verifies under rules v3") ? 0 : 1;
+    {
+        // Run as a bare script, where the opcode actually executes either way.
+        CTransaction tb = t;
+        std::vector<unsigned char> sig = SelfTestSign(keyA, lockScript, tb, 0);
+        CScript run = CScript() << sig << OP_CODESEPARATOR;
+        run += lockScript;
+        nFail += Check(EvalScript(run, tb, 0, 0, NULL, true, true) &&
+                       !EvalScript(run, tb, 0, 0, NULL, true, false),
+                       "the same lock script fails before rules v3: the opcode is unknown there") ? 0 : 1;
+    }
+    t.nLockTime = LOCK - 1;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "one block short of the lock is refused") ? 0 : 1;
+    t.nLockTime = LOCKTIME_THRESHOLD + 5;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a time in nLockTime does not satisfy a height lock") ? 0 : 1;
+    t.nLockTime = LOCK;
+    t.vin[0].nSequence = UINT_MAX;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a final input (which switches nLockTime off) is refused") ? 0 : 1;
+    t.vin[0].nSequence = 0;
+    nFail += Check(!Spend::Ok(keyB, lockScript, txFrom, t, true),
+                   "the right time with the wrong key is refused") ? 0 : 1;
+
+    // A time lock, and the wrong unit the other way round
+    {
+        const int64 TLOCK = (int64)LOCKTIME_THRESHOLD + 100000;
+        CScript ts;
+        ts << TLOCK << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(ts);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.nLockTime = (unsigned int)TLOCK;
+        nFail += Check(Spend::Ok(keyA, ts, from, s, true), "a time lock is met by an nLockTime past it") ? 0 : 1;
+        s.nLockTime = 1000;
+        nFail += Check(!Spend::Ok(keyA, ts, from, s, true), "and not by a height") ? 0 : 1;
+    }
+
+    // Malformed locks
+    {
+        CScript neg;
+        neg << (int64)-1 << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(neg);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        nFail += Check(!Spend::Ok(keyA, neg, from, s, true), "a negative lock is refused") ? 0 : 1;
+
+        CScript big;
+        big << std::vector<unsigned char>(6, 0x01) << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p2; p2.SetPayToScriptHash(big);
+        CTransaction from2; from2.vout.push_back(CTxOut(COIN, p2));
+        s.vin[0].prevout = COutPoint(from2.GetHash(), 0);
+        s.nLockTime = UINT_MAX - 1;
+        nFail += Check(!Spend::Ok(keyA, big, from2, s, true), "a lock longer than five bytes is refused") ? 0 : 1;
+
+        CScript empty;
+        empty << OP_CHECKLOCKTIMEVERIFY;
+        CTransaction s2 = t;
+        nFail += Check(!EvalScript(empty, s2, 0, 0, NULL, true, true), "CLTV on an empty stack fails") ? 0 : 1;
+    }
+
+    // ---- lock-time finality in blocks
+    {
+        CTransaction f = t;
+        f.nLockTime = 100;
+        f.vin[0].nSequence = 0;
+        nFail += Check(!f.IsFinalAt(100, 0), "nLockTime 100 cannot be in block 100") ? 0 : 1;
+        nFail += Check(f.IsFinalAt(101, 0), "and can be in block 101") ? 0 : 1;
+        f.nLockTime = LOCKTIME_THRESHOLD + 50;
+        nFail += Check(!f.IsFinalAt(1000000, LOCKTIME_THRESHOLD + 50), "a time lock waits for the median time to pass it") ? 0 : 1;
+        nFail += Check(f.IsFinalAt(1, LOCKTIME_THRESHOLD + 51), "and is final once it has") ? 0 : 1;
+        f.vin[0].nSequence = UINT_MAX;
+        nFail += Check(f.IsFinalAt(1, 0), "every input final makes the lock time irrelevant") ? 0 : 1;
+        f.nLockTime = 0;
+        f.vin[0].nSequence = 0;
+        nFail += Check(f.IsFinalAt(0, 0), "nLockTime 0 is always final") ? 0 : 1;
+    }
+
+    // ---- BIP16 enforced
+    {
+        CScript redeem; redeem << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(redeem);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.nLockTime = 0;
+        s.vin[0].scriptSig = CScript() << static_cast<std::vector<unsigned char> >(redeem);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, false),
+                       "before rules v3 the redeem script alone spends a script hash (anyone-can-spend)") ? 0 : 1;
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true),
+                       "under rules v3 it does not: the redeem script runs, and wants a signature") ? 0 : 1;
+        nFail += Check(Spend::Ok(keyA, redeem, from, s, true), "with the signature it spends") ? 0 : 1;
+        nFail += Check(GetP2SHSigOpCount(CScript() << std::vector<unsigned char>(1, 0) <<
+                                         static_cast<std::vector<unsigned char> >(redeem)) == 1,
+                       "the redeem script's CHECKSIG is counted against the block") ? 0 : 1;
+    }
+
+    // ---- the atomic swap: a hash-time-locked contract
+    //
+    // B gets the coins by showing the secret whose SHA-256 is in the script;
+    // A gets them back after the lock if B never did. The same script, byte for
+    // byte, is what the Bitcoin side of the swap uses.
+    {
+        std::vector<unsigned char> secret(32);
+        RAND_bytes(&secret[0], 32);
+        std::vector<unsigned char> hash(32);
+        SHA256(&secret[0], secret.size(), &hash[0]);
+        const int64 REFUND_AT = 2000;
+
+        CScript htlc;
+        htlc << OP_IF
+                 << OP_SHA256 << hash << OP_EQUALVERIFY << keyB.GetPubKey() << OP_CHECKSIG
+             << OP_ELSE
+                 << REFUND_AT << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG
+             << OP_ENDIF;
+        CScript p; p.SetPayToScriptHash(htlc);
+        CTransaction from; from.vout.push_back(CTxOut(10 * COIN, p));
+        CTransaction s;
+        s.vin.resize(1);
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.vout.push_back(CTxOut(10 * COIN - CENT, CScript() << keyB.GetPubKey() << OP_CHECKSIG));
+
+        // claim: <sigB> <secret> TRUE <htlc>
+        s.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigB = SelfTestSign(keyB, htlc, s, 0);
+        s.vin[0].scriptSig << sigB << secret << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, true), "B claims with the secret") ? 0 : 1;
+        nFail += Check(s.vin[0].scriptSig.IsPushOnly(), "and the claim is push-only, as relay requires") ? 0 : 1;
+
+        std::vector<unsigned char> wrong = secret;
+        wrong[0] ^= 1;
+        s.vin[0].scriptSig = CScript() << sigB << wrong << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true), "a wrong secret is refused") ? 0 : 1;
+
+        std::vector<unsigned char> sigAc = SelfTestSign(keyA, htlc, s, 0);
+        s.vin[0].scriptSig = CScript() << sigAc << secret << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true), "the secret is no use to anybody but B") ? 0 : 1;
+
+        // refund: <sigA> FALSE <htlc>, needs nLockTime >= REFUND_AT and a non-final input
+        CTransaction r = s;
+        r.vout[0] = CTxOut(10 * COIN - CENT, CScript() << keyA.GetPubKey() << OP_CHECKSIG);
+        r.vin[0].nSequence = 0;
+        r.nLockTime = REFUND_AT;
+        r.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigA = SelfTestSign(keyA, htlc, r, 0);
+        r.vin[0].scriptSig << sigA << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, r, 0, 0, true, true), "A takes the refund once the lock has passed") ? 0 : 1;
+        nFail += Check(!r.IsFinalAt(REFUND_AT, 0) && r.IsFinalAt(REFUND_AT + 1, 0),
+                       "and no block before the lock height can contain that refund") ? 0 : 1;
+
+        CTransaction early = r;
+        early.nLockTime = REFUND_AT - 1;
+        early.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigE = SelfTestSign(keyA, htlc, early, 0);
+        early.vin[0].scriptSig << sigE << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, early, 0, 0, true, true), "a refund dated before the lock is refused") ? 0 : 1;
+
+        CTransaction stolen = r;
+        stolen.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigX = SelfTestSign(keyB, htlc, stolen, 0);
+        stolen.vin[0].scriptSig << sigX << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, stolen, 0, 0, true, true), "B cannot take the refund path") ? 0 : 1;
+
+        // Before rules v3 the script hash is not enforced at all -- anybody
+        // holding the script spends it, no secret, no signature. That is the
+        // whole reason the wallet refuses to pay to one until the switch.
+        CTransaction anyone = s;
+        anyone.vin[0].scriptSig = CScript() << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, anyone, 0, 0, true, false) &&
+                       !VerifySignature(from, anyone, 0, 0, true, true),
+                       "before rules v3 a swap output is anyone-can-spend; under them it is not") ? 0 : 1;
+    }
+
+    // ---- relay before activation
+    {
+        CTransaction pay;
+        pay.vin.resize(1);
+        pay.vout.push_back(CTxOut(COIN, p2shLock));
+        nFail += Check(RulesV3Active((unsigned int)GetAdjustedTime()) || !pay.IsStandard(),
+                       "while rules v3 are not active, paying to a script hash is not relayed") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // The treasury: the script the keys in treasury.cpp make, what pays it, and
 // the coinbase split. Runs against both networks' tables; mainnet may be
 // unconfigured, and then everything that would pay it must say so.
@@ -5727,6 +5976,8 @@ int RunSelfTest(const std::string& name)
         return RunChatIdentitySelfTest();
     if (name == "chat-relay")
         return RunChatRelaySelfTest();
+    if (name == "rules-v3")
+        return RunRulesV3SelfTest();
     if (name == "chat-live")
         return RunChatLiveSelfTest();
 

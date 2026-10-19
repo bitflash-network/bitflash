@@ -293,6 +293,12 @@ void GetPoolOperatorStats(int& authorizedMiners, int& blocksFound, uint64& round
 void GetPoolWorkerStats(std::vector<PoolWorkerStatView>& out);
 void GetPendingPayouts(std::vector<PendingPayoutView>& out);
 bool ProcessMessages(CNode* pfrom);
+// May this transaction go in the block being built on the current tip? Under
+// rules v3, CTransaction::IsFinalAt at the next height and the tip's median
+// time past; before, the old rule. Every block builder asks this, so none of
+// them can produce a block that AcceptBlock would refuse.
+class CTransaction;
+bool IsFinalForNextBlock(const CTransaction& tx);
 // pnDoS, when given, receives the misbehavior score a failure is worth: 0 for
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
@@ -714,6 +720,30 @@ public:
         return true;
     }
 
+    // Rules v3: may this transaction be in a block at nBlockHeight, whose
+    // median time past is nBlockTime? Bitcoin's rule: an nLockTime below
+    // LOCKTIME_THRESHOLD is a height, at or above it a unix time, and the
+    // transaction is final once the block is past it -- or when every input
+    // says so with a final nSequence.
+    //
+    // The 0.1.0 rule above was only ever applied by the miner and the wallet:
+    // no block was ever refused for a transaction that was not final, so
+    // nLockTime meant nothing to the chain. That is harmless until a script
+    // relies on it -- OP_CHECKLOCKTIMEVERIFY checks nLockTime, and without
+    // this rule a "refund after block N" could be mined at block 1.
+    bool IsFinalAt(int nBlockHeight, int64 nBlockTime) const
+    {
+        if (nLockTime == 0)
+            return true;
+        int64 nCutoff = nLockTime < LOCKTIME_THRESHOLD ? (int64)nBlockHeight : nBlockTime;
+        if ((int64)nLockTime < nCutoff)
+            return true;
+        foreach(const CTxIn& txin, vin)
+            if (!txin.IsFinal())
+                return false;
+        return true;
+    }
+
     bool IsNewerThan(const CTransaction& old) const
     {
         if (vin.size() != old.vin.size())
@@ -802,6 +832,11 @@ public:
             vector<vector<unsigned char> > vSolutions;
             if (SolverTyped(s, whichType, vSolutions) && whichType == TX_MULTISIG &&
                 vSolutions.size() - 2 <= 3)
+                continue;
+            // From rules v3 on, a script hash is spent by its redeem script,
+            // so paying to one is safe and relayed. That is what an atomic
+            // swap and a 2-of-3 escrow pay to.
+            if (s.IsPayToScriptHash() && RulesV3Active((unsigned int)GetAdjustedTime()))
                 continue;
             return false;
         }
@@ -964,7 +999,10 @@ public:
     // nBlockTime is the time of the block these inputs are being connected
     // in -- which decides whether rules v2 apply to its signatures. 0 means
     // "not in a block yet" (mempool, template), and the current time stands in.
-    bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0);
+    // pnP2SHSigOps, if given, is incremented by the signature operations inside
+    // the redeem scripts this transaction spends (rules v3 only).
+    bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0,
+                       unsigned int* pnP2SHSigOps=NULL);
     bool ClientConnectInputs();
 
     bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL);

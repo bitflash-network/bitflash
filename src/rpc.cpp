@@ -200,7 +200,7 @@ static bool RebuildJob()
                         if (vfAlreadyAdded[n])
                             continue;
                         CTransaction& tx = (*mi).second;
-                        if (tx.IsCoinBase() || !tx.IsFinal()) continue;
+                        if (tx.IsCoinBase() || !IsFinalForNextBlock(tx)) continue;
                         map<uint256, CTxIndex> tmp(pool);
                         if (!tx.ConnectInputs(txdb, tmp, CDiskTxPos(1,1,1), 0, nFees,
                                               false, true, tx.GetMinFee(block.vtx.size() < 100), block.nTime))

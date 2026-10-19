@@ -42,7 +42,7 @@ void MakeSameSize(valtype& vch1, valtype& vch2)
 #define altstacktop(i)  (altstack.at(altstack.size()+(i)))
 
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType,
-                vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs)
+                vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs, bool fRulesV3)
 {
     CAutoBN_CTX pctx;
     CScript::const_iterator pc = script.begin();
@@ -130,6 +130,47 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             // Control
             //
             case OP_NOP:
+            break;
+
+            case OP_CHECKLOCKTIMEVERIFY:
+            {
+                // BIP65: "this output cannot be spent before <lock>". The
+                // script does not read the clock -- it cannot, the same script
+                // must give the same answer on every node at every time. It
+                // checks the spending transaction's own nLockTime instead, and
+                // the block rule (IsFinalAt) is what keeps a transaction with
+                // that nLockTime out of the chain until the lock has passed.
+                // So both halves have to hold: this one and the block rule.
+                //
+                // Before rules v3 the byte is unknown, which fails the script:
+                // an output locked this way cannot be spent by anybody until
+                // the rule exists to say when.
+                if (!fRulesV3)
+                    return false;
+                if (stack.size() < 1)
+                    return false;
+                // Five bytes, not the usual four: a unix time past 2038 needs
+                // the fifth, and the comparison below is what bounds it.
+                if (stacktop(-1).size() > 5)
+                    return false;
+                CBigNum bnLock(stacktop(-1));
+                if (bnLock < 0)
+                    return false;
+                // A height lock is not satisfied by a time and the other way
+                // round: the two halves of nLockTime are different units.
+                bool fLockIsTime = bnLock >= CBigNum((int64)LOCKTIME_THRESHOLD);
+                bool fTxIsTime = txTo.nLockTime >= LOCKTIME_THRESHOLD;
+                if (fLockIsTime != fTxIsTime)
+                    return false;
+                if (bnLock > CBigNum((int64)txTo.nLockTime))
+                    return false;
+                // A final input switches nLockTime off for the whole
+                // transaction (IsFinal), which would let it into a block early.
+                if (txTo.vin[nIn].IsFinal())
+                    return false;
+                // Left on the stack, as Bitcoin does: the script follows it with
+                // OP_DROP, and the same bytes then work on both chains.
+            }
             break;
 
             case OP_VER:
@@ -1391,35 +1432,63 @@ bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int 
 }
 
 
-bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn)
+unsigned int GetP2SHSigOpCount(const CScript& scriptSig)
+{
+    // The last push is the redeem script. A scriptSig that does not parse has
+    // no redeem script to count; it fails verification anyway.
+    CScript::const_iterator pc = scriptSig.begin();
+    opcodetype opcode;
+    valtype vch, last;
+    while (pc < scriptSig.end())
+    {
+        if (!scriptSig.GetOp(pc, opcode, vch))
+            return 0;
+        last = vch;
+    }
+    return CScript(last.begin(), last.end()).GetSigOpCount();
+}
+
+bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
+                      bool fStrictSigs, bool fRulesV3)
 {
     if (!scriptSig.IsPushOnly())
         return false;
-    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn))
+    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3))
         return false;
     if (!scriptPubKey.IsPayToScriptHash())
         return true;
 
-    // Split off the last push: that is the redeem script
-    vector<valtype> pushes;
+    // Split off the last push: that is the redeem script. What comes before it
+    // is kept as the original bytes, cut where the last push starts.
+    //
+    // It used to be rebuilt push by push, `inner << vch`, and that is wrong
+    // for exactly one kind of push: OP_1..OP_16 (and OP_1NEGATE) carry no data
+    // in GetOp, so they came back as an empty push -- OP_0. OP_TRUE turned
+    // into OP_FALSE. Every multisig spend survived it, because those start
+    // with an OP_0 that rebuilt to OP_0; the first script to choose a branch
+    // with OP_TRUE -- an atomic swap's "claim with the secret" -- ran its
+    // refund branch instead. Found by the rules-v3 suite, before anything was
+    // live.
     CScript::const_iterator pc = scriptSig.begin();
+    CScript::const_iterator pcLastStart = scriptSig.begin();
     opcodetype opcode;
-    valtype vch;
+    valtype vch, last;
+    bool fAny = false;
     while (pc < scriptSig.end())
     {
+        pcLastStart = pc;
         if (!scriptSig.GetOp(pc, opcode, vch))
             return false;
-        pushes.push_back(vch);
+        last = vch;
+        fAny = true;
     }
-    if (pushes.empty())
+    if (!fAny)
         return false;
-    CScript subscript(pushes.back().begin(), pushes.back().end());
+    CScript subscript(last.begin(), last.end());
     if (Hash160(subscript) != uint160(valtype(scriptPubKey.begin() + 2, scriptPubKey.begin() + 22)))
         return false;
-    CScript inner;
-    for (size_t i = 0; i + 1 < pushes.size(); i++)
-        inner << pushes[i];
-    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn);
+    CScript inner(scriptSig.begin(), pcLastStart);
+    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3);
 }
 
 CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn,
@@ -1465,7 +1534,8 @@ CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, uns
     return result;
 }
 
-bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs)
+bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType,
+                     bool fStrictSigs, bool fRulesV3)
 {
     assert(nIn < txTo.vin.size());
     const CTxIn& txin = txTo.vin[nIn];
@@ -1484,5 +1554,13 @@ bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsig
     if (!txin.scriptSig.IsPushOnly())
         return false;
 
-    return EvalScript(txin.scriptSig + CScript(OP_CODESEPARATOR) + txout.scriptPubKey, txTo, nIn, nHashType, NULL, fStrictSigs);
+    // Rules v3 (BIP16): an OP_HASH160 <h> OP_EQUAL output is spent by the
+    // script that hashes to h, run with the pushes before it. Until now it was
+    // spent by anybody who presented a script with the right hash, signatures
+    // or not -- which is why the wallet refused to pay to one.
+    if (fRulesV3 && txout.scriptPubKey.IsPayToScriptHash())
+        return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true);
+
+    return EvalScript(txin.scriptSig + CScript(OP_CODESEPARATOR) + txout.scriptPubKey, txTo, nIn, nHashType, NULL,
+                      fStrictSigs, fRulesV3);
 }

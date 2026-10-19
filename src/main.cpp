@@ -2016,9 +2016,12 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb)
 }
 
 
-bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime)
+bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime,
+                                 unsigned int* pnP2SHSigOps)
 {
-    bool fStrictSigs = RulesV2Active(nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime());
+    unsigned int nRulesTime = nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime();
+    bool fStrictSigs = RulesV2Active(nRulesTime);
+    bool fRulesV3 = RulesV3Active(nRulesTime);
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
     {
@@ -2074,8 +2077,14 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                         return error("ConnectInputs() : tried to spend coinbase at depth %d", nBestHeight - pindex->nHeight);
 
             // Verify signature
-            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs))
+            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
+
+            // Rules v3 runs the redeem script, so its signature operations cost
+            // what any other does and count against the block's cap. Before,
+            // a P2SH scriptSig's last push was data and cost nothing to check.
+            if (fRulesV3 && pnP2SHSigOps && txPrev.vout[prevout.n].scriptPubKey.IsPayToScriptHash())
+                *pnP2SHSigOps += GetP2SHSigOpCount(vin[i].scriptSig);
 
             // Check for conflicts
             if (!txindex.vSpent[prevout.n].IsNull())
@@ -2193,6 +2202,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
+    // CheckBlock already capped the sigops it can see in the scripts; under
+    // rules v3 the redeem scripts run too, and only here are they known.
+    unsigned int nSigOps = 0;
+    foreach(CTransaction& tx, vtx)
+        nSigOps += tx.GetSigOpCount();
     foreach(CTransaction& tx, vtx)
     {
         CDiskTxPos posThisTx(pindex->nFile, pindex->nBlockPos, nTxPos);
@@ -2213,8 +2227,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                                      tx.GetHash().ToString().substr(0,10).c_str());
         }
 
-        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime))
+        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime, &nSigOps))
             return false;
+        if (nSigOps > MAX_BLOCK_SIGOPS)
+            return error("ConnectBlock() : too many signature operations once redeem scripts are counted");
     }
 
     if (vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees))
@@ -2492,6 +2508,13 @@ bool CBlock::CheckBlock(int* pnDoS) const
     return true;
 }
 
+bool IsFinalForNextBlock(const CTransaction& tx)
+{
+    if (!pindexBest || !RulesV3Active((unsigned int)GetAdjustedTime()))
+        return tx.IsFinal();
+    return tx.IsFinalAt(pindexBest->nHeight + 1, pindexBest->GetMedianTimePast());
+}
+
 bool CBlock::AcceptBlock(int* pnDoS)
 {
     if (pnDoS)
@@ -2526,6 +2549,19 @@ bool CBlock::AcceptBlock(int* pnDoS)
         const CScript& cb = vtx[0].vin[0].scriptSig;
         if (cb.size() < expect.size() || !std::equal(expect.begin(), expect.end(), cb.begin()))
             return DoS(pnDoS, 100, error("AcceptBlock() : coinbase does not start with height %d", pindexPrev->nHeight + 1));
+    }
+
+    // Rules v3: every transaction in the block is final at its height and at
+    // the median time past of the block before it (BIP113 -- not this block's
+    // own time, which its miner picks). See CTransaction::IsFinalAt.
+    if (RulesV3Active(nTime))
+    {
+        int nHeight = pindexPrev->nHeight + 1;
+        int64 nCutoff = pindexPrev->GetMedianTimePast();
+        foreach(const CTransaction& tx, vtx)
+            if (!tx.IsFinalAt(nHeight, nCutoff))
+                return DoS(pnDoS, 10, error("AcceptBlock() : transaction %s is not final at height %d",
+                                            tx.GetHash().ToString().substr(0,10).c_str(), nHeight));
     }
 
     // Write block to history file
@@ -4558,7 +4594,7 @@ bool BitcoinMiner(int nThreadId)
                     if (vfAlreadyAdded[n])
                         continue;
                     CTransaction& tx = (*mi).second;
-                    if (tx.IsCoinBase() || !tx.IsFinal())
+                    if (tx.IsCoinBase() || !IsFinalForNextBlock(tx))
                         continue;
 
                     // Transaction fee requirements, mainly only needed for flood control
