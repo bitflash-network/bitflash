@@ -28,6 +28,11 @@ bitflash-node -nogui -datadir=/var/lib/bitflash \
 - `-rpcpassword` shorter than sixteen characters is refused.
 - `-rpcpassword=@FILE` reads the secret from a file, so it never appears in
   the process list. Prefer it on any machine other people can log into.
+- `-chatwallet`, with no `-rpcuser`/`-rpcpassword`: the same server, with a
+  fresh random password written to `<datadir>/.cookie` as `__cookie__:<hex>`
+  (bitcoind's cookie). It is how btfchat on the same machine pays and receives
+  through this wallet (`docs/btfchat.md`). Anything running as the same user
+  can read the cookie and spend; off unless asked for.
 
 ## Calling it
 
@@ -65,6 +70,13 @@ null.
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
 | `gettreasuryinfo` | — | `configured`, `network`, `page`; when configured: `required`, `keys`, the `script` decoded, `howToPay`, this node's `treasuryShare` and `poolFeeTo` |
 | `donate` | `amount` | txid of a transaction paying the treasury; the same as `sendtoaddress treasury <amount>` |
+| `sendburn` | `amount`, `datahex` | txid of a transaction burning `amount` into an OP_RETURN carrying the data (1 to 80 bytes): a public community listing, for one |
+| `swapinitiate` | `address`, `amount` | starts an atomic swap: contract, its address and txid, the **secret**, its hash, the lock -- `docs/atomic-swaps.md` |
+| `swapparticipate` | `address`, `amount`, `secrethash` | the other half: contract under someone else's secret hash |
+| `swapauditcontract` | `contract`, `txid` | the terms of a contract and whether it pays this wallet |
+| `swapredeem` | `contract`, `txid`, `secret` | takes the coins with the secret |
+| `swaprefund` | `contract`, `txid` | takes them back after the lock |
+| `swapextractsecret` | `txid` \| `rawhex`, `secrethash` | the secret, from a redeem on this chain or on Bitcoin's |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the

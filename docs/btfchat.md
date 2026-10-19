@@ -24,14 +24,26 @@ each phase is at the end.*
   them the way a node does: the onion seeds pinned in the binary, then the
   signed peer lists every node hands out (`btfchatnet.h`). No Nostr relay, no
   VPS, nothing of ours or anybody's that has to stay up.
+- **Money inside the conversation.** The chat holds no coins: the person's own
+  Bitflash wallet, started with `-chatwallet`, pays and receives through RPC
+  on 127.0.0.1 (cookie in its data directory). "Ask to be paid" sends a fresh
+  address of that wallet, signed by the chat identity; "pay" pays only an
+  address the contact signed, so nothing between the two can redirect it. An
+  incoming payment shows what *your* wallet sees of it, not what the note
+  claims.
+- **Public communities, with the chain as the directory.** Creating one burns
+  0.01 BTF into an OP_RETURN carrying its name and key; every node reads the
+  chain for listings and hands the list to the chat, and nobody can take one
+  down. Posts are signed, sealed with the room's key, and left with the nodes
+  under a daily tag, collected in the same round as the mailbox.
 - **Spam costs work, not yet coin.** Every record a node stores carries about
   a second of proof of work, more for bigger ones; nodes ration each
   connection and cap the memory the chat may use. The burn stamp below is the
   real answer and has not shipped.
 
-Not in 1.2.29, all described below: burn stamps, fixed-size envelopes, cover
+Not in 1.2.29, all described below: burn stamps on every message, fixed-size envelopes, cover
 traffic, ephemeral onions per conversation, the chain-anchored handshake,
-money inside messages, groups.
+groups with admins (MLS).
 
 ## Known attacks on 1.2.29
 
@@ -283,7 +295,7 @@ and the coin are the same program on a network that only speaks Tor.
 | phase | scope | depends on | status |
 |---|---|---|---|
 | 0 | `OP_RETURN` standard in relay policy; burn stamp format; `docs` | 1.2.28 (relay policy only, no consensus) | shipped in 1.2.28 |
-| 1a | one-to-one over onion; hybrid post-quantum channel; sealed offline envelopes held by the nodes, paid in work; local outbox | 1.2.29 nodes for the offline half | **1.2.29** |
+| 1a | one-to-one over onion; hybrid post-quantum channel; sealed offline envelopes held by the nodes, paid in work; local outbox; money in the conversation through the linked wallet; public communities listed on the chain | 1.2.29 nodes for the offline half and the directory | **1.2.29** |
 | 1 | the rest of one-to-one: fixed size, burn stamp, chain-anchored handshake, money in messages; wallet tab + RPC | rules v3 shipped | design |
 | 2 | communities: channels, join/post burns, paid reading, reputation | phase 1 | design |
 | 3 | cover traffic, ephemeral onions per conversation, node storage market | phase 1 | design |
