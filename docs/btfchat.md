@@ -33,6 +33,82 @@ Not in 1.2.29, all described below: burn stamps, fixed-size envelopes, cover
 traffic, ephemeral onions per conversation, the chain-anchored handshake,
 money inside messages, groups.
 
+## Known attacks on 1.2.29
+
+Written down so nobody has to rediscover them, and so a fix can say which one
+it closes. Each entry: what the attacker does, what stops it, what is left.
+Numbers are from `test_chatstore` and the live runs.
+
+**Flooding the nodes' memory with a GPU.** The work on each record is
+SHA-256 at 20 bits, about 1.2 s on one laptop core, more for bigger records.
+A graphics card pays that a million times over: filling the 8 MB descriptor
+budget took 13,024 records in the test, seconds on a GPU. *Stops it:* a full
+store **refuses** new records instead of evicting old ones, so nothing a node
+already holds is erased. The sender is told at once, the message stays in
+their outbox and goes direct when the other side is seen. *Left:* while the
+flood lasts, and up to a day after (records expire after 26 h), new offline
+messages do not get into the nodes. The per-connection ration (60 records a
+minute) does not help, since Tor gives an attacker as many connections as it
+wants. The fix is a stamp that costs coin (phase 1) or RandomX in place of
+SHA-256.
+
+**Many throwaway identities.** Keys are free, so somebody can publish
+thousands of descriptors and epoch keys. *Stops it:* the same budget and the
+same refusal; an identity already held can always replace its own record,
+because the room its old one leaves is what the new one uses. *Left:* a
+flood can stop **new** identities from being findable until it ages out.
+
+**A node lying about who someone is.** It could answer a lookup with another
+identity's descriptor or epoch keys and read everything sealed to them.
+*Stops it:* both are signed by the identity, and both the node that stores
+them and the client that receives them check the signature against the
+address that was asked for. A node cannot forge one.
+
+**Making an old descriptor win.** Rewrap a validly signed old descriptor with
+a newer record time. *Stops it:* the record time must equal the signed time
+inside (the descriptor's creation time, the epoch's start), so "newest" is
+decided by what the owner signed.
+
+**A node hiding what it holds.** It can answer "nothing" for a tag that has
+envelopes waiting. *Stops it, partly:* every record spreads to every 1.2.29
+node, the client asks two of them and merges, and a sender tries to leave
+every record with two nodes (it counts as left once one has kept it). *Left:* if every node a client can reach
+is the attacker's, it can withhold, though still not forge. A client starts
+from the onion seeds pinned in the binary, so a dead or hostile seed slows
+the first contact; after that the client knows every node the others told it
+about.
+
+**Pushing someone's envelopes out of their tag.** A tag holds at most 64
+envelopes and the oldest goes first. *Stops it:* a tag is computed from the
+two people's keys and changes every day; nobody else can name it, so only the
+pair can fill it.
+
+**What a node learns.** That somebody, over Tor, published or asked for a
+descriptor, or wrote to or read a tag, when, and how big. Not who: the chat
+never connects except through Tor, and a tag names a pair nobody can link to
+addresses. The number of Tor circuits a client opens is countable by whoever
+watches its connection; one circuit per two-minute round is the floor this
+release keeps to.
+
+**Inventory flood between nodes.** A peer announces thousands of record ids
+it never delivers. *Stops it:* nothing new; it is the same exposure 0.1.0 has
+for transactions (each asked-for id costs a little memory until it times
+out). Records themselves are rationed at 6,000 a minute per peer and each
+costs a signature check at most.
+
+**Old nodes.** A 1.2.28 node never sees chat inventory, because it is offered
+only to peers that advertise `NODE_CHAT`. An old node a client reaches still
+hands over its peer list, which may lead to new ones.
+
+**Clocks.** A record more than 2 h in the future is refused; a frame older
+than a day is refused by the replay guard. A machine whose clock is far off
+will see its records refused, and says so.
+
+**A node restarting.** It forgets: the store is memory only, never the disk,
+so a seized machine has nothing to give up. It gets the records back from its
+peers when it reconnects (`getchatinv`). *Left:* a record that only one node
+ever kept, lost before it spread, is gone -- which is why the sender tries two.
+
 ## What it is
 
 A messenger inside the Bitflash wallet where the identity is a `.btf`

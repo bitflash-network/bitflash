@@ -5222,6 +5222,13 @@ static int RunChatLiveSelfTest()
 {
     printf("chat-live self-test (%s, needs Tor and the network)\n", IsTestNet() ? "testnet" : "mainnet");
     int nFail = 0;
+    // Self-tests run before StartNode(), which is where the node starts
+    // Winsock. Without this every socket fails at once and the dial reads
+    // "could not reach ... over Tor" in zero seconds -- which is what the first
+    // live runs showed, against a seed curl reached fine through the same Tor.
+#ifdef _WIN32
+    SelfTestWinsock wsa;
+#endif
 
     std::string tmp;
     if (!MakeTempDir(tmp))
@@ -5240,6 +5247,11 @@ static int RunChatLiveSelfTest()
         printf("no Tor: put tor/ beside the exe or set BITFLASH_TOR to tor.exe\n");
         return 1;
     }
+    // No transport ladder here. This build counts peers to decide whether Tor
+    // works, a self-test has none, and the watchdog would move Tor onto
+    // bridges mid-run -- which is what made the first run from the 202 take
+    // eight minutes. The test is of the chat, not of the censorship fallback.
+    BtfSetTorFallbackEnabled(false);
     if (!BtfStartManagedTor(torPath, err))
     {
         printf("Tor did not start: %s\n", err.c_str());

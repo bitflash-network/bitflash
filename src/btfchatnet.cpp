@@ -25,6 +25,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <functional>
+#include <thread>
 
 namespace btfchat
 {
@@ -214,6 +216,34 @@ bool NodeLink::Await(const char* pszReply, unsigned int nReq,
     }
     errOut = "the node never answered the question";
     return false;
+}
+
+void NodeLink::CollectPeers(int nMaxMessages)
+{
+    if (nPeerVersion <= 0)
+        return;
+    // The handshake stopped before switching framing; the node did not.
+    nFraming = std::min(nPeerVersion, VERSION);
+    size_t nBefore = vPex.size();
+    for (int i = 0; i < nMaxMessages && vPex.size() == nBefore; i++)
+    {
+        std::string cmd, err;
+        std::vector<unsigned char> payload;
+        if (!Recv(cmd, payload, err))
+            return;
+        if (cmd != "btfpeers")
+            continue;
+        try
+        {
+            CDataStream ss(payload, SER_NETWORK, nFraming);
+            std::vector<std::string> v;
+            ss >> v;
+            for (size_t k = 0; k < v.size() && vPex.size() < 64; k++)
+                vPex.push_back(v[k]);
+        }
+        catch (std::exception&) {}
+        return;
+    }
 }
 
 bool NodeLink::Put(const ChatRecord& r, int& nResultOut, std::string& whyOut,
@@ -412,6 +442,12 @@ static void NoteFail(const std::string& onion, bool fNoChat)
         if (fNoChat)
             k.nNoChatUntil = GetTime() + 6 * 60 * 60;
     }
+    // A node that is merely too old still answered over Tor: Tor works. Not
+    // saying so let the watchdog decide Tor was blocked and restart it onto
+    // bridges while every node it could reach was simply 1.2.28 -- seen on the
+    // first live run against mainnet.
+    if (fNoChat)
+        BtfTorNoteNetworkReached();
 }
 
 // Up to `n` nodes worth trying now: the ones that answered lately first, the
@@ -448,6 +484,29 @@ static void PickNodes(size_t n, std::vector<std::string>& out)
         out.push_back(other[i]);
 }
 
+// Nodes tried in one round, at most. A round that keeps learning new nodes from
+// old ones would otherwise walk the whole network over Tor before giving up.
+static const size_t MAX_NODES_PER_ROUND = 10;
+
+// Top up a round's candidates with nodes learned during it -- typically from
+// the peer list of a node too old to hold chat records itself. False when
+// there is nothing new to try, or the round has tried enough.
+static bool MoreNodes(std::vector<std::string>& cand, std::set<std::string>& tried)
+{
+    if (cand.size() >= MAX_NODES_PER_ROUND)
+        return false;
+    std::vector<std::string> more;
+    PickNodes(MAX_NODES_PER_ROUND, more);
+    bool fAdded = false;
+    for (size_t i = 0; i < more.size() && cand.size() < MAX_NODES_PER_ROUND; i++)
+        if (tried.insert(more[i]).second)
+        {
+            cand.push_back(more[i]);
+            fAdded = true;
+        }
+    return fAdded;
+}
+
 void NetNodeCounts(size_t& nKnown, size_t& nGood)
 {
     EnsureSeeds();
@@ -463,11 +522,102 @@ void NetNodeCounts(size_t& nKnown, size_t& nGood)
         }
 }
 
-// One connection, handshake done. The caller closes `sock`.
-static bool Connect(const std::string& onion, btf_socket_t& sock, std::string& errOut)
+// Nodes dialled at the same time. One at a time was what made the first live
+// run on testnet take eight minutes for one answer: the peer lists it learned
+// were full of onions that no longer exist, and each one cost a full Tor
+// timeout before the next was tried. Four in flight bounds a round by the
+// slowest of four, not the sum of ten.
+static const size_t DIAL_PARALLEL = 4;
+
+// One node, dialled and introduced, or the reason it was not.
+struct Dialed
 {
-    sock = INVALID_SOCKET;
-    return ChatDialOnion(onion, NODE_DIAL_TIMEOUT, sock, errOut);
+    btf_socket_t sock;
+    SocketStream* st;
+    NodeLink* link;
+    bool fShook;
+    bool fNoChat;
+    std::string err;
+    Dialed() : sock(INVALID_SOCKET), st(NULL), link(NULL), fShook(false), fNoChat(false) {}
+    ~Dialed()
+    {
+        delete link;
+        delete st;
+        if (sock != INVALID_SOCKET)
+            closesocket(sock);
+    }
+};
+
+static void DialOne(const std::string& onion, Dialed& d)
+{
+    if (!ChatDialOnion(onion, NODE_DIAL_TIMEOUT, d.sock, d.err))
+        return;
+    d.st = new SocketStream(d.sock, NODE_IO_TIMEOUT);
+    d.link = new NodeLink(*d.st);
+    if (d.link->Handshake(d.err))
+    {
+        d.fShook = true;
+        return;
+    }
+    d.fNoChat = d.link->Services() != 0 && !(d.link->Services() & NODE_CHAT);
+    if (d.fNoChat)
+        d.link->CollectPeers(20);
+}
+
+// Run `use` on nodes until `nWanted` of them count. `use` returns 1 when the
+// node did what was asked, 0 when it answered but that answer does not count
+// (a refusal), -1 when the exchange failed. Dials in parallel batches, and
+// tops the list up with nodes learned on the way. Returns how many counted.
+template <typename F>
+static int WithNodes(int nWanted, F use, std::string& strLastErr)
+{
+    std::vector<std::string> cand;
+    PickNodes(NODES_PER_ROUND, cand);
+    std::set<std::string> tried(cand.begin(), cand.end());
+    int nDone = 0;
+    size_t at = 0;
+    while (nDone < nWanted && !fShutdown)
+    {
+        if (at >= cand.size() && !MoreNodes(cand, tried))
+            break;
+        size_t nEnd = std::min(cand.size(), at + DIAL_PARALLEL);
+        std::vector<std::string> batch(cand.begin() + at, cand.begin() + nEnd);
+        at = nEnd;
+
+        std::vector<Dialed> d(batch.size());
+        std::vector<std::thread> th;
+        for (size_t i = 0; i < batch.size(); i++)
+            th.push_back(std::thread(DialOne, std::cref(batch[i]), std::ref(d[i])));
+        for (size_t i = 0; i < th.size(); i++)
+            th[i].join();
+
+        for (size_t i = 0; i < batch.size(); i++)
+        {
+            if (!d[i].fShook)
+            {
+                NoteFail(batch[i], d[i].fNoChat);
+                strLastErr = d[i].err;
+            }
+            else if (nDone < nWanted)
+            {
+                std::string err;
+                int n = use(*d[i].link, batch[i], err);
+                if (n < 0)
+                {
+                    NoteFail(batch[i], false);
+                    strLastErr = err;
+                }
+                else
+                {
+                    NoteOk(batch[i]);
+                    nDone += n;
+                }
+            }
+            if (d[i].link)
+                LearnNodes(d[i].link->PeerDescriptors());
+        }
+    }
+    return nDone;
 }
 
 // ---- publish and query ---------------------------------------------------------
@@ -487,55 +637,21 @@ bool NetPublish(ChatRecord& r, std::string& errOut)
         }
     }
 
-    std::vector<std::string> cand;
-    PickNodes(NODES_PER_ROUND, cand);
-    if (cand.empty())
-    {
-        errOut = "no Bitflash node is known to ask yet";
-        return false;
-    }
-
-    int nKept = 0;
     std::string strLastWhy, strLastErr;
-    for (size_t i = 0; i < cand.size() && nKept < PUBLISH_COPIES && !fShutdown; i++)
-    {
-        btf_socket_t sock = INVALID_SOCKET;
-        std::string err;
-        if (!Connect(cand[i], sock, err))
+    int nKept = WithNodes(PUBLISH_COPIES,
+        [&](NodeLink& link, const std::string& onion, std::string& err) -> int
         {
-            NoteFail(cand[i], false);
-            strLastErr = err;
-            continue;
-        }
-        SocketStream st(sock, NODE_IO_TIMEOUT);
-        NodeLink link(st);
-        int nResult = ChatStore::REJECTED;
-        std::string why;
-        if (!link.Handshake(err))
-        {
-            NoteFail(cand[i], (link.Services() != 0 && !(link.Services() & NODE_CHAT)));
-            strLastErr = err;
-        }
-        else if (!link.Put(r, nResult, why, err))
-        {
-            NoteFail(cand[i], false);
-            strLastErr = err;
-        }
-        else
-        {
-            NoteOk(cand[i]);
+            int nResult = ChatStore::REJECTED;
+            std::string why;
+            if (!link.Put(r, nResult, why, err))
+                return -1;
             if (nResult == ChatStore::ACCEPTED || nResult == ChatStore::DUPLICATE)
-                nKept++;
-            else
-            {
-                strLastWhy = why;
-                LogPrint("btfchat", "btfchat: node %s refused a record: %s\n",
-                         cand[i].c_str(), why.c_str());
-            }
-        }
-        LearnNodes(link.PeerDescriptors());
-        closesocket(sock);
-    }
+                return 1;
+            strLastWhy = why;
+            LogPrint("btfchat", "btfchat: node %s refused a record: %s\n",
+                     onion.c_str(), why.c_str());
+            return 0;
+        }, strLastErr);
 
     if (nKept > 0)
         return true;
@@ -556,52 +672,20 @@ bool NetQuery(const std::vector<CChatQuery>& vQuery,
     if (vQuery.empty())
         return true;
 
-    std::vector<std::string> cand;
-    PickNodes(NODES_PER_ROUND, cand);
-    if (cand.empty())
-    {
-        errOut = "no Bitflash node is known to ask yet";
-        return false;
-    }
-
     std::vector<std::set<std::string> > seen(vQuery.size());
-    int nAnswered = 0;
     std::string strLastErr;
-    for (size_t i = 0; i < cand.size() && nAnswered < QUERY_ANSWERS && !fShutdown; i++)
-    {
-        btf_socket_t sock = INVALID_SOCKET;
-        std::string err;
-        if (!Connect(cand[i], sock, err))
+    int nAnswered = WithNodes(QUERY_ANSWERS,
+        [&](NodeLink& link, const std::string&, std::string& err) -> int
         {
-            NoteFail(cand[i], false);
-            strLastErr = err;
-            continue;
-        }
-        SocketStream st(sock, NODE_IO_TIMEOUT);
-        NodeLink link(st);
-        std::vector<std::vector<ChatRecord> > ans;
-        if (!link.Handshake(err))
-        {
-            NoteFail(cand[i], (link.Services() != 0 && !(link.Services() & NODE_CHAT)));
-            strLastErr = err;
-        }
-        else if (!link.Get(vQuery, ans, err))
-        {
-            NoteFail(cand[i], false);
-            strLastErr = err;
-        }
-        else
-        {
-            NoteOk(cand[i]);
-            nAnswered++;
+            std::vector<std::vector<ChatRecord> > ans;
+            if (!link.Get(vQuery, ans, err))
+                return -1;
             for (size_t q = 0; q < ans.size() && q < out.size(); q++)
                 for (size_t k = 0; k < ans[q].size(); k++)
                     if (seen[q].insert(ans[q][k].IdHex()).second)
                         out[q].push_back(ans[q][k]);
-        }
-        LearnNodes(link.PeerDescriptors());
-        closesocket(sock);
-    }
+            return 1;
+        }, strLastErr);
 
     if (nAnswered > 0)
         return true;

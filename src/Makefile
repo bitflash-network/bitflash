@@ -180,6 +180,17 @@ obj-node/sha.o: sha.cpp sha.h
 	@mkdir -p obj-node
 	$(CXX) -c $(CXXFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
 
+# ML-KEM is C, not C++, so the obj-node/%.o rule above cannot build it. It
+# needs its own line in every object directory -- obj-node and obj-fuzz were
+# missing it, so the headless node had never been built with the chat in it.
+obj-node/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj-node
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
+obj-fuzz/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj-fuzz
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
 bitflash-node: $(NODE_ONLY_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: bitflash-node (headless, no libGL needed)"

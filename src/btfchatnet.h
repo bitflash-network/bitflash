@@ -58,6 +58,12 @@ public:
     // Descriptors of other nodes this one handed us on the way.
     const std::vector<std::string>& PeerDescriptors() const { return vPex; }
 
+    // After a handshake that ended in "older release": read on until the node
+    // hands over its peer list, so a node that cannot hold chat records can
+    // still point us at ones that can. Bounded by message count and the
+    // stream's own timeout.
+    void CollectPeers(int nMaxMessages);
+
     uint64_t Services() const { return nServices; }
 
 private:
