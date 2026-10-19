@@ -19,6 +19,7 @@
 #include "btfchatnet.h"
 #include "chatrelay.h"
 #include "chatstore.h"
+#include "swap.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
 // node key, and a self-test has no business creating one.
@@ -4840,6 +4841,73 @@ static int RunRulesV3SelfTest()
         nFail += Check(VerifySignature(from, anyone, 0, 0, true, false) &&
                        !VerifySignature(from, anyone, 0, 0, true, true),
                        "before rules v3 a swap output is anyone-can-spend; under them it is not") ? 0 : 1;
+    }
+
+    // ---- the swap contract the RPCs build (swap.h): Decred's, byte for byte
+    {
+        std::vector<unsigned char> secret(32);
+        RAND_bytes(&secret[0], 32);
+        swap::Contract c;
+        c.secretHash.resize(32);
+        SHA256(&secret[0], 32, &c.secretHash[0]);
+        uint160 hB = Hash160(keyB.GetPubKey()), hA = Hash160(keyA.GetPubKey());
+        c.recipientPkh.assign(hB.begin(), hB.end());
+        c.refundPkh.assign(hA.begin(), hA.end());
+        c.nLockTime = 51234;
+        CScript k = swap::BuildContract(c);
+        std::string hex = HexStr(k.begin(), k.end(), false);
+        std::string sh = HexStr(c.secretHash.begin(), c.secretHash.end(), false);
+        std::string pb = HexStr(c.recipientPkh.begin(), c.recipientPkh.end(), false);
+        std::string pa = HexStr(c.refundPkh.begin(), c.refundPkh.end(), false);
+        // 51234 = 0x00c822 -> pushed as 3 bytes 22 c8 00 (the 00 keeps it positive)
+        std::string expect = "6382012088a820" + sh + "8876a914" + pb + "67" + "0322c800" +
+                             "b17576a914" + pa + "6888ac";
+        nFail += Check(hex == expect, "the contract is the atomicswap template, byte for byte") ? 0 : 1;
+
+        swap::Contract back;
+        nFail += Check(swap::ParseContract(k, back) && back.nLockTime == 51234 &&
+                       back.secretHash == c.secretHash && back.recipientPkh == c.recipientPkh &&
+                       back.refundPkh == c.refundPkh, "and parses back into the same terms") ? 0 : 1;
+        CScript longer = k;
+        longer << OP_NOP;
+        nFail += Check(!swap::ParseContract(longer, back), "a contract with anything appended is not one") ? 0 : 1;
+
+        CScript p2; p2.SetPayToScriptHash(k);
+        CTransaction from; from.vout.push_back(CTxOut(3 * COIN, p2));
+        CTransaction s;
+        s.vin.resize(1);
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.vout.push_back(CTxOut(3 * COIN - CENT, CScript() << OP_TRUE));
+        std::vector<unsigned char> sig = SelfTestSign(keyB, k, s, 0);
+        s.vin[0].scriptSig = swap::RedeemScriptSig(sig, keyB.GetPubKey(), secret, k);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, true), "the redeem the RPC builds verifies") ? 0 : 1;
+        std::vector<unsigned char> got;
+        nFail += Check(swap::ExtractSecret(s.vin[0].scriptSig, c.secretHash, got) && got == secret,
+                       "and the secret can be read back out of it") ? 0 : 1;
+
+        CTransaction r = s;
+        r.nLockTime = 51234;
+        r.vin[0].nSequence = 0;
+        r.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigA = SelfTestSign(keyA, k, r, 0);
+        r.vin[0].scriptSig = swap::RefundScriptSig(sigA, keyA.GetPubKey(), k);
+        nFail += Check(VerifySignature(from, r, 0, 0, true, true), "the refund the RPC builds verifies") ? 0 : 1;
+
+        std::vector<unsigned char> shortSecret(16, 7);
+        unsigned char hs[32];
+        SHA256(&shortSecret[0], 16, hs);
+        swap::Contract cs = c;
+        cs.secretHash.assign(hs, hs + 32);
+        CScript ks = swap::BuildContract(cs);
+        CScript p3; p3.SetPayToScriptHash(ks);
+        CTransaction from3; from3.vout.push_back(CTxOut(COIN, p3));
+        CTransaction s3 = s;
+        s3.vin[0].prevout = COutPoint(from3.GetHash(), 0);
+        s3.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sig3 = SelfTestSign(keyB, ks, s3, 0);
+        s3.vin[0].scriptSig = swap::RedeemScriptSig(sig3, keyB.GetPubKey(), shortSecret, ks);
+        nFail += Check(!VerifySignature(from3, s3, 0, 0, true, true),
+                       "a secret that is not 32 bytes is refused even when its hash matches") ? 0 : 1;
     }
 
     // ---- relay before activation
