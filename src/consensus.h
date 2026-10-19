@@ -43,7 +43,10 @@ bool RulesV2Active(unsigned int nBlockTime);
 // pay to a script hash while this reads 0, because until the rule is live
 // such an output belongs to whoever spends it first.
 static const unsigned int RULES_V3_TIME_MAINNET = 0;
-static const unsigned int RULES_V3_TIME_TESTNET = 0;
+// Testnet first, as with PoW v2: 2026-10-20 01:00 UTC, so a real swap can be
+// made on a real chain before anything is scheduled where coins are worth
+// something.
+static const unsigned int RULES_V3_TIME_TESTNET = 1792458000;
 
 unsigned int RulesV3Time();
 bool RulesV3Active(unsigned int nBlockTime);
