@@ -6642,6 +6642,31 @@ static const btfchat::SwapView* SwapTestFind(const std::vector<btfchat::SwapView
     return v.empty() ? NULL : &v.back();
 }
 
+// CHATSWAP_LIGHT=1: both Bitflash wallets run the built-in Bitcoin light
+// client, with Core only as the Bitcoin nodes they reach and as the outside
+// wallet that pays a contract. The person's part, done here: a Bitcoin
+// address to receive (and be refunded) to, and paying the contract's address
+// when the chat asks for it.
+static void SwapTestLightPerson(btfchat::SwapEngine& e, const btfchat::SwapView* v, int nBtcPort,
+                                std::set<std::string>& paid)
+{
+    if (!v || !getenv("CHATSWAP_LIGHT"))
+        return;
+    if (v->btcDestination.empty() && v->myTxid.empty() && v->paymentAddress.empty())
+    {
+        nlohmann::json addr = SwapTestBtc(nBtcPort, "getnewaddress", nlohmann::json::array(), "/wallet/w");
+        e.SetBitcoinDestination(v->id, addr.get<std::string>());
+    }
+    if (v->stage == btfchat::SW_WAIT_PAYMENT && !v->paymentAddress.empty() && !paid.count(v->paymentAddress))
+    {
+        std::string amount = strprintf("%lld.%08lld", (long long)(v->giveAmount / COIN), (long long)(v->giveAmount % COIN));
+        nlohmann::json txid = SwapTestBtc(nBtcPort, "sendtoaddress", nlohmann::json::array({ v->paymentAddress, amount }), "/wallet/w");
+        printf("    paid %s BTC to the contract %s from an outside wallet (%s)\n", amount.c_str(),
+               v->paymentAddress.c_str(), txid.is_string() ? txid.get<std::string>().c_str() : "?");
+        paid.insert(v->paymentAddress);
+    }
+}
+
 // Run both engines until both swaps end, pressing the buttons a person would.
 // stopMaker: stop running the maker once the taker has locked (the maker
 // vanishes); btcSkew: move the regtest clock this far each round once the
@@ -6653,6 +6678,7 @@ static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, 
     std::string lastM, lastT;
     int64_t nStart = GetTime(), nMock = 0;
     bool fMakerGone = false;
+    std::set<std::string> paid;
     while (GetTime() - nStart < nDeadline)
     {
         if (!fMakerGone)
@@ -6668,6 +6694,9 @@ static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, 
         const btfchat::SwapView* m = SwapTestFind(vm);
         const btfchat::SwapView* t = SwapTestFind(vt);
         std::string err;
+        if (!fMakerGone)
+            SwapTestLightPerson(maker, m, nBtcPort, paid);
+        SwapTestLightPerson(taker, t, nBtcPort, paid);
         if (m && m->fNeedsMe && !fMakerGone)
             maker.Approve(m->id, err);
         if (t && t->fNeedsMe)
@@ -6708,6 +6737,10 @@ static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, 
         if (nBtcSkew > 0 && fTakerLocked)
         {
             nMock = std::max<int64_t>(nMock, GetTime()) + nBtcSkew;
+            // A light client refuses headers more than two hours ahead of
+            // its own clock, as Bitcoin nodes do.
+            if (getenv("CHATSWAP_LIGHT"))
+                nMock = std::min<int64_t>(nMock, GetTime() + 5400);
             SwapTestBtc(nBtcPort, "setmocktime", nlohmann::json::array({ nMock }));
         }
         SwapTestBtc(nBtcPort, "generatetoaddress", nlohmann::json::array({ 1, addr }));
