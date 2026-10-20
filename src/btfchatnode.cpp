@@ -10,6 +10,7 @@
 #include "btfchatwallet.h"
 #include "community.h"
 #include "chatdir.h"
+#include "btfchatswap.h"
 #ifdef snprintf
 #undef snprintf
 #endif
@@ -237,7 +238,17 @@ static bool LoadStore()
             strOutbox = strOutbox.substr(0, nSplit3);
         }
     }
+    // The swaps in progress, fifth: secrets and contracts that, lost, leave
+    // coins locked until a refund nobody remembers to make.
+    std::string strSwaps;
+    size_t nSplit4 = strCommunities.find('\n');
+    if (nSplit4 != std::string::npos)
+    {
+        strSwaps = strCommunities.substr(nSplit4 + 1);
+        strCommunities = strCommunities.substr(0, nSplit4);
+    }
     CommunitiesFromJson(strCommunities);
+    SwapsFromJson(strSwaps);
     if (!g_roster.FromJson(strRoster, err))
         printf("btfchat: the roster in the store did not load: %s\n", err.c_str());
     if (!strHistory.empty() && !g_history.FromJson(strHistory, err))
@@ -254,7 +265,8 @@ static bool SaveStore()
     // One line of roster, then the history: newline-separated because neither
     // half's JSON contains a raw newline, and it keeps the seal to one blob.
     std::string plain = g_roster.ToJson() + "\n" + g_history.ToJson()
-                      + "\n" + g_outbox.ToJson() + "\n" + CommunitiesToJson();
+                      + "\n" + g_outbox.ToJson() + "\n" + CommunitiesToJson()
+                      + "\n" + SwapsToJson();
     std::vector<unsigned char> sealed;
     if (!SealStore(g_id, plain, sealed))
         return false;
@@ -301,6 +313,7 @@ bool ChatUnlock(const std::string& password, std::string& errOut)
         g_history = History();
         g_outbox.Wipe();
         g_communities.clear();
+        SwapsClear();
         g_lock.Unlock(GetTime());
         LoadStore();
         // Epoch keys are random and kept, never derived, so they have to exist
@@ -330,6 +343,7 @@ void ChatLock()
         // no plaintext in it.
         g_outbox.Wipe();
         g_communities.clear();
+        SwapsClear();
         // The epoch secrets go with the session. An envelope sealed to them is
         // unreadable afterwards by anybody, us included: that is the forward
         // secrecy, and keeping them would quietly throw it away.
@@ -963,7 +977,9 @@ void ChatCommunities(std::vector<std::pair<std::string, std::string> >& out)
             out.push_back(std::make_pair(it->first, it->second.name));
 }
 
-bool ChatCommunityPost(const std::string& id, const std::string& text, std::string& errOut)
+// A post or a swap offer, sealed under the community key and left with the
+// nodes under today's tag.
+static bool PostToCommunity(const std::string& id, MsgKind kind, const std::string& text, std::string& errOut)
 {
     errOut.clear();
     if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
@@ -978,7 +994,7 @@ bool ChatCommunityPost(const std::string& id, const std::string& text, std::stri
         me = g_id;
     }
     Frame f;
-    f.kind = MSG_GROUP_TEXT;
+    f.kind = kind;
     f.group = id;
     f.sent = GetTime();
     f.text = text;
@@ -1002,6 +1018,31 @@ bool ChatCommunityPost(const std::string& id, const std::string& text, std::stri
         SaveStore();
     }
     return true;
+}
+
+bool ChatCommunityPost(const std::string& id, const std::string& text, std::string& errOut)
+{
+    return PostToCommunity(id, MSG_GROUP_TEXT, text, errOut);
+}
+
+bool ChatCommunityPostOffer(const std::string& id, const std::string& offerText, std::string& errOut)
+{
+    return PostToCommunity(id, MSG_SWAP_OFFER, offerText, errOut);
+}
+
+bool ChatSendSwapStep(const std::string& peerAddr, const std::string& stepText,
+                      bool& fLeftInMailboxOut, std::string& errOut)
+{
+    Frame f;
+    f.kind = MSG_SWAP;
+    f.text = stepText;
+    return SendInConversation(peerAddr, f, stepText, fLeftInMailboxOut, errOut);
+}
+
+void ChatSaveStore()
+{
+    CRITICAL_BLOCK(cs_chat)
+        SaveStore();
 }
 
 void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out)
@@ -1360,7 +1401,7 @@ static int DeliverCommunityPosts(const std::vector<unsigned char>& key,
         std::string err;
         if (!OpenFrame(g_secp, js, f, err))
             continue;
-        if (f.kind != MSG_GROUP_TEXT || f.group != id)
+        if ((f.kind != MSG_GROUP_TEXT && f.kind != MSG_SWAP_OFFER) || f.group != id)
             continue;
         CRITICAL_BLOCK(cs_chat)
         {
@@ -1780,6 +1821,8 @@ bool ChatServiceStart(std::string& errOut)
         printf("btfchat: could not start the descriptor publisher\n");
     if (_beginthread(ThreadChatMailbox, 0, NULL) == -1)
         printf("btfchat: could not start the mailbox thread\n");
+    if (_beginthread(ThreadChatSwaps, 0, NULL) == -1)
+        printf("btfchat: could not start the swap thread\n");
 
     CRITICAL_BLOCK(cs_chat)
     {

@@ -36,6 +36,15 @@ each phase is at the end.*
   chain for listings and hands the list to the chat, and nobody can take one
   down. Posts are signed, sealed with the room's key, and left with the nodes
   under a daily tag, collected in the same round as the mailbox.
+- **BTF for BTC, inside the chat.** An offer is a signed post in a community
+  ("100 BTF for 0.001 BTC"); whoever takes it and whoever made it carry an
+  atomic swap through in their conversation, each with their own Bitflash
+  wallet -- and, for the Bitcoin half, their own Bitcoin Core (any current
+  version: the wallet signs, Core only pays and receives). Each side checks
+  the other's contract on its own nodes before locking anything, the secret
+  is read off the chain, and a swap that does not finish refunds itself at
+  its lock. Two presses to lock, nothing else (`btfchatswap.h`,
+  `docs/atomic-swaps.md`).
 - **Spam costs work, not yet coin.** Every record a node stores carries about
   a second of proof of work, more for bigger ones; nodes ration each
   connection and cap the memory the chat may use. The burn stamp below is the
@@ -115,6 +124,36 @@ hands over its peer list, which may lead to new ones.
 **Clocks.** A record more than 2 h in the future is refused; a frame older
 than a day is refused by the replay guard. A machine whose clock is far off
 will see its records refused, and says so.
+
+**A swap step that lies.** The other side says "I locked 1 BTC for you" and
+did not, or locked less, or to another address, or under another secret.
+*Stops it:* nothing is locked or redeemed on the strength of a step. The
+taker's app looks the maker's contract up on the taker's own Bitflash node or
+Bitcoin Core and needs it unspent, confirmed, paying the taker's address the
+agreed amount, with 36 hours left; the maker's app checks the taker's the
+same way, under the maker's own hash, with 6 hours left, before showing the
+secret. A raw transaction in a message is never trusted: Bitcoin is checked
+by `gettxout` on the person's own node.
+
+**Fake coins.** Paying real BTF with Bitcoin from regtest or a test chain,
+which cost nothing. *Stops it:* the wallet refuses a Bitcoin Core on a test
+chain when Bitflash is on mainnet, and the main chain when it is on testnet.
+
+**A maker who takes and runs.** The maker redeems the taker's side (showing
+the secret) and never says so. *Stops it:* the taker's app reads the secret
+off the chain itself (`swapfindsecret`, `btcfindsecret`), so it needs nothing
+from the maker. *Left:* the taker's app has to run at some point in the day
+after; if it stays closed past the maker's lock (48 h from the start), the
+maker can refund too. The app says to stay open while a swap runs.
+
+**A taker who never locks.** *Stops it:* the maker's coins come back by
+themselves at the 48-hour lock; only time is lost. A take nobody accepts, or
+a contract that never confirms, expires before anything of the waiting side
+is locked.
+
+**Somebody else's offer.** A take names the offer by its frame id, and the
+maker's app answers only for offers it posted itself with exactly those
+terms; an offer is signed, so a take goes to whoever really made it.
 
 **A node restarting.** It forgets: the store is memory only, never the disk,
 so a seized machine has nothing to give up. It gets the records back from its

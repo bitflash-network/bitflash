@@ -61,7 +61,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h community.h chatdir.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h chatswap.h btfchatswap.h community.h chatdir.h \
           proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -75,7 +75,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/mlkem.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
-            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o \
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/chatswap.o obj/btfchatswap.o \
             obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
@@ -257,30 +257,33 @@ test_btfchat: test_btfchat.cpp btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
 	$(CXX) $(CXXFLAGS) -o $@ test_btfchat.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
 
 # The frame layer: signing, the group admin proof, the replay guard.
-test_btfchatmsg: test_btfchatmsg.cpp btfchatmsg.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatmsg: test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
 
 # See the note in makefile.mingw.
-test_btfchatbox: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatbox: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 
 # The sealed history.
-test_btfchatlog: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatlog: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
 
 # See the note in makefile.mingw.
-test_btfchatlink: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatlink: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 
 # See the note in makefile.mingw.
-test_chatstore: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_chatstore: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 
 # See the note in makefile.mingw.
 test_community: test_community.cpp community.cpp community.h
 	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
 
-tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community bitflash-node
+test_chatswap: test_chatswap.cpp chatswap.cpp chatswap.h
+	$(CXX) $(CXXFLAGS) -o $@ test_chatswap.cpp chatswap.cpp
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap bitflash-node
 	./test_bip32
 	./test_btfchan
 	./test_btfaddr
@@ -291,6 +294,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./test_btfchatlink
 	./test_chatstore
 	./test_community
+	./test_chatswap
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
@@ -309,6 +313,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=script-eval
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
+	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=net-hardening
 	./bitflash-node -selftest=multisig
 	./bitflash-node -selftest=socks5-proxy

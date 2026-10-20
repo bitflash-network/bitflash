@@ -74,12 +74,12 @@ bool History::Append(const Frame& f, const std::string& peer, bool fOutgoing,
     e.txid     = f.txid;
 
     bool fOk = false;
-    if (f.kind == MSG_GROUP_TEXT)
+    if (f.kind == MSG_GROUP_TEXT || f.kind == MSG_SWAP_OFFER)
     {
         if (f.group.empty()) { errOut = "a group message with no group"; return false; }
         fOk = PushInto(mapGroup, f.group, e, errOut);
     }
-    else if (f.kind == MSG_TEXT || f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT)
+    else if (f.kind == MSG_TEXT || f.kind == MSG_PAY_ADDRESS || f.kind == MSG_PAYMENT || f.kind == MSG_SWAP)
     {
         // A payment line belongs to the conversation it happened in, under the
         // same rules as a message: filed under its sender, never under us.
@@ -229,7 +229,7 @@ static bool EntriesFromJson(const json& a, std::vector<LogEntry>& out,
         // Group lines carry their kind too -- dropping every kind that was not
         // a plain or payment message emptied every group on reload, which the
         // round-trip test caught.
-        if (le.kind != MSG_TEXT && le.kind != MSG_GROUP_TEXT && !fPay)
+        if (le.kind != MSG_TEXT && le.kind != MSG_GROUP_TEXT && le.kind != MSG_SWAP_OFFER && le.kind != MSG_SWAP && !fPay)
             continue;
         // A line with no sender or no id is not a line we can reason about, and
         // one whose id repeats would defeat the duplicate check on reload. A

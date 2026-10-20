@@ -168,6 +168,13 @@ void ChatCommunities(std::vector<std::pair<std::string, std::string> >& out);
 // Post, signed by our identity, sealed with the community key, left with the
 // nodes. Blocks on the network: call it from a worker.
 bool ChatCommunityPost(const std::string& id, const std::string& text, std::string& errOut);
+// A swap offer (chatswap.h) posted to a community, and a swap step sent in
+// a conversation -- both for the swap engine, btfchatswap.h.
+bool ChatCommunityPostOffer(const std::string& id, const std::string& offerText, std::string& errOut);
+bool ChatSendSwapStep(const std::string& peerAddr, const std::string& stepText,
+                      bool& fLeftInMailboxOut, std::string& errOut);
+// Seal and write the store now (after the swap engine changed a swap).
+void ChatSaveStore();
 void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out);
 // The public directory, from the nodes. Blocks on the network.
 bool ChatCommunityDirectory(std::vector<CChatListing>& out, std::string& errOut);

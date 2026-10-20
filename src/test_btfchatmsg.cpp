@@ -7,6 +7,7 @@
 //       -lsecp256k1 -lsodium -lssl -lcrypto -o test_btfchatmsg.exe
 
 #include "btfchatmsg.h"
+#include "chatswap.h"
 #include "btfchat.h"
 #include "btfaddr.h"
 
@@ -485,6 +486,62 @@ int main()
         CHECK(r.MayDeliver(bob.address, btfchat::MSG_PAY_ADDRESS, err) &&
               r.MayDeliver(bob.address, btfchat::MSG_PAYMENT, err),
               "and then both are delivered");
+    }
+
+    printf("swap_frames\n");
+    {
+        // An offer: a community post whose text is the offer, nothing else.
+        btfchat::SwapOffer o;
+        o.give = "BTF"; o.giveAmount = 100 * 100000000LL;
+        o.want = "BTC"; o.wantAmount = 100000;
+        btfchat::Frame f;
+        f.kind = btfchat::MSG_SWAP_OFFER;
+        f.group = std::string(64, 'd');
+        f.sent = 3000;
+        f.text = btfchat::FormatSwapOffer(o);
+        std::string js;
+        btfchat::Frame g;
+        CHECK(btfchat::SignFrame(ctx, alice, f, js, err) && btfchat::OpenFrame(ctx, js, g, err) &&
+              g.kind == btfchat::MSG_SWAP_OFFER && g.text == f.text, "an offer signs and opens");
+        btfchat::SwapOffer o2 = o;
+        o2.wantAmount = 1;
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "text", btfchat::FormatSwapOffer(o2)), g, err),
+              "an offer's price changed in transit breaks the signature");
+        btfchat::Frame bad = f;
+        bad.text = "100 BTF for cheap";
+        CHECK(!btfchat::SignFrame(ctx, alice, bad, js, err), "an offer that does not parse is refused");
+        bad = f;
+        bad.group.clear();
+        CHECK(!btfchat::SignFrame(ctx, alice, bad, js, err), "an offer outside a community is refused");
+
+        // A step: direct, its text a step.
+        btfchat::SwapStep st;
+        st.swap = std::string(32, 'e');
+        st.step = "lock1";
+        st.chain = "BTF";
+        st.contract = std::string(194, 'a');
+        st.txid = std::string(64, 'b');
+        st.to = "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8";
+        btfchat::Frame s;
+        s.kind = btfchat::MSG_SWAP;
+        s.sent = 3001;
+        s.text = btfchat::FormatSwapStep(st);
+        CHECK(btfchat::SignFrame(ctx, bob, s, js, err) && btfchat::OpenFrame(ctx, js, g, err) &&
+              g.kind == btfchat::MSG_SWAP, "a swap step signs and opens");
+        btfchat::SwapStep st2 = st;
+        st2.to = "n1BgxTvfaXj4wzW4xLx1BQ3P8tPvhvCe7P";
+        CHECK(!btfchat::OpenFrame(ctx, EditField(js, "text", btfchat::FormatSwapStep(st2)), g, err),
+              "an address swapped into a step in transit breaks the signature");
+        bad = s;
+        bad.group = std::string(64, 'c');
+        CHECK(!btfchat::SignFrame(ctx, bob, bad, js, err), "a swap step is never a group frame");
+
+        btfchat::Roster r;
+        CHECK(!r.MayDeliver(bob.address, btfchat::MSG_SWAP, err), "a stranger cannot start a swap step");
+        CHECK(r.NoteIncomingInvite(bob.address, "hi", 1, err) && r.AcceptInvite(bob.address, err) &&
+              r.MayDeliver(bob.address, btfchat::MSG_SWAP, err), "a contact can");
+        CHECK(!r.MayDeliver(bob.address, btfchat::MSG_SWAP_OFFER, err),
+              "and an offer never comes over a direct link, only from its community");
     }
 
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);

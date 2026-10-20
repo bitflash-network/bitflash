@@ -49,7 +49,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/mlkem.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
-            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o \
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/chatswap.o obj/btfchatswap.o \
             obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
@@ -65,7 +65,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h community.h chatdir.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h chatswap.h btfchatswap.h community.h chatdir.h \
           proxy.h tor.h treasury.h compat.h gui_chat.h font_roboto.h jsonrpc.h
 
 all: bitflash.exe
@@ -155,7 +155,7 @@ btfchat.exe: $(CHAT_OBJS)
 	@echo "Built: btfchat.exe"
 
 clean:
-	rm -rf obj obj-chat bitflash.exe btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe
+	rm -rf obj obj-chat bitflash.exe btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe test_chatswap.exe
 
 test_bip32.exe: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto -lcrypt32
@@ -182,34 +182,34 @@ test_btfchat.exe: test_btfchat.cpp btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
 	@echo "Built: test_btfchat.exe"
 
 # The frame layer: signing, the group admin proof, the replay guard.
-test_btfchatmsg.exe: test_btfchatmsg.cpp btfchatmsg.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatmsg.exe: test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
 	@echo "Built: test_btfchatmsg.exe"
 
 # The offline path: epoch tags, rotating epoch keys, sealed envelopes. Links the
 # ML-KEM object, because an envelope resting on a relay is the case the
 # post-quantum half exists for.
-test_btfchatbox.exe: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatbox.exe: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 	@echo "Built: test_btfchatbox.exe"
 
 # The sealed history.
-test_btfchatlog.exe: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatlog.exe: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
 	@echo "Built: test_btfchatlog.exe"
 
 # The link: the handshake and framing over an abstract stream, plus the one
 # function that owns the order an incoming frame is taken apart in. The test
 # drives it over a blocking in-memory pipe with the endpoint in a thread, so the
 # protocol is exercised without a socket.
-test_btfchatlink.exe: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_btfchatlink.exe: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 	@echo "Built: test_btfchatlink.exe"
 
 # The records the nodes hold for the chat: wire form, proof of work, and every
 # rule about what a node keeps. Pure logic, so no node and no socket.
-test_chatstore.exe: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
-	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+test_chatstore.exe: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
 	@echo "Built: test_chatstore.exe"
 
 # Public communities: the listing format, names, the daily tag, the seal.
@@ -217,7 +217,12 @@ test_community.exe: test_community.cpp community.cpp community.h
 	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
 	@echo "Built: test_community.exe"
 
-tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe bitflash.exe
+# Swaps arranged in the chat: what an offer and each step must look like.
+test_chatswap.exe: test_chatswap.cpp chatswap.cpp chatswap.h
+	$(CXX) $(CXXFLAGS) -o $@ test_chatswap.cpp chatswap.cpp
+	@echo "Built: test_chatswap.exe"
+
+tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe test_chatswap.exe bitflash.exe
 	./test_bip32.exe
 	./test_btfchan.exe
 	./test_btfaddr.exe
@@ -228,6 +233,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./test_btfchatlink.exe
 	./test_chatstore.exe
 	./test_community.exe
+	./test_chatswap.exe
 	./bitflash.exe -selftest=wallet-keypool
 	./bitflash.exe -selftest=wallet-hd
 	./bitflash.exe -selftest=wallet-format
@@ -248,6 +254,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=script-eval
 	./bitflash.exe -selftest=rules-v2
 	./bitflash.exe -selftest=rules-v3
+	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=net-hardening
 	./bitflash.exe -selftest=multisig
 	./bitflash.exe -selftest=socks5-proxy

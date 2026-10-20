@@ -6,6 +6,7 @@
 #include "selftest.h"
 #include "btfchatnode.h"
 #include "btfchatwallet.h"
+#include "btcswap.h"
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -227,6 +228,11 @@ static void PrintUsage()
     printf("  /rpcport=N                 (JSON-RPC port, default 8432; testnet 18432)\n");
     printf("  /chatwallet                (let btfchat on this machine pay and receive with this\n");
     printf("                              wallet: RPC on 127.0.0.1, password in <datadir>/.cookie)\n");
+    printf("  /btcchain=main|testnet4|test|signet|regtest  (the Bitcoin chain for BTF<->BTC swaps;\n");
+    printf("                              default main, testnet4 on Bitflash testnet)\n");
+    printf("  /btcdatadir=DIR /btcrpcport=N /btcwallet=NAME  (where this machine's Bitcoin Core is;\n");
+    printf("                              its .cookie is read, or /btcrpcuser=U /btcrpcpassword=P)\n");
+    printf("  /btcfeerate=BTC            (per 1000 vbytes, when Core has no fee estimate)\n");
     printf("  /bindaddr=IP               (listen on this address instead of loopback;\n");
     printf("                              only for a Tor running on another machine --\n");
     printf("                              a reachable plain port exposes this node's onion)\n");
@@ -545,6 +551,15 @@ static void ParseStartupArguments(int argc, char* argv[])
         if (fJsonRpc)
             fprintf(stderr, "-chatwallet: btfchat on this machine can use this wallet (cookie in the data directory)\n");
     }
+    // The Bitcoin half of a swap: where this machine's Bitcoin Core is. Read
+    // only when a btc* call is made; nothing connects to Core before that.
+    btcswap::Configure(argval2(argc, argv, "/btcchain", "-btcchain"),
+                       argval2(argc, argv, "/btcdatadir", "-btcdatadir"),
+                       atoi(argval2(argc, argv, "/btcrpcport", "-btcrpcport").c_str()),
+                       argval2(argc, argv, "/btcwallet", "-btcwallet"),
+                       argval2(argc, argv, "/btcrpcuser", "-btcrpcuser"),
+                       argval2(argc, argv, "/btcrpcpassword", "-btcrpcpassword"),
+                       argval2(argc, argv, "/btcfeerate", "-btcfeerate"));
 #endif
 
     // Commands that do their work and exit have no use for Tor, and starting it

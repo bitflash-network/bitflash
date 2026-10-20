@@ -33,6 +33,8 @@
 #include "btfchatwallet.h"
 #include "chatdir.h"
 #include "community.h"
+#include "chatswap.h"
+#include "btfchatswap.h"
 #include "tor.h"
 
 #include <algorithm>
@@ -62,6 +64,10 @@ enum ActionKind
     ACT_DIRECTORY, // fetch the public community directory from the nodes
     ACT_CREATE,    // list a public community on the chain (burns 0.01 BTF)
     ACT_POST,      // post in a community
+    ACT_OFFER,     // post a swap offer in a community
+    ACT_TAKE,      // take somebody's swap offer
+    ACT_SWAP_OK,   // the person's yes on a swap: accept a take, or lock our side
+    ACT_SWAP_CANCEL,
 };
 
 CCriticalSection cs_ui;
@@ -96,6 +102,10 @@ const char* ActionLabel(ActionKind k)
     case ACT_DIRECTORY: return "asking the nodes for the public directory";
     case ACT_CREATE:  return "listing the community on the chain (burns 0.01 BTF)";
     case ACT_POST:    return "posting";
+    case ACT_OFFER:   return "checking your wallet and posting the offer";
+    case ACT_TAKE:    return "starting the swap";
+    case ACT_SWAP_OK: return "telling the swap to go on";
+    case ACT_SWAP_CANCEL: return "cancelling the swap";
     default:          return "";
     }
 }
@@ -181,6 +191,25 @@ void ThreadChatUiWorker(void*)
             }
             case ACT_POST:
                 fOk = btfchat::ChatCommunityPost(addr, text, err);
+                break;
+            case ACT_OFFER:
+            {
+                btfchat::SwapOffer o;
+                fOk = btfchat::ParseSwapOffer(text, o, err) && btfchat::ChatSwapPostOffer(addr, o, err);
+                if (fOk)
+                    err = "offer posted: " + btfchat::DescribeSwapOffer(o);
+                break;
+            }
+            case ACT_TAKE:
+                fOk = btfchat::ChatSwapTake(addr, text, err);
+                if (fOk)
+                    err = "swap started -- it goes on in your conversation with them";
+                break;
+            case ACT_SWAP_OK:
+                fOk = btfchat::ChatSwapApprove(text, err);
+                break;
+            case ACT_SWAP_CANCEL:
+                fOk = btfchat::ChatSwapCancel(text, err);
                 break;
             case ACT_REQUEST:
             case ACT_PAY:
@@ -419,6 +448,12 @@ std::string g_selectedCommunity;      // or which community (its id); one or the
 bool g_fShowDirectory = false;
 char g_communityNameBuf[40] = {0};
 char g_postBuf[1024] = {0};
+// A swap offer being written: what we give (0 BTF, 1 BTC) and the two amounts.
+int  g_offerGive = 0;
+char g_offerGiveBuf[32] = {0};
+char g_offerWantBuf[32] = {0};
+// The swap whose lock is waiting for its second press.
+std::string g_swapConfirm;
 bool g_fShowInvite = false;           // the "add someone" panel
 bool g_fConfirmAddress = false;       // showing the just-unlocked address
 
@@ -774,7 +809,7 @@ void DrawCommunity()
     }
     Hairline();
 
-    const float inputH = 58.0f;
+    const float inputH = 92.0f;
     ImGui::BeginChild("##communitylog", ImVec2(0.0f, -inputH), false);
     std::vector<btfchat::LogEntry> log;
     btfchat::ChatCommunityLog(g_selectedCommunity, log);
@@ -792,6 +827,29 @@ void DrawCommunity()
         ImGui::TextUnformatted(ShortAddr(log[i].from).c_str());
         ImGui::PopStyleColor();
         ImGui::SameLine();
+        btfchat::SwapOffer offer;
+        std::string offerErr;
+        if (log[i].kind == btfchat::MSG_SWAP_OFFER && btfchat::ParseSwapOffer(log[i].text, offer, offerErr))
+        {
+            // An offer: the terms are the signed post, the take goes to whoever signed it.
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_WARN);
+            ImGui::TextWrapped("[SWAP] gives %s%s%s", btfchat::DescribeSwapOffer(offer).c_str(),
+                               offer.note.empty() ? "" : " -- ", offer.note.c_str());
+            ImGui::PopStyleColor();
+            if (!log[i].outgoing)
+            {
+                ImGui::SameLine();
+                bool fCanTake = !Busy();
+                if (!fCanTake) ImGui::BeginDisabled();
+                if (ImGui::SmallButton(("take##" + log[i].id).c_str()))
+                    Queue(ACT_TAKE, g_selectedCommunity, log[i].id, "");
+                if (!fCanTake) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Starts a swap with them in your conversation. Nothing is locked until\n"
+                                      "their side is on the chain, checked, and you confirm.");
+            }
+            continue;
+        }
         ImGui::PushStyleColor(ImGuiCol_Text, log[i].outgoing ? COL_MINE : COL_TEXT);
         ImGui::TextWrapped("%s", log[i].text.c_str());
         ImGui::PopStyleColor();
@@ -814,7 +872,135 @@ void DrawCommunity()
         Queue(ACT_POST, g_selectedCommunity, g_postBuf, "");
         memset(g_postBuf, 0, sizeof(g_postBuf));
     }
+
+    // A swap offer: what we give and what we want for it. Posting locks
+    // nothing; whoever takes it locks second, after we do.
+    const char* coins[] = { "BTF", "BTC" };
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    ImGui::TextUnformatted("swap: give");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100.0f);
+    ImGui::InputTextWithHint("##offergive", "amount", g_offerGiveBuf, sizeof(g_offerGiveBuf),
+                             ImGuiInputTextFlags_CharsDecimal);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(64.0f);
+    ImGui::Combo("##offercoin", &g_offerGive, coins, 2);
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    ImGui::Text("for");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100.0f);
+    ImGui::InputTextWithHint("##offerwant", "amount", g_offerWantBuf, sizeof(g_offerWantBuf),
+                             ImGuiInputTextFlags_CharsDecimal);
+    ImGui::SameLine();
+    ImGui::Text("%s", coins[1 - g_offerGive]);
+    ImGui::SameLine();
+    btfchat::SwapOffer o;
+    o.give = coins[g_offerGive];
+    o.want = coins[1 - g_offerGive];
+    int64 nGive = 0, nWant = 0;
+    bool fOfferOk = ParseMoney(g_offerGiveBuf, nGive) && nGive > 0 && ParseMoney(g_offerWantBuf, nWant) && nWant > 0 &&
+                    !Busy();
+    if (!fOfferOk) ImGui::BeginDisabled();
+    if (ImGui::Button("offer"))
+    {
+        o.giveAmount = nGive;
+        o.wantAmount = nWant;
+        Queue(ACT_OFFER, g_selectedCommunity, btfchat::FormatSwapOffer(o), "");
+        memset(g_offerGiveBuf, 0, sizeof(g_offerGiveBuf));
+        memset(g_offerWantBuf, 0, sizeof(g_offerWantBuf));
+    }
+    if (!fOfferOk) ImGui::EndDisabled();
     ImGui::EndChild();
+}
+
+// The swaps with this person, above the conversation: where each stands, and
+// the one button it may be waiting for.
+void DrawSwaps(const std::string& peer)
+{
+    std::vector<btfchat::SwapView> swaps;
+    btfchat::ChatSwapList(swaps);
+    for (size_t i = 0; i < swaps.size(); i++)
+    {
+        const btfchat::SwapView& s = swaps[i];
+        if (s.peer != peer)
+            continue;
+        bool fFinal = s.stage == btfchat::SW_DONE || s.stage == btfchat::SW_REFUNDED ||
+                      s.stage == btfchat::SW_CANCELLED || s.stage == btfchat::SW_FAILED;
+        // Finished swaps stay a day, then make room.
+        if (fFinal && GetTime() - s.updated > 24 * 3600)
+            continue;
+        ImVec4 col = s.stage == btfchat::SW_DONE ? COL_OK
+                   : (s.stage == btfchat::SW_FAILED ? COL_BAD : (fFinal ? COL_DIM : COL_WARN));
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextWrapped("[SWAP] you give %s %s, get %s %s -- %s",
+                           btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str(),
+                           btfchat::FormatSwapAmount(s.wantAmount).c_str(), s.want.c_str(), s.status.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered() && (!s.myTxid.empty() || !s.theirTxid.empty()))
+            ImGui::SetTooltip("ours   %s\ntheirs %s\nredeem %s\nrefund %s", s.myTxid.c_str(), s.theirTxid.c_str(),
+                              s.redeemTxid.c_str(), s.refundTxid.c_str());
+        bool fBusy = Busy();
+        if (s.fNeedsMe)
+        {
+            std::string label = strprintf("%s: lock %s %s", s.fMaker ? "accept" : "go on",
+                                          btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str());
+            if (fBusy) ImGui::BeginDisabled();
+            if (g_swapConfirm != s.id)
+            {
+                if (ImGui::SmallButton((label + "##" + s.id).c_str()))
+                    g_swapConfirm = s.id;
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.25f, 0.05f, 1.0f));
+                if (ImGui::SmallButton(("confirm: " + label + "##c" + s.id).c_str()))
+                {
+                    Queue(ACT_SWAP_OK, peer, s.id, "");
+                    g_swapConfirm.clear();
+                }
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Your coins go into the contract. They come back by themselves if the\n"
+                                      "swap does not finish -- keep the chat open until it does.");
+            }
+            if (fBusy) ImGui::EndDisabled();
+            ImGui::SameLine();
+        }
+        if (s.fCanCancel)
+        {
+            if (fBusy) ImGui::BeginDisabled();
+            if (ImGui::SmallButton(("cancel##swap" + s.id).c_str()))
+            {
+                Queue(ACT_SWAP_CANCEL, peer, s.id, "");
+                g_swapConfirm.clear();
+            }
+            if (fBusy) ImGui::EndDisabled();
+        }
+        else if (s.fNeedsMe)
+            ImGui::NewLine();
+    }
+}
+
+// A swap step as a line of the conversation: what happened, not the JSON.
+std::string DescribeStep(const btfchat::LogEntry& e)
+{
+    btfchat::SwapStep st;
+    std::string err;
+    if (!btfchat::ParseSwapStep(e.text, st, err))
+        return "a swap step this build cannot read";
+    const char* who = e.outgoing ? "you" : "they";
+    if (st.step == "take")
+        return strprintf("%s asked to take the offer: %s", who, btfchat::DescribeSwapOffer(st.terms).c_str());
+    if (st.step == "lock1" || st.step == "lock2")
+        return strprintf("%s locked %s side on the %s chain", who, e.outgoing ? "your" : "their", st.chain.c_str());
+    if (st.step == "redeemed")
+        return strprintf("%s took the other side with the secret", who);
+    if (st.step == "cancel")
+        return strprintf("%s cancelled%s%s", who, st.why.empty() ? "" : ": ", st.why.c_str());
+    return st.step;
 }
 
 void DrawConversation()
@@ -854,6 +1040,7 @@ void DrawConversation()
     }
 
     const float inputH = 92.0f;
+    DrawSwaps(g_selected);
     ImGui::BeginChild("##chatlog", ImVec2(0.0f, -inputH), false);
     std::vector<btfchat::LogEntry> log;
     btfchat::ChatConversation(g_selected, log);
@@ -864,6 +1051,13 @@ void DrawConversation()
         ImGui::TextUnformatted(FmtWhen(e.sent).c_str());
         ImGui::PopStyleColor();
         ImGui::SameLine();
+        if (e.kind == btfchat::MSG_SWAP)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+            ImGui::TextWrapped("[swap] %s", DescribeStep(e).c_str());
+            ImGui::PopStyleColor();
+            continue;
+        }
         if (e.kind == btfchat::MSG_PAY_ADDRESS)
         {
             std::string what = e.amount > 0

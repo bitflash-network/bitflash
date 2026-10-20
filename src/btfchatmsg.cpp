@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license.
 
 #include "btfchatmsg.h"
+#include "chatswap.h"
 
 #include "btfaddr.h"
 
@@ -201,6 +202,26 @@ static bool CheckFields(const Frame& f, std::string& errOut)
         if (f.text.size() > MAX_TEXT_BYTES) { errOut = "the message is too long"; return false; }
         if (!f.proof.empty())  { errOut = "a group message carries no admin proof"; return false; }
         return true;
+
+    case MSG_SWAP_OFFER:
+    {
+        // A post in a community, so it names one; its text is the offer and
+        // nothing else -- a frame the app acts on is parsed, not read.
+        if (f.group.empty() || f.group.size() > 64) { errOut = "an offer is posted in a community"; return false; }
+        if (!f.proof.empty())  { errOut = "an offer carries no admin proof"; return false; }
+        if (f.text.size() > MAX_TEXT_BYTES) { errOut = "the offer is too long"; return false; }
+        SwapOffer o;
+        return ParseSwapOffer(f.text, o, errOut);
+    }
+
+    case MSG_SWAP:
+    {
+        if (!f.group.empty())  { errOut = "a swap step is direct, never in a group"; return false; }
+        if (!f.proof.empty())  { errOut = "a swap step carries no admin proof"; return false; }
+        if (f.text.size() > MAX_TEXT_BYTES) { errOut = "the swap step is too long"; return false; }
+        SwapStep s;
+        return ParseSwapStep(f.text, s, errOut);
+    }
     }
 
     // Payment frames: direct only, never in a group -- an address offered to a
@@ -318,7 +339,7 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
     {
         f.version = j.value("v", 0);
         int nKind = j.value("k", -1);
-        if (nKind < MSG_INVITE || nKind > MSG_PAYMENT)
+        if (nKind < MSG_INVITE || nKind > MSG_SWAP)
         {
             errOut = "unknown frame kind";
             return false;

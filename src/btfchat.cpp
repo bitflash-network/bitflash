@@ -370,6 +370,20 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
         errOut = "not accepted";
         return false;
 
+    case MSG_SWAP:
+        // A swap is arranged with somebody we agreed to talk to, never a
+        // stranger: a step names addresses the app will lock coins towards.
+        if (st == PEER_ACCEPTED)
+            return true;
+        errOut = "not accepted";
+        return false;
+
+    case MSG_SWAP_OFFER:
+        // Offers are community posts, read off the community, never handed
+        // over a direct link.
+        errOut = "offers come through their community";
+        return false;
+
     case MSG_GROUP_INVITE:
         // May come from someone we do not know -- that is what an invite is for.
         // Blocked was already refused above, which is the property that matters.

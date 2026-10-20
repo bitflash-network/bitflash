@@ -264,7 +264,15 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
     case MSG_TEXT:
     case MSG_PAY_ADDRESS:
     case MSG_PAYMENT:
+    case MSG_SWAP:
+        // A swap step lands in the history like a message; the swap engine
+        // reads it from there (btfchatswap.h), whichever way it arrived.
         return history->Append(f, f.from, false, errOut);
+
+    case MSG_SWAP_OFFER:
+        // MayDeliver already refused it; kept so the switch stays complete.
+        errOut = "offers come through their community";
+        return false;
 
     case MSG_GROUP_TEXT:
         return history->Append(f, std::string(), false, errOut);

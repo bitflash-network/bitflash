@@ -77,6 +77,15 @@ null.
 | `swapredeem` | `contract`, `txid`, `secret` | takes the coins with the secret |
 | `swaprefund` | `contract`, `txid` | takes them back after the lock |
 | `swapextractsecret` | `txid` \| `rawhex`, `secrethash` | the secret, from a redeem on this chain or on Bitcoin's |
+| `swapfindsecret` | `contract`, `txid` | whether a contract of ours was spent, and the secret if the spend showed it |
+| `btcswapinfo` | -- | the Bitcoin Core this wallet swaps against (`-btcchain`, `-btcdatadir`...): chain, height, balance, fee rate |
+| `btcnewaddress` | -- | a Bitcoin address whose key is in THIS wallet, to be paid BTC to in a swap |
+| `btcinitiate` | `address`, `amount` | starts a swap on Bitcoin: Core funds the contract; the keys and the secret are this wallet's |
+| `btcparticipate` | `address`, `amount`, `secrethash` | the other half, on Bitcoin |
+| `btcauditcontract` | `contract`, `rawhex` \| `txid` \| `txid:vout` | a Bitcoin contract as this machine's Core sees it: unspent, confirmations, amount, whether it pays us |
+| `btcredeem` | `contract`, ref, `secret` | takes the BTC into a fresh address of Core's wallet |
+| `btcrefund` | `contract`, ref | takes it back after the lock |
+| `btcfindsecret` | `contract`, ref, [`fromheight`] | whether a Bitcoin contract was spent, and the secret |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the

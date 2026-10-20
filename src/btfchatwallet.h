@@ -19,6 +19,8 @@
 #ifndef BITFLASH_BTFCHATWALLET_H
 #define BITFLASH_BTFCHATWALLET_H
 
+#include "rpcclient.h"
+
 #include <string>
 #include <stdint.h>
 
@@ -47,6 +49,11 @@ bool WalletBurn(int64_t amount, const std::string& dataHex, std::string& txidOut
 // how many confirmations. False when the wallet has never seen it.
 bool WalletLookup(const std::string& txid, int64_t& receivedOut, int& confirmationsOut,
                   std::string& errOut);
+
+// Any call, for the swap engine (btfchatswap.h): the swap* and btc* calls,
+// where the wallet does the work on both chains.
+bool WalletRpc(const std::string& method, const nlohmann::json& params, nlohmann::json& resultOut,
+               std::string& errOut);
 
 } // namespace btfchat
 

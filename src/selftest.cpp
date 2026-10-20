@@ -20,6 +20,8 @@
 #include "chatrelay.h"
 #include "chatstore.h"
 #include "swap.h"
+#include "btcswap.h"
+#include "btfchatswap.h"
 #include "btfchatwallet.h"
 #include "chatdir.h"
 #include "community.h"
@@ -6110,6 +6112,427 @@ static int RunManagedTorSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The Bitcoin half of a swap, without a Bitcoin Core: addresses, reading
+// Bitcoin's witness serialization, and the redeem and refund this wallet
+// signs. What Core itself does with them is the regtest run's job.
+static int RunBtcSwapSelfTest()
+{
+    printf("btc-swap self-test\n");
+    int nFail = 0;
+    std::string err;
+
+    btcswap::Chain mainChain, testChain;
+    mainChain.name = "main";
+    mainChain.fMain = true;
+    mainChain.pkhVersion = 0x00;
+    mainChain.shVersion = 0x05;
+    testChain.name = "regtest";
+    testChain.pkhVersion = 0x6f;
+    testChain.shVersion = 0xc4;
+
+    // ---- addresses
+    std::vector<unsigned char> zero(20, 0), pkh;
+    nFail += Check(btcswap::PkhToAddress(mainChain, zero) == "1111111111111111111114oLvT2",
+                   "a zero key hash is 1111111111111111111114oLvT2 on main, as in Bitcoin") ? 0 : 1;
+    nFail += Check(btcswap::PkhToAddress(testChain, zero) == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8",
+                   "and mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8 on the test chains") ? 0 : 1;
+    nFail += Check(btcswap::AddressToPkh(mainChain, "1111111111111111111114oLvT2", pkh, err) && pkh == zero,
+                   "a main address reads back to its key hash") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(testChain, "1111111111111111111114oLvT2", pkh, err) &&
+                   err.find("another Bitcoin network") != std::string::npos,
+                   "a main address is refused on a test chain") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(mainChain, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", pkh, err),
+                   "a bc1 address is refused: the contract holds a key hash") ? 0 : 1;
+    CScript scriptAny;
+    scriptAny << OP_TRUE;
+    nFail += Check(btcswap::ScriptAddress(mainChain, scriptAny)[0] == '3' && btcswap::ScriptAddress(testChain, scriptAny)[0] == '2',
+                   "a contract's address is 3... on main and 2... on the test chains") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(mainChain, btcswap::ScriptAddress(mainChain, scriptAny), pkh, err) &&
+                   err.find("script address") != std::string::npos,
+                   "a script address is refused as a party to the contract") ? 0 : 1;
+
+    // ---- a contract whose keys are this wallet's
+    CKey keyR, keyF;
+    keyR.MakeNewKey();
+    keyF.MakeNewKey();
+    std::vector<unsigned char> pubR = keyR.GetPubKey(), pubF = keyF.GetPubKey();
+    uint160 hR = Hash160(pubR), hF = Hash160(pubF);
+    swap::Contract c;
+    c.recipientPkh.assign(hR.begin(), hR.end());
+    c.refundPkh.assign(hF.begin(), hF.end());
+    std::vector<unsigned char> secret(32);
+    RAND_bytes(&secret[0], 32);
+    c.secretHash.resize(32);
+    SHA256(&secret[0], 32, &c.secretHash[0]);
+    c.nLockTime = 1800000000;
+    CScript contract = swap::BuildContract(c);
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+
+    // ---- Bitcoin's serialization, with and without a witness
+    CTransaction fund;
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint(uint256(7), 1);
+    fund.vout.push_back(CTxOut(10000000, p2sh));
+    fund.vout.push_back(CTxOut(5000, CScript() << OP_0 << std::vector<unsigned char>(20, 1)));
+    CDataStream ss(SER_NETWORK);
+    ss << fund;
+    std::vector<unsigned char> plain(ss.begin(), ss.end());
+    std::vector<unsigned char> wit(plain.begin(), plain.begin() + 4);
+    wit.push_back(0x00);
+    wit.push_back(0x01);
+    wit.insert(wit.end(), plain.begin() + 4, plain.end() - 4);
+    wit.push_back(2);                                   // two witness items
+    wit.push_back(72);
+    wit.insert(wit.end(), 72, 0x30);
+    wit.push_back(33);
+    wit.insert(wit.end(), 33, 0x02);
+    wit.insert(wit.end(), plain.end() - 4, plain.end());
+
+    CTransaction parsed;
+    nFail += Check(btcswap::ParseTx(wit, parsed) && parsed.GetHash() == fund.GetHash() &&
+                   parsed.vout.size() == 2 && parsed.vout[0].scriptPubKey == p2sh,
+                   "a witness transaction reads, with the txid of its form without the witness") ? 0 : 1;
+    nFail += Check(btcswap::ParseTx(plain, parsed) && parsed.GetHash() == fund.GetHash(),
+                   "and so does the same transaction without one") ? 0 : 1;
+    std::vector<unsigned char> cut(wit.begin(), wit.end() - 5), extra = wit;
+    extra.push_back(0);
+    nFail += Check(!btcswap::ParseTx(cut, parsed) && !btcswap::ParseTx(extra, parsed),
+                   "a truncated transaction, or one with bytes after it, does not") ? 0 : 1;
+    std::vector<unsigned char> blk(80, 0);
+    blk.push_back(2);
+    blk.insert(blk.end(), wit.begin(), wit.end());
+    blk.insert(blk.end(), plain.begin(), plain.end());
+    std::vector<CTransaction> txs;
+    nFail += Check(btcswap::ParseBlockTxs(blk, txs) && txs.size() == 2 && txs[0].GetHash() == fund.GetHash() &&
+                   txs[1].GetHash() == fund.GetHash(),
+                   "a raw block reads into its transactions, witness or not") ? 0 : 1;
+
+    // ---- the redeem this wallet signs
+    COutPoint outpoint(fund.GetHash(), 0);
+    CScript scriptTo;
+    scriptTo << OP_0 << std::vector<unsigned char>(20, 2);    // Core's bc1 address
+    CTransaction redeem, refund;
+    int64 nFee = 0;
+    nFail += Check(btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, &secret, 10000, redeem, nFee, err),
+                   "the recipient key and the secret redeem the contract") ? 0 : 1;
+    int64 nSize = (int64)::GetSerializeSize(redeem, SER_NETWORK);
+    int64 nNeed = (nSize * 10000 + 999) / 1000;
+    // At least the rate for its size; a signature is 71 to 73 bytes, so at
+    // most a couple of bytes' worth over.
+    nFail += Check(nFee >= nNeed && nFee <= nNeed + 30 && redeem.vout.size() == 1 &&
+                   redeem.vout[0].nValue == 10000000 - nFee && redeem.vout[0].scriptPubKey == scriptTo,
+                   "one output, to Core's address, the fee at the rate asked for its size") ? 0 : 1;
+    std::vector<unsigned char> got;
+    nFail += Check(swap::ExtractSecret(redeem.vin[0].scriptSig, c.secretHash, got) && got == secret,
+                   "the redeem shows the secret, as the other side needs") ? 0 : 1;
+    CDataStream ssR(SER_NETWORK);
+    ssR << redeem;
+    CTransaction back;
+    nFail += Check(btcswap::ParseTx(std::vector<unsigned char>(ssR.begin(), ssR.end()), back) && back.GetHash() == redeem.GetHash(),
+                   "and serializes as a plain Bitcoin transaction") ? 0 : 1;
+    std::vector<unsigned char> wrong(32, 9);
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, &wrong, 10000, redeem, nFee, err),
+                   "a wrong secret does not") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyF, pubF, &secret, 10000, redeem, nFee, err),
+                   "nor does the refund key with the secret") ? 0 : 1;
+
+    // ---- the refund
+    nFail += Check(btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyF, pubF, NULL, 10000, refund, nFee, err) &&
+                   refund.nLockTime == (unsigned int)c.nLockTime && refund.vin[0].nSequence == 0,
+                   "the refund key refunds, with the lock in nLockTime and an input that keeps it on") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, NULL, 10000, refund, nFee, err),
+                   "the recipient cannot take the refund path") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 1500, scriptTo, keyR, pubR, &secret, 10000, redeem, nFee, err) &&
+                   err.find("less than the fee") != std::string::npos,
+                   "a contract worth less than its fee is not spent into dust") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- chat-swap: the swap engine, end to end, with coins ------------------------
+//
+// Two engines (btfchatswap.h) wired to each other in place of the chat, each
+// to a real Bitflash wallet on testnet and through it to a real Bitcoin Core
+// on regtest. Every round both engines are written out and read back, as if
+// the app had restarted. Not in `make tests`: it needs the wallets and Core.
+//
+//   CHATSWAP_A=port:passfile   Alice's Bitflash wallet (RPC user "swap")
+//   CHATSWAP_B=port:passfile   Bob's
+//   CHATSWAP_BTC=port          the regtest Core both wallets use (user/pass swap/swap,
+//                              wallet "w" mines)
+
+namespace
+{
+struct SwapTestHost : public btfchat::SwapHost
+{
+    std::string addr;
+    SwapTestHost* other = NULL;
+    std::vector<btfchat::LogEntry> convo;
+    std::map<std::string, btfchat::SwapOffer> offers;
+    LoopbackRpc wallet;
+
+    std::string MyAddress() { return addr; }
+    bool PeerAccepted(const std::string&) { return true; }
+    bool Invite(const std::string&, const std::string&, std::string&) { return true; }
+    bool SendStep(const std::string&, const std::string& text, std::string&)
+    {
+        btfchat::LogEntry e;
+        e.from = addr;
+        e.sent = GetTime();
+        unsigned char b[16];
+        RAND_bytes(b, sizeof(b));
+        e.id = HexStr(b, b + sizeof(b), false);
+        e.text = text;
+        e.kind = btfchat::MSG_SWAP;
+        e.outgoing = true;
+        convo.push_back(e);
+        e.outgoing = false;
+        other->convo.push_back(e);
+        return true;
+    }
+    void Contacts(std::vector<std::string>& out) { out.assign(1, other->addr); }
+    void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out = convo; }
+    bool FindMyOffer(const std::string& id, btfchat::SwapOffer& out)
+    {
+        if (!offers.count(id))
+            return false;
+        out = offers[id];
+        return true;
+    }
+    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    {
+        return LoopbackRpcCall(wallet, method, params, r, err);
+    }
+    void Changed() {}
+};
+
+static nlohmann::json SwapTestBtc(int nPort, const std::string& method, const nlohmann::json& params,
+                                  const std::string& path = "/")
+{
+    LoopbackRpc to;
+    to.nPort = nPort;
+    to.strPath = path;
+    to.strAuth = "swap:swap";
+    to.strWho = "Bitcoin Core";
+    nlohmann::json r;
+    std::string err;
+    if (!LoopbackRpcCall(to, method, params, r, err))
+        throw std::runtime_error("Bitcoin Core " + method + ": " + err);
+    return r;
+}
+
+static bool SwapTestWallet(const char* env, LoopbackRpc& to)
+{
+    const char* v = getenv(env);
+    if (!v)
+        return false;
+    std::string s = v;
+    size_t c = s.find(':');
+    if (c == std::string::npos)
+        return false;
+    to.nPort = atoi(s.substr(0, c).c_str());
+    FILE* f = fopen(s.substr(c + 1).c_str(), "rb");
+    if (!f)
+        return false;
+    char buf[256] = "";
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    std::string pass(buf, n);
+    while (!pass.empty() && (pass[pass.size() - 1] == '\n' || pass[pass.size() - 1] == '\r'))
+        pass.erase(pass.size() - 1);
+    to.strAuth = "swap:" + pass;
+    to.strWho = env;
+    to.nTimeoutSecs = 900;
+    return true;
+}
+
+static const btfchat::SwapView* SwapTestFind(const std::vector<btfchat::SwapView>& v)
+{
+    return v.empty() ? NULL : &v.back();
+}
+
+// Run both engines until both swaps end, pressing the buttons a person would.
+// stopMaker: stop running the maker once the taker has locked (the maker
+// vanishes); btcSkew: move the regtest clock this far each round once the
+// taker has locked (to reach a Bitcoin refund without waiting for it).
+static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, int nBtcPort,
+                        int64_t nDeadline, bool fStopMakerAfterTakerLocks, int64_t nBtcSkew,
+                        btfchat::SwapView& makerEnd, btfchat::SwapView& takerEnd)
+{
+    std::string lastM, lastT;
+    int64_t nStart = GetTime(), nMock = 0;
+    bool fMakerGone = false;
+    while (GetTime() - nStart < nDeadline)
+    {
+        if (!fMakerGone)
+            maker.Round();
+        taker.Round();
+        // As if the app had been closed and opened again.
+        maker.FromJson(maker.ToJson());
+        taker.FromJson(taker.ToJson());
+
+        std::vector<btfchat::SwapView> vm, vt;
+        maker.List(vm);
+        taker.List(vt);
+        const btfchat::SwapView* m = SwapTestFind(vm);
+        const btfchat::SwapView* t = SwapTestFind(vt);
+        std::string err;
+        if (m && m->fNeedsMe && !fMakerGone)
+            maker.Approve(m->id, err);
+        if (t && t->fNeedsMe)
+            taker.Approve(t->id, err);
+        std::string sm = m ? strprintf("%d %s", m->stage, m->status.c_str()) : "-";
+        std::string st = t ? strprintf("%d %s", t->stage, t->status.c_str()) : "-";
+        if (sm != lastM) { printf("    [%4ds] maker: %s\n", (int)(GetTime() - nStart), sm.c_str()); lastM = sm; }
+        if (st != lastT) { printf("    [%4ds] taker: %s\n", (int)(GetTime() - nStart), st.c_str()); lastT = st; }
+        fflush(stdout);
+
+        bool fTakerLocked = t && !t->myTxid.empty();
+        // Gone the moment the taker's side is locked -- before the maker's
+        // next round could read lock2 and redeem.
+        if (fStopMakerAfterTakerLocks && fTakerLocked && !fMakerGone)
+        {
+            printf("    the maker goes away\n");
+            fMakerGone = true;
+        }
+        auto fin = [](const btfchat::SwapView* v) {
+            return v && (v->stage == btfchat::SW_DONE || v->stage == btfchat::SW_REFUNDED ||
+                         v->stage == btfchat::SW_CANCELLED || v->stage == btfchat::SW_FAILED);
+        };
+        if (fMakerGone && fin(t))
+        {
+            // The taker is done; the maker comes back, to find its own refund.
+            printf("    the maker comes back\n");
+            fMakerGone = false;
+            fStopMakerAfterTakerLocks = false;
+        }
+        if (fin(m) && fin(t))
+        {
+            makerEnd = *m;
+            takerEnd = *t;
+            return true;
+        }
+        // Bitcoin blocks, so contracts there confirm; Bitflash makes its own.
+        nlohmann::json addr = SwapTestBtc(nBtcPort, "getnewaddress", nlohmann::json::array(), "/wallet/w");
+        if (nBtcSkew > 0 && fTakerLocked)
+        {
+            nMock = std::max<int64_t>(nMock, GetTime()) + nBtcSkew;
+            SwapTestBtc(nBtcPort, "setmocktime", nlohmann::json::array({ nMock }));
+        }
+        SwapTestBtc(nBtcPort, "generatetoaddress", nlohmann::json::array({ 1, addr }));
+        Sleep(10000);
+    }
+    std::vector<btfchat::SwapView> vm, vt;
+    maker.List(vm);
+    taker.List(vt);
+    if (!vm.empty()) makerEnd = vm.back();
+    if (!vt.empty()) takerEnd = vt.back();
+    return false;
+}
+} // namespace
+
+static int RunChatSwapSelfTest()
+{
+    printf("chat-swap self-test (testnet Bitflash wallets + Bitcoin Core regtest)\n");
+    SwapTestHost a, b;
+    const char* pszBtc = getenv("CHATSWAP_BTC");
+    if (!IsTestNet() || !SwapTestWallet("CHATSWAP_A", a.wallet) || !SwapTestWallet("CHATSWAP_B", b.wallet) || !pszBtc)
+    {
+        printf("  needs -testnet and CHATSWAP_A, CHATSWAP_B, CHATSWAP_BTC; see selftest.cpp\n");
+        return 1;
+    }
+    int nBtc = atoi(pszBtc);
+    int nFail = 0;
+    a.addr = "alice.btf";
+    b.addr = "bob.btf";
+    a.other = &b;
+    b.other = &a;
+
+    try
+    {
+        // ---- 1: Alice gives BTF, Bob gives BTC; both finish
+        {
+            printf("  1. Alice offers 1 BTF for 0.05 BTC; Bob takes it\n");
+            btfchat::SwapEngine ea(&a), eb(&b);
+            btfchat::SwapOffer o;
+            o.give = "BTF"; o.giveAmount = COIN;
+            o.want = "BTC"; o.wantAmount = 5000000;
+            a.offers["11111111111111111111111111111111"] = o;
+            std::string id, err;
+            nFail += Check(eb.Take(a.addr, "11111111111111111111111111111111", o, id, err), "Bob takes the offer") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(ea, eb, nBtc, 7200, false, 0, m, t);
+            nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
+                           "both sides finish: DONE and DONE") ? 0 : 1;
+            nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
+            double got = tx.value("amount", 0.0);
+            nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's Bitcoin Core wallet got %.8f BTC", got).c_str()) ? 0 : 1;
+            nlohmann::json bt;
+            std::string e2;
+            nFail += Check(LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
+                           bt.value("amount", 0.0) > 0.98,
+                           strprintf("Bob's Bitflash wallet got %.8f BTF", bt.value("amount", 0.0)).c_str()) ? 0 : 1;
+        }
+
+        // ---- 2: Bob gives BTC, Alice gives BTF; the other direction
+        {
+            printf("  2. Bob offers 0.04 BTC for 0.8 BTF; Alice takes it\n");
+            btfchat::SwapEngine ea(&a), eb(&b);
+            a.convo.clear();
+            b.convo.clear();
+            btfchat::SwapOffer o;
+            o.give = "BTC"; o.giveAmount = 4000000;
+            o.want = "BTF"; o.wantAmount = 80000000;
+            b.offers["22222222222222222222222222222222"] = o;
+            std::string id, err;
+            nFail += Check(ea.Take(b.addr, "22222222222222222222222222222222", o, id, err), "Alice takes it") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(eb, ea, nBtc, 7200, false, 0, m, t);
+            nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
+                           "both sides finish the other way round too") ? 0 : 1;
+        }
+
+        // ---- 3: Alice locks, Bob locks, Alice vanishes: both refund
+        {
+            printf("  3. Alice offers 0.5 BTF for 0.03 BTC; Bob locks; Alice vanishes\n");
+            btfchat::SwapConfig cfg;
+            // Short locks (test chains only): 6 Bitflash blocks for Alice, 15
+            // minutes of Bitcoin median time for Bob, and the margins to match.
+            cfg.nBtfInitiatorBlocks = 6;
+            cfg.nBtcParticipantSecs = 900;
+            cfg.nTakerMinLeft = 240;
+            cfg.nMakerMinLeft = 60;
+            btfchat::SwapEngine ea(&a, cfg), eb(&b, cfg);
+            a.convo.clear();
+            b.convo.clear();
+            btfchat::SwapOffer o;
+            o.give = "BTF"; o.giveAmount = 50000000;
+            o.want = "BTC"; o.wantAmount = 3000000;
+            a.offers["33333333333333333333333333333333"] = o;
+            std::string id, err;
+            nFail += Check(eb.Take(a.addr, "33333333333333333333333333333333", o, id, err), "Bob takes it") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(ea, eb, nBtc, 14400, true, 300, m, t);
+            nFail += Check(fEnd && t.stage == btfchat::SW_REFUNDED && !t.refundTxid.empty(),
+                           "Bob's BTC comes back by itself after its lock") ? 0 : 1;
+            nFail += Check(fEnd && m.stage == btfchat::SW_REFUNDED && !m.refundTxid.empty(),
+                           "and Alice's BTF after hers -- she never showed the secret") ? 0 : 1;
+        }
+    }
+    catch (std::exception& e)
+    {
+        nFail += Check(false, e.what()) ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -6180,6 +6603,10 @@ int RunSelfTest(const std::string& name)
         return RunChatWalletSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
+    if (name == "btc-swap")
+        return RunBtcSwapSelfTest();
+    if (name == "chat-swap")
+        return RunChatSwapSelfTest();
     if (name == "chat-live")
         return RunChatLiveSelfTest();
 

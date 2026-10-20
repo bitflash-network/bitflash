@@ -137,6 +137,10 @@ enum MsgKind
     // so a payment cannot be redirected by anything between you.
     MSG_PAY_ADDRESS,     // "pay me here": a B address of the sender's wallet
     MSG_PAYMENT,         // "I paid you": txid, amount, the address it went to
+    // Atomic swaps BTF<->BTC arranged in the chat (chatswap.h). An offer is a
+    // post in a public community; the steps go in the conversation.
+    MSG_SWAP_OFFER,      // a community post: "I give X, I want Y"
+    MSG_SWAP,            // one step of a swap between the two of us
 };
 
 struct Invite
