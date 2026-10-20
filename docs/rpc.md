@@ -63,7 +63,10 @@ null.
 | `validateaddress` | `address` | `isvalid`, and `ismine` when it is |
 | `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards |
 | `sendtoaddress` | `address`, `amount` | txid of the transaction it created and broadcast |
-| `gettransaction` | `txid` | amount, confirmations, block, `details` per output |
+| `gettransaction` | `txid` | amount, confirmations, block, `details` per output, `bip125-replaceable` |
+| `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
+| `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
+| `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
 | `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
 | `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
@@ -91,6 +94,14 @@ null.
 amount as a number or as a string. The word `treasury` stands for the
 treasury's multisig script wherever an address is taken (`sendtoaddress`,
 `createrawtransaction` outputs); `docs/treasury.md`.
+
+**Unconfirmed payments can change their txid.** From 1.2.29 the wallet sends
+replaceable (BIP125) so a payment can be sped up, and the same holds for a
+deposit someone makes to you: until it is in a block, its sender may replace
+it with one paying more -- or paying somebody else. Credit deposits on
+confirmations, never on the memory pool, and match a deposit by address and
+amount rather than by the txid first seen. `gettransaction` says
+`bip125-replaceable: yes` while that is possible.
 
 ## The loop an exchange runs
 

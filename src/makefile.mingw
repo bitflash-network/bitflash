@@ -49,7 +49,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/mlkem.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
-            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o \
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o \
             obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
@@ -65,7 +65,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h chatswap.h btfchatswap.h bip21.h community.h chatdir.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp community.h chatdir.h \
           proxy.h tor.h treasury.h compat.h gui_chat.h font_roboto.h jsonrpc.h
 
 all: bitflash.exe
@@ -223,8 +223,8 @@ test_chatswap.exe: test_chatswap.cpp chatswap.cpp chatswap.h
 	@echo "Built: test_chatswap.exe"
 
 # Payment links (bitflash: URIs, BIP21).
-test_bip21.exe: test_bip21.cpp bip21.cpp bip21.h
-	$(CXX) $(CXXFLAGS) -o $@ test_bip21.cpp bip21.cpp
+test_bip21.exe: test_bip21.cpp bip21.cpp bip21.h qrcodegen.cpp qrcodegen.hpp
+	$(CXX) $(CXXFLAGS) -o $@ test_bip21.cpp bip21.cpp qrcodegen.cpp
 	@echo "Built: test_bip21.exe"
 
 tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe test_chatswap.exe test_bip21.exe bitflash.exe

@@ -25,6 +25,7 @@
 #include "tor.h"
 #include "treasury.h"
 #include "bip21.h"
+#include "qrcodegen.hpp"
 #include "font_roboto.h"
 
 // ---------------------------------------------------------------------------
@@ -876,7 +877,7 @@ static void DrawSendDialog()
 static void DrawRequestDialog()
 {
     if (!g_showRequest) return;
-    ImGui::SetNextWindowSize(ImVec2(560.0f, 200.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Request a Payment", &g_showRequest,
@@ -907,7 +908,33 @@ static void DrawRequestDialog()
         ImGui::InputText("##ruri", (char*)uri.c_str(), uri.size() + 1, ImGuiInputTextFlags_ReadOnly);
         ImGui::SameLine();
         if (ImGui::Button("Copy##ruri")) ImGui::SetClipboardText(uri.c_str());
-        ImGui::TextDisabled("Whoever pays pastes this into Send; a phone wallet reads it from a QR code.");
+        ImGui::TextDisabled("Whoever pays pastes this into Send, or scans the code below.");
+
+        // The QR code of the link: dark modules on white with the four-module
+        // quiet zone the standard asks for, whatever the window theme, or
+        // phone cameras do not read it.
+        ImGui::Spacing();
+        try {
+            qrcodegen::QrCode qr = qrcodegen::QrCode::encodeText(uri.c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
+            int nModules = qr.getSize() + 8;
+            float side = 300.0f;
+            float cell = (float)(int)(side / nModules);
+            if (cell < 2.0f) cell = 2.0f;
+            side = cell * nModules;
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            p.x += (ImGui::GetContentRegionAvail().x - side) * 0.5f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), IM_COL32(255, 255, 255, 255));
+            for (int y = 0; y < qr.getSize(); y++)
+                for (int x = 0; x < qr.getSize(); x++)
+                    if (qr.getModule(x, y)) {
+                        ImVec2 a(p.x + (x + 4) * cell, p.y + (y + 4) * cell);
+                        dl->AddRectFilled(a, ImVec2(a.x + cell, a.y + cell), IM_COL32(0, 0, 0, 255));
+                    }
+            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, side));
+        } catch (const std::exception&) {
+            ImGui::TextDisabled("(too long for a QR code)");
+        }
 
         ImGui::Spacing();
         if (ImGui::Button("Close", ImVec2(90.0f, 0.0f)))

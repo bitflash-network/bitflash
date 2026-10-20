@@ -1,6 +1,7 @@
 // Standalone tests for payment links (bip21.h).
 
 #include "bip21.h"
+#include "qrcodegen.hpp"
 
 #include <cstdio>
 #include <string>
@@ -52,6 +53,36 @@ int main()
     w.amount = 0;
     w.label.clear();
     CHECK(MakePaymentLink(w) == std::string("bitflash:") + ADDR, "an address alone writes as one");
+
+    printf("qr code\n");
+    {
+        // The wallet draws the link as a QR code. The library is tested
+        // upstream; what matters here is that a long link -- label and message
+        // at their usual lengths -- still fits one, at the error correction the
+        // wallet uses. (Decoded by a real reader when this was written: the
+        // exact link came back.)
+        PaymentLink q;
+        q.address = ADDR;
+        q.amount = 123456789;
+        q.label = std::string(60, 'x');
+        q.message = std::string(120, 'y');
+        std::string uri = MakePaymentLink(q);
+        bool fOk = false;
+        int nSize = 0;
+        try {
+            qrcodegen::QrCode code = qrcodegen::QrCode::encodeText(uri.c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
+            nSize = code.getSize();
+            fOk = nSize >= 21 && nSize <= 177;
+        } catch (...) {}
+        CHECK(fOk, "a long payment link fits a QR code at medium error correction");
+        qrcodegen::QrCode a = qrcodegen::QrCode::encodeText("bitflash:x", qrcodegen::QrCode::Ecc::MEDIUM);
+        qrcodegen::QrCode b = qrcodegen::QrCode::encodeText("bitflash:x", qrcodegen::QrCode::Ecc::MEDIUM);
+        bool fSame = a.getSize() == b.getSize();
+        for (int y = 0; fSame && y < a.getSize(); y++)
+            for (int x = 0; fSame && x < a.getSize(); x++)
+                fSame = a.getModule(x, y) == b.getModule(x, y);
+        CHECK(fSame, "the same link always draws the same code");
+    }
 
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);
     return g_fail == 0 ? 0 : 1;
