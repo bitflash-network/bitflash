@@ -191,6 +191,7 @@ int ChatPollMailboxes(std::string& errOut);
 
 void ChatPendingInvites(std::vector<Invite>& out);
 void ChatContacts(std::vector<std::string>& out);          // accepted, sorted
+void ChatSentInvites(std::vector<std::string>& out);       // invited by us, no answer yet
 void ChatConversation(const std::string& peerAddr, std::vector<LogEntry>& out);
 // What is still waiting to go to that address, oldest first. Kept apart from the
 // conversation on purpose: these have not been delivered, and showing them as if

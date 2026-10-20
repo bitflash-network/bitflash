@@ -451,6 +451,14 @@ void ChatPendingInvites(std::vector<Invite>& out)
             g_roster.Pending(out);
 }
 
+void ChatSentInvites(std::vector<std::string>& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_chat)
+        if (g_fUnlocked)
+            g_roster.Invited(out);
+}
+
 void ChatContacts(std::vector<std::string>& out)
 {
     out.clear();
@@ -682,29 +690,78 @@ bool ChatInvite(const std::string& peerAddr, const std::string& note, std::strin
     return fOk;
 }
 
+static bool LeaveInMailbox(const std::string& peerAddr, const Identity& id,
+                           const std::string& frameJson, std::string& errOut);
+
+// Tell somebody we said yes: directly, else in their mailbox -- which they
+// read for everyone they invited, so the yes reaches them even when they are
+// not reachable this minute.
+static bool SendAccept(const std::string& peerAddr, std::string& errOut)
+{
+    Identity id;
+    CRITICAL_BLOCK(cs_chat)
+    {
+        if (!g_fUnlocked)
+        {
+            errOut = "the chat is locked";
+            return false;
+        }
+        id = g_id;
+    }
+    Frame f;
+    f.kind = MSG_INVITE_ACCEPT;
+    f.sent = GetTime();
+    std::string js;
+    bool fOk = SignFrame(g_secp, id, f, js, errOut);
+    if (fOk && !SendOneFrame(peerAddr, js, errOut))
+    {
+        std::string strLive = errOut, strBox;
+        fOk = LeaveInMailbox(peerAddr, id, js, strBox);
+        errOut = fOk ? std::string() : strLive + "; mailbox: " + strBox;
+    }
+    IdentityClear(id);
+    return fOk;
+}
+
+// Accepts nobody pressed a button for (Inbox::strAcceptReply), sent from the
+// mailbox thread: never from a thread serving an inbound connection.
+static std::set<std::string> g_setAcceptReplies;
+
+static void FlushAcceptReplies()
+{
+    std::set<std::string> todo;
+    CRITICAL_BLOCK(cs_chat)
+        todo = g_setAcceptReplies;
+    for (std::set<std::string>::const_iterator it = todo.begin(); it != todo.end() && !fShutdown; ++it)
+    {
+        std::string err;
+        if (SendAccept(*it, err))
+            CRITICAL_BLOCK(cs_chat)
+                g_setAcceptReplies.erase(*it);
+        else
+            LogPrint("btfchat", "btfchat: could not tell %s we accepted: %s\n", it->c_str(), err.c_str());
+    }
+}
+
 bool ChatAcceptInvite(const std::string& peerAddr, std::string& errOut)
 {
     errOut.clear();
     if (!ChatUnlocked()) { errOut = "the chat is locked"; return false; }
 
-    Identity id;
     CRITICAL_BLOCK(cs_chat)
     {
         if (!g_roster.AcceptInvite(peerAddr, errOut))
             return false;
         SaveStore();
-        id = g_id;
     }
 
-    Frame f;
-    f.kind = MSG_INVITE_ACCEPT;
-    f.sent = GetTime();
-    std::string js;
-    bool fOk = SignFrame(g_secp, id, f, js, errOut) && SendOneFrame(peerAddr, js, errOut);
-    IdentityClear(id);
+    bool fOk = SendAccept(peerAddr, errOut);
     // The accept is recorded locally either way: if the notification did not
     // reach them, their next message still arrives, because we are the side that
-    // had to consent.
+    // had to consent. And the accept is tried again with the mailbox rounds.
+    if (!fOk)
+        CRITICAL_BLOCK(cs_chat)
+            g_setAcceptReplies.insert(peerAddr);
     if (!fOk)
         errOut = "accepted here, but could not tell them: " + errOut;
     return true;
@@ -1327,6 +1384,8 @@ static void ThreadChatServe(void* parg)
                 fDelivered = inbox.Deliver(js, peer, GetTime(), f, reason);
                 if (fDelivered)
                     SaveStore();
+                if (fDelivered && !inbox.strAcceptReply.empty())
+                    g_setAcceptReplies.insert(inbox.strAcceptReply);
             }
 
             if (fDelivered)
@@ -1493,6 +1552,11 @@ int ChatPollMailboxes(std::string& errOut)
         }
         id = g_id;
         g_roster.Accepted(contacts);
+        // And everyone we invited: their accept, or their first message, may
+        // be waiting in the mailbox while they cannot be reached directly.
+        std::vector<std::string> invited;
+        g_roster.Invited(invited);
+        contacts.insert(contacts.end(), invited.begin(), invited.end());
     }
 
     int64_t nNow = GetTime();
@@ -1606,6 +1670,11 @@ int ChatPollMailboxes(std::string& errOut)
                     fDelivered = inbox.Deliver(js, std::string(), nNow, f, reason);
                     if (fDelivered)
                         SaveStore();
+                    if (fDelivered && !inbox.strAcceptReply.empty())
+                    {
+                        g_setAcceptReplies.insert(inbox.strAcceptReply);
+                        g_fFlushOutbox = true;
+                    }
                 }
                 if (fDelivered)
                     nDelivered++;
@@ -1702,6 +1771,7 @@ static void ThreadChatMailbox(void* parg)
                     printf("btfchat: %d message(s) collected from the mailbox\n", n);
 
                 g_fFlushOutbox = false;
+                FlushAcceptReplies();
                 int nOut = FlushOutbox();
                 if (nOut > 0)
                     printf("btfchat: %d message(s) sent from the outbox\n", nOut);
@@ -1721,6 +1791,7 @@ static void ThreadChatMailbox(void* parg)
                 if (g_fFlushOutbox && ChatUnlocked())
                 {
                     g_fFlushOutbox = false;
+                    FlushAcceptReplies();
                     int nNow = FlushOutbox();
                     if (nNow > 0)
                         printf("btfchat: %d message(s) sent from the outbox\n", nNow);

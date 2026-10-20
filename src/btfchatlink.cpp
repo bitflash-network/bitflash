@@ -199,6 +199,7 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
                     Frame& out, std::string& errOut)
 {
     errOut.clear();
+    strAcceptReply.clear();
     if (!secpctx || !roster || !replay || !history || myAddress.empty())
     {
         errOut = "the inbox is not wired up";
@@ -250,10 +251,23 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
         return false;
 
     // 5. The effect. Exactly one of these per frame.
+    PeerState stBefore = roster->State(f.from);
     switch (f.kind)
     {
     case MSG_INVITE:
-        return roster->NoteIncomingInvite(f.from, f.text, f.sent, errOut);
+        if (stBefore == PEER_ACCEPTED)
+        {
+            // Already talking: our yes was lost on the way. Say it again.
+            strAcceptReply = f.from;
+            return true;
+        }
+        if (!roster->NoteIncomingInvite(f.from, f.text, f.sent, errOut))
+            return false;
+        // Crossing invites become a conversation here, with nobody pressing
+        // accept -- and ours may never have reached them.
+        if (stBefore == PEER_INVITE_OUT)
+            strAcceptReply = f.from;
+        return true;
 
     case MSG_INVITE_ACCEPT:
         return roster->NoteInviteAccepted(f.from, errOut);
@@ -265,6 +279,10 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
     case MSG_PAY_ADDRESS:
     case MSG_PAYMENT:
     case MSG_SWAP:
+        // Somebody we invited writing to us has taken our invite, whether or
+        // not their accept ever arrived (Roster::MayDeliver).
+        if (stBefore == PEER_INVITE_OUT && !roster->NoteInviteAccepted(f.from, errOut))
+            return false;
         // A swap step lands in the history like a message; the swap engine
         // reads it from there (btfchatswap.h), whichever way it arrived.
         return history->Append(f, f.from, false, errOut);

@@ -389,6 +389,58 @@ int main()
         CHECK(history.MessageCount() == 1, "so the conversation has one line");
     }
 
+    // The run that found it: both invited, bob's invite reached alice (who
+    // became accepted with no button pressed), alice's never reached bob. Bob
+    // sat at "invite sent" and dropped alice's "oi" as not accepted.
+    printf("a_half_crossed_invite_still_becomes_a_conversation\n");
+    {
+        btfchat::Roster ra, rb;
+        btfchat::ReplayGuard pa, pb;
+        btfchat::History ha, hb;
+        btfchat::Inbox ina, inb;
+        ina.secpctx = ctx; ina.myAddress = alice.address; ina.roster = &ra; ina.replay = &pa; ina.history = &ha;
+        inb.secpctx = ctx; inb.myAddress = bob.address;   inb.roster = &rb; inb.replay = &pb; inb.history = &hb;
+
+        CHECK(rb.NoteOutgoingInvite(alice.address, NOW, err), "bob invites alice");
+        CHECK(ra.NoteOutgoingInvite(bob.address, NOW, err), "alice invites bob, and hers is lost");
+        btfchat::Frame inv;
+        inv.kind = btfchat::MSG_INVITE; inv.sent = NOW; inv.text = "oi";
+        std::string jsInv;
+        CHECK(btfchat::SignFrame(ctx, bob, inv, jsInv, err), "bob signs his invite");
+        btfchat::Frame g;
+        CHECK(ina.Deliver(jsInv, bob.address, NOW, g, err), "bob's reaches alice");
+        CHECK(ra.State(bob.address) == btfchat::PEER_ACCEPTED, "crossing: alice is talking to bob");
+        CHECK(ina.strAcceptReply == bob.address, "and is told to send bob her yes");
+
+        // Her yes is lost too; her first message is what reaches bob.
+        btfchat::Frame msg;
+        msg.kind = btfchat::MSG_TEXT; msg.sent = NOW + 1; msg.text = "oi";
+        std::string jsMsg;
+        CHECK(btfchat::SignFrame(ctx, alice, msg, jsMsg, err), "alice writes");
+        CHECK(inb.Deliver(jsMsg, alice.address, NOW + 1, g, err), "bob takes it: he invited her");
+        CHECK(rb.State(alice.address) == btfchat::PEER_ACCEPTED, "and now talks to her");
+        std::vector<btfchat::LogEntry> v;
+        hb.Conversation(alice.address, v);
+        CHECK(v.size() == 1 && v[0].text == "oi", "her message is in his conversation");
+        CHECK(inb.strAcceptReply.empty(), "a message asks for no reply of its own");
+
+        // Bob, not knowing, sends his invite again: alice answers with her yes.
+        btfchat::Frame again;
+        again.kind = btfchat::MSG_INVITE; again.sent = NOW + 2; again.text = "oi?";
+        std::string jsAgain;
+        CHECK(btfchat::SignFrame(ctx, bob, again, jsAgain, err), "bob invites again");
+        CHECK(ina.Deliver(jsAgain, bob.address, NOW + 2, g, err), "alice takes the invite");
+        CHECK(ina.strAcceptReply == bob.address && ra.PendingCount() == 0,
+              "and answers it with her yes, not a second pending invite");
+
+        // A stranger's message is still refused.
+        btfchat::Frame strange;
+        strange.kind = btfchat::MSG_TEXT; strange.sent = NOW; strange.text = "oi";
+        std::string jsStrange;
+        CHECK(btfchat::SignFrame(ctx, eve, strange, jsStrange, err), "eve writes to bob");
+        CHECK(!inb.Deliver(jsStrange, eve.address, NOW, g, err), "nobody invited eve: refused");
+    }
+
     printf("deliver_refuses_a_frame_the_peer_did_not_write\n");
     {
         btfchat::Roster roster;

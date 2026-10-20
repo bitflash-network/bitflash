@@ -660,6 +660,35 @@ void DrawSidebar(float width)
         }
     }
 
+    // Invites we sent and nobody answered yet. Shown, so a person knows the
+    // invite exists and can send it again -- the first try routinely fails
+    // while the other side's onion is still coming up.
+    std::vector<std::string> sent;
+    btfchat::ChatSentInvites(sent);
+    if (!sent.empty())
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::Text("invites sent (%d)", (int)sent.size());
+        ImGui::PopStyleColor();
+        for (size_t i = 0; i < sent.size(); i++)
+        {
+            ImGui::PushID(("sent" + sent[i]).c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
+            ImGui::TextUnformatted(ShortAddr(sent[i]).c_str());
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+            ImGui::TextUnformatted("waiting for them to accept");
+            ImGui::PopStyleColor();
+            bool fBusy = Busy();
+            if (fBusy) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("send again"))
+                Queue(ACT_INVITE, sent[i], "", "");
+            if (fBusy) ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        Hairline();
+    }
+
     std::vector<std::string> contacts;
     btfchat::ChatContacts(contacts);
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);

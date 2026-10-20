@@ -300,6 +300,11 @@ void Roster::Accepted(std::vector<std::string>& out) const
     CollectByState(mapPeers, PEER_ACCEPTED, out);
 }
 
+void Roster::Invited(std::vector<std::string>& out) const
+{
+    CollectByState(mapPeers, PEER_INVITE_OUT, out);
+}
+
 void Roster::Blocked(std::vector<std::string>& out) const
 {
     CollectByState(mapPeers, PEER_BLOCKED, out);
@@ -342,10 +347,13 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
     case MSG_INVITE:
         // A stranger's one allowance. Also allowed from PEER_INVITE_OUT: two
         // people who invite each other at the same time are agreeing, not
-        // colliding, and refusing there would deadlock the pair.
-        if (st == PEER_UNKNOWN || st == PEER_INVITE_OUT)
+        // colliding, and refusing there would deadlock the pair. And from
+        // PEER_ACCEPTED: they invite again because our yes never reached
+        // them, and the answer is to say it again (Inbox::Deliver), not to
+        // ignore them.
+        if (st == PEER_UNKNOWN || st == PEER_INVITE_OUT || st == PEER_ACCEPTED)
             return true;
-        errOut = (st == PEER_ACCEPTED) ? "already talking" : "invite already pending";
+        errOut = "invite already pending";
         return false;
 
     case MSG_INVITE_ACCEPT:
@@ -354,8 +362,11 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
         errOut = "we never invited them";
         return false;
 
+    // Somebody we invited can only write to us after taking our invite, so
+    // their first message IS their yes -- also when the accept itself never
+    // arrived (Inbox::Deliver records it). We consented by inviting them.
     case MSG_TEXT:
-        if (st == PEER_ACCEPTED)
+        if (st == PEER_ACCEPTED || st == PEER_INVITE_OUT)
             return true;
         errOut = "not accepted";
         return false;
@@ -365,7 +376,7 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
         // Only from somebody we agreed to talk to. A stranger's "pay me here"
         // is the oldest scam there is, and it does not get to sit in the list
         // of people this wallet might pay.
-        if (st == PEER_ACCEPTED)
+        if (st == PEER_ACCEPTED || st == PEER_INVITE_OUT)
             return true;
         errOut = "not accepted";
         return false;
@@ -373,7 +384,7 @@ bool Roster::MayDeliver(const std::string& addr, MsgKind kind, std::string& errO
     case MSG_SWAP:
         // A swap is arranged with somebody we agreed to talk to, never a
         // stranger: a step names addresses the app will lock coins towards.
-        if (st == PEER_ACCEPTED)
+        if (st == PEER_ACCEPTED || st == PEER_INVITE_OUT)
             return true;
         errOut = "not accepted";
         return false;

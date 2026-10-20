@@ -178,8 +178,10 @@ int main()
         CHECK(r.State(ALICE) == btfchat::PEER_ACCEPTED, "the state is accepted");
         CHECK(r.PendingCount() == 0, "the invite left the pending list");
         CHECK(r.MayDeliver(ALICE, btfchat::MSG_TEXT, err), "now a message may arrive");
-        CHECK(!r.MayDeliver(ALICE, btfchat::MSG_INVITE, err),
-              "an invite from someone we already talk to is refused");
+        CHECK(r.MayDeliver(ALICE, btfchat::MSG_INVITE, err),
+              "an invite from someone we already talk to passes: our yes was lost, and is said again");
+        CHECK(!r.NoteIncomingInvite(ALICE, "oi de novo", 1001, err) && r.PendingCount() == 0,
+              "but it is never a second pending invite");
     }
 
     printf("the_roster_can_list_who_is_in_it\n");
@@ -252,8 +254,10 @@ int main()
         btfchat::Roster r;
         CHECK(r.NoteOutgoingInvite(ALICE, 1000, err), "we invite alice");
         CHECK(r.State(ALICE) == btfchat::PEER_INVITE_OUT, "state is invite-out");
-        CHECK(!r.MayDeliver(ALICE, btfchat::MSG_TEXT, err),
-              "she cannot write before accepting");
+        CHECK(r.MayDeliver(ALICE, btfchat::MSG_TEXT, err),
+              "her first message is her yes: we invited her");
+        CHECK(!r.MayDeliver(BOB, btfchat::MSG_TEXT, err),
+              "somebody we never invited still cannot write");
         CHECK(r.MayDeliver(ALICE, btfchat::MSG_INVITE, err),
               "her invite crossing ours is allowed");
         CHECK(r.NoteIncomingInvite(ALICE, "oi", 1001, err), "and is recorded");

@@ -178,6 +178,8 @@ public:
     // Everyone we have an accepted conversation with, and everyone we blocked.
     // Sorted, so the interface does not have to and two runs look the same.
     void      Accepted(std::vector<std::string>& out) const;
+    // Everyone we invited who has not answered yet.
+    void      Invited(std::vector<std::string>& out) const;
     void      Blocked(std::vector<std::string>& out) const;
     bool      GetGroup(const std::string& id, Group& out) const;
     void      Groups(std::vector<Group>& out) const;

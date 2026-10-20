@@ -107,6 +107,11 @@ struct Inbox
     Roster*      roster;
     ReplayGuard* replay;
     History*     history;
+    // Set by Deliver when an invite was answered without a person pressing
+    // anything -- it crossed ours, or it came again from somebody we already
+    // accepted -- so their side still thinks it is waiting. The caller sends
+    // them our accept; nothing else would ever tell them.
+    std::string  strAcceptReply;
 
     Inbox() : secpctx(NULL), roster(NULL), replay(NULL), history(NULL) {}
 
