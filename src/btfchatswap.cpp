@@ -24,6 +24,7 @@ static json SwapToJson(const ChatSwap& s)
     json j;
     j["id"] = s.id; j["peer"] = s.peer; j["offer"] = s.offerId; j["maker"] = s.fMaker;
     j["give"] = s.give; j["ga"] = s.giveAmount; j["want"] = s.want; j["wa"] = s.wantAmount;
+    j["btcDestination"] = s.btcDestination; j["paymentAddress"] = s.paymentAddress;
     j["myRecv"] = s.myRecv; j["theirRecv"] = s.theirRecv;
     j["secret"] = s.secret; j["hash"] = s.secretHash;
     j["myC"] = s.myContract; j["myTx"] = s.myTxid; j["myN"] = s.myVout;
@@ -45,6 +46,7 @@ static bool SwapFromJson(const json& j, ChatSwap& s)
         s.offerId = j.value("offer", std::string()); s.fMaker = j.value("maker", false);
         s.give = j.value("give", std::string()); s.giveAmount = j.value("ga", (int64_t)0);
         s.want = j.value("want", std::string()); s.wantAmount = j.value("wa", (int64_t)0);
+        s.btcDestination = j.value("btcDestination", std::string()); s.paymentAddress = j.value("paymentAddress", std::string());
         s.myRecv = j.value("myRecv", std::string()); s.theirRecv = j.value("theirRecv", std::string());
         s.secret = j.value("secret", std::string()); s.secretHash = j.value("hash", std::string());
         s.myContract = j.value("myC", std::string()); s.myTxid = j.value("myTx", std::string());
@@ -306,6 +308,7 @@ static bool TakeLockResult(ChatSwap& s, const json& r, std::string& err)
         err = "the wallet's answer has no contract";
         return false;
     }
+    s.paymentAddress = r.value("awaitingPayment", false) ? r.value("contractAddress", std::string()) : std::string();
     s.myContract = r["contract"].get<std::string>();
     s.myTxid = r["contractTxid"].get<std::string>();
     s.myVout = s.give == "BTC" && r.contains("vout") ? r["vout"].get<int>() : -1;
@@ -333,8 +336,10 @@ void SwapEngine::TryRefund(ChatSwap& s)
         return;
     }
     json r;
+    json refundParams = json::array({s.myContract, Ref(s.give, s.myTxid, s.myVout)});
+    if (s.give == "BTC" && !s.btcDestination.empty()) refundParams.push_back(s.btcDestination);
     if (Wallet(Method(s.give, "swaprefund", "btcrefund"),
-               json::array({ s.myContract, Ref(s.give, s.myTxid, s.myVout) }), r, err) && r.is_object())
+               refundParams, r, err) && r.is_object())
     {
         s.refundTxid = r.value("txid", std::string());
         s.stage = SW_REFUNDED;
@@ -360,6 +365,19 @@ void SwapEngine::Tick(ChatSwap& s)
 {
     int64_t nNow = GetTime();
     std::string err;
+    if ((s.stage == SW_TAKE_RECEIVED || s.stage == SW_READY_TO_LOCK) && s.fUserOk)
+    {
+        json info;
+        if (Wallet("btcswapinfo", json::array(), info, err) && info.value("backend", std::string()) == "light")
+        {
+            json checked;
+            if (s.btcDestination.empty() || !Wallet("btcvalidatedestination", json::array({s.btcDestination}), checked, err))
+            {
+                s.status = "enter your Bitcoin receiving address before locking";
+                s.lastError = err; s.fUserOk = false; return;
+            }
+        }
+    }
     switch (s.stage)
     {
     case SW_INVITING:
@@ -443,7 +461,7 @@ void SwapEngine::Tick(ChatSwap& s)
             s.fUserOk = false;      // the person decides again, knowing why
             return;
         }
-        s.stage = SW_LOCKED;
+        s.stage = s.paymentAddress.empty() ? SW_LOCKED : SW_WAIT_PAYMENT;
         s.fSentLock = false;
         s.status = "locked ours; waiting for them to lock theirs";
         // Saved by the caller before anything else is tried: the secret is in
@@ -494,9 +512,31 @@ void SwapEngine::Tick(ChatSwap& s)
             s.fUserOk = false;
             return;
         }
-        s.stage = SW_LOCKED;
+        s.stage = s.paymentAddress.empty() ? SW_LOCKED : SW_WAIT_PAYMENT;
         s.fSentLock = false;
         s.status = "locked ours; waiting for them to take it, which shows the secret";
+        return;
+    }
+
+    case SW_WAIT_PAYMENT:
+    {
+        s.status = "waiting for you to pay the contract: pay exactly " + AmountText(s.giveAmount) + " BTC to " + s.paymentAddress;
+        json audit;
+        if (!Wallet("btcauditcontract", json::array({s.myContract, ""}), audit, err))
+        {
+            s.lastError = err;
+            return;
+        }
+        if (!audit.value("unspent", false) || audit.value("confirmations", 0) < MinConfirmations()) return;
+        s.myTxid = audit.at("contractTxid").get<std::string>(); s.myVout = audit.at("vout").get<int>();
+        if (Sats(audit["amount"]) != s.giveAmount || audit.value("secondsUntilRefund", (int64_t)0) <= 0)
+        {
+            s.stage = SW_REFUNDING;
+            s.status = "payment amount differs or contract expired; waiting to refund";
+            return;
+        }
+        s.stage = SW_LOCKED; s.fSentLock = false;
+        s.status = "Bitcoin contract payment confirmed";
         return;
     }
 
@@ -574,8 +614,10 @@ void SwapEngine::Tick(ChatSwap& s)
             }
         }
         json r;
+        json redeemParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret});
+        if (s.want == "BTC" && !s.btcDestination.empty()) redeemParams.push_back(s.btcDestination);
         if (Wallet(Method(s.want, "swapredeem", "btcredeem"),
-                   json::array({ s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret }), r, err) &&
+                   redeemParams, r, err) &&
             r.is_object())
         {
             s.redeemTxid = r.value("txid", std::string());
@@ -763,6 +805,7 @@ void SwapEngine::Round()
                 // never undoes a lock.
                 bool fApprovedMeanwhile = it->second.fUserOk && !before.fUserOk && s.stage == before.stage;
                 bool fCancelledMeanwhile = it->second.stage == SW_CANCELLED && before.stage != SW_CANCELLED;
+                s.btcDestination = it->second.btcDestination;
                 it->second = s;
                 if (fApprovedMeanwhile)
                     it->second.fUserOk = true;
@@ -785,10 +828,10 @@ void SwapEngine::List(std::vector<SwapView>& out)
             SwapView v;
             v.id = s.id; v.peer = s.peer; v.fMaker = s.fMaker;
             v.give = s.give; v.want = s.want; v.giveAmount = s.giveAmount; v.wantAmount = s.wantAmount;
-            v.stage = s.stage;
+            v.stage = s.stage; v.btcDestination = s.btcDestination; v.paymentAddress = s.paymentAddress;
             v.status = s.status + (s.lastError.empty() ? std::string() : " (" + s.lastError + ")");
             v.fNeedsMe = !s.fUserOk && (s.stage == SW_TAKE_RECEIVED || s.stage == SW_READY_TO_LOCK);
-            v.fCanCancel = s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage);
+            v.fCanCancel = s.myContract.empty() && s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage);
             v.myTxid = s.myTxid; v.theirTxid = s.theirTxid;
             v.redeemTxid = s.redeemTxid; v.refundTxid = s.refundTxid;
             v.updated = s.updated;
@@ -841,6 +884,19 @@ bool SwapEngine::Approve(const std::string& id, std::string& errOut)
     return true;
 }
 
+bool SwapEngine::SetBitcoinDestination(const std::string& id, const std::string& address)
+{
+    if (address.empty() || address.size() > 90) return false;
+    CRITICAL_BLOCK(cs)
+    {
+        auto it = swaps.find(id);
+        if (it == swaps.end() || !it->second.myContract.empty() || !it->second.redeemTxid.empty()) return false;
+        it->second.btcDestination = address;
+    }
+    host->Changed();
+    return true;
+}
+
 bool SwapEngine::Cancel(const std::string& id, std::string& errOut)
 {
     errOut.clear();
@@ -853,7 +909,7 @@ bool SwapEngine::Cancel(const std::string& id, std::string& errOut)
             errOut = "no such swap in progress";
             return false;
         }
-        if (!it->second.myTxid.empty() || it->second.fUserOk)
+        if (!it->second.myContract.empty() || !it->second.myTxid.empty() || it->second.fUserOk)
         {
             errOut = "ours is locked (or being locked): it comes back at the lock, or the swap finishes";
             return false;
@@ -985,6 +1041,11 @@ bool ChatSwapApprove(const std::string& id, std::string& errOut)
 bool ChatSwapCancel(const std::string& id, std::string& errOut)
 {
     return g_engine.Cancel(id, errOut);
+}
+
+bool ChatSwapBitcoinDestination(const std::string& id, const std::string& address)
+{
+    return g_engine.SetBitcoinDestination(id, address);
 }
 
 void ChatSwapWake()

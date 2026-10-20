@@ -6,6 +6,7 @@
 #include "headers.h"
 #include "btcswap.h"
 #include "swap.h"
+#include "btclight.h"
 
 using json = nlohmann::json;
 
@@ -15,6 +16,7 @@ namespace btcswap
 static CCriticalSection cs_config;
 static std::string g_strChain, g_strDataDir, g_strWallet, g_strUser, g_strPassword, g_strFeeRate;
 static int g_nPort = 0;
+static std::string ConfiguredChain();
 
 void Configure(const std::string& strChain, const std::string& strDataDir, int nPort,
                const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
@@ -29,6 +31,15 @@ void Configure(const std::string& strChain, const std::string& strDataDir, int n
         g_strUser = strUser;
         g_strPassword = strPassword;
         g_strFeeRate = strFeeRate;
+    }
+    if (UsingLight())
+    {
+        Chain chain;
+        std::string err;
+        // Loading the queue here resumes broadcasts after a wallet restart,
+        // even before the person next opens the swap screen or calls RPC.
+        if (!btclight::CheckChain(ConfiguredChain(), chain, err))
+            printf("Bitcoin light: %s\n", err.c_str());
     }
 }
 
@@ -94,10 +105,28 @@ static std::string CoreDataDir()
 #endif
 }
 
+bool UsingLight()
+{
+    CRITICAL_BLOCK(cs_config)
+    {
+        if (!g_strDataDir.empty() || g_nPort || !g_strWallet.empty() || !g_strUser.empty() || !g_strPassword.empty())
+            return false;
+    }
+    // An existing cookie keeps the original automatic Core setup working.
+    std::string sub = ChainSubdir(ConfiguredChain());
+    return !DirExists(CoreDataDir() + (sub.empty() ? "" : "/" + sub) + "/.cookie");
+}
+
 bool Call(const std::string& method, const json& params, json& resultOut, std::string& errOut,
           size_t nMaxBytes, int* pnCodeOut)
 {
     std::string chain = ConfiguredChain();
+    if (UsingLight())
+    {
+        Chain info;
+        if (!btclight::CheckChain(chain, info, errOut)) return false;
+        return btclight::Call(method, params, resultOut, errOut);
+    }
     LoopbackRpc to;
     to.strWho = "Bitcoin Core";
     to.nMaxBytes = nMaxBytes;
@@ -132,6 +161,7 @@ bool Call(const std::string& method, const json& params, json& resultOut, std::s
 
 bool CheckChain(Chain& out, std::string& errOut)
 {
+    if (UsingLight()) return btclight::CheckChain(ConfiguredChain(), out, errOut);
     json r;
     if (!Call("getblockchaininfo", json::array(), r, errOut))
         return false;

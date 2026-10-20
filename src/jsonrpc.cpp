@@ -24,6 +24,7 @@
 #include "treasury.h"
 #include "swap.h"
 #include "btcswap.h"
+#include "btclight.h"
 #include "invoice.h"
 
 #ifndef _WIN32
@@ -1768,7 +1769,7 @@ static json BtcCall(const string& method, const json& params, size_t nMaxBytes =
     json r;
     string err;
     if (!btcswap::Call(method, params, r, err, nMaxBytes))
-        throw runtime_error("Bitcoin Core: " + err);
+        throw runtime_error(string(btcswap::UsingLight() ? "Bitcoin light: " : "Bitcoin Core: ") + err);
     return r;
 }
 
@@ -1819,6 +1820,16 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
 {
     CScript contract = swap::BuildContract(c);
     string strAddr = btcswap::ScriptAddress(chain, contract);
+    if (btcswap::UsingLight())
+    {
+        btclight::Watch(contract);
+        json j = BtcContractJson(chain, c, contract);
+        j["contractTxid"] = ""; j["vout"] = -1;
+        j["amount"] = ValueFromAmount(nValue);
+        j["awaitingPayment"] = true;
+        j["paymentInstructions"] = "pay exactly " + BtcAmountText(nValue) + " BTC to " + strAddr;
+        return j;
+    }
     json txid = BtcCall("sendtoaddress", json::array({ strAddr, BtcAmountText(nValue) }));
     if (!txid.is_string())
         throw runtime_error("Bitcoin Core did not return a transaction id");
@@ -1868,11 +1879,29 @@ static json rpc_btcswapinfo(const json&)
     j["mediantime"] = chain.nMedianTime;
     json bal;
     string err;
+    j["backend"] = btcswap::UsingLight() ? "light" : "core";
+    if (btcswap::UsingLight())
+    {
+        json status = BtcCall("getblockchaininfo", json::array());
+        j["light"] = status;
+        j["balance"] = nullptr;
+        j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB());
+        return j;
+    }
     j["balance"] = btcswap::Call("getbalance", json::array(), bal, err) ? bal : json(nullptr);
     if (!err.empty())
         j["walletError"] = err;
     j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB());
     return j;
+}
+
+static json rpc_btcvalidatedestination(const json& p)
+{
+    btcswap::Chain chain = RequireBitcoin();
+    if (p.size() != 1 || !p[0].is_string()) throw runtime_error("btcvalidatedestination <Bitcoin address>");
+    CScript script; string err;
+    if (!btclight::Destination(chain, p[0].get<string>(), script, err)) throw runtime_error(err);
+    return json{{"valid",true}};
 }
 
 // btcnewaddress -- a Bitcoin address whose key is in THIS wallet: what to
@@ -1983,6 +2012,16 @@ struct BtcContractOut
 static BtcContractOut BtcResolveContract(const json& v, const CScript& contract)
 {
     BtcContractOut o;
+    if (btcswap::UsingLight())
+    {
+        json found = btclight::Find(contract, v.is_string() ? v.get<string>() : "", false);
+        o.txid = uint256(found["contractTxid"].get<string>());
+        o.n = found["vout"].get<int>() < 0 ? 0 : found["vout"].get<unsigned int>();
+        o.fUnspent = found["unspent"].get<bool>();
+        o.nConfirmations = found["confirmations"].get<int>();
+        if (o.fUnspent) o.nValue = AmountFromValue(found["amount"]);
+        return o;
+    }
     string s = v.is_string() ? v.get<string>() : string();
     size_t colon = s.find(':');
     int64 nFromTx = -1;
@@ -2023,12 +2062,12 @@ static BtcContractOut BtcResolveContract(const json& v, const CScript& contract)
 // Bitcoin node's chain, unspent, confirmed, to OUR key, with time left.
 static json rpc_btcauditcontract(const json& p)
 {
-    if (p.size() < 2)
+    if (p.size() < 1)
         throw runtime_error("btcauditcontract <contract hex> <contract transaction hex or txid>");
     btcswap::Chain chain = RequireBitcoin();
     CScript contract;
     swap::Contract c = ContractFromParam(p[0], contract);
-    BtcContractOut o = BtcResolveContract(p[1], contract);
+    BtcContractOut o = BtcResolveContract(p.size() > 1 ? p[1] : json(""), contract);
     json j = BtcContractJson(chain, c, contract);
     j["contractTxid"] = o.txid.GetHex();
     j["vout"] = (int)o.n;
@@ -2052,7 +2091,7 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
     swap::Contract c = ContractFromParam(p[0], contract);
     BtcContractOut o = BtcResolveContract(p[1], contract);
     if (!o.fUnspent)
-        throw runtime_error("Bitcoin Core does not see that contract output unspent "
+        throw runtime_error("the Bitcoin backend does not see that contract output unspent "
                             "(already redeemed or refunded, or not on this chain)");
     if (!pSecret && chain.nMedianTime <= c.nLockTime)
         throw runtime_error(strprintf("the refund opens when Bitcoin's median time passes %s (about %lld minutes)",
@@ -2062,13 +2101,26 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
     CKey key;
     KeyForContract(c, pSecret != NULL, key, vchPubKey);
 
-    // The coins go to a fresh address of Bitcoin Core's own wallet.
-    json addr = BtcCall("getnewaddress", json::array());
-    json info = BtcCall("getaddressinfo", json::array({ addr }));
-    if (!info.is_object() || !info.contains("scriptPubKey") || !info["scriptPubKey"].is_string())
-        throw runtime_error("Bitcoin Core gave no address to be paid to");
-    vector<unsigned char> vchTo = ParseHex(info["scriptPubKey"].get<string>());
-    CScript scriptTo(vchTo.begin(), vchTo.end());
+    json addr;
+    CScript scriptTo;
+    if (btcswap::UsingLight())
+    {
+        size_t destination = pSecret ? 3 : 2;
+        if (p.size() <= destination || !p[destination].is_string())
+            throw runtime_error("Bitcoin light needs your Bitcoin destination address as the last parameter");
+        addr = p[destination];
+        string err;
+        if (!btclight::Destination(chain, addr.get<string>(), scriptTo, err)) throw runtime_error(err);
+    }
+    else
+    {
+        addr = BtcCall("getnewaddress", json::array());
+        json info = BtcCall("getaddressinfo", json::array({ addr }));
+        if (!info.is_object() || !info.contains("scriptPubKey") || !info["scriptPubKey"].is_string())
+            throw runtime_error("Bitcoin Core gave no address to be paid to");
+        vector<unsigned char> vchTo = ParseHex(info["scriptPubKey"].get<string>());
+        scriptTo = CScript(vchTo.begin(), vchTo.end());
+    }
 
     CTransaction tx;
     int64 nFee = 0;
@@ -2093,7 +2145,7 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
 static json rpc_btcredeem(const json& p)
 {
     if (p.size() < 3 || !p[2].is_string())
-        throw runtime_error("btcredeem <contract hex> <contract transaction hex or txid> <secret hex>");
+        throw runtime_error("btcredeem <contract hex> <contract transaction hex or txid> <secret hex> [Bitcoin destination]");
     string strSecret = p[2].get<string>();
     if (strSecret.size() != 64 || !IsHex(strSecret))
         throw runtime_error("the secret is 64 hex characters");
@@ -2107,7 +2159,7 @@ static json rpc_btcredeem(const json& p)
 static json rpc_btcrefund(const json& p)
 {
     if (p.size() < 2)
-        throw runtime_error("btcrefund <contract hex> <contract transaction hex or txid>");
+        throw runtime_error("btcrefund <contract hex> <contract transaction hex or txid> [Bitcoin destination]");
     json j = BtcSpend(p, NULL);
     LogSwap(json{{"refunded", j["txid"]}, {"chain", "bitcoin"}});
     return j;
@@ -2126,6 +2178,7 @@ static json rpc_btcfindsecret(const json& p)
     btcswap::Chain chain = RequireBitcoin();
     CScript contract;
     swap::Contract c = ContractFromParam(p[0], contract);
+    if (btcswap::UsingLight()) return btclight::Find(contract, p[1].get<string>(), true);
     BtcContractOut o = BtcResolveContract(p[1], contract);
     unsigned int n = o.n;
     string strTxid = o.txid.GetHex();
@@ -2196,7 +2249,7 @@ static json rpc_help(const json&)
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
            "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
-           "btcswapinfo btcnewaddress btcinitiate btcparticipate btcauditcontract btcredeem btcrefund btcfindsecret "
+           "btcswapinfo btcnewaddress btcvalidatedestination btcinitiate btcparticipate btcauditcontract btcredeem btcrefund btcfindsecret "
            "gettorinfo settorbridges gettreasuryinfo donate sendburn help";
 }
 
@@ -2242,6 +2295,7 @@ static const RpcEntry kMethods[] = {
     { "swapextractsecret", rpc_swapextractsecret },
     { "swapfindsecret",   rpc_swapfindsecret },
     { "btcswapinfo",      rpc_btcswapinfo },
+    { "btcvalidatedestination", rpc_btcvalidatedestination },
     { "btcnewaddress",    rpc_btcnewaddress },
     { "btcinitiate",      rpc_btcinitiate },
     { "btcparticipate",   rpc_btcparticipate },

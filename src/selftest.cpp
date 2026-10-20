@@ -21,6 +21,7 @@
 #include "chatstore.h"
 #include "swap.h"
 #include "btcswap.h"
+#include "btclight.h"
 #include "btfchatswap.h"
 #include "invoice.h"
 #include "bip21.h"
@@ -6888,6 +6889,8 @@ int RunSelfTest(const std::string& name)
         return RunChatWalletSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
+    if (name == "btc-light")
+        return btclight::SelfTest();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

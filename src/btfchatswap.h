@@ -63,6 +63,7 @@ enum SwapStage
     SW_REFUNDED,
     SW_CANCELLED,        // ended before anything of ours was locked
     SW_FAILED,           // something the engine cannot fix; see status
+    SW_WAIT_PAYMENT,     // the external Bitcoin wallet must fund our contract
 };
 
 struct SwapView
@@ -76,6 +77,7 @@ struct SwapView
     bool        fNeedsMe;           // TAKE_RECEIVED or READY_TO_LOCK
     bool        fCanCancel;         // nothing of ours is locked yet
     std::string myTxid, theirTxid, redeemTxid, refundTxid;
+    std::string btcDestination, paymentAddress;
     int64_t     updated;
 
     SwapView() : fMaker(false), giveAmount(0), wantAmount(0), stage(0), fNeedsMe(false),
@@ -130,6 +132,7 @@ struct ChatSwap
     std::string theirRecv;       // where they want ours (on `give`)
     std::string secret, secretHash;
     std::string myContract, myTxid;
+    std::string btcDestination, paymentAddress;
     int         myVout = -1;
     std::string theirContract, theirTxid;
     int         theirVout = -1;
@@ -155,6 +158,7 @@ public:
               std::string& idOut, std::string& errOut);
     bool Approve(const std::string& id, std::string& errOut);
     bool Cancel(const std::string& id, std::string& errOut);
+    bool SetBitcoinDestination(const std::string& id, const std::string& address);
 
     // One round: read the other side's steps, move every swap one step.
     void Round();
@@ -203,6 +207,7 @@ bool ChatSwapApprove(const std::string& id, std::string& errOut);
 
 // Only while nothing of ours is locked.
 bool ChatSwapCancel(const std::string& id, std::string& errOut);
+bool ChatSwapBitcoinDestination(const std::string& id, const std::string& address);
 
 // Look again now, instead of at the next round.
 void ChatSwapWake();

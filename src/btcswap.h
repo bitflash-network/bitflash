@@ -62,6 +62,8 @@ struct Chain
     int64 nMedianTime = 0;
 };
 
+bool UsingLight();
+
 // One call to Bitcoin Core. nMaxBytes: a raw block needs more than the default.
 bool Call(const std::string& method, const nlohmann::json& params, nlohmann::json& resultOut,
           std::string& errOut, size_t nMaxBytes = 4 * 1024 * 1024, int* pnCodeOut = NULL);

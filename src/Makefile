@@ -61,7 +61,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h \
           proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -75,7 +75,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/mlkem.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
-            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/btclight.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
             obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
@@ -318,6 +318,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
 	./bitflash-node -selftest=btc-swap
+	./bitflash-node -selftest=btc-light
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice
 	./bitflash-node -selftest=net-hardening

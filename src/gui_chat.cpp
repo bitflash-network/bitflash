@@ -943,6 +943,28 @@ void DrawSwaps(const std::string& peer)
         if (ImGui::IsItemHovered() && (!s.myTxid.empty() || !s.theirTxid.empty()))
             ImGui::SetTooltip("ours   %s\ntheirs %s\nredeem %s\nrefund %s", s.myTxid.c_str(), s.theirTxid.c_str(),
                               s.redeemTxid.c_str(), s.refundTxid.c_str());
+        if (!fFinal && (s.give == "BTC" || s.want == "BTC"))
+        {
+            ImGui::PushID(s.id.c_str());
+            static std::map<std::string, std::string> destinations;
+            std::string& text = destinations[s.id];
+            if (text.empty()) text = s.btcDestination;
+            char address[96] = {0}; strncpy(address, text.c_str(), sizeof(address)-1);
+            bool editable = s.myTxid.empty() && s.paymentAddress.empty();
+            if (!editable) ImGui::BeginDisabled();
+            if (ImGui::InputTextWithHint("your Bitcoin receiving address", "1... / 3... / bc1... / tb1... / bcrt1...", address, sizeof(address)))
+                text = address;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("save address")) btfchat::ChatSwapBitcoinDestination(s.id, text);
+            if (!editable) ImGui::EndDisabled();
+            if (s.stage == btfchat::SW_WAIT_PAYMENT)
+            {
+                ImGui::TextWrapped("Waiting for you to pay the contract. Pay exactly %s BTC.", btfchat::FormatSwapAmount(s.giveAmount).c_str());
+                ImGui::TextWrapped("%s", s.paymentAddress.c_str());
+                if (ImGui::SmallButton("copy payment address")) ImGui::SetClipboardText(s.paymentAddress.c_str());
+            }
+            ImGui::PopID();
+        }
         bool fBusy = Busy();
         if (s.fNeedsMe)
         {

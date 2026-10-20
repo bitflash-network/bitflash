@@ -45,10 +45,67 @@ The initiator's lock is 48 hours and the participant's 24, so that the
 participant always has a day to redeem after the initiator has shown the
 secret.
 
+## Embedded Bitcoin light client (no Bitcoin Core)
+
+Without explicit Core RPC settings or an existing Core cookie, the wallet uses
+Bitcoin P2P directly. `btcswapinfo` reports `backend: light`, header height,
+filter progress, number of filter peers and any network error. The first sync
+starts at the embedded height-zero checkpoint and downloads headers and filter
+hashes; it does not download historical Bitcoin blocks. Mainnet and testnet4
+also require a minimum accumulated chain work before payments are usable.
+Regtest needs `-btcchain=regtest -btcpeer=127.0.0.1:18444` on Bitflash testnet.
+The peer must advertise `NODE_COMPACT_FILTERS` (Core nodes need
+`-blockfilterindex -peerblockfilters` to serve these).
+
+`-btcpeer=host:port` may be repeated; supplying peers disables DNS seeds.
+Otherwise service-filtered Bitcoin DNS seeds (`x49.`) and discovered addresses
+provide peers. Connections use the wallet's `BtfConnectSocket` transport and
+therefore its configured Tor proxy. Two available peers must agree on filter
+headers before scanning proceeds. A disagreement stops audits rather than
+choosing one peer's answer. With one peer, omission resistance depends on that
+peer; compact filters are not committed by Bitcoin proof of work.
+
+- `btcnewaddress` still creates the contract recipient key in Bitflash.
+- `btcinitiate` / `btcparticipate` return `awaitingPayment`, `contractAddress`
+  and `paymentInstructions`: pay the exact amount from your Bitcoin wallet.
+  They do not send Bitcoin automatically.
+- `btcauditcontract <contract> [ref]` watches the P2SH output script. An empty
+  reference discovers its payment through filters; multiple payments require
+  an explicit `txid:vout`. Until headers and watched filters catch up, the
+  audit reports synchronization rather than asserting that coins are absent.
+- `btcredeem <contract> <ref> <secret> <Bitcoin destination>` and
+  `btcrefund <contract> <ref> <Bitcoin destination>` require a destination in
+  light mode. Legacy, P2SH, SegWit v0 and Bech32m witness addresses are decoded
+  locally and must match the selected Bitcoin network.
+- `btcfindsecret` reads confirmed spending transactions from matched blocks.
+  Light mode does not inspect the mempool or perform arbitrary historical
+  transaction searches. New watches include a week of overlap at initial
+  synchronization and 400 blocks when added to an already synchronized wallet.
+- Signed spends are saved before returning and rebroadcast each round until
+  included in an active-chain matched block. A reorg resumes rebroadcast.
+
+In chat, save **your Bitcoin receiving address** before approving a light-mode
+swap. It stays local to the saved swap, separate from its contract key address.
+The chat displays **waiting for you to pay the contract**, the amount and a
+copyable contract address; it announces a lock only after its payment confirms.
+An unexpected funding amount is retained for refund, never accepted as the
+agreed swap amount. Keep the chat open through completion or refund.
+
+State lives under `GetAppDir()` in `btc-light-<network>.headers`, `.filters`
+and `.json`. Contracts, scan cursor, matched blocks and pending broadcasts
+survive restarts. Store failures stop the light client instead of discarding
+history. The `.json` file is replaced atomically; headers and filter headers use
+validated append-only logs, with an atomic filter-log replacement after reorg.
+A truncated log requires backup recovery.
+
+Explicit `-btcdatadir`, `-btcrpcport`, `-btcwallet`, RPC credentials, or an
+existing default Core cookie keep the original Core path below. A configured
+Core RPC failure does not silently switch a running swap's backend.
+
 ## 1. In btfchat
 
 Needs the chat linked to the Bitflash wallet (`-chatwallet`), and for the
-Bitcoin side, Bitcoin Core running on the same machine (below).
+Bitcoin side, the embedded light client above or Bitcoin Core on the same machine (below).
 
 - **Offer**: in a community, under the posts, `swap: give 100 BTF for 0.001 BTC`
   and **offer**. It is a signed post: anybody in the community sees it with a
