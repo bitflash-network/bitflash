@@ -177,7 +177,7 @@ static bool EnsureSecp()
 
 // The sealed store: roster and history in one file under the identity's store
 // key. Read while holding cs_chat.
-static bool LoadStore()
+static bool LoadStore(std::string& errOut)
 {
     FILE* f = fopen(ChatStorePath().c_str(), "rb");
     if (!f)
@@ -195,6 +195,7 @@ static bool LoadStore()
         {
             fclose(f);
             printf("btfchat: the store file is implausibly large, ignoring it\n");
+            errOut = "btfchat.dat in the data folder is implausibly large; move it away to start fresh";
             return false;
         }
     }
@@ -206,9 +207,14 @@ static bool LoadStore()
     if (!OpenStore(g_id, &blob[0], blob.size(), plain))
     {
         // The usual cause is a different session password: this file belongs to
-        // another identity. Not an error, and emphatically not something to
-        // overwrite without being told to.
+        // another identity, and its conversations are only readable by that
+        // one. So the unlock stops here -- going on would open an empty chat as
+        // somebody else, and its first save would write over every one of
+        // them. (It did, in testing: one mistyped password and a whole
+        // history was gone.)
         printf("btfchat: the store does not belong to this identity\n");
+        errOut = "this password opens a different identity from the one saved here. Type the password you "
+                 "used before -- or, to start over as a new identity, move btfchat.dat out of the data folder.";
         return false;
     }
 
@@ -216,7 +222,10 @@ static bool LoadStore()
     std::string err;
     size_t nSplit = plain.find('\n');
     if (nSplit == std::string::npos)
+    {
+        errOut = "the saved chat in btfchat.dat opens but cannot be read; it is left as it is";
         return false;
+    }
     std::string strRoster = plain.substr(0, nSplit);
     std::string strRest = plain.substr(nSplit + 1);
     // The outbox is the third line and arrived later than the other two. A store
@@ -247,8 +256,21 @@ static bool LoadStore()
         strSwaps = strCommunities.substr(nSplit4 + 1);
         strCommunities = strCommunities.substr(0, nSplit4);
     }
+    // The mailbox's epoch keys, sixth: what opens a message left while the
+    // app was closed (Mailbox::ToJson).
+    std::string strMailbox;
+    size_t nSplit5 = strSwaps.find('\n');
+    if (nSplit5 != std::string::npos)
+    {
+        strMailbox = strSwaps.substr(nSplit5 + 1);
+        strSwaps = strSwaps.substr(0, nSplit5);
+    }
     CommunitiesFromJson(strCommunities);
     SwapsFromJson(strSwaps);
+    if (!g_mailbox.FromJson(strMailbox, err))
+        printf("btfchat: the mailbox keys in the store did not load: %s\n", err.c_str());
+    if (!strMailbox.empty())
+        sodium_memzero(&strMailbox[0], strMailbox.size());
     if (!g_roster.FromJson(strRoster, err))
         printf("btfchat: the roster in the store did not load: %s\n", err.c_str());
     if (!strHistory.empty() && !g_history.FromJson(strHistory, err))
@@ -266,7 +288,7 @@ static bool SaveStore()
     // half's JSON contains a raw newline, and it keeps the seal to one blob.
     std::string plain = g_roster.ToJson() + "\n" + g_history.ToJson()
                       + "\n" + g_outbox.ToJson() + "\n" + CommunitiesToJson()
-                      + "\n" + SwapsToJson();
+                      + "\n" + SwapsToJson() + "\n" + g_mailbox.ToJson();
     std::vector<unsigned char> sealed;
     if (!SealStore(g_id, plain, sealed))
         return false;
@@ -314,14 +336,36 @@ bool ChatUnlock(const std::string& password, std::string& errOut)
         g_outbox.Wipe();
         g_communities.clear();
         SwapsClear();
+        g_mailbox.Wipe();
         g_lock.Unlock(GetTime());
-        LoadStore();
-        // Epoch keys are random and kept, never derived, so they have to exist
-        // before anyone can leave us anything -- and they are destroyed with the
-        // session, which is what makes an old envelope unreadable by everyone.
+        std::string strStore;
+        if (!LoadStore(strStore))
+        {
+            // Not this identity's file (a mistyped password, usually), or not
+            // readable: stop, and leave the file exactly as it is.
+            g_roster = Roster();
+            g_history = History();
+            g_outbox.Wipe();
+            g_communities.clear();
+            SwapsClear();
+            g_mailbox.Wipe();
+            IdentityClear(g_id);
+            g_fUnlocked = false;
+            g_lock.Lock();
+            IdentityClear(id);
+            errOut = strStore.empty() ? "the saved chat could not be read" : strStore;
+            return false;
+        }
+        // Epoch keys are random, never derived, so they have to exist before
+        // anyone can leave us anything. They are kept in the sealed store --
+        // a message left while we were closed is sealed to the ones we
+        // published before closing -- and destroyed once they are
+        // MAILBOX_KEEP_EPOCHS old, which is what makes an old envelope
+        // unreadable by everyone.
         std::string e;
         if (!g_mailbox.Rotate(GetTime(), e))
             printf("btfchat: could not make epoch keys: %s\n", e.c_str());
+        SaveStore();
     }
     IdentityClear(id);
     printf("btfchat: unlocked as %s\n", ChatAddress().c_str());
@@ -1045,6 +1089,15 @@ void ChatSaveStore()
         SaveStore();
 }
 
+std::string ChatMailboxPublicHex()
+{
+    unsigned char x[btf::CHAN_KEYBYTES], k[btf::CHAN_KEM_PUBBYTES];
+    CRITICAL_BLOCK(cs_chat)
+        if (g_fUnlocked && g_mailbox.PublicFor(MailboxEpoch(GetTime()), x, k))
+            return HexStr(x, x + sizeof(x), false);
+    return std::string();
+}
+
 void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out)
 {
     out.clear();
@@ -1587,9 +1640,18 @@ static void ThreadChatMailbox(void* parg)
                 std::string err;
                 // Rotation first: a new day needs new keys published before
                 // anybody seals to the old ones.
+                // A new epoch's keys are saved before they are published: a
+                // key somebody sealed to and we then lost to a crash would be
+                // a message nobody can ever read.
                 CRITICAL_BLOCK(cs_chat)
                     if (g_fUnlocked)
+                    {
+                        size_t nBefore = g_mailbox.LiveEpochs();
+                        bool fHad = g_mailbox.Has(MailboxEpoch(GetTime()));
                         g_mailbox.Rotate(GetTime(), err);
+                        if (!fHad || g_mailbox.LiveEpochs() != nBefore)
+                            SaveStore();
+                    }
 
                 // Published when the epoch turns, and again every few hours in
                 // case the nodes holding it restarted and forgot. Not every

@@ -211,6 +211,72 @@ void Mailbox::Wipe()
     mapKeys.clear();
 }
 
+static std::string BoxHex(const unsigned char* p, size_t n)
+{
+    std::string s(n * 2 + 1, '\0');
+    sodium_bin2hex(&s[0], s.size(), p, n);
+    s.resize(n * 2);
+    return s;
+}
+
+static bool BoxUnhex(const std::string& s, unsigned char* out, size_t n)
+{
+    size_t got = 0;
+    return s.size() == n * 2 &&
+           sodium_hex2bin(out, n, s.c_str(), s.size(), NULL, &got, NULL) == 0 && got == n;
+}
+
+std::string Mailbox::ToJson() const
+{
+    json a = json::array();
+    for (std::map<int64_t, EpochKeys>::const_iterator it = mapKeys.begin(); it != mapKeys.end(); ++it)
+    {
+        const EpochKeys& k = it->second;
+        a.push_back(json{{"e", k.epoch},
+                         {"xp", BoxHex(k.x_pk, sizeof(k.x_pk))}, {"xs", BoxHex(k.x_sk, sizeof(k.x_sk))},
+                         {"kp", BoxHex(k.kem_pk, sizeof(k.kem_pk))}, {"ks", BoxHex(k.kem_sk, sizeof(k.kem_sk))}});
+    }
+    return a.dump();
+}
+
+bool Mailbox::FromJson(const std::string& s, std::string& errOut)
+{
+    errOut.clear();
+    Wipe();
+    if (s.empty())
+        return true;
+    try
+    {
+        json a = json::parse(s);
+        if (!a.is_array())
+        {
+            errOut = "the epoch keys are not a list";
+            return false;
+        }
+        for (size_t i = 0; i < a.size() && i < 16; i++)
+        {
+            const json& e = a[i];
+            EpochKeys k;
+            k.epoch = e.value("e", (int64_t)-1);
+            bool fOk = k.epoch >= 0 &&
+                       BoxUnhex(e.value("xp", std::string()), k.x_pk, sizeof(k.x_pk)) &&
+                       BoxUnhex(e.value("xs", std::string()), k.x_sk, sizeof(k.x_sk)) &&
+                       BoxUnhex(e.value("kp", std::string()), k.kem_pk, sizeof(k.kem_pk)) &&
+                       BoxUnhex(e.value("ks", std::string()), k.kem_sk, sizeof(k.kem_sk));
+            if (fOk)
+                mapKeys[k.epoch] = k;
+            EpochKeysClear(k);
+        }
+    }
+    catch (...)
+    {
+        Wipe();
+        errOut = "the epoch keys do not parse";
+        return false;
+    }
+    return true;
+}
+
 // ---- sealing ---------------------------------------------------------------
 
 bool SealEnvelope(const unsigned char their_x_pk[btf::CHAN_KEYBYTES],

@@ -128,6 +128,15 @@ public:
     // Destroy everything.
     void Wipe();
 
+    // The keys still held, for the sealed store -- and back. They have to
+    // outlive the app: an envelope left while we were closed is sealed to the
+    // keys we published before closing, and a session that made new ones on
+    // every start could never open it. Forward secrecy is per epoch, not per
+    // session: Rotate still destroys a key once it is MAILBOX_KEEP_EPOCHS old,
+    // and from then on the store does not carry it either.
+    std::string ToJson() const;
+    bool FromJson(const std::string& s, std::string& errOut);
+
     size_t LiveEpochs() const { return mapKeys.size(); }
     bool   Has(int64_t nEpoch) const { return mapKeys.count(nEpoch) != 0; }
 

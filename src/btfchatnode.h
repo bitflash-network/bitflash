@@ -175,6 +175,10 @@ bool ChatSendSwapStep(const std::string& peerAddr, const std::string& stepText,
                       bool& fLeftInMailboxOut, std::string& errOut);
 // Seal and write the store now (after the swap engine changed a swap).
 void ChatSaveStore();
+
+// The public X25519 half of this epoch's mailbox key, hex; empty when locked.
+// What others seal to -- for the self-test that it survives closing the app.
+std::string ChatMailboxPublicHex();
 void ChatCommunityLog(const std::string& id, std::vector<LogEntry>& out);
 // The public directory, from the nodes. Blocks on the network.
 bool ChatCommunityDirectory(std::vector<CChatListing>& out, std::string& errOut);

@@ -5875,6 +5875,46 @@ static int RunChatIdentitySelfTest()
                    idPass.address != id1.address,
                    "and gives a different chat identity, as it must") ? 0 : 1;
 
+    // ---- closing the app and opening it again (what a tester ran into)
+    // A message left while the app was closed is sealed to the mailbox key
+    // published before closing; and a mistyped password must not open an
+    // empty chat as somebody else and then save over the real one.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "back to the plain phrase") ? 0 : 1;
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err), "the chat opens") ? 0 : 1;
+    std::string strPub = btfchat::ChatMailboxPublicHex();
+    std::string strAddr = btfchat::ChatAddress();
+    nFail += Check(strPub.size() == 64, "with this epoch's mailbox key, the one others seal to") ? 0 : 1;
+    btfchat::ChatLock();
+    std::string strFile = btfchat::ChatStorePath(), strBefore, strAfter;
+    {
+        FILE* f = fopen(strFile.c_str(), "rb");
+        char buf[4096];
+        size_t n;
+        while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+            strBefore.append(buf, n);
+        if (f) fclose(f);
+    }
+    nFail += Check(!strBefore.empty(), "closing it leaves the sealed store on disk") ? 0 : 1;
+    nFail += Check(!btfchat::ChatUnlock("senha-digitada-errada", err) && !btfchat::ChatUnlocked() &&
+                   err.find("different identity") != std::string::npos,
+                   "a mistyped password is refused, saying why -- not an empty chat as somebody else") ? 0 : 1;
+    {
+        FILE* f = fopen(strFile.c_str(), "rb");
+        char buf[4096];
+        size_t n;
+        while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+            strAfter.append(buf, n);
+        if (f) fclose(f);
+    }
+    nFail += Check(strAfter == strBefore, "and the saved chat is left byte for byte as it was") ? 0 : 1;
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err) && btfchat::ChatAddress() == strAddr,
+                   "the right password opens it again, as the same identity") ? 0 : 1;
+    nFail += Check(btfchat::ChatMailboxPublicHex() == strPub,
+                   "with the SAME mailbox key: a message left while it was closed opens") ? 0 : 1;
+    btfchat::ChatLock();
+
     printf("%s (%d failures)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail);
     return nFail == 0 ? 0 : 1;
 }

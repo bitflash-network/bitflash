@@ -371,6 +371,41 @@ int main()
               "and the gate refuses it: she was never accepted");
     }
 
+    printf("the_mailbox_survives_closing_the_app\n");
+    {
+        // What a tester found: a message left while the app was closed never
+        // arrived, because the epoch keys it was sealed to died with the
+        // session. They now go in the sealed store and come back with it.
+        const int64_t NOW = 1792500000, DAY = 86400;
+        std::string err;
+        btfchat::Mailbox before;
+        CHECK(before.Rotate(NOW, err), "bob opens the app: this epoch's keys");
+        unsigned char x[32], k[btf::CHAN_KEM_PUBBYTES];
+        CHECK(before.PublicFor(btfchat::MailboxEpoch(NOW), x, k), "and publishes them");
+        std::string saved = before.ToJson();
+        before.Wipe();
+        CHECK(before.LiveEpochs() == 0, "bob closes the app: nothing left in memory");
+
+        std::vector<unsigned char> env, got;
+        CHECK(btfchat::SealEnvelope(x, k, "{\"left\":\"while bob was away\"}", env, err),
+              "alice leaves a message, sealed to the keys bob published");
+
+        btfchat::Mailbox after;
+        CHECK(after.FromJson(saved, err) && after.LiveEpochs() == 1, "bob opens the app again: the keys come back from the store");
+        CHECK(after.Rotate(NOW + 3600, err) && after.LiveEpochs() == 1,
+              "and the same day keeps the same keys, not new ones");
+        CHECK(after.Open(&env[0], env.size(), got, err) &&
+              std::string((const char*)&got[0], got.size()) == "{\"left\":\"while bob was away\"}",
+              "so alice's message opens");
+        CHECK(after.Rotate(NOW + 2 * DAY, err) && !after.Open(&env[0], env.size(), got, err),
+              "and two days on the key is destroyed: forward secrecy per epoch");
+        btfchat::Mailbox later;
+        CHECK(later.FromJson(after.ToJson(), err) && !later.Open(&env[0], env.size(), got, err),
+              "nor does a store written after that carry it");
+        CHECK(!btfchat::Mailbox().FromJson("not json", err) && btfchat::Mailbox().FromJson("", err),
+              "a damaged list is refused; none at all (an older store) is fine");
+    }
+
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);
     secp256k1_context_destroy(ctx);
     return g_fail == 0 ? 0 : 1;
