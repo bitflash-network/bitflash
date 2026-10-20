@@ -6253,6 +6253,149 @@ static int RunBtcSwapSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- fee-policy: fees as a market, and replacing a transaction (BIP125) --------
+//
+// In a temporary data directory, through the real memory pool: a parent sits
+// in the pool, its children spend it with different fees, and AcceptTransaction
+// decides on every replacement exactly as it does for one off the network.
+
+extern map<COutPoint, CInPoint> mapNextTx;   // main.cpp
+
+// Into the pool with no checks, as AddToMemoryPool does (it is protected):
+// for a parent whose own inputs the test does not have.
+static void FeeTestAddToPool(const CTransaction& tx)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        uint256 h = tx.GetHash();
+        mapTransactions[h] = tx;
+        for (unsigned int i = 0; i < tx.vin.size(); i++)
+            mapNextTx[tx.vin[i].prevout] = CInPoint(&mapTransactions[h], i);
+    }
+}
+
+static CTransaction FeeTestChild(const CTransaction& parent, unsigned int n, int64 nFee, unsigned int nSequence,
+                                 const CScript& scriptTo)
+{
+    CTransaction tx;
+    tx.vin.push_back(CTxIn(parent.GetHash(), n, CScript(), nSequence));
+    tx.vout.push_back(CTxOut(parent.vout[n].nValue - nFee, scriptTo));
+    return tx;
+}
+
+static int RunFeePolicySelfTest()
+{
+    printf("fee-policy self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    try
+    {
+        // ---- the rules on their own
+        CTransaction t;
+        t.vin.resize(1);
+        nFail += Check(!t.SignalsReplacement(), "an input with the final sequence does not allow replacement") ? 0 : 1;
+        t.vin[0].nSequence = SEQUENCE_FINAL - 1;
+        nFail += Check(!t.SignalsReplacement(), "nor does final minus one (that is for nLockTime alone)") ? 0 : 1;
+        t.vin[0].nSequence = SEQUENCE_REPLACEABLE;
+        nFail += Check(t.SignalsReplacement(), "below that, it does") ? 0 : 1;
+        nFail += Check(FeeForSize(1000, 250) == 250 && FeeForSize(1000, 1) == 1 && FeeForSize(1001, 1000) == 1001,
+                       "a rate per 1000 bytes rounds up to whole satoshis") ? 0 : 1;
+        std::string why;
+        std::vector<std::pair<int64, unsigned int> > vOld(1, std::make_pair((int64)100000, 200u));
+        nFail += Check(ReplacementPaysEnough(100000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200), 200, vOld, why),
+                       "a replacement paying the old fee plus the relay fee for its size is enough") ? 0 : 1;
+        nFail += Check(!ReplacementPaysEnough(100000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200) - 1, 200, vOld, why),
+                       "one satoshi less is not") ? 0 : 1;
+        nFail += Check(!ReplacementPaysEnough(1000000, 2000, vOld, why) && why.find("per byte") != std::string::npos,
+                       "more in total but less per byte is not") ? 0 : 1;
+        vOld.push_back(std::make_pair((int64)100000, 200u));
+        nFail += Check(!ReplacementPaysEnough(150000, 200, vOld, why),
+                       "replacing two, it has to pay for both") ? 0 : 1;
+
+        // ---- the pool
+        CTxDB txdb("cr+");
+        CKey key;
+        key.MakeNewKey();
+        CScript scriptTo;
+        scriptTo << OP_DUP << OP_HASH160 << Hash160(key.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+        CTransaction parent;
+        parent.vin.push_back(CTxIn(COutPoint(uint256(77), 0)));
+        for (int i = 0; i < 6; i++)
+            parent.vout.push_back(CTxOut(10 * COIN, CScript() << OP_TRUE));
+        FeeTestAddToPool(parent);
+
+        CTransaction a = FeeTestChild(parent, 0, 1000, SEQUENCE_REPLACEABLE, scriptTo);
+        CTransaction b = FeeTestChild(parent, 1, 9000, SEQUENCE_REPLACEABLE, scriptTo);
+        CTransaction c = FeeTestChild(parent, 2, 5000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(a.AcceptTransaction(txdb, true) && b.AcceptTransaction(txdb, true) && c.AcceptTransaction(txdb, true),
+                       "three children paying 1000, 9000 and 5000 enter the pool") ? 0 : 1;
+        std::vector<CTransaction*> vOrder;
+        CRITICAL_BLOCK(cs_mapTransactions)
+            MempoolByFeeRate(txdb, vOrder);
+        bool fOrder = vOrder.size() == 4 && vOrder[0]->GetHash() == b.GetHash() && vOrder[1]->GetHash() == c.GetHash() &&
+                      vOrder[2]->GetHash() == a.GetHash();
+        nFail += Check(fOrder, "a block takes them best fee per byte first: 9000, 5000, 1000 (the parent, unpriced, last)") ? 0 : 1;
+
+        CTransaction a2 = FeeTestChild(parent, 0, 1000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200) + 500,
+                                       SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(a2.AcceptTransaction(txdb, true), "a replacement for the 1000 that pays enough more is taken") ? 0 : 1;
+        bool fGone = false, fIn = false;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            fGone = !mapTransactions.count(a.GetHash());
+            fIn = mapTransactions.count(a2.GetHash()) > 0;
+        }
+        nFail += Check(fGone && fIn, "and the one it replaces leaves the pool") ? 0 : 1;
+        CTransaction a3 = FeeTestChild(parent, 0, 1001, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(!a3.AcceptTransaction(txdb, true), "one paying less than what is there now is refused") ? 0 : 1;
+
+        CTransaction d = FeeTestChild(parent, 3, 1000, SEQUENCE_FINAL, scriptTo);
+        CTransaction d2 = FeeTestChild(parent, 3, 50000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(d.AcceptTransaction(txdb, true) && !d2.AcceptTransaction(txdb, true),
+                       "a transaction that did not allow replacement is not replaced, whatever the fee") ? 0 : 1;
+        // The 0.1.0 rule took a "newer version" -- a higher sequence -- for
+        // the same fee, again and again. Sequence 5 then 6, same fee:
+        CTransaction f = FeeTestChild(parent, 5, 1000, 5, scriptTo);
+        CTransaction f2 = FeeTestChild(parent, 5, 1000, 6, scriptTo);
+        nFail += Check(f.AcceptTransaction(txdb, true) && !f2.AcceptTransaction(txdb, true),
+                       "the old free replacement by a higher sequence is gone: a replacement pays") ? 0 : 1;
+
+        CTransaction e = FeeTestChild(parent, 4, 1000, SEQUENCE_REPLACEABLE, scriptTo);
+        bool fE = e.AcceptTransaction(txdb, true);
+        // A child of e, so replacing e would drop it too.
+        CTransaction eChild;
+        eChild.vin.push_back(CTxIn(e.GetHash(), 0, CScript(), SEQUENCE_REPLACEABLE));
+        eChild.vout.push_back(CTxOut(e.vout[0].nValue - 1000, scriptTo));
+        FeeTestAddToPool(eChild);
+        CTransaction e2 = FeeTestChild(parent, 4, 90000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(fE && !e2.AcceptTransaction(txdb, true),
+                       "a transaction others build on in the pool is not replaced") ? 0 : 1;
+
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            mapTransactions.clear();
+            mapNextTx.clear();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    DBFlush(true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // ---- chat-swap: the swap engine, end to end, with coins ------------------------
 //
 // Two engines (btfchatswap.h) wired to each other in place of the chat, each
@@ -6606,6 +6749,8 @@ int RunSelfTest(const std::string& name)
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")
         return RunChatSwapSelfTest();
+    if (name == "fee-policy")
+        return RunFeePolicySelfTest();
     if (name == "chat-live")
         return RunChatLiveSelfTest();
 

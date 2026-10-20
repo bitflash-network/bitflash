@@ -24,6 +24,7 @@
 #include "walletcmd.h"
 #include "tor.h"
 #include "treasury.h"
+#include "bip21.h"
 #include "font_roboto.h"
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,11 @@ static bool        g_needRefresh       = true;
 
 static char        g_sendAddr[128]        = {};
 static char        g_sendAmount[32]       = {};
+static std::string g_sendFor;                 // who/what a pasted payment link said
+// "Request a payment": a bitflash: link (BIP21) for this wallet's address.
+static bool        g_showRequest          = false;
+static char        g_reqAmount[32]        = {};
+static char        g_reqLabel[64]         = {};
 static std::string g_sendStatus;
 static char        g_backupPath[512]      = {};
 static std::string g_backupStatus;
@@ -87,8 +93,9 @@ static char        g_bridgeText[4096]     = {};
 static std::string g_bridgeTextLoaded;
 static std::string g_torActionMsg;
 
-struct TxRow { std::string date, desc; int64 amount; int depth; };
+struct TxRow { std::string date, desc; int64 amount; int depth; uint256 hash; bool fCanSpeedUp; };
 static std::vector<TxRow> g_txRows;
+static std::string g_speedUpStatus;   // what the last "speed up" did
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -289,7 +296,9 @@ static void RefreshWallet()
                 net  = wtx.GetCredit() - wtx.GetDebit();
                 desc = "Received";
             }
-            g_txRows.push_back({DateTimeStr(wtx.GetTxTime()), desc, net, depth});
+            // A payment of ours still waiting, sent replaceable: it can be sped up.
+            bool fCanSpeedUp = depth < 1 && wtx.GetDebit() > 0 && net < 0 && wtx.SignalsReplacement();
+            g_txRows.push_back({DateTimeStr(wtx.GetTxTime()), desc, net, depth, wtx.GetHash(), fCanSpeedUp});
         }
     }
     g_lastWalletRefresh = GetTime();
@@ -439,6 +448,11 @@ static void DrawMainWindow()
     ImGui::PopStyleColor();
     ImGui::SameLine();
     if (ImGui::Button("Copy##a")) ImGui::SetClipboardText(g_myAddress.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("Request##a")) g_showRequest = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A payment link (bitflash:...) for this address, with an amount:\n"
+                          "to paste in a chat or show as a QR code.");
 
     ImGui::TextDisabled("Balance:");
     ImGui::SameLine();
@@ -563,6 +577,26 @@ static void DrawMainWindow()
             bool isOrphaned         = (row.desc.find("orphaned") != std::string::npos);
             if (isOrphaned)
                 ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Orphaned");
+            else if (row.depth < 1 && row.fCanSpeedUp) {
+                // Speed up: the same payment again, a higher fee from its
+                // change (BIP125). At least the base rate, more if the
+                // waiting transactions say the next block needs more.
+                if (ImGui::SmallButton(("speed up##" + row.hash.GetHex()).c_str())) {
+                    uint256 newTxid;
+                    int64 nOld = 0, nNew = 0;
+                    std::string err;
+                    int64 nRate = std::max(std::max(EstimateNextBlockFeePerKB(), nPayTxFeePerKB), (int64)CENT);
+                    if (BumpFee(row.hash, nRate, newTxid, nOld, nNew, err))
+                        g_speedUpStatus = strprintf("Sped up: the fee went from %s to %s BTF.",
+                                                    FmtMoney(nOld).c_str(), FmtMoney(nNew).c_str());
+                    else
+                        g_speedUpStatus = "Could not speed it up: " + err;
+                    g_needRefresh = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Unconfirmed. Sends the same payment again with a higher fee,\n"
+                                      "taken from its change, so miners take it sooner.");
+            }
             else if (row.depth < 1)
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "Unconfirmed");
             else if (isImmatureCoinbase)
@@ -585,6 +619,11 @@ static void DrawMainWindow()
                     "%s BTF",  FmtMoney(row.amount).c_str());
         }
         ImGui::EndTable();
+    }
+    if (!g_speedUpStatus.empty()) {
+        ImGui::TextWrapped("%s", g_speedUpStatus.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("ok##speedup")) g_speedUpStatus.clear();
     }
 
     // ---- Mode panels ----
@@ -765,6 +804,24 @@ static void DrawSendDialog()
         }
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputText("##sa", g_sendAddr, sizeof(g_sendAddr));
+        // A payment link pasted here fills in the address and the amount.
+        bool fLink = true;
+        for (int i = 0; i < 9 && fLink; i++)
+            fLink = g_sendAddr[i] && tolower((unsigned char)g_sendAddr[i]) == "bitflash:"[i];
+        if (fLink) {
+            PaymentLink link;
+            std::string err;
+            if (ParsePaymentLink(g_sendAddr, link, err) && link.address.size() < sizeof(g_sendAddr)) {
+                snprintf(g_sendAddr, sizeof(g_sendAddr), "%s", link.address.c_str());
+                if (link.amount > 0)
+                    snprintf(g_sendAmount, sizeof(g_sendAmount), "%s", FmtMoney(link.amount).c_str());
+                g_sendFor = link.label + (!link.label.empty() && !link.message.empty() ? " -- " : "") + link.message;
+                g_sendStatus = "";
+            } else
+                g_sendStatus = "Payment link: " + err;
+        }
+        if (!g_sendFor.empty())
+            ImGui::TextDisabled("For: %s", g_sendFor.c_str());
 
         ImGui::Text("Amount (BTF):");
         ImGui::SetNextItemWidth(180.0f);
@@ -796,6 +853,7 @@ static void DrawSendDialog()
                     g_sendStatus = "";
                     memset(g_sendAddr,   0, sizeof(g_sendAddr));
                     memset(g_sendAmount, 0, sizeof(g_sendAmount));
+                    g_sendFor.clear();
                     g_needRefresh = true;
                 } else {
                     g_sendStatus = "Transaction failed.";
@@ -806,7 +864,54 @@ static void DrawSendDialog()
         if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) {
             g_showSend = false;
             g_sendStatus = "";
+            g_sendFor.clear();
         }
+    }
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Request a payment: a bitflash: link for this wallet's address
+// ---------------------------------------------------------------------------
+static void DrawRequestDialog()
+{
+    if (!g_showRequest) return;
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 200.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin("Request a Payment", &g_showRequest,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse))
+    {
+        ImGui::Text("Amount (BTF, optional):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputText("##ra", g_reqAmount, sizeof(g_reqAmount));
+        ImGui::Text("For (optional):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##rl", g_reqLabel, sizeof(g_reqLabel));
+
+        PaymentLink link;
+        link.address = g_myAddress;
+        int64 n = 0;
+        bool fAmountOk = g_reqAmount[0] == 0 || (ParseMoney(g_reqAmount, n) && n > 0);
+        if (fAmountOk)
+            link.amount = n;
+        link.label = g_reqLabel;
+        std::string uri = MakePaymentLink(link);
+
+        ImGui::Spacing();
+        if (!fAmountOk)
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "That amount is not a BTF amount.");
+        ImGui::SetNextItemWidth(-80.0f);
+        ImGui::InputText("##ruri", (char*)uri.c_str(), uri.size() + 1, ImGuiInputTextFlags_ReadOnly);
+        ImGui::SameLine();
+        if (ImGui::Button("Copy##ruri")) ImGui::SetClipboardText(uri.c_str());
+        ImGui::TextDisabled("Whoever pays pastes this into Send; a phone wallet reads it from a QR code.");
+
+        ImGui::Spacing();
+        if (ImGui::Button("Close", ImVec2(90.0f, 0.0f)))
+            g_showRequest = false;
     }
     ImGui::End();
 }
@@ -853,6 +958,21 @@ static void DrawOptionsDialog()
             snprintf(feeStr, sizeof(feeStr), "%s", FmtMoney(nTransactionFee).c_str());
         ImGui::SetNextItemWidth(180.0f);
         ImGui::InputText("BTF per transaction##fee", feeStr, sizeof(feeStr));
+        // The rate: what a transaction pays for its size. 0 is the minimum,
+        // which is free while blocks have room.
+        static char rateStr[32] = {};
+        if (rateStr[0] == '\0')
+            snprintf(rateStr, sizeof(rateStr), "%s", FmtMoney(nPayTxFeePerKB).c_str());
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputText("BTF per 1000 bytes##rate", rateStr, sizeof(rateStr));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("suggest")) {
+            int64 n = EstimateNextBlockFeePerKB();
+            snprintf(rateStr, sizeof(rateStr), "%s", FmtMoney(n).c_str());
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("What the next block needs, from the transactions waiting now.\n"
+                              "0 means everything waiting fits: the minimum is enough.");
 
         // Mining mode
         ImGui::SeparatorText("Mining Mode");
@@ -985,6 +1105,11 @@ static void DrawOptionsDialog()
             if (ParseMoney(feeStr, fee)) {
                 nTransactionFee = fee;
                 CWalletDB().WriteSetting("nTransactionFee", nTransactionFee);
+            }
+            int64 rate = 0;
+            if (ParseMoney(rateStr, rate) && rate >= 0 && rate <= COIN) {
+                nPayTxFeePerKB = rate;
+                CWalletDB().WriteSetting("nPayTxFeePerKB", nPayTxFeePerKB);
             }
 
             bool poolChanged =
@@ -1808,6 +1933,7 @@ int RunGUI(int argc, char* argv[])
         // Draw order matters: status bar last so it is always on top.
         DrawMainWindow();
         DrawSendDialog();
+        DrawRequestDialog();
         DrawOptionsDialog();
         DrawWalletSafetyDialog();
         DrawCreatePhraseDialog();

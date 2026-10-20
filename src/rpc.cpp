@@ -187,19 +187,20 @@ static bool RebuildJob()
             CRITICAL_BLOCK(cs_mapTransactions)
             {
                 map<uint256, CTxIndex> pool;
-                vector<char> vfAlreadyAdded(mapTransactions.size());
+                // The same order the solo miner uses: best fee per byte first.
+                vector<CTransaction*> vOrder;
+                MempoolByFeeRate(txdb, vOrder);
+                vector<char> vfAlreadyAdded(vOrder.size());
                 bool fFoundSomething = true;
                 unsigned int sz = 0;
                 while (fFoundSomething && sz < MAX_SIZE / 2)
                 {
                     fFoundSomething = false;
-                    unsigned int n = 0;
-                    for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin();
-                         mi != mapTransactions.end(); ++mi, ++n)
+                    for (unsigned int n = 0; n < vOrder.size(); n++)
                     {
                         if (vfAlreadyAdded[n])
                             continue;
-                        CTransaction& tx = (*mi).second;
+                        CTransaction& tx = *vOrder[n];
                         if (tx.IsCoinBase() || !IsFinalForNextBlock(tx)) continue;
                         map<uint256, CTxIndex> tmp(pool);
                         if (!tx.ConnectInputs(txdb, tmp, CDiskTxPos(1,1,1), 0, nFees,

@@ -309,6 +309,9 @@ static json WalletTxToJson(const CWalletTx& wtx)
     j["confirmations"] = nDepth;
     j["time"]          = (int64)wtx.nTimeReceived;
     j["timereceived"]  = (int64)wtx.nTimeReceived;
+    // Bitcoin Core's name for it: while unconfirmed, can it be replaced
+    // (sped up with bumpfee, or by its sender for a payment to us)?
+    j["bip125-replaceable"] = nDepth > 0 ? "no" : (wtx.SignalsReplacement() ? "yes" : "no");
     if (nDepth > 0)
     {
         j["blockhash"] = wtx.hashBlock.GetHex();
@@ -559,6 +562,63 @@ static json rpc_getbalance(const json& p)
         }
     }
     return ValueFromAmount(nTotal);
+}
+
+// estimatefee -- BTF per 1000 bytes to be in the next block, from what is
+// waiting now. 0: everything waiting fits, the minimum is enough.
+static json rpc_estimatefee(const json&)
+{
+    int64 n = EstimateNextBlockFeePerKB();
+    json j;
+    j["feeRatePerKB"] = ValueFromAmount(n);
+    j["minimumEnough"] = n == 0;
+    CRITICAL_BLOCK(cs_mapTransactions)
+        j["waiting"] = (int)mapTransactions.size();
+    return j;
+}
+
+// settxfee <BTF per 1000 bytes> -- the rate this wallet pays; 0 is the minimum.
+static json rpc_settxfee(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("settxfee <BTF per 1000 bytes>  (0: the minimum)");
+    string s = p[0].is_string() ? p[0].get<string>() : strprintf("%.8f", p[0].get<double>());
+    int64 n = 0;
+    if (!ParseMoney(s.c_str(), n) || n < 0 || n > COIN)
+        throw runtime_error("a rate from 0 to 1 BTF per 1000 bytes");
+    nPayTxFeePerKB = n;
+    CWalletDB().WriteSetting("nPayTxFeePerKB", nPayTxFeePerKB);
+    return true;
+}
+
+// bumpfee <txid> [BTF per 1000 bytes] -- speed up a payment of ours that is
+// still waiting: the same payment again, the extra fee from its change.
+static json rpc_bumpfee(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("bumpfee <txid> [BTF per 1000 bytes]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    int64 nRate = 0;
+    if (p.size() >= 2)
+    {
+        string s = p[1].is_string() ? p[1].get<string>() : strprintf("%.8f", p[1].get<double>());
+        if (!ParseMoney(s.c_str(), nRate) || nRate <= 0 || nRate > COIN)
+            throw runtime_error("a rate above 0 and up to 1 BTF per 1000 bytes");
+    }
+    else
+        nRate = max(EstimateNextBlockFeePerKB(), nPayTxFeePerKB);
+    uint256 newTxid;
+    int64 nOld = 0, nNew = 0;
+    string err;
+    if (!BumpFee(uint256(p[0].get<string>()), nRate, newTxid, nOld, nNew, err))
+        throw runtime_error(err);
+    json j;
+    j["txid"] = newTxid.GetHex();
+    j["replaces"] = p[0];
+    j["oldFee"] = ValueFromAmount(nOld);
+    j["newFee"] = ValueFromAmount(nNew);
+    return j;
 }
 
 static json rpc_sendtoaddress(const json& p)
@@ -2097,7 +2157,7 @@ static json rpc_btcfindsecret(const json& p)
 static json rpc_help(const json&)
 {
     return "getinfo getblockcount getblockhash getblock getnewaddress validateaddress "
-           "getbalance sendtoaddress gettransaction listtransactions listsinceblock "
+           "getbalance sendtoaddress estimatefee settxfee bumpfee gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
            "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
@@ -2117,6 +2177,9 @@ static const RpcEntry kMethods[] = {
     { "validateaddress",  rpc_validateaddress },
     { "getbalance",       rpc_getbalance },
     { "sendtoaddress",    rpc_sendtoaddress },
+    { "estimatefee",      rpc_estimatefee },
+    { "settxfee",         rpc_settxfee },
+    { "bumpfee",          rpc_bumpfee },
     { "donate",           rpc_donate },
     { "sendburn",         rpc_sendburn },
     { "gettreasuryinfo",  rpc_gettreasuryinfo },

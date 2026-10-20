@@ -35,6 +35,7 @@
 #include "community.h"
 #include "chatswap.h"
 #include "btfchatswap.h"
+#include "bip21.h"
 #include "tor.h"
 
 #include <algorithm>
@@ -1066,6 +1067,20 @@ void DrawConversation()
             ImGui::PushStyleColor(ImGuiCol_Text, COL_WARN);
             ImGui::TextWrapped("[BTF] %s%s%s", what.c_str(), e.text.empty() ? "" : " -- ", e.text.c_str());
             ImGui::PopStyleColor();
+            if (!e.outgoing)
+            {
+                // The same request as a payment link, for paying it from
+                // another wallet: the address is still the one they signed.
+                ImGui::SameLine();
+                if (ImGui::SmallButton(("copy link##" + e.id).c_str()))
+                {
+                    PaymentLink link;
+                    link.address = e.payTo;
+                    link.amount = e.amount;
+                    link.message = e.text;
+                    ImGui::SetClipboardText(MakePaymentLink(link).c_str());
+                }
+            }
             continue;
         }
         if (e.kind == btfchat::MSG_PAYMENT)
