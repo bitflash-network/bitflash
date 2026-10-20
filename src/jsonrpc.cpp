@@ -1439,6 +1439,19 @@ static void KeyForContract(const swap::Contract& c, bool fRedeem, CKey& key, vec
     }
 }
 
+extern map<COutPoint, CInPoint> mapNextTx;   // main.cpp: memory-pool spends
+
+// Already spent, in the memory pool or in the chain?
+static bool OutputSpent(const COutPoint& outpoint)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+        if (mapNextTx.count(outpoint))
+            return true;
+    CTxIndex txindex;
+    return CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && outpoint.n < txindex.vSpent.size() &&
+           !txindex.vSpent[outpoint.n].IsNull();
+}
+
 // Spend a contract output: redeem with the secret, or refund after the lock.
 static json SpendContract(const CScript& contract, const swap::Contract& c, const uint256& txid,
                           const vector<unsigned char>* pSecret)
@@ -1448,6 +1461,8 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
     CTransaction txFrom;
     unsigned int nOut = 0;
     FindContractOutput(contract, txid, txFrom, nOut);
+    if (OutputSpent(COutPoint(txFrom.GetHash(), nOut)))
+        throw runtime_error("that contract is already spent (redeemed or refunded)");
 
     vector<unsigned char> vchPubKey;
     CKey key;

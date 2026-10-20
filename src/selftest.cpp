@@ -6452,10 +6452,10 @@ static int RunChatSwapSelfTest()
     a.other = &b;
     b.other = &a;
 
-    try
+    // Each scenario on its own: one that throws does not hide the others.
     {
         // ---- 1: Alice gives BTF, Bob gives BTC; both finish
-        {
+        try {
             printf("  1. Alice offers 1 BTF for 0.05 BTC; Bob takes it\n");
             btfchat::SwapEngine ea(&a), eb(&b);
             btfchat::SwapOffer o;
@@ -6473,13 +6473,16 @@ static int RunChatSwapSelfTest()
             nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's Bitcoin Core wallet got %.8f BTC", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
-            nFail += Check(LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
-                           bt.value("amount", 0.0) > 0.98,
-                           strprintf("Bob's Bitflash wallet got %.8f BTF", bt.value("amount", 0.0)).c_str()) ? 0 : 1;
-        }
+            bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
+                        bt.is_object();
+            double amt = fGot ? bt.value("amount", 0.0) : 0.0;
+            nFail += Check(fGot && amt > 0.98,
+                           strprintf("Bob's Bitflash wallet got %.8f BTF (redeem %s%s%s)", amt, t.redeemTxid.c_str(),
+                                     fGot ? "" : ": ", e2.c_str()).c_str()) ? 0 : 1;
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
 
         // ---- 2: Bob gives BTC, Alice gives BTF; the other direction
-        {
+        try {
             printf("  2. Bob offers 0.04 BTC for 0.8 BTF; Alice takes it\n");
             btfchat::SwapEngine ea(&a), eb(&b);
             a.convo.clear();
@@ -6494,10 +6497,10 @@ static int RunChatSwapSelfTest()
             bool fEnd = SwapTestRun(eb, ea, nBtc, 7200, false, 0, m, t);
             nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
                            "both sides finish the other way round too") ? 0 : 1;
-        }
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
 
         // ---- 3: Alice locks, Bob locks, Alice vanishes: both refund
-        {
+        try {
             printf("  3. Alice offers 0.5 BTF for 0.03 BTC; Bob locks; Alice vanishes\n");
             btfchat::SwapConfig cfg;
             // Short locks (test chains only): 6 Bitflash blocks for Alice, 15
@@ -6521,11 +6524,7 @@ static int RunChatSwapSelfTest()
                            "Bob's BTC comes back by itself after its lock") ? 0 : 1;
             nFail += Check(fEnd && m.stage == btfchat::SW_REFUNDED && !m.refundTxid.empty(),
                            "and Alice's BTF after hers -- she never showed the secret") ? 0 : 1;
-        }
-    }
-    catch (std::exception& e)
-    {
-        nFail += Check(false, e.what()) ? 0 : 1;
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
     }
 
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
