@@ -24,6 +24,7 @@
 #include "treasury.h"
 #include "swap.h"
 #include "btcswap.h"
+#include "invoice.h"
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -562,6 +563,39 @@ static json rpc_getbalance(const json& p)
         }
     }
     return ValueFromAmount(nTotal);
+}
+
+// ---- invoices (invoice.h): the shop's own payment gateway ----
+
+// createinvoice <amount> [description] [expiry seconds=3600] [order id]
+static json rpc_createinvoice(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("createinvoice <amount> [description] [expiry seconds, default 3600] [order id]");
+    string strDesc = p.size() >= 2 && p[1].is_string() ? p[1].get<string>() : string();
+    int64 nExpiry = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int64>() : 3600;
+    string strOrder = p.size() >= 4 && p[3].is_string() ? p[3].get<string>() : string();
+    return invoice::Create(AmountFromValue(p[0]), strDesc, nExpiry, strOrder);
+}
+
+static json rpc_getinvoice(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("getinvoice <id>");
+    return invoice::Get(p[0].get<string>());
+}
+
+// listinvoices [status]
+static json rpc_listinvoices(const json& p)
+{
+    return invoice::List(p.size() >= 1 && p[0].is_string() ? p[0].get<string>() : string());
+}
+
+static json rpc_cancelinvoice(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("cancelinvoice <id>");
+    return invoice::Cancel(p[0].get<string>());
 }
 
 // estimatefee -- BTF per 1000 bytes to be in the next block, from what is
@@ -2157,7 +2191,8 @@ static json rpc_btcfindsecret(const json& p)
 static json rpc_help(const json&)
 {
     return "getinfo getblockcount getblockhash getblock getnewaddress validateaddress "
-           "getbalance sendtoaddress estimatefee settxfee bumpfee gettransaction listtransactions listsinceblock "
+           "getbalance sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
+           "gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
            "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
@@ -2178,6 +2213,10 @@ static const RpcEntry kMethods[] = {
     { "getbalance",       rpc_getbalance },
     { "sendtoaddress",    rpc_sendtoaddress },
     { "estimatefee",      rpc_estimatefee },
+    { "createinvoice",    rpc_createinvoice },
+    { "getinvoice",       rpc_getinvoice },
+    { "listinvoices",     rpc_listinvoices },
+    { "cancelinvoice",    rpc_cancelinvoice },
     { "settxfee",         rpc_settxfee },
     { "bumpfee",          rpc_bumpfee },
     { "donate",           rpc_donate },

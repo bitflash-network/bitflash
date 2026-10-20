@@ -7,6 +7,7 @@
 #include "btfchatnode.h"
 #include "btfchatwallet.h"
 #include "btcswap.h"
+#include "invoice.h"
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -233,6 +234,10 @@ static void PrintUsage()
     printf("  /btcdatadir=DIR /btcrpcport=N /btcwallet=NAME  (where this machine's Bitcoin Core is;\n");
     printf("                              its .cookie is read, or /btcrpcuser=U /btcrpcpassword=P)\n");
     printf("  /btcfeerate=BTC            (per 1000 vbytes, when Core has no fee estimate)\n");
+    printf("  /invoicewebhook=URL        (invoices: POST each status change to http://host[:port]/path)\n");
+    printf("  /invoicewebhooksecret=S    (sign those POSTs: X-Bitflash-Signature: sha256=HMAC(S, body))\n");
+    printf("  /invoicenotify=CMD         (invoices: run CMD on each status change, %%s = invoice id)\n");
+    printf("  /invoiceminconf=N          (confirmations for an invoice to be paid; 2 mainnet, 1 testnet)\n");
     printf("  /bindaddr=IP               (listen on this address instead of loopback;\n");
     printf("                              only for a Tor running on another machine --\n");
     printf("                              a reachable plain port exposes this node's onion)\n");
@@ -560,6 +565,17 @@ static void ParseStartupArguments(int argc, char* argv[])
                        argval2(argc, argv, "/btcrpcuser", "-btcrpcuser"),
                        argval2(argc, argv, "/btcrpcpassword", "-btcrpcpassword"),
                        argval2(argc, argv, "/btcfeerate", "-btcfeerate"));
+    // Invoices: the shop's own payment gateway (invoice.h).
+    {
+        invoice::Config ic;
+        ic.strWebhookUrl    = argval2(argc, argv, "/invoicewebhook", "-invoicewebhook");
+        ic.strWebhookSecret = argval2(argc, argv, "/invoicewebhooksecret", "-invoicewebhooksecret");
+        ic.strNotifyCommand = argval2(argc, argv, "/invoicenotify", "-invoicenotify");
+        ic.nMinConf         = atoi(argval2(argc, argv, "/invoiceminconf", "-invoiceminconf").c_str());
+        std::string strErr;
+        if (!invoice::Configure(ic, strErr))
+            StartupRefuse(strErr, "");
+    }
 #endif
 
     // Commands that do their work and exit have no use for Tor, and starting it
@@ -1471,6 +1487,11 @@ int main(int argc, char* argv[])
     if (fJsonRpc) {
         if (_beginthread(ThreadJsonRpcServer, 0, NULL) == (uintptr_t)-1)
             printf("Error: _beginthread(ThreadJsonRpcServer) failed\n");
+#ifndef BITFLASH_CHAT_APP
+        // Invoices are made through the RPC, so they are watched while it runs.
+        if (_beginthread(invoice::ThreadInvoices, 0, NULL) == (uintptr_t)-1)
+            printf("Error: _beginthread(ThreadInvoices) failed\n");
+#endif
     }
 #ifdef BITFLASH_CHAT_APP
     // btfchat never mines. It carries the chain so it validates on its own

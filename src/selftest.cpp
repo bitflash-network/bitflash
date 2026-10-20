@@ -22,6 +22,8 @@
 #include "swap.h"
 #include "btcswap.h"
 #include "btfchatswap.h"
+#include "invoice.h"
+#include "bip21.h"
 #include "btfchatwallet.h"
 #include "chatdir.h"
 #include "community.h"
@@ -6396,6 +6398,107 @@ static int RunFeePolicySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- invoice: the shop's own payment gateway (invoice.h) ------------------------
+
+static int RunInvoiceSelfTest()
+{
+    printf("invoice self-test\n");
+    int nFail = 0;
+    using invoice::StatusFor;
+    // ---- the status rule
+    nFail += Check(StatusFor(100, 0, 0, false, 2000, 1000) == "waiting", "nothing yet: waiting") ? 0 : 1;
+    nFail += Check(StatusFor(100, 40, 0, false, 2000, 1000) == "partial", "some of it: partial") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 0, false, 2000, 1000) == "seen", "all of it, unconfirmed: seen -- not money yet") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, false, 2000, 1000) == "paid", "all of it, confirmed: paid") ? 0 : 1;
+    nFail += Check(StatusFor(100, 150, 150, false, 2000, 1000) == "paid", "more than asked is still paid (and reported as overpaid)") ? 0 : 1;
+    nFail += Check(StatusFor(100, 40, 0, false, 2000, 3000) == "expired", "the time ran out first: expired") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, false, 2000, 3000) == "paid", "paid after the time ran out is still paid: the money is there") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, true, 2000, 1000) == "cancelled", "cancelled is cancelled") ? 0 : 1;
+
+    // ---- the signature a shop checks (RFC 4231-style known vector)
+    nFail += Check(invoice::SignBody("key", "The quick brown fox jumps over the lazy dog") ==
+                   "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+                   "the webhook signature is HMAC-SHA256, as any shop's code computes it") ? 0 : 1;
+
+    // ---- URLs
+    std::string host, path;
+    unsigned short port = 0;
+    nFail += Check(invoice::ParseHttpUrl("http://127.0.0.1:8080/btf/hook", host, port, path) &&
+                   host == "127.0.0.1" && port == 8080 && path == "/btf/hook", "http://host:port/path reads") ? 0 : 1;
+    nFail += Check(invoice::ParseHttpUrl("http://shop.example", host, port, path) && port == 80 && path == "/",
+                   "port and path default") ? 0 : 1;
+    nFail += Check(!invoice::ParseHttpUrl("https://shop.example/hook", host, port, path),
+                   "https is refused rather than sent in the clear") ? 0 : 1;
+    nFail += Check(!invoice::ParseHttpUrl("http://shop.example/a b", host, port, path),
+                   "a URL that would break the request line is refused") ? 0 : 1;
+
+    // ---- the QR a checkout page shows
+    std::string svg = invoice::QrSvg("bitflash:BE39QRszEZSeqHnGEHqsZZV2hu5d8GCQAw?amount=1");
+    nFail += Check(svg.compare(0, 4, "<svg") == 0 && svg.find("fill=\"#ffffff\"") != std::string::npos &&
+                   svg.find("M4,4h1v1h-1z") != std::string::npos,
+                   "the QR is an SVG, white behind, the first finder module at the quiet zone's edge") ? 0 : 1;
+
+    // ---- an invoice's life, in a wallet of its own
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    std::string strOld = strSetDataDir;
+    strSetDataDir = tmp;
+    try
+    {
+        if (!LoadWallet())
+            throw std::runtime_error("LoadWallet failed");
+        nlohmann::json a = invoice::Create(150000000, "Two coffees", 600, "order-41");
+        std::string id = a["id"].get<std::string>();
+        nFail += Check(id.size() == 32 && a["status"] == "waiting" && a["amount"].get<double>() == 1.5,
+                       "an invoice is made: an id, waiting, 1.5 BTF") ? 0 : 1;
+        uint160 hAddr;
+        bool fMine = AddressToHash160(a["address"].get<std::string>(), hAddr);
+        CRITICAL_BLOCK(cs_mapKeys)
+            fMine = fMine && mapPubKeys.count(hAddr) && mapKeys.count(mapPubKeys[hAddr]);
+        nFail += Check(fMine,
+                       "its address is a fresh one of this wallet: the money comes straight here") ? 0 : 1;
+        PaymentLink link;
+        std::string err;
+        nFail += Check(ParsePaymentLink(a["copyPaste"].get<std::string>(), link, err) &&
+                       link.address == a["address"] && link.amount == 150000000 && link.message == "Two coffees",
+                       "the copy-and-paste is the payment link, with the amount and what it is for") ? 0 : 1;
+        nFail += Check(a["qrSvg"].get<std::string>().compare(0, 4, "<svg") == 0, "and the QR comes with it") ? 0 : 1;
+        nlohmann::json b = invoice::Create(100000000, "", 600, "");
+        nFail += Check(b["address"] != a["address"], "every invoice has its own address") ? 0 : 1;
+        nFail += Check(invoice::Get(id)["orderId"] == "order-41", "getinvoice finds it by id") ? 0 : 1;
+        nFail += Check(invoice::List("waiting").size() == 2, "listinvoices waiting lists both") ? 0 : 1;
+        invoice::Cancel(b["id"].get<std::string>());
+        nFail += Check(invoice::Get(b["id"].get<std::string>())["status"] == "cancelled" &&
+                       invoice::List("waiting").size() == 1, "a cancelled one leaves the waiting list") ? 0 : 1;
+        bool fThrew = false;
+        try { invoice::Create(0, "", 600, ""); } catch (std::exception&) { fThrew = true; }
+        nFail += Check(fThrew, "an invoice for nothing is refused") ? 0 : 1;
+        fThrew = false;
+        try { invoice::Get("00000000000000000000000000000000"); } catch (std::exception&) { fThrew = true; }
+        nFail += Check(fThrew, "an unknown id is an error, not an empty invoice") ? 0 : 1;
+        FILE* f = fopen((tmp + "/invoices.json").c_str(), "rb");
+        bool fFile = f != NULL;
+        if (f) fclose(f);
+        nFail += Check(fFile, "invoices are kept on disk in the data directory") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    DBFlush(true);
+    strSetDataDir = strOld;
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // ---- chat-swap: the swap engine, end to end, with coins ------------------------
 //
 // Two engines (btfchatswap.h) wired to each other in place of the chat, each
@@ -6751,6 +6854,8 @@ int RunSelfTest(const std::string& name)
         return RunChatSwapSelfTest();
     if (name == "fee-policy")
         return RunFeePolicySelfTest();
+    if (name == "invoice")
+        return RunInvoiceSelfTest();
     if (name == "chat-live")
         return RunChatLiveSelfTest();
 

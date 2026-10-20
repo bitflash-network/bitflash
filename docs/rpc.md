@@ -64,6 +64,10 @@ null.
 | `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards |
 | `sendtoaddress` | `address`, `amount` | txid of the transaction it created and broadcast |
 | `gettransaction` | `txid` | amount, confirmations, block, `details` per output, `bip125-replaceable` |
+| `createinvoice` | `amount`, [`description`], [`expirysecs`], [`orderid`] | an invoice for the shop's own gateway: fresh address, payment link, QR as SVG -- `docs/invoices.md` |
+| `getinvoice` | `id` | its status (`waiting`, `partial`, `seen`, `paid`, `expired`, `cancelled`) and what arrived |
+| `listinvoices` | [`status`] | all invoices, or those in one status |
+| `cancelinvoice` | `id` | stop expecting it |
 | `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
 | `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
 | `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
