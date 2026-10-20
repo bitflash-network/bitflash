@@ -262,6 +262,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=rules-v3
 	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=btc-light
+	./bitflash.exe -selftest=swap-wait-payment
 	./bitflash.exe -selftest=fee-policy
 	./bitflash.exe -selftest=invoice
 	./bitflash.exe -selftest=net-hardening

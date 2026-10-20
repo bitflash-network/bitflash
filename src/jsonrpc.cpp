@@ -2103,6 +2103,7 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
 
     json addr;
     CScript scriptTo;
+    int64 nFeeRate = btcswap::FeeRatePerKvB();
     if (btcswap::UsingLight())
     {
         size_t destination = pSecret ? 3 : 2;
@@ -2111,6 +2112,15 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
         addr = p[destination];
         string err;
         if (!btclight::Destination(chain, addr.get<string>(), scriptTo, err)) throw runtime_error(err);
+        // The light client has no fee estimate and no memory pool to say a
+        // spend went in. A spend that sits unconfirmed is made again with a
+        // higher rate (BTC per 1000 vbytes) after the destination.
+        if (p.size() > destination + 1 && !p[destination + 1].is_null())
+        {
+            nFeeRate = AmountFromValue(p[destination + 1]);
+            if (nFeeRate < 1000 || nFeeRate > COIN / 100)
+                throw runtime_error("fee rate out of range (0.00001 to 0.01 BTC per 1000 vbytes)");
+        }
     }
     else
     {
@@ -2126,7 +2136,7 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
     int64 nFee = 0;
     string err;
     if (!btcswap::BuildSpend(contract, COutPoint(o.txid, o.n), o.nValue, scriptTo,
-                             key, vchPubKey, pSecret, btcswap::FeeRatePerKvB(), tx, nFee, err))
+                             key, vchPubKey, pSecret, nFeeRate, tx, nFee, err))
         throw runtime_error(err);
     CDataStream ss(SER_NETWORK);
     ss << tx;
@@ -2137,7 +2147,10 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
     j["tx"] = strHex;
     j["amount"] = ValueFromAmount(o.nValue - nFee);
     j["fee"] = ValueFromAmount(nFee);
+    j["feeRatePerKvB"] = ValueFromAmount(nFeeRate);
     j["to"] = addr;
+    // Core checked it into its memory pool; the light client only sent it.
+    j["awaitingConfirmation"] = btcswap::UsingLight();
     return j;
 }
 
@@ -2145,7 +2158,7 @@ static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
 static json rpc_btcredeem(const json& p)
 {
     if (p.size() < 3 || !p[2].is_string())
-        throw runtime_error("btcredeem <contract hex> <contract transaction hex or txid> <secret hex> [Bitcoin destination]");
+        throw runtime_error("btcredeem <contract hex> <contract transaction hex or txid> <secret hex> [Bitcoin destination] [fee rate]");
     string strSecret = p[2].get<string>();
     if (strSecret.size() != 64 || !IsHex(strSecret))
         throw runtime_error("the secret is 64 hex characters");
@@ -2159,7 +2172,7 @@ static json rpc_btcredeem(const json& p)
 static json rpc_btcrefund(const json& p)
 {
     if (p.size() < 2)
-        throw runtime_error("btcrefund <contract hex> <contract transaction hex or txid> [Bitcoin destination]");
+        throw runtime_error("btcrefund <contract hex> <contract transaction hex or txid> [Bitcoin destination] [fee rate]");
     json j = BtcSpend(p, NULL);
     LogSwap(json{{"refunded", j["txid"]}, {"chain", "bitcoin"}});
     return j;

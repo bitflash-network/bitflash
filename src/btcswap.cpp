@@ -403,6 +403,8 @@ bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue
         tx.nLockTime = (unsigned int)c.nLockTime;
         tx.vin[0].nSequence = 0;
     }
+    else
+        tx.vin[0].nSequence = SEQUENCE_REPLACEABLE;   // a stuck redeem can be made again with a higher fee
     // A signature is 71 to 73 bytes, so each signing can change the size the
     // fee is for. The fee only grows, so this ends once it covers the size of
     // the transaction as finally signed -- a byte or two over at most.

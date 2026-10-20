@@ -116,6 +116,7 @@ struct SwapConfig
     int64_t nMakerMinLeft = 6 * 3600;    // on the taker's, before the maker shows the secret
     int64_t nGiveUpWaiting = 12 * 3600;  // a contract that never confirms
     int64_t nAnswerWithin = 24 * 3600;   // a take nobody answers
+    int64_t nRedeemBumpAfter = 3600;     // a light-client Bitcoin redeem still unconfirmed: send again, fee doubled
     int     nMinConfirmations = 0;       // 0: 1 on testnet, 2 on mainnet
     // Test chains only (the wallet refuses them on mainnet): shorter locks.
     int     nBtfInitiatorBlocks = 0, nBtfParticipantBlocks = 0;
@@ -141,6 +142,7 @@ struct ChatSwap
     bool        fUserOk = false, fInvited = false, fSentLock = false;
     std::string status, lastError;
     int64_t     created = 0, updated = 0, theirSince = 0;
+    int64_t     redeemSince = 0, redeemFeeRate = 0;   // a Bitcoin redeem the light client sent, not yet confirmed
 };
 
 class SwapEngine
@@ -173,6 +175,7 @@ private:
     int  MinConfirmations() const;
     bool Wallet(const char* method, const nlohmann::json& params, nlohmann::json& r, std::string& err);
     bool NewAddress(const std::string& coin, std::string& out, std::string& err);
+    bool TheirTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err);
     bool SendStep(const ChatSwap& s, SwapStep& st, std::string& err);
     void SendCancel(const ChatSwap& s, const std::string& why);
     int  CheckTheirs(const ChatSwap& s, int64_t nMinLeft, const std::string& expectHash,

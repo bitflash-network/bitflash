@@ -319,6 +319,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=rules-v3
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light
+	./bitflash-node -selftest=swap-wait-payment
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice
 	./bitflash-node -selftest=net-hardening

@@ -39,6 +39,14 @@
 #include <string>
 #include <vector>
 
+// Boost before 1.84 calls an unqualified swap() in a template that is only
+// valid while no namespace named swap exists. Parse it first: the Bitcoin
+// light client's big integers pull it in, and Debian 13 ships Boost 1.83.
+#include <boost/version.hpp>
+#if BOOST_VERSION < 108400
+#include <boost/core/swap.hpp>
+#endif
+
 namespace swap
 {
 

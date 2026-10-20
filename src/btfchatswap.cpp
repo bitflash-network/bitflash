@@ -33,6 +33,7 @@ static json SwapToJson(const ChatSwap& s)
     j["stage"] = s.stage; j["ok"] = s.fUserOk; j["inv"] = s.fInvited; j["sent"] = s.fSentLock;
     j["status"] = s.status; j["err"] = s.lastError;
     j["created"] = s.created; j["updated"] = s.updated; j["since"] = s.theirSince;
+    j["rsince"] = s.redeemSince; j["rfee"] = s.redeemFeeRate;
     return j;
 }
 
@@ -59,6 +60,7 @@ static bool SwapFromJson(const json& j, ChatSwap& s)
         s.status = j.value("status", std::string()); s.lastError = j.value("err", std::string());
         s.created = j.value("created", (int64_t)0); s.updated = j.value("updated", (int64_t)0);
         s.theirSince = j.value("since", (int64_t)0);
+        s.redeemSince = j.value("rsince", (int64_t)0); s.redeemFeeRate = j.value("rfee", (int64_t)0);
     }
     catch (...) { return false; }
     return s.id.size() == 32 && !s.peer.empty() && SwapCoinOk(s.give) && SwapCoinOk(s.want);
@@ -284,6 +286,20 @@ bool SwapEngine::MyTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err)
     return true;
 }
 
+// Seconds until their contract can be refunded by them; 0 once it can, or
+// once it is spent and there is nothing left in it to take.
+bool SwapEngine::TheirTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err)
+{
+    json a;
+    if (!Wallet(Method(s.want, "swapauditcontract", "btcauditcontract"),
+                json::array({ s.theirContract, Ref(s.want, s.theirTxid, s.theirVout) }), a, err) || !a.is_object())
+        return false;
+    nLeft = !a.value("unspent", false) ? 0
+          : s.want == "BTC" ? a.value("secondsUntilRefund", (int64_t)0)
+                            : a.value("blocksUntilRefund", (int64_t)0) * BTF_BLOCK_SECS;
+    return true;
+}
+
 // Has a contract been spent, and did the spend show the secret?
 bool SwapEngine::FindSecret(const std::string& coin, const std::string& contract, const std::string& ref,
                             bool& fSpent, std::string& secretOut, bool& fRefunded, std::string& err)
@@ -324,6 +340,58 @@ void SwapEngine::TryRefund(ChatSwap& s)
 {
     int64_t nLeft = 1;
     std::string err;
+    if (!s.fMaker && !s.refundTxid.empty())
+    {
+        // Our refund went out, but the maker holds the secret and can still
+        // redeem ours instead -- outbidding the refund's fee -- which shows
+        // the secret. Until their own lock opens, the refund stage keeps
+        // looking for that (above), so theirs would be ours to take.
+        if (!TheirTimeLeft(s, nLeft, err))
+        {
+            s.lastError = err;
+            return;
+        }
+        if (nLeft <= 0)
+        {
+            s.stage = SW_REFUNDED;
+            s.status = "refunded: our " + FormatSwapAmount(s.giveAmount) + " " + s.give + " came back";
+        }
+        else
+            s.status = strprintf("refunded ours; watching theirs for %lld more minutes in case ours is taken instead",
+                                 (long long)(nLeft / 60 + 1));
+        return;
+    }
+    if (s.give == "BTC" && s.myTxid.empty())
+    {
+        // Our contract waited for a payment from another wallet. Paid after
+        // all: refund that like any other lock. Never paid: once a day past
+        // the lock has given a late payment time to confirm, it is over.
+        json a;
+        if (!Wallet("btcauditcontract", json::array({ s.myContract, "" }), a, err) || !a.is_object())
+        {
+            s.lastError = err;
+            return;
+        }
+        // A funding found, spent or not, names its transaction; none is zeros.
+        std::string strFunding = a.value("contractTxid", std::string());
+        if (a.value("unspent", false) || (!strFunding.empty() && strFunding.find_first_not_of('0') != std::string::npos))
+        {
+            s.myTxid = a.value("contractTxid", std::string());
+            s.myVout = a.value("vout", -1);
+        }
+        else if (GetTime() > a.value("lockTime", (int64_t)0) + 86400)
+        {
+            s.stage = SW_CANCELLED;
+            s.status = "ended: nothing was ever paid into our contract";
+            return;
+        }
+        else
+        {
+            if (s.stage == SW_REFUNDING)
+                s.status = "nothing was paid into our contract; do not pay it now (anything already sent comes back at the lock)";
+            return;
+        }
+    }
     if (!MyTimeLeft(s, nLeft, err))
     {
         s.lastError = err;
@@ -342,6 +410,12 @@ void SwapEngine::TryRefund(ChatSwap& s)
                refundParams, r, err) && r.is_object())
     {
         s.refundTxid = r.value("txid", std::string());
+        if (!s.fMaker && !s.theirContract.empty())
+        {
+            s.stage = SW_REFUNDING;
+            s.status = "refunded ours; watching theirs in case ours is taken instead";
+            return;
+        }
         s.stage = SW_REFUNDED;
         s.status = "refunded: our " + FormatSwapAmount(s.giveAmount) + " " + s.give + " came back";
         return;
@@ -527,6 +601,25 @@ void SwapEngine::Tick(ChatSwap& s)
             s.lastError = err;
             return;
         }
+        std::string strFunding = audit.value("contractTxid", std::string());
+        bool fFunded = audit.value("unspent", false) ||
+                       (!strFunding.empty() && strFunding.find_first_not_of('0') != std::string::npos);
+        if (!fFunded && audit.value("secondsUntilRefund", (int64_t)1) <= 0)
+        {
+            // Nothing paid before the lock: there is no swap left to make. The
+            // refund stage still watches, in case a payment is on its way.
+            SendCancel(s, "the Bitcoin contract was never paid");
+            s.stage = SW_REFUNDING;
+            s.status = "nothing was paid into our contract before its lock; do not pay it now";
+            return;
+        }
+        if (fFunded && !audit.value("unspent", false))
+        {
+            // Paid and already spent: the refund stage finds out by whom.
+            s.myTxid = strFunding; s.myVout = audit.value("vout", -1);
+            s.stage = SW_REFUNDING;
+            return;
+        }
         if (!audit.value("unspent", false) || audit.value("confirmations", 0) < MinConfirmations()) return;
         s.myTxid = audit.at("contractTxid").get<std::string>(); s.myVout = audit.at("vout").get<int>();
         if (Sats(audit["amount"]) != s.giveAmount || audit.value("secondsUntilRefund", (int64_t)0) <= 0)
@@ -585,6 +678,44 @@ void SwapEngine::Tick(ChatSwap& s)
 
     case SW_REDEEMING:
     {
+        if (s.redeemSince > 0)
+        {
+            // The light client sent our Bitcoin redeem but cannot see a memory
+            // pool: the swap is done only once the redeem is in a block. The
+            // secret is out, so until then the other side's lock is a race --
+            // a redeem that sits is sent again with twice the fee.
+            bool fSpent = false, fRefunded = false;
+            std::string secret, e2;
+            if (FindSecret(s.want, s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), fSpent, secret, fRefunded, e2) && fSpent)
+            {
+                s.redeemSince = 0;
+                s.stage = fRefunded ? SW_FAILED : SW_DONE;
+                s.status = fRefunded ? "they refunded theirs before our redeem confirmed"
+                                     : "done: received " + FormatSwapAmount(s.wantAmount) + " " + s.want;
+                return;
+            }
+            if (!e2.empty())
+                s.lastError = e2;
+            if (nNow - s.redeemSince < config.nRedeemBumpAfter)
+            {
+                s.status = "redeemed; waiting for Bitcoin to confirm it";
+                return;
+            }
+            int64_t nRate = std::min<int64_t>(std::max<int64_t>(s.redeemFeeRate, 1000) * 2, 1000000);
+            json r;
+            json bumpParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret,
+                                           s.btcDestination, AmountText(nRate)});
+            if (Wallet("btcredeem", bumpParams, r, err) && r.is_object())
+            {
+                s.redeemTxid = r.value("txid", std::string());
+                s.redeemSince = nNow;
+                s.redeemFeeRate = nRate;
+                s.status = "our redeem was not confirmed yet; sent it again with a higher fee";
+            }
+            else
+                s.lastError = err;
+            return;
+        }
         if (s.fMaker)
         {
             std::string hash, why;
@@ -621,8 +752,17 @@ void SwapEngine::Tick(ChatSwap& s)
             r.is_object())
         {
             s.redeemTxid = r.value("txid", std::string());
-            s.stage = SW_DONE;
-            s.status = "done: received " + FormatSwapAmount(s.wantAmount) + " " + s.want;
+            if (s.want == "BTC" && r.value("awaitingConfirmation", false))
+            {
+                s.redeemSince = nNow;
+                s.redeemFeeRate = r.contains("feeRatePerKvB") ? Sats(r["feeRatePerKvB"]) : 0;
+                s.status = "redeemed; waiting for Bitcoin to confirm it";
+            }
+            else
+            {
+                s.stage = SW_DONE;
+                s.status = "done: received " + FormatSwapAmount(s.wantAmount) + " " + s.want;
+            }
             if (s.fMaker)
             {
                 SwapStep st;
@@ -805,12 +945,23 @@ void SwapEngine::Round()
                 // never undoes a lock.
                 bool fApprovedMeanwhile = it->second.fUserOk && !before.fUserOk && s.stage == before.stage;
                 bool fCancelledMeanwhile = it->second.stage == SW_CANCELLED && before.stage != SW_CANCELLED;
+                // Cancelled while waiting for the contract's payment: the round
+                // may have just seen that payment, but the swap stays called off
+                // and the refund stage gives the payment back.
+                bool fWithdrawnMeanwhile = before.stage == SW_WAIT_PAYMENT && it->second.stage == SW_REFUNDING &&
+                                           (s.stage == SW_WAIT_PAYMENT || s.stage == SW_LOCKED);
+                std::string strWithdrawn = it->second.status;
                 s.btcDestination = it->second.btcDestination;
                 it->second = s;
                 if (fApprovedMeanwhile)
                     it->second.fUserOk = true;
                 if (fCancelledMeanwhile && s.myTxid.empty())
                     it->second.stage = SW_CANCELLED;
+                if (fWithdrawnMeanwhile)
+                {
+                    it->second.stage = SW_REFUNDING;
+                    it->second.status = strWithdrawn;
+                }
             }
         }
         if (fChanged)
@@ -831,7 +982,8 @@ void SwapEngine::List(std::vector<SwapView>& out)
             v.stage = s.stage; v.btcDestination = s.btcDestination; v.paymentAddress = s.paymentAddress;
             v.status = s.status + (s.lastError.empty() ? std::string() : " (" + s.lastError + ")");
             v.fNeedsMe = !s.fUserOk && (s.stage == SW_TAKE_RECEIVED || s.stage == SW_READY_TO_LOCK);
-            v.fCanCancel = s.myContract.empty() && s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage);
+            v.fCanCancel = (s.myContract.empty() && s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage)) ||
+                           (s.stage == SW_WAIT_PAYMENT && s.myTxid.empty());
             v.myTxid = s.myTxid; v.theirTxid = s.theirTxid;
             v.redeemTxid = s.redeemTxid; v.refundTxid = s.refundTxid;
             v.updated = s.updated;
@@ -909,13 +1061,24 @@ bool SwapEngine::Cancel(const std::string& id, std::string& errOut)
             errOut = "no such swap in progress";
             return false;
         }
-        if (!it->second.myContract.empty() || !it->second.myTxid.empty() || it->second.fUserOk)
+        if (it->second.stage == SW_WAIT_PAYMENT && it->second.myTxid.empty())
+        {
+            // Our contract exists but nothing paid it yet. It cannot simply be
+            // forgotten -- a payment may already be on its way -- so the refund
+            // stage keeps watching it and gives back anything that arrives.
+            it->second.stage = SW_REFUNDING;
+            it->second.status = "cancelled: do not pay the contract now (anything already sent comes back at the lock)";
+        }
+        else if (!it->second.myContract.empty() || !it->second.myTxid.empty() || it->second.fUserOk)
         {
             errOut = "ours is locked (or being locked): it comes back at the lock, or the swap finishes";
             return false;
         }
-        it->second.stage = SW_CANCELLED;
-        it->second.status = "cancelled";
+        else
+        {
+            it->second.stage = SW_CANCELLED;
+            it->second.status = "cancelled";
+        }
         s = it->second;
     }
     if (s.fInvited || s.fMaker || !s.myRecv.empty())

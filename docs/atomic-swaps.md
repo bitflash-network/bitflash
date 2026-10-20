@@ -91,6 +91,23 @@ copyable contract address; it announces a lock only after its payment confirms.
 An unexpected funding amount is retained for refund, never accepted as the
 agreed swap amount. Keep the chat open through completion or refund.
 
+- **Cancel while waiting for the payment.** A swap still waiting for you to
+  pay its contract can be cancelled. The contract is not forgotten: if a
+  payment was already on its way, it comes back to your Bitcoin address at
+  the lock. If nothing is paid by the lock the swap is called off by itself,
+  and a day after the lock it ends. Never pay a cancelled contract.
+- **A light-mode redeem is done only when it is in a block.** The light client
+  sends but sees no memory pool, and once a redeem is sent the secret is
+  public. A Bitcoin redeem still unconfirmed after an hour goes out again at
+  twice the fee rate (the redeem signals BIP125), up to 0.01 BTC per 1000
+  vbytes. With no fee estimate in light mode the first rate is `-btcfeerate`,
+  10 sat/vB when unset; set it higher when Bitcoin's fees are high.
+- **A taker's refund is watched to the end.** The maker holds the secret and
+  could still redeem the taker's contract after the taker's refund was sent,
+  outbidding its fee. Until the maker's own lock opens, the taker's chat keeps
+  looking for that redeem, and if it appears it takes the maker's coins with
+  the secret it shows. This holds with Bitcoin Core too.
+
 State lives under `GetAppDir()` in `btc-light-<network>.headers`, `.filters`
 and `.json`. Contracts, scan cursor, matched blocks and pending broadcasts
 survive restarts. Store failures stop the light client instead of discarding

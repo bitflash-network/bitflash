@@ -6819,6 +6819,265 @@ static int RunChatSwapSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// -selftest=swap-wait-payment -- a swap whose Bitcoin contract waits to be paid
+// from another wallet (the light backend). Nothing is locked yet, but the
+// contract exists, so it can neither hang forever nor be dropped while a
+// payment may be on its way. The wallet is a stand-in that answers the audit
+// the way the light backend does.
+namespace
+{
+struct WaitPayHost : public btfchat::SwapHost
+{
+    nlohmann::json audit;                           // our own BTC contract ("00")
+    std::map<std::string, nlohmann::json> audits;   // any other contract, by its hex
+    std::map<std::string, nlohmann::json> finds;    // btcfindsecret/swapfindsecret, by contract
+    nlohmann::json refundParams, redeemParams;
+    int nRefunds = 0, nSteps = 0, nRedeems = 0;
+    std::string lastStep;
+
+    std::string MyAddress() { return "me"; }
+    bool PeerAccepted(const std::string&) { return true; }
+    bool Invite(const std::string&, const std::string&, std::string&) { return true; }
+    bool SendStep(const std::string&, const std::string& text, std::string&) { nSteps++; lastStep = text; return true; }
+    void Contacts(std::vector<std::string>& out) { out.clear(); }
+    void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out.clear(); }
+    bool FindMyOffer(const std::string&, btfchat::SwapOffer&) { return false; }
+    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    {
+        std::string contract = params.is_array() && !params.empty() && params[0].is_string() ? params[0].get<std::string>() : "";
+        if (method == "btcauditcontract" || method == "swapauditcontract")
+        {
+            r = audits.count(contract) ? audits[contract] : audit;
+            return true;
+        }
+        if (method == "btcfindsecret" || method == "swapfindsecret")
+        {
+            r = finds.count(contract) ? finds[contract] : nlohmann::json{ { "spent", false } };
+            return true;
+        }
+        if (method == "btcrefund" || method == "swaprefund") { nRefunds++; refundParams = params; r = { { "txid", std::string(64, 'f') } }; return true; }
+        if (method == "btcredeem")
+        {
+            // As the light client answers: sent, not seen in any memory pool.
+            nRedeems++; redeemParams = params;
+            r = { { "txid", strprintf("%064d", nRedeems) }, { "feeRatePerKvB", 0.0001 }, { "awaitingConfirmation", true } };
+            return true;
+        }
+        if (method == "swapredeem") { nRedeems++; redeemParams = params; r = { { "txid", std::string(64, 'd') } }; return true; }
+        if (method == "btcswapinfo") { r = { { "backend", "light" } }; return true; }
+        err = "not in this test: " + method;
+        return false;
+    }
+    void Changed() {}
+
+    void Unpaid(int64_t nSecondsLeft, int64_t nLockTime)
+    {
+        audit = { { "contractTxid", std::string(64, '0') }, { "vout", 0 }, { "unspent", false },
+                  { "confirmations", 0 }, { "amount", nullptr }, { "secondsUntilRefund", nSecondsLeft },
+                  { "lockTime", nLockTime } };
+    }
+    void Paid(double amount, int64_t nSecondsLeft, int64_t nLockTime)
+    {
+        audit = { { "contractTxid", std::string(64, 'a') }, { "vout", 1 }, { "unspent", true },
+                  { "confirmations", 6 }, { "amount", amount }, { "secondsUntilRefund", nSecondsLeft },
+                  { "lockTime", nLockTime } };
+    }
+};
+
+static std::string WaitPaySwapJson(const std::string& id)
+{
+    nlohmann::json s = { { "id", id }, { "peer", "them" }, { "maker", true },
+                         { "give", "BTC" }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
+                         { "btcDestination", "bcrt1qdestination" }, { "paymentAddress", "2NcontractAddress" },
+                         { "myC", "00" }, { "myTx", "" }, { "myN", -1 }, { "stage", (int)btfchat::SW_WAIT_PAYMENT },
+                         { "ok", true }, { "inv", true }, { "created", GetTime() }, { "updated", GetTime() } };
+    nlohmann::json j = { { "swaps", nlohmann::json::array({ s }) }, { "seen", nlohmann::json::array() } };
+    return j.dump();
+}
+
+static btfchat::SwapView WaitPayView(btfchat::SwapEngine& e)
+{
+    std::vector<btfchat::SwapView> v;
+    e.List(v);
+    return v.empty() ? btfchat::SwapView() : v[0];
+}
+} // namespace
+
+static int RunSwapWaitPaymentSelfTest()
+{
+    int nFail = 0;
+    const std::string id(32, '1');
+    int64_t nNow = GetTime();
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Unpaid(3600, nNow + 3600);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_WAIT_PAYMENT, "unpaid, lock ahead: still waiting for the payment") ? 0 : 1;
+        nFail += Check(v.fCanCancel, "and it can be cancelled") ? 0 : 1;
+        std::string err;
+        nFail += Check(e.Cancel(id, err), "cancel is accepted") ? 0 : 1;
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "cancelled: the contract is still watched, not forgotten") ? 0 : 1;
+        nFail += Check(h.lastStep.find("cancel") != std::string::npos, "the other side is told") ? 0 : 1;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRefunds == 0, "nothing paid: nothing to refund yet") ? 0 : 1;
+
+        // The payment was already on its way when it was cancelled.
+        h.Paid(0.01, 1800, nNow + 1800);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && v.myTxid == std::string(64, 'a'),
+                       "a late payment is adopted for the refund") ? 0 : 1;
+        nFail += Check(h.nRefunds == 0, "and not refunded before its lock") ? 0 : 1;
+        h.Paid(0.01, 0, nNow - 60);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRefunds == 1, "at the lock it comes back") ? 0 : 1;
+        nFail += Check(h.refundParams.size() == 3 && h.refundParams[1] == std::string(64, 'a') + ":1" &&
+                       h.refundParams[2] == "bcrt1qdestination",
+                       "to the person's own Bitcoin address, from the output that was paid") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Unpaid(0, nNow - 3600);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nSteps == 1,
+                       "never paid by its lock: the swap is called off and the other side told") ? 0 : 1;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "still watched for a day past the lock") ? 0 : 1;
+        h.Unpaid(0, nNow - 2 * 86400);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_CANCELLED && h.nRefunds == 0, "then it ends, with nothing to refund") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Paid(0.02, 7200, nNow + 7200);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && v.myTxid == std::string(64, 'a'),
+                       "a wrong amount paid in: the swap stops and that payment is refunded") ? 0 : 1;
+        std::string err;
+        nFail += Check(!e.Cancel(id, err), "and once something is locked, cancel is refused") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Paid(0.01, 7200, nNow + 7200);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_LOCKED && v.myTxid == std::string(64, 'a') && !v.fCanCancel,
+                       "the exact amount, confirmed: the swap goes on and can no longer be cancelled") ? 0 : 1;
+    }
+
+    // A maker who wants BTC redeems it through the light client, which only
+    // sends: the swap is done when the redeem is in a block, and a redeem that
+    // sits goes out again with twice the fee -- the secret is already public.
+    {
+        const std::string secret(64, 'a'), hash(64, 'c');
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", true },
+                              { "give", "BTF" }, { "ga", 100000000 }, { "want", "BTC" }, { "wa", 1000000 },
+                              { "btcDestination", "bcrt1qdestination" }, { "myRecv", "mvMine" },
+                              { "secret", secret }, { "hash", hash },
+                              { "myC", "22" }, { "myTx", std::string(64, '2') },
+                              { "thC", "11" }, { "thTx", std::string(64, '1') }, { "thN", 0 },
+                              { "stage", (int)btfchat::SW_REDEEMING }, { "ok", true }, { "inv", true },
+                              { "created", nNow }, { "updated", nNow }, { "since", nNow } };
+        std::string state = nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump();
+        WaitPayHost h;
+        h.audits["11"] = { { "recipientIsMine", true }, { "recipient", "mvMine" }, { "secretHash", hash },
+                           { "unspent", true }, { "confirmations", 6 }, { "amount", 0.01 }, { "secondsUntilRefund", 8 * 3600 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(state);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nRedeems == 1 && v.stage == btfchat::SW_REDEEMING && v.status.find("waiting for Bitcoin") != std::string::npos,
+                       "light redeem sent: not done until it confirms") ? 0 : 1;
+        nFail += Check(h.redeemParams.size() == 4 && h.redeemParams[3] == "bcrt1qdestination", "to the person's own address") ? 0 : 1;
+        nFail += Check(h.lastStep.find("redeemed") != std::string::npos, "and the other side is told") ? 0 : 1;
+        h.audits["11"]["secondsUntilRefund"] = 60;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(h.nRedeems == 1 && v.stage == btfchat::SW_REDEEMING,
+                       "before the bump time: no second redeem, and their lock running low cancels nothing") ? 0 : 1;
+
+        btfchat::SwapConfig quick;
+        quick.nRedeemBumpAfter = 0;
+        btfchat::SwapEngine e2(&h, quick);
+        e2.FromJson(e.ToJson());
+        e2.Round();
+        v = WaitPayView(e2);
+        nFail += Check(h.nRedeems == 2 && h.redeemParams.size() == 5 && h.redeemParams[4] == "0.00020000" &&
+                       v.redeemTxid == strprintf("%064d", 2),
+                       "still unconfirmed: sent again at twice the fee rate") ? 0 : 1;
+        h.finds["11"] = { { "spent", true }, { "secret", secret } };
+        e2.Round();
+        v = WaitPayView(e2);
+        nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 2, "in a block: done") ? 0 : 1;
+    }
+
+    // A taker's refund is not the end while the maker can still redeem ours
+    // with the secret instead: until their lock opens, that is watched for.
+    for (int nCase = 0; nCase < 2; nCase++)
+    {
+        const std::string secret(64, 'b');
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false },
+                              { "give", "BTC" }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
+                              { "btcDestination", "bcrt1qdestination" }, { "hash", std::string(64, 'c') },
+                              { "myC", "33" }, { "myTx", std::string(64, '3') }, { "myN", 1 },
+                              { "thC", "44" }, { "thTx", std::string(64, '4') },
+                              { "stage", (int)btfchat::SW_REFUNDING }, { "ok", true }, { "inv", true },
+                              { "created", nNow }, { "updated", nNow } };
+        WaitPayHost h;
+        h.audits["33"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+        h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 100 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump());
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nRefunds == 1 && v.stage == btfchat::SW_REFUNDING && !v.refundTxid.empty(),
+                       "taker refunded ours: still watching while theirs is locked") ? 0 : 1;
+        e.Round();
+        nFail += Check(h.nRefunds == 1, "the refund is not sent twice") ? 0 : 1;
+        if (nCase == 0)
+        {
+            // The maker outbid our refund with a redeem: the secret is out.
+            h.finds["33"] = { { "spent", true }, { "secret", secret } };
+            e.Round();
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 1 && h.redeemParams.size() >= 3 && h.redeemParams[2] == secret,
+                           "ours was taken instead: theirs is taken with the secret") ? 0 : 1;
+        }
+        else
+        {
+            h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 0 } };
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRedeems == 0, "their lock opened: the refund stands, it is over") ? 0 : 1;
+        }
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -6895,6 +7154,8 @@ int RunSelfTest(const std::string& name)
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")
         return RunChatSwapSelfTest();
+    if (name == "swap-wait-payment")
+        return RunSwapWaitPaymentSelfTest();
     if (name == "fee-policy")
         return RunFeePolicySelfTest();
     if (name == "invoice")
