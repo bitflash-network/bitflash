@@ -58,12 +58,12 @@ static uint256 ReadHash(const Bytes& b, size_t p)
     if (p > b.size() || b.size()-p < 32) throw std::runtime_error("short Bitcoin hash");
     return uint256(Bytes(b.begin()+p, b.begin()+p+32));
 }
-static void HashBytes(Bytes& b, const uint256& h) { b.insert(b.end(), h.begin(), h.end()); }
+static void HashBytes(Bytes& b, uint256 h) { b.insert(b.end(), h.begin(), h.end()); }
 static uint256 Joined(const uint256& a, const uint256& b)
 {
     Bytes raw; HashBytes(raw, a); HashBytes(raw, b); return Digest(raw);
 }
-static Integer Number(const uint256& h)
+static Integer Number(uint256 h)   // by value: this uint256 has no const begin()
 {
     Integer n = 0;
     for (int i = 31; i >= 0; --i) { n <<= 8; n += h.begin()[i]; }
@@ -199,7 +199,7 @@ std::vector<uint256> Headers::Locator() const
     return out;
 }
 
-static uint64_t Sip(const uint256& hash, const Bytes& script)
+static uint64_t Sip(uint256 hash, const Bytes& script)
 {
     unsigned char out[8];
     crypto_shorthash_siphash24(out, script.empty() ? (const unsigned char*)"" : &script[0], script.size(), hash.begin());
