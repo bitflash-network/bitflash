@@ -909,6 +909,34 @@ static const BtfSeed pszBtfSeedsMainnet[] =
     // in. (The old Almaty rendezvous seed is retired: this release is onion-only.)
     { "fd5gieenz3oep42siocc7z7ldealvt6iztu3nkekzphc6prwwcs45xi.btf",
       "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8443" },
+    // Ordinary nodes of the network, so a cold start does not hang on one
+    // machine. Taken from the seed's own peer cache on 2026-10-21: each had
+    // the same onion on 2026-09-21 already, is not one of the seed's siblings,
+    // and answered a dial over Tor that day. Dialled in random order
+    // (TryBtfSeeds); one gone dark costs a dial, and the peers any of them
+    // hands over are what the node keeps from then on.
+    { "cxfhzq6l5dc2grizlpskdydcsnfa2ohcqbehentr6wqwieq3xjcn5di.btf",
+      "cgj5gj7ggqpogtx2gqgfjnwxztzlyx3qlgjlq2kgnqhahvyqqkx3zlyd.onion:8433" },
+    { "fp2uoke4v6xfclnuh2qzrsz3dm3c7qv6dejyw3vjj7ukhtb4dvbzeba.btf",
+      "emdihxzyc5qfma7zl45cd6vqmhzytjmjaljfradchiysaceetzvt5fyd.onion:8433" },
+    { "udqzv4cf7qyplydit65qxqavvjbqcq73gvf7fhqjd234apwphnldx3y.btf",
+      "ile2rtim2m2gmoegacydpdwhxvqu5iuhxs3ipgxmhlcx7e6r6i3ag4ad.onion:8433" },
+    { "hcqkzcxnnr3utjzuhsdyq2ya26gndpj77epyitymxcg4mc5uwyua3wy.btf",
+      "c3vlkxrpnthybwtrn7rkw2ltqd7xejn6g37ecyfeab5uaehfjkyy3hyd.onion:8433" },
+    { "obi2c77lr4lpwwtw3a7goxem64hwvxbiqjmysibux3ulah6bbrmmw5q.btf",
+      "dmwlrhiffdkhz34q2n65k3xhbzgxwycosg3vy46lziapvlalr7dvvxid.onion:8433" },
+    { "c7fgc7ztyex5a6lv4ohi6qxiskm22uq2ccfeveucgl2ujyhnik64lpq.btf",
+      "v73bqnzkyzllwqwi4sizpjrwvv7v4j44ke7dqjuqtrqwj6fmyzg76zid.onion:8433" },
+    { "g7lqcjgh4a63qjuqyyvuwyapryjxfkoho7w65ehbrmwig5xz635o6ka.btf",
+      "4kdphuo7q7yj25jchfftvhuvshm4q437ww74iy7s5npxquids4sy34id.onion:8433" },
+    { "6lnmhvkbtefcgrsk2sz6jdwzmx75w675eqco2taobmji3e6t5ohn7li.btf",
+      "7hry6agkp44r73fl5dyytbjetdv7kbc3eya3glxa54rqjptxkyuig4ad.onion:8433" },
+    { "7ma7xdplhgoe3nbbdtumsa4rvc4ghsw5htolathokfs5jfft7pg5dxq.btf",
+      "etgxwd62l7qrabgv3uchsdvh47c7zuo6gmy5gffsntm4wpx5wtlqlgqd.onion:8433" },
+    { "sarhtei4dgcxy5w52y6dnpzrx4vajx33idscrwah5gciqcrtkye6wii.btf",
+      "e2bd7mriwuavejtzjyvnh7kyjtgryvli43w7kalfmcx7i5pj6h44u3ad.onion:8433" },
+    { "ms57aom62jkzhsqrpa5aspbbzzrgidbwcrs4d22iprbwaolv3l65yoy.btf",
+      "bncfybx3uyt27mx2zfk4s4dqff3ej254iupamrfgxnwaygxo3vccamad.onion:8433" },
 };
 
 static const BtfSeed pszBtfSeedsTestnet[] =
@@ -961,8 +989,18 @@ static int TryBtfSeeds()
     // That is the whole point of a cold-start floor: Nostr discovery routes over
     // Tor, which frequently has no exit to reach the Nostr relays, so a fresh
     // node with an empty peer cache must be able to reach the seed without it.
+    //
+    // In random order: each dial can take a couple of minutes to fail, so a
+    // fixed order would make every cold start wait on whichever seed is first
+    // when it is down, and would send every newcomer to the same machine.
+    vector<size_t> vOrder;
     for (size_t i = 0; i < nSeeds; i++)
+        vOrder.push_back(i);
+    for (size_t i = vOrder.size(); i > 1; i--)
+        std::swap(vOrder[i - 1], vOrder[GetRand(i)]);
+    for (size_t k = 0; k < vOrder.size(); k++)
     {
+        size_t i = vOrder[k];
         if (fShutdown) return nConnected;
         if (ConnectNodeBtfResolved(seeds[i].btfAddr, "", seeds[i].onion, dummyEnc))
         {

@@ -3205,6 +3205,22 @@ static int RunNetworkParamsSelfTest()
         uint256 mainMerkle = hashGenesisMerkleRoot;
         unsigned int mainNonce = GENESIS_NONCE;
 
+        {
+            // The cold-start list: more than the one machine, each a distinct
+            // v3 onion. One host down must not leave a new node with nowhere to go.
+            std::vector<std::string> seeds;
+            BtfSeedOnions(seeds);
+            std::set<std::string> distinct(seeds.begin(), seeds.end());
+            bool fShape = true;
+            for (size_t i = 0; i < seeds.size(); i++)
+            {
+                size_t dot = seeds[i].find(".onion:");
+                fShape = fShape && dot == 56;
+            }
+            nFail += Check(seeds.size() >= 8 && distinct.size() == seeds.size() && fShape,
+                           strprintf("mainnet cold start knows %u distinct v3 onion seeds", (unsigned)seeds.size()).c_str()) ? 0 : 1;
+        }
+
         SelectChainParams(true);
         nFail += Check(IsTestNet(), "testnet selection is sticky") ? 0 : 1;
         nFail += Check(ntohs(GetDefaultPort()) == TESTNET_PORT,

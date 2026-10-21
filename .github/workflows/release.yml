@@ -1,0 +1,192 @@
+name: Release packages
+
+# Builds every release package on GitHub's machines instead of one of ours,
+# and tries the Linux ones on fresh distributions before anyone downloads
+# them (1.2.27 shipped a Tor that failed on Fedora 44 and Ubuntu 26.04).
+#
+# Run by hand (Actions -> Release packages -> Run workflow) to get the
+# packages as a downloadable artifact. Pushing a v* tag does the same and
+# also opens a DRAFT release with them and SHA256SUMS.
+#
+# The signing key never comes here. SHA256SUMS.asc is made on the
+# founder's machine and added to the draft before it is published.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  # A change to this file is proven on the PR that makes it.
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux packages
+    runs-on: ubuntu-24.04
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: '1'   # appimagetool without FUSE
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dependencies
+        run: make deps-linux
+      - name: Wallet AppImage with Tor
+        run: make appimage-tor
+      - name: Headless node
+        run: make linux-node
+      - name: btfchat AppImage with Tor
+        run: make btfchat-appimage-tor
+      - name: Self-tests on the shipped node binary
+        run: |
+          V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
+          for t in rules-v3 network-params swap-wait-payment fee-policy; do
+            ./bitflash-node-$V-x86_64 -selftest=$t | tail -1
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            Bitflash-*-x86_64.AppImage
+            BtfChat-*-x86_64.AppImage
+            bitflash-node-*-x86_64
+          if-no-files-found: error
+
+  linux-distros:
+    name: Linux packages on ${{ matrix.image }}
+    needs: linux
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['fedora:44', 'ubuntu:26.04', 'ubuntu:24.04', 'debian:13']
+    container: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+      - name: What a desktop has (OpenGL), nothing more
+        run: |
+          if command -v dnf >/dev/null; then dnf -q -y install mesa-libGL libglvnd-glx findutils procps-ng
+          else apt-get -qq update && apt-get -qq install -y libgl1 procps; fi
+      - name: The AppImages load and pass their self-tests
+        # They carry their own libraries: nothing installed but OpenGL.
+        run: |
+          chmod +x ./*.AppImage ./bitflash-node-*
+          ./Bitflash-*-x86_64.AppImage --appimage-extract >/dev/null && mv squashfs-root wallet
+          ./BtfChat-*-x86_64.AppImage --appimage-extract >/dev/null && mv squashfs-root chat
+          ./wallet/AppRun -selftest=rules-v3 | tail -1
+          ./chat/AppRun -selftest=rules-v3 | tail -1
+      - name: The headless node, with the libraries its notes name (Debian/Ubuntu)
+        # The node binary uses the system's libraries, so it is for Debian and
+        # Ubuntu, where these package names hold; elsewhere, the AppImage.
+        if: "!startsWith(matrix.image, 'fedora')"
+        run: |
+          apt-get -qq install -y libsodium23 libdb5.3++ libsqlite3-0 \
+            $(apt-cache show libssl3t64 >/dev/null 2>&1 && echo libssl3t64 || echo libssl3)
+          ./bitflash-node-*-x86_64 -selftest=rules-v3 | tail -1
+      - name: The bundled Tor runs here
+        run: |
+          set -e
+          for app in wallet chat; do
+            tor=$(find $app -name tor -type f | head -1)
+            LD_LIBRARY_PATH=$(dirname "$tor") "$tor" --version | head -1
+          done
+      - name: A fresh wallet finds the network over its own Tor
+        # A cold start, from the seeds baked in -- the path every new user
+        # takes. The Tor network decides how long it takes; only a node that
+        # never gets a peer fails the job.
+        timeout-minutes: 8
+        run: |
+          mkdir -p dd
+          ./wallet/AppRun -nogui -managedtor -debug=net -datadir=$PWD/dd > w.out 2>&1 &
+          W=$!
+          for i in $(seq 1 72); do
+            sleep 5
+            n=$(grep -c "Added time data" dd/debug.log 2>/dev/null || true)
+            if [ "${n:-0}" -gt 0 ]; then echo "peer after $((i*5)) s"; break; fi
+          done
+          grep -E "hidden service ready|btfseed: reached|Added time data" dd/debug.log | head -5 || true
+          kill $W || true
+          [ "${n:-0}" -gt 0 ]
+
+  windows:
+    name: Windows package
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            zip
+            unzip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glfw
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-db
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-libsodium
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            autoconf
+            automake
+            libtool
+      - name: Build the zip with Tor
+        run: make windows-tor
+      - name: The zip runs on its own (no MSYS2 on the PATH)
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Makefile -Pattern '^VERSION\s*:=\s*(\S+)').Matches[0].Groups[1].Value
+          Expand-Archive "Bitflash-$v-windows-with-tor.zip" -DestinationPath unpacked
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $dir = "unpacked\Bitflash-$v-windows"
+          foreach ($t in "rules-v3", "network-params", "swap-wait-payment") {
+            $p = Start-Process "$dir\Bitflash.exe" -ArgumentList "-selftest=$t" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "st-$t.txt"
+            Get-Content "st-$t.txt" | Select-Object -Last 1
+            if ($p.ExitCode -ne 0) { exit 1 }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: Bitflash-*-windows-with-tor.zip
+          if-no-files-found: error
+
+  draft:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, linux-distros, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Open a draft (nothing is public until the founder publishes it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --draft \
+            --title "Bitflash ${GITHUB_REF_NAME#v}" \
+            --notes "Draft from the release workflow. The notes, the Bitflash Miner packages and SHA256SUMS.asc are added before publishing."
