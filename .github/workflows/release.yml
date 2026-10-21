@@ -214,14 +214,25 @@ jobs:
         timeout-minutes: 3
         run: |
           cd try/$D
+          REALHOME=$HOME
           export HOME=$PWD/chat-home && mkdir -p $HOME
-          ./btfchat -testnet > chat.out 2>&1 &
+          # As README-macOS.txt tells people to start it.
+          ./btfchat -testnet -managedtor > chat.out 2>&1 &
           C=$!
-          sleep 25
+          sleep 30
           screencapture -x $GITHUB_WORKSPACE/btfchat-macos.png || true
-          if kill -0 $C 2>/dev/null; then echo "btfchat still running after 25 s"; ok=1; else echo "btfchat exited:"; ok=0; fi
-          tail -20 chat.out
-          kill $C 2>/dev/null || true
+          if kill -0 $C 2>/dev/null; then
+            echo "btfchat still running after 30 s"; ok=1
+            kill $C 2>/dev/null || true
+          else
+            wait $C; echo "btfchat exited with status $?"; ok=0
+          fi
+          echo "--- its output:"; tail -30 chat.out
+          if [ "$ok" = 0 ]; then
+            echo "--- the newest crash report, if macOS wrote one:"
+            r=$(ls -t $REALHOME/Library/Logs/DiagnosticReports/btfchat* /Library/Logs/DiagnosticReports/btfchat* 2>/dev/null | head -1)
+            [ -n "$r" ] && head -120 "$r"
+          fi
           [ "$ok" = 1 ]
       - uses: actions/upload-artifact@v4
         if: always()
