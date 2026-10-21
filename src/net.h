@@ -19,6 +19,10 @@ static const unsigned int PUBLISH_HOPS = 5;
 enum
 {
     NODE_NETWORK = (1 << 0),
+    // Holds and relays chat records (chatstore.h). Inventory of that kind is
+    // only ever offered to a peer that says this, so a node from before the
+    // chat never sees a type it would choke on.
+    NODE_CHAT    = (1 << 1),
 };
 
 
@@ -38,6 +42,11 @@ void ThreadBtfConnect(void* parg);
 // Cached direct-onion endpoint (host.onion:port) for a .btf address, from peers
 // we have reached before. True on a hit -- lets callers skip a Nostr resolve.
 bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut);
+// The pinned onion seeds of the active network. The chat app starts from these
+// the same way a node does: no server to ask first.
+void BtfSeedOnions(vector<string>& vOut);
+// False for an onion whose port says it belongs to the other network.
+bool BtfOnionFitsThisNetwork(const string& strOnion);
 extern string strBtfConnect;
 // Bootstrap seeds added at runtime with /btfseed=ADDRESS:ENCHEX (repeatable).
 // The compiled-in list lives in net.cpp; these are appended to it.
@@ -504,6 +513,7 @@ enum
     MSG_REVIEW,
     MSG_PRODUCT,
     MSG_TABLE,
+    MSG_CHATREC,
 };
 
 static const char* ppszTypeName[] =
@@ -514,6 +524,7 @@ static const char* ppszTypeName[] =
     "review",
     "product",
     "table",
+    "chatrec",
 };
 
 class CInv
@@ -679,6 +690,14 @@ public:
     // Last "btfpeers" we accepted from this node, to rate-limit the exchange.
     int64 nLastPexRecv;
 
+    // Chat records this peer has handed us in the current minute, the minute
+    // it started, and the last time it asked for our whole inventory. See
+    // chatrelay.cpp: the store is open to anybody, so each peer gets a ration.
+    int64 nChatWindowStart;
+    int nChatPutsInWindow;
+    int nChatQueriesInWindow;
+    int64 nLastChatInvAsked;
+
     // Last getblocks we sent this peer, so we do not ask the same question
     // over and over. See CNode::PushGetBlocks.
     CBlockIndex* pindexLastGetBlocksBegin;
@@ -728,6 +747,10 @@ public:
         nReleaseTime = 0;
         nDisconnectSince = 0;
         nLastPexRecv = 0;
+        nChatWindowStart = 0;
+        nChatPutsInWindow = 0;
+        nChatQueriesInWindow = 0;
+        nLastChatInvAsked = 0;
         pindexLastGetBlocksBegin = NULL;
         hashLastGetBlocksEnd = 0;
         nTimeConnected = GetTime();

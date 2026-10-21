@@ -4,6 +4,7 @@
 // Peer discovery over Nostr relays. See nostr.h.
 
 #include "headers.h"
+#include "tor.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -897,6 +898,12 @@ public:
             rc->ws.Close();
             rc->fConnected = rc->ws.Connect(relay, timeoutSec);
             fJustConnected = rc->fConnected;
+            // A relay that answered is proof Tor carried a connection end to
+            // end. The Tor watchdog needs to hear it: in a build with no peers
+            // to count, this is the only honest evidence that Tor works, and
+            // without it the watchdog restarts Tor with bridges forever.
+            if (rc->fConnected)
+                BtfTorNoteNetworkReached();
         }
     }
     ~CRelayLease()

@@ -15,6 +15,9 @@ bool JsonRpcConfigure(const std::string& strUser, const std::string& strPassword
 
 // Listener thread. Serves one request at a time; exchange integrations poll
 // sequentially and the wallet lock would serialise them anyway.
+// -chatwallet: the same server, on 127.0.0.1, with a random password written
+// to <datadir>/.cookie for local tools -- btfchat paying from this wallet.
+bool JsonRpcConfigureCookie(const std::string& strPort);
 void ThreadJsonRpcServer(void* parg);
 
 #endif

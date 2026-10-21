@@ -988,6 +988,7 @@ public:
             string strKey;
             ssKey >> strKey;
             if (strKey == "nTransactionFee")    ssValue >> nTransactionFee;
+            if (strKey == "nPayTxFeePerKB")     ssValue >> nPayTxFeePerKB;
             if (strKey == "addrIncoming")       ssValue >> addrIncoming;
 
             if (!fMineModeFromCommandLine)
@@ -1321,6 +1322,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 string strKey;
                 ssKey >> strKey;
                 if (strKey == "nTransactionFee")    ssValue >> nTransactionFee;
+                if (strKey == "nPayTxFeePerKB")     ssValue >> nPayTxFeePerKB;
                 if (strKey == "addrIncoming")       ssValue >> addrIncoming;
 
                 // Mining mode is restored, but only when no flag chose one.

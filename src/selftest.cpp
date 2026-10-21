@@ -14,6 +14,25 @@
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
 #include "sockcount.h"
+#include "btfchatnode.h"
+#include "btfchatsock.h"
+#include "btfchatnet.h"
+#include "chatrelay.h"
+#include "chatstore.h"
+#include "swap.h"
+#include "btcswap.h"
+#include "btclight.h"
+#include "btfchatswap.h"
+#include "invoice.h"
+#include "bip21.h"
+#include "btfchatwallet.h"
+#include "chatdir.h"
+#include "community.h"
+#include "jsonrpc.h"
+// The chat test signs frames, so it needs a secp256k1 context of its own. Not
+// the node identity from nostr.h: asking for that would generate and persist a
+// node key, and a self-test has no business creating one.
+#include <secp256k1.h>
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -362,7 +381,7 @@ static int RunWalletHDSelfTest()
         std::vector<unsigned char> vchPreSeedKey = keyUser.GetPubKey();
         std::string strPreSeedAddr = PubKeyToAddress(keyUser.GetPubKey());
 
-        nFail += Check(SetHDSeedFromMnemonic(strPhraseA, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strPhraseA, "", strError),
                        "a valid phrase installs a seed") ? 0 : 1;
         nFail += Check(HaveHDSeed(), "the wallet reports having a seed") ? 0 : 1;
         nFail += Check(nHDKeySchema == HD_SCHEMA_BIP44,
@@ -445,7 +464,7 @@ static int RunWalletHDSelfTest()
         std::vector<unsigned char> vchBefore = vchHDMaster;
         int nSchemaBefore = nHDKeySchema;
         unsigned int nCoinTypeBefore = nHDCoinType;
-        nFail += Check(!SetHDSeedFromMnemonic("not a mnemonic at all", strError),
+        nFail += Check(!SetHDSeedFromMnemonic("not a mnemonic at all", "", strError),
                        "an invalid phrase is refused") ? 0 : 1;
         nFail += Check(vchHDMaster == vchBefore,
                        "a refused phrase leaves the existing seed alone") ? 0 : 1;
@@ -465,7 +484,7 @@ static int RunWalletHDSelfTest()
             first.push_back(HexStrLocal(key.GetPubKey()));
         }
 
-        SetHDSeedFromMnemonic(strPhraseA, strError);
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
         std::vector<std::string> again;
         for (unsigned int i = 0; i < 5; i++)
         {
@@ -477,7 +496,7 @@ static int RunWalletHDSelfTest()
         nFail += Check(first == again,
                        "the same phrase derives the same keys in the same order") ? 0 : 1;
 
-        SetHDSeedFromMnemonic(strPhraseB, strError);
+        SetHDSeedFromMnemonic(strPhraseB, "", strError);
         std::vector<std::string> other;
         for (unsigned int i = 0; i < 5; i++)
         {
@@ -488,13 +507,57 @@ static int RunWalletHDSelfTest()
         }
         nFail += Check(first != other, "a different phrase derives different keys") ? 0 : 1;
 
+        // The BIP39 passphrase has to reach the seed, not merely be accepted.
+        // If the plumbing dropped it the wallet would look identical and the
+        // user would believe coins were protected by something that was never
+        // applied -- so this compares derived keys, not return codes.
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystaple", strError);
+        std::vector<std::string> withPass;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            withPass.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(first != withPass,
+                       "the same phrase with a passphrase derives different keys") ? 0 : 1;
+
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystaple", strError);
+        std::vector<std::string> withPassAgain;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            withPassAgain.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(withPass == withPassAgain,
+                       "the same phrase and passphrase derive the same keys") ? 0 : 1;
+
+        // One character off is a different wallet, silently. This is the shape
+        // of the mistake that loses coins, so it is worth a test of its own.
+        SetHDSeedFromMnemonic(strPhraseA, "correcthorsebatterystapl", strError);
+        std::vector<std::string> nearMiss;
+        for (unsigned int i = 0; i < 5; i++)
+        {
+            CKey key;
+            if (!DeriveHDKey(i, key, strError))
+                throw std::runtime_error("derivation failed: " + strError);
+            nearMiss.push_back(HexStrLocal(key.GetPubKey()));
+        }
+        nFail += Check(withPass != nearMiss,
+                       "a passphrase off by one character is a different wallet") ? 0 : 1;
+
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
+
         std::set<std::string> distinct(first.begin(), first.end());
         nFail += Check(distinct.size() == first.size(),
                        "consecutive indices give distinct keys") ? 0 : 1;
 
         // With a seed installed the pool must be derived from it, and the
         // counter must move exactly once per key.
-        SetHDSeedFromMnemonic(strPhraseA, strError);
+        SetHDSeedFromMnemonic(strPhraseA, "", strError);
         unsigned int nReceiveNextBefore = nHDReceiveNext;
         TopUpKeyPool();
 
@@ -2198,7 +2261,7 @@ static int RunWalletEncryptSelfTest()
         string strError;
         const string strMnemonic =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, "", strError),
                        "a phrase can be installed before encryption") ? 0 : 1;
         TopUpKeyPool();
 
@@ -2382,7 +2445,7 @@ static int RunWalletSQLiteEncryptSelfTest()
         string strError;
         const string strMnemonic =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, strError),
+        nFail += Check(SetHDSeedFromMnemonic(strMnemonic, "", strError),
                        "a phrase can be installed before encryption") ? 0 : 1;
         TopUpKeyPool();
 
@@ -2756,7 +2819,7 @@ static int RunWalletConvertSelfTest()
         string strError;
         nFail += Check(SetHDSeedFromMnemonic(
                            "abandon abandon abandon abandon abandon abandon abandon "
-                           "abandon abandon abandon abandon about", strError),
+                           "abandon abandon abandon abandon about", "", strError),
                        "a phrase can be installed before conversion") ? 0 : 1;
         TopUpKeyPool();
 
@@ -4393,8 +4456,10 @@ static int RunMultisigSelfTest()
         std::string strKeyAddr = PubKeyToAddress(keyA.GetPubKey());
         nFail += Check(DecodeAnyAddress(strKeyAddr, h, fScript) && !fScript && h == Hash160(keyA.GetPubKey()),
                        "a B address decodes as a key hash") ? 0 : 1;
-        nFail += Check(!RulesV3Active(GetAdjustedTime()) && RulesV3Time() == 0,
-                       "rules v3 are not scheduled: pay-to-script-hash is not live") ? 0 : 1;
+        nFail += Check(RulesV3Time() == RULES_V3_TIME_MAINNET && RulesV3Time() == 1795262400 &&
+                       RulesV3Active(GetAdjustedTime()) == ((unsigned int)GetAdjustedTime() >= RulesV3Time()),
+                       "rules v3 on mainnet switch on at 2026-11-21 12:00 UTC, not before") ? 0 : 1;
+        bool fV3Now = RulesV3Active(GetAdjustedTime());
 
         // ---- IsMine and relay policy
         nFail += Check(!IsMine(ms), "2-of-3 with one key elsewhere is not 'mine': the wallet cannot spend it alone... " ) ? 0 : 1;
@@ -4417,7 +4482,7 @@ static int RunMultisigSelfTest()
         txStd.vout[0].scriptPubKey = ms4;
         nFail += Check(!txStd.IsStandard(), "four keys is not (relay policy, not validity)") ? 0 : 1;
         txStd.vout[0].scriptPubKey = p2sh;
-        nFail += Check(!txStd.IsStandard(), "a pay-to-script-hash output is not relayed before rules v3") ? 0 : 1;
+        nFail += Check(txStd.IsStandard() == fV3Now, "a pay-to-script-hash output is relayed only once rules v3 are live") ? 0 : 1;
         txStd.vout[0].scriptPubKey = p2pkh;
         txStd.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(72, 1) << std::vector<unsigned char>(72, 2) << std::vector<unsigned char>(72, 3);
         nFail += Check(txStd.IsStandard(), "a scriptSig with three signatures fits the relay limit") ? 0 : 1;
@@ -4555,6 +4620,412 @@ static int RunMultisigSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The chat's link to a wallet (btfchatwallet.h) against the real RPC server:
+// a wallet started the -chatwallet way, a cookie on disk, and the chat's client
+// asking it for its balance and an address -- over 127.0.0.1, as in use.
+static int RunChatWalletSelfTest()
+{
+    printf("chat-wallet self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock wsa;
+#endif
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+
+    int nPort = 30000 + (int)(GetTime() % 20000);
+    nFail += Check(JsonRpcConfigureCookie(strprintf("%d", nPort)), "-chatwallet configures the RPC with a cookie") ? 0 : 1;
+    std::string cookiePath = GetAppDir() + "/.cookie";
+    std::string cookie;
+    {
+        FILE* f = fopen(cookiePath.c_str(), "rb");
+        char buf[200] = {0};
+        if (f) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
+        cookie = buf;
+    }
+    nFail += Check(cookie.compare(0, 11, "__cookie__:") == 0 && cookie.size() >= 11 + 64,
+                   "the cookie is a user and a 64-character random password") ? 0 : 1;
+
+    if (_beginthread(ThreadJsonRpcServer, 0, NULL) == -1)
+    {
+        printf("could not start the RPC server\n");
+        return 1;
+    }
+    Sleep(500);
+
+    btfchat::WalletLinkConfigure(tmp, nPort);
+    std::string st, err;
+    bool fLinked = btfchat::WalletLinked(st);
+    nFail += Check(fLinked && st.find("wallet linked") != std::string::npos,
+                   "the chat reaches the wallet with the cookie") ? 0 : 1;
+    if (!fLinked) printf("       %s\n", st.c_str());
+
+    std::string addr;
+    bool fGot = btfchat::WalletNewAddress(addr, err);
+    bool fOurs = false;
+    {
+        uint160 h;
+        bool fScript = false;
+        if (fGot && DecodeAnyAddress(addr, h, fScript) && !fScript)
+            CRITICAL_BLOCK(cs_mapKeys)
+                fOurs = mapPubKeys.count(h) != 0;
+    }
+    nFail += Check(fGot && fOurs, "and gets a fresh address that is the wallet's own") ? 0 : 1;
+
+    std::string txid;
+    nFail += Check(!btfchat::WalletPay(addr, COIN, txid, err) && !err.empty(),
+                   "paying from an empty wallet fails, and says why") ? 0 : 1;
+    int64_t nRecv = 0;
+    int nConf = 0;
+    nFail += Check(!btfchat::WalletLookup(std::string(64, '1'), nRecv, nConf, err),
+                   "a transaction the wallet never saw is not reported as received") ? 0 : 1;
+
+    // A stale or wrong cookie -- the wallet restarted, or somebody guessed.
+    {
+        FILE* f = fopen(cookiePath.c_str(), "wb");
+        if (f) { fputs("__cookie__:0000000000000000000000000000000000000000000000000000000000000000\n", f); fclose(f); }
+    }
+    fLinked = btfchat::WalletLinked(st);
+    nFail += Check(!fLinked && st.find("refused the cookie") != std::string::npos,
+                   "a wrong cookie is refused, and the chat says so") ? 0 : 1;
+
+    btfchat::WalletLinkConfigure(tmp, nPort == 65535 ? 1 : nPort + 1);
+    fLinked = btfchat::WalletLinked(st);
+    nFail += Check(!fLinked && st.find("not answering") != std::string::npos,
+                   "no wallet on the port: the chat says it is not answering") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// One signature by `key` over input nIn of tx, against scriptCode, SIGHASH_ALL.
+static std::vector<unsigned char> SelfTestSign(CKey& key, const CScript& scriptCode,
+                                               const CTransaction& tx, unsigned int nIn)
+{
+    uint256 hash = SignatureHash(scriptCode, tx, nIn, SIGHASH_ALL);
+    std::vector<unsigned char> sig;
+    key.Sign(hash, sig);
+    sig.push_back((unsigned char)SIGHASH_ALL);
+    return sig;
+}
+
+// Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
+// enforced, and the hash-time-locked script an atomic swap is made of. The
+// rules are driven here through their flags, not the activation time, so the
+// suite checks the rule itself whatever date consensus.h holds.
+static int RunRulesV3SelfTest()
+{
+    printf("rules-v3 self-test\n");
+    int nFail = 0;
+
+    CKey keyA, keyB;
+    keyA.MakeNewKey();
+    keyB.MakeNewKey();
+
+    // ---- the opcode
+    nFail += Check(std::string(GetOpName(OP_CHECKLOCKTIMEVERIFY)) == "OP_CHECKLOCKTIMEVERIFY" &&
+                   OP_CHECKLOCKTIMEVERIFY == 0xb1,
+                   "OP_CHECKLOCKTIMEVERIFY is 0xb1, the byte Bitcoin uses") ? 0 : 1;
+
+    // A bare lock script: <lock> CLTV DROP <A> CHECKSIG
+    const int64 LOCK = 1000;
+    CScript lockScript;
+    lockScript << LOCK << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+    CScript p2shLock;
+    p2shLock.SetPayToScriptHash(lockScript);
+
+    CTransaction txFrom;
+    txFrom.vout.push_back(CTxOut(5 * COIN, p2shLock));
+    CTransaction t;
+    t.vin.resize(1);
+    t.vin[0].prevout = COutPoint(txFrom.GetHash(), 0);
+    t.vin[0].nSequence = 0;
+    t.vout.push_back(CTxOut(5 * COIN - CENT, CScript() << keyA.GetPubKey() << OP_CHECKSIG));
+
+    struct Spend
+    {
+        static bool Ok(CKey& key, const CScript& redeem, const CTransaction& from, CTransaction tx,
+                       bool fV3)
+        {
+            tx.vin[0].scriptSig = CScript();
+            std::vector<unsigned char> sig = SelfTestSign(key, redeem, tx, 0);
+            tx.vin[0].scriptSig << sig << static_cast<std::vector<unsigned char> >(redeem);
+            return VerifySignature(from, tx, 0, 0, true, fV3);
+        }
+    };
+
+    t.nLockTime = LOCK;
+    nFail += Check(Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a spend whose nLockTime reaches the lock verifies under rules v3") ? 0 : 1;
+    {
+        // Run as a bare script, where the opcode actually executes either way.
+        CTransaction tb = t;
+        std::vector<unsigned char> sig = SelfTestSign(keyA, lockScript, tb, 0);
+        CScript run = CScript() << sig << OP_CODESEPARATOR;
+        run += lockScript;
+        nFail += Check(EvalScript(run, tb, 0, 0, NULL, true, true) &&
+                       !EvalScript(run, tb, 0, 0, NULL, true, false),
+                       "the same lock script fails before rules v3: the opcode is unknown there") ? 0 : 1;
+    }
+    t.nLockTime = LOCK - 1;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "one block short of the lock is refused") ? 0 : 1;
+    t.nLockTime = LOCKTIME_THRESHOLD + 5;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a time in nLockTime does not satisfy a height lock") ? 0 : 1;
+    t.nLockTime = LOCK;
+    t.vin[0].nSequence = UINT_MAX;
+    nFail += Check(!Spend::Ok(keyA, lockScript, txFrom, t, true),
+                   "a final input (which switches nLockTime off) is refused") ? 0 : 1;
+    t.vin[0].nSequence = 0;
+    nFail += Check(!Spend::Ok(keyB, lockScript, txFrom, t, true),
+                   "the right time with the wrong key is refused") ? 0 : 1;
+
+    // A time lock, and the wrong unit the other way round
+    {
+        const int64 TLOCK = (int64)LOCKTIME_THRESHOLD + 100000;
+        CScript ts;
+        ts << TLOCK << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(ts);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.nLockTime = (unsigned int)TLOCK;
+        nFail += Check(Spend::Ok(keyA, ts, from, s, true), "a time lock is met by an nLockTime past it") ? 0 : 1;
+        s.nLockTime = 1000;
+        nFail += Check(!Spend::Ok(keyA, ts, from, s, true), "and not by a height") ? 0 : 1;
+    }
+
+    // Malformed locks
+    {
+        CScript neg;
+        neg << (int64)-1 << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(neg);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        nFail += Check(!Spend::Ok(keyA, neg, from, s, true), "a negative lock is refused") ? 0 : 1;
+
+        CScript big;
+        big << std::vector<unsigned char>(6, 0x01) << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p2; p2.SetPayToScriptHash(big);
+        CTransaction from2; from2.vout.push_back(CTxOut(COIN, p2));
+        s.vin[0].prevout = COutPoint(from2.GetHash(), 0);
+        s.nLockTime = UINT_MAX - 1;
+        nFail += Check(!Spend::Ok(keyA, big, from2, s, true), "a lock longer than five bytes is refused") ? 0 : 1;
+
+        CScript empty;
+        empty << OP_CHECKLOCKTIMEVERIFY;
+        CTransaction s2 = t;
+        nFail += Check(!EvalScript(empty, s2, 0, 0, NULL, true, true), "CLTV on an empty stack fails") ? 0 : 1;
+    }
+
+    // ---- lock-time finality in blocks
+    {
+        CTransaction f = t;
+        f.nLockTime = 100;
+        f.vin[0].nSequence = 0;
+        nFail += Check(!f.IsFinalAt(100, 0), "nLockTime 100 cannot be in block 100") ? 0 : 1;
+        nFail += Check(f.IsFinalAt(101, 0), "and can be in block 101") ? 0 : 1;
+        f.nLockTime = LOCKTIME_THRESHOLD + 50;
+        nFail += Check(!f.IsFinalAt(1000000, LOCKTIME_THRESHOLD + 50), "a time lock waits for the median time to pass it") ? 0 : 1;
+        nFail += Check(f.IsFinalAt(1, LOCKTIME_THRESHOLD + 51), "and is final once it has") ? 0 : 1;
+        f.vin[0].nSequence = UINT_MAX;
+        nFail += Check(f.IsFinalAt(1, 0), "every input final makes the lock time irrelevant") ? 0 : 1;
+        f.nLockTime = 0;
+        f.vin[0].nSequence = 0;
+        nFail += Check(f.IsFinalAt(0, 0), "nLockTime 0 is always final") ? 0 : 1;
+    }
+
+    // ---- BIP16 enforced
+    {
+        CScript redeem; redeem << keyA.GetPubKey() << OP_CHECKSIG;
+        CScript p; p.SetPayToScriptHash(redeem);
+        CTransaction from; from.vout.push_back(CTxOut(COIN, p));
+        CTransaction s = t;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.nLockTime = 0;
+        s.vin[0].scriptSig = CScript() << static_cast<std::vector<unsigned char> >(redeem);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, false),
+                       "before rules v3 the redeem script alone spends a script hash (anyone-can-spend)") ? 0 : 1;
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true),
+                       "under rules v3 it does not: the redeem script runs, and wants a signature") ? 0 : 1;
+        nFail += Check(Spend::Ok(keyA, redeem, from, s, true), "with the signature it spends") ? 0 : 1;
+        nFail += Check(GetP2SHSigOpCount(CScript() << std::vector<unsigned char>(1, 0) <<
+                                         static_cast<std::vector<unsigned char> >(redeem)) == 1,
+                       "the redeem script's CHECKSIG is counted against the block") ? 0 : 1;
+    }
+
+    // ---- the atomic swap: a hash-time-locked contract
+    //
+    // B gets the coins by showing the secret whose SHA-256 is in the script;
+    // A gets them back after the lock if B never did. The same script, byte for
+    // byte, is what the Bitcoin side of the swap uses.
+    {
+        std::vector<unsigned char> secret(32);
+        RAND_bytes(&secret[0], 32);
+        std::vector<unsigned char> hash(32);
+        SHA256(&secret[0], secret.size(), &hash[0]);
+        const int64 REFUND_AT = 2000;
+
+        CScript htlc;
+        htlc << OP_IF
+                 << OP_SHA256 << hash << OP_EQUALVERIFY << keyB.GetPubKey() << OP_CHECKSIG
+             << OP_ELSE
+                 << REFUND_AT << OP_CHECKLOCKTIMEVERIFY << OP_DROP << keyA.GetPubKey() << OP_CHECKSIG
+             << OP_ENDIF;
+        CScript p; p.SetPayToScriptHash(htlc);
+        CTransaction from; from.vout.push_back(CTxOut(10 * COIN, p));
+        CTransaction s;
+        s.vin.resize(1);
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.vout.push_back(CTxOut(10 * COIN - CENT, CScript() << keyB.GetPubKey() << OP_CHECKSIG));
+
+        // claim: <sigB> <secret> TRUE <htlc>
+        s.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigB = SelfTestSign(keyB, htlc, s, 0);
+        s.vin[0].scriptSig << sigB << secret << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, true), "B claims with the secret") ? 0 : 1;
+        nFail += Check(s.vin[0].scriptSig.IsPushOnly(), "and the claim is push-only, as relay requires") ? 0 : 1;
+
+        std::vector<unsigned char> wrong = secret;
+        wrong[0] ^= 1;
+        s.vin[0].scriptSig = CScript() << sigB << wrong << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true), "a wrong secret is refused") ? 0 : 1;
+
+        std::vector<unsigned char> sigAc = SelfTestSign(keyA, htlc, s, 0);
+        s.vin[0].scriptSig = CScript() << sigAc << secret << OP_TRUE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true), "the secret is no use to anybody but B") ? 0 : 1;
+
+        // refund: <sigA> FALSE <htlc>, needs nLockTime >= REFUND_AT and a non-final input
+        CTransaction r = s;
+        r.vout[0] = CTxOut(10 * COIN - CENT, CScript() << keyA.GetPubKey() << OP_CHECKSIG);
+        r.vin[0].nSequence = 0;
+        r.nLockTime = REFUND_AT;
+        r.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigA = SelfTestSign(keyA, htlc, r, 0);
+        r.vin[0].scriptSig << sigA << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, r, 0, 0, true, true), "A takes the refund once the lock has passed") ? 0 : 1;
+        nFail += Check(!r.IsFinalAt(REFUND_AT, 0) && r.IsFinalAt(REFUND_AT + 1, 0),
+                       "and no block before the lock height can contain that refund") ? 0 : 1;
+
+        CTransaction early = r;
+        early.nLockTime = REFUND_AT - 1;
+        early.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigE = SelfTestSign(keyA, htlc, early, 0);
+        early.vin[0].scriptSig << sigE << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, early, 0, 0, true, true), "a refund dated before the lock is refused") ? 0 : 1;
+
+        CTransaction stolen = r;
+        stolen.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigX = SelfTestSign(keyB, htlc, stolen, 0);
+        stolen.vin[0].scriptSig << sigX << OP_FALSE << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(!VerifySignature(from, stolen, 0, 0, true, true), "B cannot take the refund path") ? 0 : 1;
+
+        // Before rules v3 the script hash is not enforced at all -- anybody
+        // holding the script spends it, no secret, no signature. That is the
+        // whole reason the wallet refuses to pay to one until the switch.
+        CTransaction anyone = s;
+        anyone.vin[0].scriptSig = CScript() << static_cast<std::vector<unsigned char> >(htlc);
+        nFail += Check(VerifySignature(from, anyone, 0, 0, true, false) &&
+                       !VerifySignature(from, anyone, 0, 0, true, true),
+                       "before rules v3 a swap output is anyone-can-spend; under them it is not") ? 0 : 1;
+    }
+
+    // ---- the swap contract the RPCs build (swap.h): Decred's, byte for byte
+    {
+        std::vector<unsigned char> secret(32);
+        RAND_bytes(&secret[0], 32);
+        swap::Contract c;
+        c.secretHash.resize(32);
+        SHA256(&secret[0], 32, &c.secretHash[0]);
+        uint160 hB = Hash160(keyB.GetPubKey()), hA = Hash160(keyA.GetPubKey());
+        c.recipientPkh.assign(hB.begin(), hB.end());
+        c.refundPkh.assign(hA.begin(), hA.end());
+        c.nLockTime = 51234;
+        CScript k = swap::BuildContract(c);
+        std::string hex = HexStr(k.begin(), k.end(), false);
+        std::string sh = HexStr(c.secretHash.begin(), c.secretHash.end(), false);
+        std::string pb = HexStr(c.recipientPkh.begin(), c.recipientPkh.end(), false);
+        std::string pa = HexStr(c.refundPkh.begin(), c.refundPkh.end(), false);
+        // 51234 = 0x00c822 -> pushed as 3 bytes 22 c8 00 (the 00 keeps it positive)
+        std::string expect = "6382012088a820" + sh + "8876a914" + pb + "67" + "0322c800" +
+                             "b17576a914" + pa + "6888ac";
+        nFail += Check(hex == expect, "the contract is the atomicswap template, byte for byte") ? 0 : 1;
+
+        swap::Contract back;
+        nFail += Check(swap::ParseContract(k, back) && back.nLockTime == 51234 &&
+                       back.secretHash == c.secretHash && back.recipientPkh == c.recipientPkh &&
+                       back.refundPkh == c.refundPkh, "and parses back into the same terms") ? 0 : 1;
+        CScript longer = k;
+        longer << OP_NOP;
+        nFail += Check(!swap::ParseContract(longer, back), "a contract with anything appended is not one") ? 0 : 1;
+
+        CScript p2; p2.SetPayToScriptHash(k);
+        CTransaction from; from.vout.push_back(CTxOut(3 * COIN, p2));
+        CTransaction s;
+        s.vin.resize(1);
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.vout.push_back(CTxOut(3 * COIN - CENT, CScript() << OP_TRUE));
+        std::vector<unsigned char> sig = SelfTestSign(keyB, k, s, 0);
+        s.vin[0].scriptSig = swap::RedeemScriptSig(sig, keyB.GetPubKey(), secret, k);
+        nFail += Check(VerifySignature(from, s, 0, 0, true, true), "the redeem the RPC builds verifies") ? 0 : 1;
+        std::vector<unsigned char> got;
+        nFail += Check(swap::ExtractSecret(s.vin[0].scriptSig, c.secretHash, got) && got == secret,
+                       "and the secret can be read back out of it") ? 0 : 1;
+
+        CTransaction r = s;
+        r.nLockTime = 51234;
+        r.vin[0].nSequence = 0;
+        r.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sigA = SelfTestSign(keyA, k, r, 0);
+        r.vin[0].scriptSig = swap::RefundScriptSig(sigA, keyA.GetPubKey(), k);
+        nFail += Check(VerifySignature(from, r, 0, 0, true, true), "the refund the RPC builds verifies") ? 0 : 1;
+
+        std::vector<unsigned char> shortSecret(16, 7);
+        unsigned char hs[32];
+        SHA256(&shortSecret[0], 16, hs);
+        swap::Contract cs = c;
+        cs.secretHash.assign(hs, hs + 32);
+        CScript ks = swap::BuildContract(cs);
+        CScript p3; p3.SetPayToScriptHash(ks);
+        CTransaction from3; from3.vout.push_back(CTxOut(COIN, p3));
+        CTransaction s3 = s;
+        s3.vin[0].prevout = COutPoint(from3.GetHash(), 0);
+        s3.vin[0].scriptSig = CScript();
+        std::vector<unsigned char> sig3 = SelfTestSign(keyB, ks, s3, 0);
+        s3.vin[0].scriptSig = swap::RedeemScriptSig(sig3, keyB.GetPubKey(), shortSecret, ks);
+        nFail += Check(!VerifySignature(from3, s3, 0, 0, true, true),
+                       "a secret that is not 32 bytes is refused even when its hash matches") ? 0 : 1;
+    }
+
+    // ---- relay before activation
+    {
+        CTransaction pay;
+        pay.vin.resize(1);
+        pay.vout.push_back(CTxOut(COIN, p2shLock));
+        nFail += Check(RulesV3Active((unsigned int)GetAdjustedTime()) || !pay.IsStandard(),
+                       "while rules v3 are not active, paying to a script hash is not relayed") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // The treasury: the script the keys in treasury.cpp make, what pays it, and
 // the coinbase split. Runs against both networks' tables; mainnet may be
 // unconfigured, and then everything that would pay it must say so.
@@ -4621,6 +5092,834 @@ static int RunTreasurySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The chat over real sockets.
+//
+// btfchatlink is tested on its own over an in-memory pipe, so the protocol is
+// already covered. What this covers is the socket glue: that SocketStream moves
+// the bytes a Link needs, over a loopback pair, with the endpoint accepting the
+// way the Tor-forwarded listener will. Loopback, not Tor, because the point is
+// the glue -- Tor in the path would make the test measure Tor.
+static int RunChatLinkSelfTest()
+{
+    printf("chat-link self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock winsock;
+    nFail += Check(winsock.fStarted, "Winsock started") ? 0 : 1;
+#endif
+
+    secp256k1_context* ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    nFail += Check(ctx != NULL, "secp256k1 context created") ? 0 : 1;
+    if (!ctx)
+        return nFail;
+    {
+        unsigned char rnd[32];
+        RAND_bytes(rnd, sizeof(rnd));
+        secp256k1_context_randomize(ctx, rnd);
+    }
+
+    // Two identities from fixed seeds. The chat key comes from the recovery
+    // phrase and the session password, and neither is anywhere near this test.
+    std::string err;
+    btfchat::Identity alice, bob;
+    {
+        std::vector<unsigned char> seed(64, 0xA1);
+        nFail += Check(btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", alice, err),
+                       "a chat identity derives") ? 0 : 1;
+        seed.assign(64, 0xB2);
+        nFail += Check(btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", bob, err),
+                       "and a second one") ? 0 : 1;
+    }
+    nFail += Check(alice.address != bob.address, "two different .btf addresses") ? 0 : 1;
+
+    // A loopback pair standing in for Tor forwarding its hidden service to the
+    // chat listener.
+    SOCKET listener = INVALID_SOCKET;
+    nFail += Check(btfchat::ChatListen(0, listener, err) == false,
+                   "a chat listener refuses port 0") ? 0 : 1;
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    bool fUp = listener != INVALID_SOCKET
+        && bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && listen(listener, 1) == 0;
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    fUp = fUp && getsockname(listener, (struct sockaddr*)&addr, &addrLen) == 0;
+    nFail += Check(fUp, "loopback chat listener up") ? 0 : 1;
+
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    bool fConn = fUp && client != INVALID_SOCKET
+        && connect(client, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    SOCKET server = fConn ? accept(listener, NULL, NULL) : INVALID_SOCKET;
+    nFail += Check(fConn && server != INVALID_SOCKET, "dialled and accepted") ? 0 : 1;
+
+    if (fConn && server != INVALID_SOCKET)
+    {
+        // The handshake needs both sides at once, so the endpoint runs in a
+        // thread, exactly as the listener thread will.
+        btfchat::SocketStream sClient(client, 20);
+        btfchat::SocketStream sServer(server, 20);
+        btfchat::Link linkClient, linkServer;
+
+        struct Arg
+        {
+            btfchat::Link*         link;
+            btfchat::SocketStream* stream;
+            const unsigned char*   sk;
+            bool                   fOk;
+            std::string            err;
+        };
+        Arg arg;
+        arg.link = &linkServer; arg.stream = &sServer; arg.sk = bob.chan_sk; arg.fOk = false;
+
+        struct Runner
+        {
+            static void Accept(void* p)
+            {
+                Arg* a = (Arg*)p;
+                a->fOk = a->link->AcceptAsEndpoint(*a->stream, a->sk, a->err);
+            }
+        };
+        bool fThread = _beginthread(Runner::Accept, 0, &arg) != -1;
+        nFail += Check(fThread, "endpoint thread started") ? 0 : 1;
+
+        bool fCl = linkClient.ConnectAsClient(sClient, bob.chan_pk, err);
+        nFail += Check(fCl, "the client handshake completed over a socket") ? 0 : 1;
+        if (!fCl)
+            printf("       (%s)\n", err.c_str());
+
+        // Wait for the endpoint side rather than guessing.
+        for (int i = 0; i < 200 && !arg.fOk; i++)
+            Sleep(50);
+        nFail += Check(arg.fOk, "and so did the endpoint") ? 0 : 1;
+        if (!arg.fOk && !arg.err.empty())
+            printf("       (%s)\n", arg.err.c_str());
+
+        if (fCl && arg.fOk)
+        {
+            // A real frame, signed, over the socket, through the whole inbound
+            // path on the receiving side.
+            btfchat::Roster roster;
+            btfchat::ReplayGuard replay;
+            btfchat::History history;
+            btfchat::Inbox inbox;
+            inbox.secpctx = ctx;
+            inbox.myAddress = bob.address;
+            inbox.roster = &roster;
+            inbox.replay = &replay;
+            inbox.history = &history;
+
+            int64 nNow = GetTime();
+
+            btfchat::Frame inv;
+            inv.kind = btfchat::MSG_INVITE;
+            inv.sent = nNow;
+            inv.text = "primeiro contato";
+            std::string jsInv;
+            nFail += Check(btfchat::SignFrame(ctx, alice, inv, jsInv, err),
+                           "alice signs an invite") ? 0 : 1;
+            nFail += Check(linkClient.SendFrame(sClient, jsInv, err),
+                           "it goes out over the socket") ? 0 : 1;
+
+            std::string got;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err) && got == jsInv,
+                           "and arrives byte for byte") ? 0 : 1;
+
+            btfchat::Frame opened;
+            nFail += Check(inbox.Deliver(got, alice.address, nNow, opened, err),
+                           "the inbound path accepts it") ? 0 : 1;
+            nFail += Check(roster.State(alice.address) == btfchat::PEER_INVITE_IN,
+                           "and it lands as a pending invite") ? 0 : 1;
+
+            // Before bob accepts, a message is refused -- over a real socket the
+            // same as over the pipe.
+            btfchat::Frame msg;
+            msg.kind = btfchat::MSG_TEXT;
+            msg.sent = nNow;
+            msg.text = "posso falar antes de aceitar?";
+            std::string jsMsg;
+            btfchat::SignFrame(ctx, alice, msg, jsMsg, err);
+            nFail += Check(linkClient.SendFrame(sClient, jsMsg, err), "a message is sent") ? 0 : 1;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err), "and received") ? 0 : 1;
+            nFail += Check(!inbox.Deliver(got, alice.address, nNow, opened, err),
+                           "and refused: nothing before the accept") ? 0 : 1;
+            nFail += Check(history.MessageCount() == 0, "nothing was filed") ? 0 : 1;
+
+            nFail += Check(roster.AcceptInvite(alice.address, err), "bob accepts") ? 0 : 1;
+            btfchat::Frame msg2;
+            msg2.kind = btfchat::MSG_TEXT;
+            msg2.sent = nNow;
+            msg2.text = "agora sim";
+            std::string jsMsg2;
+            btfchat::SignFrame(ctx, alice, msg2, jsMsg2, err);
+            nFail += Check(linkClient.SendFrame(sClient, jsMsg2, err), "she writes again") ? 0 : 1;
+            nFail += Check(linkServer.RecvFrame(sServer, got, err), "it arrives") ? 0 : 1;
+            nFail += Check(inbox.Deliver(got, alice.address, nNow, opened, err) &&
+                           history.MessageCount() == 1,
+                           "and this one is filed") ? 0 : 1;
+
+            // The reply direction, so both ratchets are exercised over sockets.
+            btfchat::Frame rep;
+            rep.kind = btfchat::MSG_TEXT;
+            rep.sent = nNow;
+            rep.text = "recebido";
+            std::string jsRep;
+            btfchat::SignFrame(ctx, bob, rep, jsRep, err);
+            nFail += Check(linkServer.SendFrame(sServer, jsRep, err), "bob answers") ? 0 : 1;
+            nFail += Check(linkClient.RecvFrame(sClient, got, err) && got == jsRep,
+                           "and alice reads it") ? 0 : 1;
+        }
+
+        linkClient.Close();
+        linkServer.Close();
+    }
+
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (server != INVALID_SOCKET) closesocket(server);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+
+    // Outbound is onion-only, with no clearnet fallback. Checked here because it
+    // is a policy, not an implementation detail: a fallback that works when Tor
+    // is down leaks the user's address at the worst possible moment.
+    SOCKET s = INVALID_SOCKET;
+    nFail += Check(!btfchat::ChatDialOnion("127.0.0.1:8533", 5, s, err) &&
+                   err.find("onion") != std::string::npos,
+                   "dialling a clearnet address is refused") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("example.com:8533", 5, s, err),
+                   "and so is a hostname") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("noport.onion", 5, s, err),
+                   "an endpoint with no port is refused") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("abc.onion:notanumber", 5, s, err),
+                   "and one with a junk port") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion("abc.onion:99999", 5, s, err),
+                   "and one out of range") ? 0 : 1;
+    // With a well-formed onion and no Tor configured, it must refuse rather than
+    // find another way out.
+    nFail += Check(!BtfTorProxyEnabled(), "no Tor proxy in a self-test") ? 0 : 1;
+    nFail += Check(!btfchat::ChatDialOnion(
+                       "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:8533",
+                       5, s, err) && err.find("Tor") != std::string::npos,
+                   "and with no Tor it refuses instead of falling back") ? 0 : 1;
+
+    secp256k1_context_destroy(ctx);
+
+    printf("%s (%d failures)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail);
+    return nFail == 0 ? 0 : 1;
+}
+
+// Where the chat identity comes from.
+//
+// The point being protected here is that the twelve words never reach the chat.
+// The wallet keeps the BIP32 master key and chain code, not the BIP39 seed, and
+// those two are a deterministic function of the seed -- so the same phrase gives
+// the same chat identity on any machine while the phrase itself stays out of this
+// process. A phrase that is not in memory cannot be screenshotted or logged.
+// A Stream whose far end is a node's own message handler: what the client
+// writes goes into the node's receive buffer and through ProcessMessages, what
+// the node pushed is what the client reads. The real node code against the real
+// chat client, with no socket and no Tor in between.
+class HandlerStream : public btfchat::Stream
+{
+public:
+    explicit HandlerStream(CNode* p) : pnode(p) {}
+    bool Write(const unsigned char* p, size_t n)
+    {
+        pnode->vRecv.insert(pnode->vRecv.end(), (const char*)p, (const char*)p + n);
+        ProcessMessages(pnode);
+        return !pnode->fDisconnect;
+    }
+    bool Read(unsigned char* p, size_t n)
+    {
+        if (pnode->vSend.size() < n)
+            return false;
+        memcpy(p, &pnode->vSend.begin()[0], n);
+        pnode->vSend.ignore((int)n);
+        return true;
+    }
+private:
+    CNode* pnode;
+};
+
+// Pull every complete message out of a node's send buffer.
+static void DrainMessages(CNode& node, std::vector<std::pair<std::string, std::vector<char> > >& out)
+{
+    out.clear();
+    unsigned int nHdr = CMessageHeader::SizeOnWire(node.vSend.GetVersion());
+    while (node.vSend.size() >= nHdr)
+    {
+        CDataStream h(node.vSend.begin(), node.vSend.begin() + nHdr, SER_NETWORK, node.vSend.GetVersion());
+        CMessageHeader hdr;
+        h >> hdr;
+        if (node.vSend.size() < nHdr + hdr.nMessageSize)
+            break;
+        std::vector<char> pay(node.vSend.begin() + nHdr, node.vSend.begin() + nHdr + hdr.nMessageSize);
+        out.push_back(std::make_pair(hdr.GetCommand(), pay));
+        node.vSend.ignore((int)(nHdr + hdr.nMessageSize));
+    }
+}
+
+static btfchat::ChatRecord SelfTestEnvelope(const std::vector<unsigned char>& tag, size_t nPayload)
+{
+    btfchat::ChatRecord r;
+    r.kind = btfchat::CHATREC_ENVELOPE;
+    r.key = tag;
+    r.nTime = GetTime();
+    r.payload.resize(nPayload);
+    RAND_bytes(&r.payload[0], (int)nPayload);
+    btfchat::ChatRecordMine(r);
+    return r;
+}
+
+static int RunChatRelaySelfTest()
+{
+    printf("chat-relay self-test\n");
+    int nFail = 0;
+    std::string err, why;
+    // A datadir of its own: the community directory reads and writes a file in
+    // it, and a self-test has no business touching the real one.
+    {
+        std::string tmp;
+        if (MakeTempDir(tmp))
+            strSetDataDir = tmp;
+    }
+
+    // A peer that holds chat records, to watch what the node relays to it, and
+    // one that does not, to make sure it is never offered any.
+    CNode* peerChat = new CNode(INVALID_SOCKET, CAddress());
+    peerChat->nVersion = VERSION;
+    peerChat->nServices = NODE_NETWORK | NODE_CHAT;
+    peerChat->vSend.SetVersion(VERSION);
+    peerChat->vRecv.SetVersion(VERSION);
+    CNode* peerOld = new CNode(INVALID_SOCKET, CAddress());
+    peerOld->nVersion = VERSION;
+    peerOld->nServices = NODE_NETWORK;
+    CRITICAL_BLOCK(cs_vNodes)
+    {
+        vNodes.push_back(peerChat);
+        vNodes.push_back(peerOld);
+    }
+
+    // ---- the chat app, connected to this node
+    CNode* app = new CNode(INVALID_SOCKET, CAddress(), true);
+    HandlerStream st(app);
+    btfchat::NodeLink link(st);
+    nFail += Check(link.Handshake(err), "the chat client completes a handshake with the real node handler") ? 0 : 1;
+    if (!err.empty()) printf("       %s\n", err.c_str());
+    nFail += Check((link.Services() & NODE_CHAT) != 0, "and the node says it holds chat records") ? 0 : 1;
+    nFail += Check(app->nVersion == VERSION && app->fClient,
+                   "the node sees a client, not a node: no chain asked of it") ? 0 : 1;
+
+    std::vector<unsigned char> tag(16);
+    RAND_bytes(&tag[0], 16);
+    btfchat::ChatRecord env = SelfTestEnvelope(tag, 700);
+    int nResult = -1;
+    nFail += Check(link.Put(env, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                   "an envelope left by the app is kept, and the app is told so") ? 0 : 1;
+    nResult = -1;
+    nFail += Check(link.Put(env, nResult, why, err) && nResult == btfchat::ChatStore::DUPLICATE,
+                   "the same envelope again is a duplicate, not an error") ? 0 : 1;
+
+    btfchat::ChatRecord lazy = env;
+    lazy.payload[0] ^= 1;
+    while (btfchat::ChatRecordHasWork(lazy))
+        lazy.nNonce++;
+    nResult = -1;
+    nFail += Check(link.Put(lazy, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED &&
+                   why.find("proof of work") != std::string::npos,
+                   "one without the work is refused, and the app is told why") ? 0 : 1;
+
+    // ---- asking
+    {
+        std::vector<unsigned char> other(16);
+        RAND_bytes(&other[0], 16);
+        std::vector<CChatQuery> q(2);
+        q[0].kind = btfchat::CHATREC_ENVELOPE; q[0].key = tag;   q[0].nSince = 0; q[0].nMax = 64;
+        q[1].kind = btfchat::CHATREC_ENVELOPE; q[1].key = other; q[1].nSince = 0; q[1].nMax = 64;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 2,
+                       "two questions in one request get two answers") ? 0 : 1;
+        nFail += Check(ans.size() == 2 && ans[0].size() == 1 && ans[0][0].IdHex() == env.IdHex(),
+                       "the first is the envelope left under that tag") ? 0 : 1;
+        nFail += Check(ans.size() == 2 && ans[1].empty(), "the second, under a tag nobody used, is empty") ? 0 : 1;
+
+        q.resize(1);
+        q[0].nSince = GetTime() + 60;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].empty(),
+                       "'since' after it leaves it out") ? 0 : 1;
+    }
+
+    // ---- relayed to the node that holds chat records, never to the old one
+    CInv invEnv;
+    {
+        unsigned char id[32];
+        env.Id(id);
+        uint256 h;
+        memcpy(h.begin(), id, 32);
+        invEnv = CInv(MSG_CHATREC, h);
+    }
+    bool fOffered = false, fOfferedOld = false, fOfferedApp = false;
+    CNode* who[3] = { peerChat, peerOld, app };
+    bool* flag[3] = { &fOffered, &fOfferedOld, &fOfferedApp };
+    for (int w = 0; w < 3; w++)
+        CRITICAL_BLOCK(who[w]->cs_inventory)
+            for (size_t i = 0; i < who[w]->vInventoryToSend.size(); i++)
+                if (who[w]->vInventoryToSend[i].type == invEnv.type &&
+                    who[w]->vInventoryToSend[i].hash == invEnv.hash)
+                    *flag[w] = true;
+    nFail += Check(fOffered, "a kept record is offered to the peer that holds chat records") ? 0 : 1;
+    nFail += Check(!fOfferedOld, "and never to a node from before the chat") ? 0 : 1;
+    nFail += Check(!fOfferedApp, "nor back to where it came from") ? 0 : 1;
+    nFail += Check(ChatRelayAlreadyHave(invEnv), "and the node answers 'have' for it") ? 0 : 1;
+
+    // ---- the peer asks for it, the node sends it
+    std::vector<std::pair<std::string, std::vector<char> > > msgs;
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("getdata", std::vector<CInv>(1, invEnv));
+        peerChat->vSend.clear();
+        peerChat->vRecv.insert(peerChat->vRecv.end(), wire.vSend.begin(), wire.vSend.end());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        bool fGot = false;
+        for (size_t i = 0; i < msgs.size(); i++)
+            if (msgs[i].first == "chatrec")
+            {
+                CDataStream ss(msgs[i].second, SER_NETWORK, VERSION);
+                std::vector<unsigned char> blob;
+                ss >> blob;
+                btfchat::ChatRecord back;
+                fGot = !blob.empty() && back.Parse(&blob[0], blob.size()) && back.IdHex() == env.IdHex();
+            }
+        nFail += Check(fGot, "getdata from a peer is answered with the record itself") ? 0 : 1;
+    }
+
+    // ---- a record relayed by another node is taken, and the app can find it
+    std::vector<unsigned char> tag2(16);
+    RAND_bytes(&tag2[0], 16);
+    btfchat::ChatRecord relayed = SelfTestEnvelope(tag2, 300);
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("chatrec", relayed.Serialize());
+        peerChat->vRecv.insert(peerChat->vRecv.end(), wire.vSend.begin(), wire.vSend.end());
+        ProcessMessages(peerChat);
+        std::vector<CChatQuery> q(1);
+        q[0].kind = btfchat::CHATREC_ENVELOPE; q[0].key = tag2; q[0].nSince = 0; q[0].nMax = 64;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].size() == 1 &&
+                       ans[0][0].IdHex() == relayed.IdHex(),
+                       "a record another node relays is kept and served to the app") ? 0 : 1;
+    }
+
+    // ---- a peer that just connected can ask for everything we hold, once in a while
+    {
+        CNode wire(INVALID_SOCKET, CAddress());
+        wire.vSend.clear();
+        wire.vSend.SetVersion(VERSION);
+        wire.PushMessage("getchatinv");
+        std::vector<char> once(wire.vSend.begin(), wire.vSend.end());
+        peerChat->vSend.clear();
+        peerChat->vRecv.insert(peerChat->vRecv.end(), &once[0], &once[0] + once.size());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        size_t nOffered = 0;
+        for (size_t i = 0; i < msgs.size(); i++)
+            if (msgs[i].first == "inv")
+            {
+                CDataStream ss(msgs[i].second, SER_NETWORK, VERSION);
+                std::vector<CInv> v;
+                ss >> v;
+                for (size_t k = 0; k < v.size(); k++)
+                    if (v[k].type == MSG_CHATREC)
+                        nOffered++;
+            }
+        nFail += Check(nOffered == 2, "getchatinv is answered with the ids of every record held") ? 0 : 1;
+
+        peerChat->vRecv.insert(peerChat->vRecv.end(), &once[0], &once[0] + once.size());
+        ProcessMessages(peerChat);
+        DrainMessages(*peerChat, msgs);
+        nFail += Check(msgs.empty(), "and asking again straight away gets nothing") ? 0 : 1;
+    }
+
+    // ---- descriptors: published by one identity, resolved and verified by the client rules
+    {
+        btfchat::Identity alice;
+        std::vector<unsigned char> seed(64, 0x77);
+        btfchat::DeriveIdentityFromSeed(seed, "senha-bem-comprida", alice, err);
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        std::string encHex = HexStr(alice.chan_pk, alice.chan_pk + 32, false);   // no spaces: the default has them
+        int64 nCreated = GetTime();
+        std::string onion = "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8533";
+        std::string desc = btf::SignDescriptor(ctx, alice.sign_sk, encHex, "", (uint64_t)nCreated, onion);
+        btfchat::ChatRecord d;
+        d.kind = btfchat::CHATREC_DESC;
+        unsigned char pk[32];
+        btf::ParseAddress(alice.address, pk);
+        d.key.assign(pk, pk + 32);
+        d.nTime = nCreated;
+        d.payload.assign(desc.begin(), desc.end());
+        btfchat::ChatRecordMine(d);
+        nResult = -1;
+        nFail += Check(link.Put(d, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                       "a signed chat descriptor is kept") ? 0 : 1;
+
+        std::vector<CChatQuery> q(1);
+        q[0].kind = btfchat::CHATREC_DESC; q[0].key = d.key; q[0].nSince = 0; q[0].nMax = 1;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        bool fOk = link.Get(q, ans, err) && ans.size() == 1 && ans[0].size() == 1;
+        nFail += Check(fOk && btfchat::ChatRecordVerifySigned(ctx, ans[0][0], GetTime(), why),
+                       "and what the node answers verifies against the address asked for") ? 0 : 1;
+        secp256k1_context_destroy(ctx);
+        btfchat::IdentityClear(alice);
+    }
+
+    // ---- the ration: a chat app may not fill the node by itself
+    {
+        CNode* greedy = new CNode(INVALID_SOCKET, CAddress(), true);
+        HandlerStream gs(greedy);
+        btfchat::NodeLink gl(gs);
+        gl.Handshake(err);
+        btfchat::ChatRecord junk;
+        junk.kind = btfchat::CHATREC_ENVELOPE;
+        junk.key.assign(16, 0);
+        junk.nTime = GetTime();
+        junk.payload.assign(10, 1);
+        for (int i = 0; i < 60; i++)
+            gl.Put(junk, nResult, why, err);
+        btfchat::ChatRecord fine = SelfTestEnvelope(tag, 100);
+        nResult = -1;
+        nFail += Check(gl.Put(fine, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED &&
+                       why.find("slow down") != std::string::npos,
+                       "past sixty records a minute, even a good one is turned away") ? 0 : 1;
+        delete greedy;
+    }
+
+    // ---- the public community directory: a listing in a block, read by the
+    // node, asked for by the app
+    {
+        unsigned char ckey[32];
+        RAND_bytes(ckey, 32);
+        std::vector<unsigned char> data = community::ListingData(ckey, "selftest-room");
+        CBlock block;
+        CTransaction tx;
+        tx.vin.resize(1);
+        tx.vout.push_back(CTxOut(community::MIN_BURN, CScript() << OP_RETURN << data));
+        CTransaction cheap = tx;
+        cheap.vout[0].nValue = community::MIN_BURN - 1;
+        cheap.vout[0].scriptPubKey = CScript() << OP_RETURN << community::ListingData(ckey, "cheap-room");
+        block.vtx.push_back(tx);
+        block.vtx.push_back(cheap);
+        nFail += Check(ChatDirectoryScanBlock(block, 4242) == 1,
+                       "the node reads a listing out of a block, and not one that burned too little") ? 0 : 1;
+        std::vector<CChatListing> dir;
+        int nHeight = -1;
+        nFail += Check(link.GetDirectory(dir, nHeight, err), "the app asks the node for the directory") ? 0 : 1;
+        bool fFound = false;
+        for (size_t i = 0; i < dir.size(); i++)
+            if (dir[i].name == "selftest-room" && dir[i].nHeight == 4242 &&
+                dir[i].key == std::vector<unsigned char>(ckey, ckey + 32))
+                fFound = true;
+        nFail += Check(fFound, "and gets the listing back, key, name and block") ? 0 : 1;
+        nFail += Check(ChatDirectoryScanBlock(block, 4243) == 0, "a listing seen once is not listed twice") ? 0 : 1;
+    }
+
+    // ---- the client will not use a node that does not hold chat records
+    {
+        uint64 nSaved = nLocalServices;
+        nLocalServices = NODE_NETWORK;            // what a 1.2.28 node says
+        CNode* old = new CNode(INVALID_SOCKET, CAddress(), true);
+        nLocalServices = nSaved;
+        HandlerStream os(old);
+        btfchat::NodeLink ol(os);
+        bool fShook = ol.Handshake(err);
+        nFail += Check(!fShook && err.find("older release") != std::string::npos,
+                       "a node from before the chat is recognised and not used") ? 0 : 1;
+        delete old;
+    }
+
+    CRITICAL_BLOCK(cs_vNodes)
+    {
+        vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peerChat));
+        vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peerOld));
+    }
+    delete peerChat;
+    delete peerOld;
+    delete app;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// Not part of `make tests`: it needs Tor and the live network. It is the bench
+// proof that the offline mailbox works against real nodes over real Tor, which
+// chat-relay cannot be -- that one runs the node handler in-process.
+//
+// Starts its own Tor in a temp datadir (the bundled one beside the exe, or the
+// tor.exe named by BITFLASH_TOR), then: asks the network for a tag nobody uses,
+// leaves an envelope under a fresh tag, and collects it back. Prints what it
+// reached and why it failed, so a failure says which half broke.
+static int RunChatLiveSelfTest()
+{
+    printf("chat-live self-test (%s, needs Tor and the network)\n", IsTestNet() ? "testnet" : "mainnet");
+    int nFail = 0;
+    // Self-tests run before StartNode(), which is where the node starts
+    // Winsock. Without this every socket fails at once and the dial reads
+    // "could not reach ... over Tor" in zero seconds -- which is what the first
+    // live runs showed, against a seed curl reached fine through the same Tor.
+#ifdef _WIN32
+    SelfTestWinsock wsa;
+#endif
+
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+
+    std::string torPath, err;
+    const char* pszTor = getenv("BITFLASH_TOR");
+    if (pszTor && *pszTor)
+        torPath = pszTor;
+    else if (!BtfBundledTorPath(torPath))
+    {
+        printf("no Tor: put tor/ beside the exe or set BITFLASH_TOR to tor.exe\n");
+        return 1;
+    }
+    // No transport ladder here. This build counts peers to decide whether Tor
+    // works, a self-test has none, and the watchdog would move Tor onto
+    // bridges mid-run -- which is what made the first run from the 202 take
+    // eight minutes. The test is of the chat, not of the censorship fallback.
+    BtfSetTorFallbackEnabled(false);
+    if (!BtfStartManagedTor(torPath, err))
+    {
+        printf("Tor did not start: %s\n", err.c_str());
+        return 1;
+    }
+    int64 nStart = GetTime();
+    while (BtfManagedTorBootstrapPercent() < 100 && GetTime() - nStart < 240)
+        Sleep(1000);
+    printf("  Tor bootstrap %d%% after %d s\n", BtfManagedTorBootstrapPercent(), (int)(GetTime() - nStart));
+
+    unsigned char tag[16];
+    RAND_bytes(tag, sizeof(tag));
+    std::string tagHex = HexStr(tag, tag + 16, false);   // no spaces: the default has them
+
+    std::vector<std::pair<std::string, int64_t> > ask(1, std::make_pair(tagHex, (int64_t)0));
+    std::map<std::string, std::vector<std::vector<unsigned char> > > got;
+    // "Bootstrapped 100%" is not yet "can find an onion": right after it Tor
+    // may still lack the directory servers that hold onion descriptors, and a
+    // dial then fails at once. The chat app simply asks again next round; this
+    // does the same, a few times, past the client's own back-off.
+    bool fAsked = false;
+    for (int nTry = 1; nTry <= 4 && !fAsked; nTry++)
+    {
+        int64 t0 = GetTime();
+        fAsked = btfchat::NetFetchEnvelopes(ask, got, err);
+        printf("  first question, try %d: %s in %d s%s%s\n", nTry, fAsked ? "answered" : "NOT answered",
+               (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+        if (!fAsked && nTry < 4)
+            Sleep(70 * 1000);
+    }
+    int64 t0 = GetTime();
+    nFail += Check(fAsked && got[tagHex].empty(),
+                   "a node of this network answers, and has nothing under a tag nobody used") ? 0 : 1;
+
+    std::vector<unsigned char> env(600);
+    RAND_bytes(&env[0], (int)env.size());
+    t0 = GetTime();
+    bool fLeft = btfchat::NetPostEnvelope(tagHex, env, err);
+    printf("  leaving an envelope: %s in %d s%s%s\n", fLeft ? "kept" : "NOT kept",
+           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+    nFail += Check(fLeft, "an envelope is kept by at least one node") ? 0 : 1;
+
+    got.clear();
+    t0 = GetTime();
+    bool fBack = btfchat::NetFetchEnvelopes(ask, got, err) && got[tagHex].size() == 1 &&
+                 got[tagHex][0] == env;
+    printf("  collecting it: %s in %d s%s%s\n", fBack ? "found" : "NOT found",
+           (int)(GetTime() - t0), err.empty() ? "" : " -- ", err.c_str());
+    nFail += Check(fBack, "and comes back, byte for byte, from the network") ? 0 : 1;
+
+    size_t nKnown = 0, nGood = 0;
+    btfchat::NetNodeCounts(nKnown, nGood);
+    printf("  nodes known %u, answering %u\n", (unsigned)nKnown, (unsigned)nGood);
+
+    BtfStopManagedTor();
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+static int RunChatIdentitySelfTest()
+{
+    printf("chat-identity self-test\n");
+    int nFail = 0;
+
+    // SetHDSeedFromMnemonic writes to wallet.dat, so this runs in a datadir of
+    // its own and takes nothing real with it.
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    printf("  temp datadir: %s\n", tmp.c_str());
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+
+    std::string err;
+    std::vector<unsigned char> seed;
+
+    // A wallet with no phrase installed hands out nothing, and says so rather
+    // than handing back something derived from whatever happened to be in the
+    // globals.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(!btfchat::ChatSeedFromWallet(seed, err) && seed.empty(),
+                   "a wallet with no recovery phrase yields no chat seed") ? 0 : 1;
+    btfchat::Identity none;
+    nFail += Check(!btfchat::UnlockIdentity("senha-bem-comprida", none, err),
+                   "and no identity can be unlocked from it") ? 0 : 1;
+
+    // Install a phrase the way -restorephrase does, then check the chat seed is
+    // exactly master || chain code.
+    const char* PHRASE =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "a phrase installs") ? 0 : 1;
+    nFail += Check(HaveHDSeed(), "and the wallet has an HD seed") ? 0 : 1;
+
+    nFail += Check(btfchat::ChatSeedFromWallet(seed, err) && seed.size() == 64,
+                   "the chat seed is 64 bytes") ? 0 : 1;
+    if (seed.size() == 64 && vchHDMaster.size() == 32 && vchHDChainCode.size() == 32)
+    {
+        nFail += Check(memcmp(&seed[0], &vchHDMaster[0], 32) == 0 &&
+                       memcmp(&seed[32], &vchHDChainCode[0], 32) == 0,
+                       "and it is the master key followed by the chain code") ? 0 : 1;
+    }
+    else
+        nFail++;
+
+    // The identity, and the properties the whole design rests on.
+    btfchat::Identity id1, id2, idOther;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", id1, err),
+                   "an identity unlocks with a session password") ? 0 : 1;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", id2, err) &&
+                   id1.address == id2.address,
+                   "the same password gives the same .btf address") ? 0 : 1;
+    nFail += Check(btfchat::UnlockIdentity("outra-senha-comprida", idOther, err) &&
+                   idOther.address != id1.address,
+                   "another password gives a DIFFERENT identity, not an error") ? 0 : 1;
+    nFail += Check(!btfchat::UnlockIdentity("curta", none, err),
+                   "a password under 12 characters is refused") ? 0 : 1;
+
+    // The chat key is not the wallet key. If this ever fails, being reachable
+    // for a conversation would be publishing spending material.
+    CKey walletKey;
+    if (DeriveHDKey(0, walletKey, err))
+    {
+        // GetPrivKey returns a secure_allocator vector, so it is copied byte by
+        // byte rather than assigned to a plain one.
+        CPrivKey vchWalletPriv = walletKey.GetPrivKey();
+        std::string strWallet((const char*)&vchWalletPriv[0], vchWalletPriv.size());
+        std::string strChatSign((const char*)id1.sign_sk, 32);
+        std::string strChatChan((const char*)id1.chan_sk, 32);
+        nFail += Check(strWallet.find(strChatSign) == std::string::npos,
+                       "the chat signing key is not the wallet's first key") ? 0 : 1;
+        nFail += Check(strWallet.find(strChatChan) == std::string::npos,
+                       "nor is the chat channel key") ? 0 : 1;
+    }
+    else
+        nFail++;
+    nFail += Check(memcmp(id1.sign_sk, &vchHDMaster[0], 32) != 0,
+                   "and neither is the wallet master key itself") ? 0 : 1;
+
+    // Reinstalling the same phrase rebuilds the same chat identity: this is what
+    // makes the chat survive moving to another machine with the words alone.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "the phrase installs again") ? 0 : 1;
+    btfchat::Identity idAgain;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", idAgain, err) &&
+                   idAgain.address == id1.address,
+                   "and the chat identity comes back identical") ? 0 : 1;
+
+    // A BIP39 passphrase makes a different wallet, so a different chat identity.
+    // Stated in a test because it is the kind of thing a user discovers the hard
+    // way otherwise.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "vigesima-quinta-palavra", err),
+                   "the same phrase with a 25th word installs") ? 0 : 1;
+    btfchat::Identity idPass;
+    nFail += Check(btfchat::UnlockIdentity("senha-bem-comprida", idPass, err) &&
+                   idPass.address != id1.address,
+                   "and gives a different chat identity, as it must") ? 0 : 1;
+
+    // ---- closing the app and opening it again (what a tester ran into)
+    // A message left while the app was closed is sealed to the mailbox key
+    // published before closing; and a mistyped password must not open an
+    // empty chat as somebody else and then save over the real one.
+    vchHDMaster.clear();
+    vchHDChainCode.clear();
+    nFail += Check(SetHDSeedFromMnemonic(PHRASE, "", err), "back to the plain phrase") ? 0 : 1;
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err), "the chat opens") ? 0 : 1;
+    std::string strPub = btfchat::ChatMailboxPublicHex();
+    std::string strAddr = btfchat::ChatAddress();
+    nFail += Check(strPub.size() == 64, "with this epoch's mailbox key, the one others seal to") ? 0 : 1;
+    btfchat::ChatLock();
+    std::string strFile = btfchat::ChatStorePath(), strBefore, strAfter;
+    {
+        FILE* f = fopen(strFile.c_str(), "rb");
+        char buf[4096];
+        size_t n;
+        while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+            strBefore.append(buf, n);
+        if (f) fclose(f);
+    }
+    nFail += Check(!strBefore.empty(), "closing it leaves the sealed store on disk") ? 0 : 1;
+    nFail += Check(!btfchat::ChatUnlock("senha-digitada-errada", err) && !btfchat::ChatUnlocked() &&
+                   err.find("different identity") != std::string::npos,
+                   "a mistyped password is refused, saying why -- not an empty chat as somebody else") ? 0 : 1;
+    {
+        FILE* f = fopen(strFile.c_str(), "rb");
+        char buf[4096];
+        size_t n;
+        while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+            strAfter.append(buf, n);
+        if (f) fclose(f);
+    }
+    nFail += Check(strAfter == strBefore, "and the saved chat is left byte for byte as it was") ? 0 : 1;
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err) && btfchat::ChatAddress() == strAddr,
+                   "the right password opens it again, as the same identity") ? 0 : 1;
+    nFail += Check(btfchat::ChatMailboxPublicHex() == strPub,
+                   "with the SAME mailbox key: a message left while it was closed opens") ? 0 : 1;
+    btfchat::ChatLock();
+
+    printf("%s (%d failures)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail);
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunManagedTorSelfTest()
 {
     printf("managed-tor self-test\n");
@@ -4651,6 +5950,85 @@ static int RunManagedTorSelfTest()
                    "maps a second port (p2p+1) for the mining pool over onion") ? 0 : 1;
     nFail += Check(torrc.find("UseBridges") == std::string::npos,
                    "no bridge config when none is requested") ? 0 : 1;
+
+    // btfchat's hidden service. Not requested unless a port is set, and when it
+    // is, it gets its OWN HiddenServiceDir -- a second virtual port on the node's
+    // onion would make the chat address and the P2P address the same string, and
+    // being reachable for a conversation would publish which node you mine on.
+    nFail += Check(torrc.find("chat-onion") == std::string::npos,
+                   "no chat onion service unless one is asked for") ? 0 : 1;
+    nFail += Check(BtfManagedTorChatPort() == 0,
+                   "the chat service is off by default") ? 0 : 1;
+    nFail += Check(BtfManagedTorChatOnion().empty(),
+                   "and has no onion until Tor makes one") ? 0 : 1;
+
+    std::string torrcC = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 8533);
+    nFail += Check(torrcC.find("HiddenServiceDir \"C:/mt/chat-onion-service\"") != std::string::npos,
+                   "the chat service gets its own hidden service directory") ? 0 : 1;
+    nFail += Check(torrcC.find("HiddenServicePort 8533 127.0.0.1:8533") != std::string::npos,
+                   "mapped to the chat listener") ? 0 : 1;
+    // Order is not cosmetic here: in a torrc a HiddenServicePort belongs to the
+    // HiddenServiceDir above it, so the chat's Dir line has to come after the
+    // node's ports or the chat port would be added to the node's onion instead.
+    nFail += Check(torrcC.find("C:/mt/chat-onion-service") >
+                   torrcC.find("HiddenServicePort 8434 127.0.0.1:8434"),
+                   "and declared after the node ports, so the two do not merge") ? 0 : 1;
+    nFail += Check(torrcC.find("HiddenServiceDir \"C:/mt/onion-service\"") != std::string::npos,
+                   "while the node keeps its own service") ? 0 : 1;
+    // Two Dir lines, two services, two .onion names.
+    {
+        size_t nDirs = 0, at = 0;
+        while ((at = torrcC.find("HiddenServiceDir ", at)) != std::string::npos)
+        { nDirs++; at += 1; }
+        nFail += Check(nDirs == 2, "exactly two hidden services, so two onion names") ? 0 : 1;
+    }
+    // A port with no directory, or a directory with no port, asks for nothing:
+    // half a service in a torrc is a Tor that refuses to start.
+    std::string torrcD = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    std::string(), 8533);
+    nFail += Check(torrcD.find("8533") == std::string::npos,
+                   "a chat port with no directory is ignored") ? 0 : 1;
+    std::string torrcE = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 8433,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 0);
+    nFail += Check(torrcE.find("chat-onion") == std::string::npos,
+                   "and a directory with no port is ignored too") ? 0 : 1;
+
+    // btfchat runs no peer-to-peer node, so it asks for no node service: a P2P
+    // port of 0 means "nothing listens here". An onion that exists and refuses
+    // every connection still announces a Bitflash node at that address, which is
+    // precisely what a chat identity must not do.
+    std::string torrcF = BtfBuildManagedTorrcForTest("C:/mt/data", "C:/mt/onion-service",
+                                                    19050, 19051, 0,
+                                                    std::vector<std::string>(),
+                                                    std::map<std::string, std::string>(),
+                                                    "C:/mt/chat-onion-service", 8533);
+    nFail += Check(torrcF.find("C:/mt/onion-service") == std::string::npos,
+                   "a P2P port of 0 asks for no node onion service") ? 0 : 1;
+    nFail += Check(torrcF.find("HiddenServicePort 8433") == std::string::npos &&
+                   torrcF.find("HiddenServicePort 8434") == std::string::npos,
+                   "and maps neither the P2P port nor the pool port") ? 0 : 1;
+    nFail += Check(torrcF.find("HiddenServiceDir \"C:/mt/chat-onion-service\"") != std::string::npos &&
+                   torrcF.find("HiddenServicePort 8533 127.0.0.1:8533") != std::string::npos,
+                   "while the chat still gets its own service") ? 0 : 1;
+    {
+        size_t nDirs = 0, at = 0;
+        while ((at = torrcF.find("HiddenServiceDir ", at)) != std::string::npos)
+        { nDirs++; at += 1; }
+        nFail += Check(nDirs == 1, "exactly one hidden service: the chat's") ? 0 : 1;
+    }
+    // And SOCKS is still there, because that is how the chat dials out at all.
+    nFail += Check(torrcF.find("SocksPort 127.0.0.1:19050") != std::string::npos,
+                   "with SOCKS still bound, which is how it dials out") ? 0 : 1;
 
     // With PT binaries and bridges, the torrc must wire both transports: one
     // ClientTransportPlugin per binary, then every Bridge line.
@@ -4777,6 +6155,962 @@ static int RunManagedTorSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The Bitcoin half of a swap, without a Bitcoin Core: addresses, reading
+// Bitcoin's witness serialization, and the redeem and refund this wallet
+// signs. What Core itself does with them is the regtest run's job.
+static int RunBtcSwapSelfTest()
+{
+    printf("btc-swap self-test\n");
+    int nFail = 0;
+    std::string err;
+
+    btcswap::Chain mainChain, testChain;
+    mainChain.name = "main";
+    mainChain.fMain = true;
+    mainChain.pkhVersion = 0x00;
+    mainChain.shVersion = 0x05;
+    testChain.name = "regtest";
+    testChain.pkhVersion = 0x6f;
+    testChain.shVersion = 0xc4;
+
+    // ---- addresses
+    std::vector<unsigned char> zero(20, 0), pkh;
+    nFail += Check(btcswap::PkhToAddress(mainChain, zero) == "1111111111111111111114oLvT2",
+                   "a zero key hash is 1111111111111111111114oLvT2 on main, as in Bitcoin") ? 0 : 1;
+    nFail += Check(btcswap::PkhToAddress(testChain, zero) == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8",
+                   "and mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8 on the test chains") ? 0 : 1;
+    nFail += Check(btcswap::AddressToPkh(mainChain, "1111111111111111111114oLvT2", pkh, err) && pkh == zero,
+                   "a main address reads back to its key hash") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(testChain, "1111111111111111111114oLvT2", pkh, err) &&
+                   err.find("another Bitcoin network") != std::string::npos,
+                   "a main address is refused on a test chain") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(mainChain, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", pkh, err),
+                   "a bc1 address is refused: the contract holds a key hash") ? 0 : 1;
+    CScript scriptAny;
+    scriptAny << OP_TRUE;
+    nFail += Check(btcswap::ScriptAddress(mainChain, scriptAny)[0] == '3' && btcswap::ScriptAddress(testChain, scriptAny)[0] == '2',
+                   "a contract's address is 3... on main and 2... on the test chains") ? 0 : 1;
+    nFail += Check(!btcswap::AddressToPkh(mainChain, btcswap::ScriptAddress(mainChain, scriptAny), pkh, err) &&
+                   err.find("script address") != std::string::npos,
+                   "a script address is refused as a party to the contract") ? 0 : 1;
+
+    // ---- a contract whose keys are this wallet's
+    CKey keyR, keyF;
+    keyR.MakeNewKey();
+    keyF.MakeNewKey();
+    std::vector<unsigned char> pubR = keyR.GetPubKey(), pubF = keyF.GetPubKey();
+    uint160 hR = Hash160(pubR), hF = Hash160(pubF);
+    swap::Contract c;
+    c.recipientPkh.assign(hR.begin(), hR.end());
+    c.refundPkh.assign(hF.begin(), hF.end());
+    std::vector<unsigned char> secret(32);
+    RAND_bytes(&secret[0], 32);
+    c.secretHash.resize(32);
+    SHA256(&secret[0], 32, &c.secretHash[0]);
+    c.nLockTime = 1800000000;
+    CScript contract = swap::BuildContract(c);
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+
+    // ---- Bitcoin's serialization, with and without a witness
+    CTransaction fund;
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint(uint256(7), 1);
+    fund.vout.push_back(CTxOut(10000000, p2sh));
+    fund.vout.push_back(CTxOut(5000, CScript() << OP_0 << std::vector<unsigned char>(20, 1)));
+    CDataStream ss(SER_NETWORK);
+    ss << fund;
+    std::vector<unsigned char> plain(ss.begin(), ss.end());
+    std::vector<unsigned char> wit(plain.begin(), plain.begin() + 4);
+    wit.push_back(0x00);
+    wit.push_back(0x01);
+    wit.insert(wit.end(), plain.begin() + 4, plain.end() - 4);
+    wit.push_back(2);                                   // two witness items
+    wit.push_back(72);
+    wit.insert(wit.end(), 72, 0x30);
+    wit.push_back(33);
+    wit.insert(wit.end(), 33, 0x02);
+    wit.insert(wit.end(), plain.end() - 4, plain.end());
+
+    CTransaction parsed;
+    nFail += Check(btcswap::ParseTx(wit, parsed) && parsed.GetHash() == fund.GetHash() &&
+                   parsed.vout.size() == 2 && parsed.vout[0].scriptPubKey == p2sh,
+                   "a witness transaction reads, with the txid of its form without the witness") ? 0 : 1;
+    nFail += Check(btcswap::ParseTx(plain, parsed) && parsed.GetHash() == fund.GetHash(),
+                   "and so does the same transaction without one") ? 0 : 1;
+    std::vector<unsigned char> cut(wit.begin(), wit.end() - 5), extra = wit;
+    extra.push_back(0);
+    nFail += Check(!btcswap::ParseTx(cut, parsed) && !btcswap::ParseTx(extra, parsed),
+                   "a truncated transaction, or one with bytes after it, does not") ? 0 : 1;
+    std::vector<unsigned char> blk(80, 0);
+    blk.push_back(2);
+    blk.insert(blk.end(), wit.begin(), wit.end());
+    blk.insert(blk.end(), plain.begin(), plain.end());
+    std::vector<CTransaction> txs;
+    nFail += Check(btcswap::ParseBlockTxs(blk, txs) && txs.size() == 2 && txs[0].GetHash() == fund.GetHash() &&
+                   txs[1].GetHash() == fund.GetHash(),
+                   "a raw block reads into its transactions, witness or not") ? 0 : 1;
+
+    // ---- the redeem this wallet signs
+    COutPoint outpoint(fund.GetHash(), 0);
+    CScript scriptTo;
+    scriptTo << OP_0 << std::vector<unsigned char>(20, 2);    // Core's bc1 address
+    CTransaction redeem, refund;
+    int64 nFee = 0;
+    nFail += Check(btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, &secret, 10000, redeem, nFee, err),
+                   "the recipient key and the secret redeem the contract") ? 0 : 1;
+    int64 nSize = (int64)::GetSerializeSize(redeem, SER_NETWORK);
+    int64 nNeed = (nSize * 10000 + 999) / 1000;
+    // At least the rate for its size; a signature is 71 to 73 bytes, so at
+    // most a couple of bytes' worth over.
+    nFail += Check(nFee >= nNeed && nFee <= nNeed + 30 && redeem.vout.size() == 1 &&
+                   redeem.vout[0].nValue == 10000000 - nFee && redeem.vout[0].scriptPubKey == scriptTo,
+                   "one output, to Core's address, the fee at the rate asked for its size") ? 0 : 1;
+    std::vector<unsigned char> got;
+    nFail += Check(swap::ExtractSecret(redeem.vin[0].scriptSig, c.secretHash, got) && got == secret,
+                   "the redeem shows the secret, as the other side needs") ? 0 : 1;
+    CDataStream ssR(SER_NETWORK);
+    ssR << redeem;
+    CTransaction back;
+    nFail += Check(btcswap::ParseTx(std::vector<unsigned char>(ssR.begin(), ssR.end()), back) && back.GetHash() == redeem.GetHash(),
+                   "and serializes as a plain Bitcoin transaction") ? 0 : 1;
+    std::vector<unsigned char> wrong(32, 9);
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, &wrong, 10000, redeem, nFee, err),
+                   "a wrong secret does not") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyF, pubF, &secret, 10000, redeem, nFee, err),
+                   "nor does the refund key with the secret") ? 0 : 1;
+
+    // ---- the refund
+    nFail += Check(btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyF, pubF, NULL, 10000, refund, nFee, err) &&
+                   refund.nLockTime == (unsigned int)c.nLockTime && refund.vin[0].nSequence == 0,
+                   "the refund key refunds, with the lock in nLockTime and an input that keeps it on") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 10000000, scriptTo, keyR, pubR, NULL, 10000, refund, nFee, err),
+                   "the recipient cannot take the refund path") ? 0 : 1;
+    nFail += Check(!btcswap::BuildSpend(contract, outpoint, 1500, scriptTo, keyR, pubR, &secret, 10000, redeem, nFee, err) &&
+                   err.find("less than the fee") != std::string::npos,
+                   "a contract worth less than its fee is not spent into dust") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- fee-policy: fees as a market, and replacing a transaction (BIP125) --------
+//
+// In a temporary data directory, through the real memory pool: a parent sits
+// in the pool, its children spend it with different fees, and AcceptTransaction
+// decides on every replacement exactly as it does for one off the network.
+
+extern map<COutPoint, CInPoint> mapNextTx;   // main.cpp
+
+// Into the pool with no checks, as AddToMemoryPool does (it is protected):
+// for a parent whose own inputs the test does not have.
+static void FeeTestAddToPool(const CTransaction& tx)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        uint256 h = tx.GetHash();
+        mapTransactions[h] = tx;
+        for (unsigned int i = 0; i < tx.vin.size(); i++)
+            mapNextTx[tx.vin[i].prevout] = CInPoint(&mapTransactions[h], i);
+    }
+}
+
+static CTransaction FeeTestChild(const CTransaction& parent, unsigned int n, int64 nFee, unsigned int nSequence,
+                                 const CScript& scriptTo)
+{
+    CTransaction tx;
+    tx.vin.push_back(CTxIn(parent.GetHash(), n, CScript(), nSequence));
+    tx.vout.push_back(CTxOut(parent.vout[n].nValue - nFee, scriptTo));
+    return tx;
+}
+
+static int RunFeePolicySelfTest()
+{
+    printf("fee-policy self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    try
+    {
+        // ---- the rules on their own
+        CTransaction t;
+        t.vin.resize(1);
+        nFail += Check(!t.SignalsReplacement(), "an input with the final sequence does not allow replacement") ? 0 : 1;
+        t.vin[0].nSequence = SEQUENCE_FINAL - 1;
+        nFail += Check(!t.SignalsReplacement(), "nor does final minus one (that is for nLockTime alone)") ? 0 : 1;
+        t.vin[0].nSequence = SEQUENCE_REPLACEABLE;
+        nFail += Check(t.SignalsReplacement(), "below that, it does") ? 0 : 1;
+        nFail += Check(FeeForSize(1000, 250) == 250 && FeeForSize(1000, 1) == 1 && FeeForSize(1001, 1000) == 1001,
+                       "a rate per 1000 bytes rounds up to whole satoshis") ? 0 : 1;
+        std::string why;
+        std::vector<std::pair<int64, unsigned int> > vOld(1, std::make_pair((int64)100000, 200u));
+        nFail += Check(ReplacementPaysEnough(100000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200), 200, vOld, why),
+                       "a replacement paying the old fee plus the relay fee for its size is enough") ? 0 : 1;
+        nFail += Check(!ReplacementPaysEnough(100000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200) - 1, 200, vOld, why),
+                       "one satoshi less is not") ? 0 : 1;
+        nFail += Check(!ReplacementPaysEnough(1000000, 2000, vOld, why) && why.find("per byte") != std::string::npos,
+                       "more in total but less per byte is not") ? 0 : 1;
+        vOld.push_back(std::make_pair((int64)100000, 200u));
+        nFail += Check(!ReplacementPaysEnough(150000, 200, vOld, why),
+                       "replacing two, it has to pay for both") ? 0 : 1;
+
+        // ---- the pool
+        CTxDB txdb("cr+");
+        CKey key;
+        key.MakeNewKey();
+        CScript scriptTo;
+        scriptTo << OP_DUP << OP_HASH160 << Hash160(key.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+        CTransaction parent;
+        parent.vin.push_back(CTxIn(COutPoint(uint256(77), 0)));
+        for (int i = 0; i < 6; i++)
+            parent.vout.push_back(CTxOut(10 * COIN, CScript() << OP_TRUE));
+        FeeTestAddToPool(parent);
+
+        CTransaction a = FeeTestChild(parent, 0, 1000, SEQUENCE_REPLACEABLE, scriptTo);
+        CTransaction b = FeeTestChild(parent, 1, 9000, SEQUENCE_REPLACEABLE, scriptTo);
+        CTransaction c = FeeTestChild(parent, 2, 5000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(a.AcceptTransaction(txdb, true) && b.AcceptTransaction(txdb, true) && c.AcceptTransaction(txdb, true),
+                       "three children paying 1000, 9000 and 5000 enter the pool") ? 0 : 1;
+        std::vector<CTransaction*> vOrder;
+        CRITICAL_BLOCK(cs_mapTransactions)
+            MempoolByFeeRate(txdb, vOrder);
+        bool fOrder = vOrder.size() == 4 && vOrder[0]->GetHash() == b.GetHash() && vOrder[1]->GetHash() == c.GetHash() &&
+                      vOrder[2]->GetHash() == a.GetHash();
+        nFail += Check(fOrder, "a block takes them best fee per byte first: 9000, 5000, 1000 (the parent, unpriced, last)") ? 0 : 1;
+
+        CTransaction a2 = FeeTestChild(parent, 0, 1000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200) + 500,
+                                       SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(a2.AcceptTransaction(txdb, true), "a replacement for the 1000 that pays enough more is taken") ? 0 : 1;
+        bool fGone = false, fIn = false;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            fGone = !mapTransactions.count(a.GetHash());
+            fIn = mapTransactions.count(a2.GetHash()) > 0;
+        }
+        nFail += Check(fGone && fIn, "and the one it replaces leaves the pool") ? 0 : 1;
+        CTransaction a3 = FeeTestChild(parent, 0, 1001, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(!a3.AcceptTransaction(txdb, true), "one paying less than what is there now is refused") ? 0 : 1;
+
+        CTransaction d = FeeTestChild(parent, 3, 1000, SEQUENCE_FINAL, scriptTo);
+        CTransaction d2 = FeeTestChild(parent, 3, 50000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(d.AcceptTransaction(txdb, true) && !d2.AcceptTransaction(txdb, true),
+                       "a transaction that did not allow replacement is not replaced, whatever the fee") ? 0 : 1;
+        // The 0.1.0 rule took a "newer version" -- a higher sequence -- for
+        // the same fee, again and again. Sequence 5 then 6, same fee:
+        CTransaction f = FeeTestChild(parent, 5, 1000, 5, scriptTo);
+        CTransaction f2 = FeeTestChild(parent, 5, 1000, 6, scriptTo);
+        nFail += Check(f.AcceptTransaction(txdb, true) && !f2.AcceptTransaction(txdb, true),
+                       "the old free replacement by a higher sequence is gone: a replacement pays") ? 0 : 1;
+
+        CTransaction e = FeeTestChild(parent, 4, 1000, SEQUENCE_REPLACEABLE, scriptTo);
+        bool fE = e.AcceptTransaction(txdb, true);
+        // A child of e, so replacing e would drop it too.
+        CTransaction eChild;
+        eChild.vin.push_back(CTxIn(e.GetHash(), 0, CScript(), SEQUENCE_REPLACEABLE));
+        eChild.vout.push_back(CTxOut(e.vout[0].nValue - 1000, scriptTo));
+        FeeTestAddToPool(eChild);
+        CTransaction e2 = FeeTestChild(parent, 4, 90000, SEQUENCE_REPLACEABLE, scriptTo);
+        nFail += Check(fE && !e2.AcceptTransaction(txdb, true),
+                       "a transaction others build on in the pool is not replaced") ? 0 : 1;
+
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            mapTransactions.clear();
+            mapNextTx.clear();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    DBFlush(true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- invoice: the shop's own payment gateway (invoice.h) ------------------------
+
+static int RunInvoiceSelfTest()
+{
+    printf("invoice self-test\n");
+    int nFail = 0;
+    using invoice::StatusFor;
+    // ---- the status rule
+    nFail += Check(StatusFor(100, 0, 0, false, 2000, 1000) == "waiting", "nothing yet: waiting") ? 0 : 1;
+    nFail += Check(StatusFor(100, 40, 0, false, 2000, 1000) == "partial", "some of it: partial") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 0, false, 2000, 1000) == "seen", "all of it, unconfirmed: seen -- not money yet") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, false, 2000, 1000) == "paid", "all of it, confirmed: paid") ? 0 : 1;
+    nFail += Check(StatusFor(100, 150, 150, false, 2000, 1000) == "paid", "more than asked is still paid (and reported as overpaid)") ? 0 : 1;
+    nFail += Check(StatusFor(100, 40, 0, false, 2000, 3000) == "expired", "the time ran out first: expired") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, false, 2000, 3000) == "paid", "paid after the time ran out is still paid: the money is there") ? 0 : 1;
+    nFail += Check(StatusFor(100, 100, 100, true, 2000, 1000) == "cancelled", "cancelled is cancelled") ? 0 : 1;
+
+    // ---- the signature a shop checks (RFC 4231-style known vector)
+    nFail += Check(invoice::SignBody("key", "The quick brown fox jumps over the lazy dog") ==
+                   "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+                   "the webhook signature is HMAC-SHA256, as any shop's code computes it") ? 0 : 1;
+
+    // ---- URLs
+    std::string host, path;
+    unsigned short port = 0;
+    nFail += Check(invoice::ParseHttpUrl("http://127.0.0.1:8080/btf/hook", host, port, path) &&
+                   host == "127.0.0.1" && port == 8080 && path == "/btf/hook", "http://host:port/path reads") ? 0 : 1;
+    nFail += Check(invoice::ParseHttpUrl("http://shop.example", host, port, path) && port == 80 && path == "/",
+                   "port and path default") ? 0 : 1;
+    nFail += Check(!invoice::ParseHttpUrl("https://shop.example/hook", host, port, path),
+                   "https is refused rather than sent in the clear") ? 0 : 1;
+    nFail += Check(!invoice::ParseHttpUrl("http://shop.example/a b", host, port, path),
+                   "a URL that would break the request line is refused") ? 0 : 1;
+
+    // ---- the QR a checkout page shows
+    std::string svg = invoice::QrSvg("bitflash:BE39QRszEZSeqHnGEHqsZZV2hu5d8GCQAw?amount=1");
+    nFail += Check(svg.compare(0, 4, "<svg") == 0 && svg.find("fill=\"#ffffff\"") != std::string::npos &&
+                   svg.find("M4,4h1v1h-1z") != std::string::npos,
+                   "the QR is an SVG, white behind, the first finder module at the quiet zone's edge") ? 0 : 1;
+
+    // ---- an invoice's life, in a wallet of its own
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    std::string strOld = strSetDataDir;
+    strSetDataDir = tmp;
+    try
+    {
+        if (!LoadWallet())
+            throw std::runtime_error("LoadWallet failed");
+        nlohmann::json a = invoice::Create(150000000, "Two coffees", 600, "order-41");
+        std::string id = a["id"].get<std::string>();
+        nFail += Check(id.size() == 32 && a["status"] == "waiting" && a["amount"].get<double>() == 1.5,
+                       "an invoice is made: an id, waiting, 1.5 BTF") ? 0 : 1;
+        uint160 hAddr;
+        bool fMine = AddressToHash160(a["address"].get<std::string>(), hAddr);
+        CRITICAL_BLOCK(cs_mapKeys)
+            fMine = fMine && mapPubKeys.count(hAddr) && mapKeys.count(mapPubKeys[hAddr]);
+        nFail += Check(fMine,
+                       "its address is a fresh one of this wallet: the money comes straight here") ? 0 : 1;
+        PaymentLink link;
+        std::string err;
+        nFail += Check(ParsePaymentLink(a["copyPaste"].get<std::string>(), link, err) &&
+                       link.address == a["address"] && link.amount == 150000000 && link.message == "Two coffees",
+                       "the copy-and-paste is the payment link, with the amount and what it is for") ? 0 : 1;
+        nFail += Check(a["qrSvg"].get<std::string>().compare(0, 4, "<svg") == 0, "and the QR comes with it") ? 0 : 1;
+        nlohmann::json b = invoice::Create(100000000, "", 600, "");
+        nFail += Check(b["address"] != a["address"], "every invoice has its own address") ? 0 : 1;
+        nFail += Check(invoice::Get(id)["orderId"] == "order-41", "getinvoice finds it by id") ? 0 : 1;
+        nFail += Check(invoice::List("waiting").size() == 2, "listinvoices waiting lists both") ? 0 : 1;
+        invoice::Cancel(b["id"].get<std::string>());
+        nFail += Check(invoice::Get(b["id"].get<std::string>())["status"] == "cancelled" &&
+                       invoice::List("waiting").size() == 1, "a cancelled one leaves the waiting list") ? 0 : 1;
+        bool fThrew = false;
+        try { invoice::Create(0, "", 600, ""); } catch (std::exception&) { fThrew = true; }
+        nFail += Check(fThrew, "an invoice for nothing is refused") ? 0 : 1;
+        fThrew = false;
+        try { invoice::Get("00000000000000000000000000000000"); } catch (std::exception&) { fThrew = true; }
+        nFail += Check(fThrew, "an unknown id is an error, not an empty invoice") ? 0 : 1;
+        FILE* f = fopen((tmp + "/invoices.json").c_str(), "rb");
+        bool fFile = f != NULL;
+        if (f) fclose(f);
+        nFail += Check(fFile, "invoices are kept on disk in the data directory") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    DBFlush(true);
+    strSetDataDir = strOld;
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- chat-swap: the swap engine, end to end, with coins ------------------------
+//
+// Two engines (btfchatswap.h) wired to each other in place of the chat, each
+// to a real Bitflash wallet on testnet and through it to a real Bitcoin Core
+// on regtest. Every round both engines are written out and read back, as if
+// the app had restarted. Not in `make tests`: it needs the wallets and Core.
+//
+//   CHATSWAP_A=port:passfile   Alice's Bitflash wallet (RPC user "swap")
+//   CHATSWAP_B=port:passfile   Bob's
+//   CHATSWAP_BTC=port          the regtest Core both wallets use (user/pass swap/swap,
+//                              wallet "w" mines)
+
+namespace
+{
+struct SwapTestHost : public btfchat::SwapHost
+{
+    std::string addr;
+    SwapTestHost* other = NULL;
+    std::vector<btfchat::LogEntry> convo;
+    std::map<std::string, btfchat::SwapOffer> offers;
+    LoopbackRpc wallet;
+
+    std::string MyAddress() { return addr; }
+    bool PeerAccepted(const std::string&) { return true; }
+    bool Invite(const std::string&, const std::string&, std::string&) { return true; }
+    bool SendStep(const std::string&, const std::string& text, std::string&)
+    {
+        btfchat::LogEntry e;
+        e.from = addr;
+        e.sent = GetTime();
+        unsigned char b[16];
+        RAND_bytes(b, sizeof(b));
+        e.id = HexStr(b, b + sizeof(b), false);
+        e.text = text;
+        e.kind = btfchat::MSG_SWAP;
+        e.outgoing = true;
+        convo.push_back(e);
+        e.outgoing = false;
+        other->convo.push_back(e);
+        return true;
+    }
+    void Contacts(std::vector<std::string>& out) { out.assign(1, other->addr); }
+    void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out = convo; }
+    bool FindMyOffer(const std::string& id, btfchat::SwapOffer& out)
+    {
+        if (!offers.count(id))
+            return false;
+        out = offers[id];
+        return true;
+    }
+    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    {
+        return LoopbackRpcCall(wallet, method, params, r, err);
+    }
+    void Changed() {}
+};
+
+static nlohmann::json SwapTestBtc(int nPort, const std::string& method, const nlohmann::json& params,
+                                  const std::string& path = "/")
+{
+    LoopbackRpc to;
+    to.nPort = nPort;
+    to.strPath = path;
+    to.strAuth = "swap:swap";
+    to.strWho = "Bitcoin Core";
+    nlohmann::json r;
+    std::string err;
+    if (!LoopbackRpcCall(to, method, params, r, err))
+        throw std::runtime_error("Bitcoin Core " + method + ": " + err);
+    return r;
+}
+
+static bool SwapTestWallet(const char* env, LoopbackRpc& to)
+{
+    const char* v = getenv(env);
+    if (!v)
+        return false;
+    std::string s = v;
+    size_t c = s.find(':');
+    if (c == std::string::npos)
+        return false;
+    to.nPort = atoi(s.substr(0, c).c_str());
+    FILE* f = fopen(s.substr(c + 1).c_str(), "rb");
+    if (!f)
+        return false;
+    char buf[256] = "";
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    std::string pass(buf, n);
+    while (!pass.empty() && (pass[pass.size() - 1] == '\n' || pass[pass.size() - 1] == '\r'))
+        pass.erase(pass.size() - 1);
+    to.strAuth = "swap:" + pass;
+    to.strWho = env;
+    to.nTimeoutSecs = 900;
+    return true;
+}
+
+static const btfchat::SwapView* SwapTestFind(const std::vector<btfchat::SwapView>& v)
+{
+    return v.empty() ? NULL : &v.back();
+}
+
+// CHATSWAP_LIGHT=1: both Bitflash wallets run the built-in Bitcoin light
+// client, with Core only as the Bitcoin nodes they reach and as the outside
+// wallet that pays a contract. The person's part, done here: a Bitcoin
+// address to receive (and be refunded) to, and paying the contract's address
+// when the chat asks for it.
+static void SwapTestLightPerson(btfchat::SwapEngine& e, const btfchat::SwapView* v, int nBtcPort,
+                                std::set<std::string>& paid)
+{
+    if (!v || !getenv("CHATSWAP_LIGHT"))
+        return;
+    if (v->btcDestination.empty() && v->myTxid.empty() && v->paymentAddress.empty())
+    {
+        nlohmann::json addr = SwapTestBtc(nBtcPort, "getnewaddress", nlohmann::json::array(), "/wallet/w");
+        e.SetBitcoinDestination(v->id, addr.get<std::string>());
+    }
+    if (v->stage == btfchat::SW_WAIT_PAYMENT && !v->paymentAddress.empty() && !paid.count(v->paymentAddress))
+    {
+        std::string amount = strprintf("%lld.%08lld", (long long)(v->giveAmount / COIN), (long long)(v->giveAmount % COIN));
+        nlohmann::json txid = SwapTestBtc(nBtcPort, "sendtoaddress", nlohmann::json::array({ v->paymentAddress, amount }), "/wallet/w");
+        printf("    paid %s BTC to the contract %s from an outside wallet (%s)\n", amount.c_str(),
+               v->paymentAddress.c_str(), txid.is_string() ? txid.get<std::string>().c_str() : "?");
+        paid.insert(v->paymentAddress);
+    }
+}
+
+// Run both engines until both swaps end, pressing the buttons a person would.
+// stopMaker: stop running the maker once the taker has locked (the maker
+// vanishes); btcSkew: move the regtest clock this far each round once the
+// taker has locked (to reach a Bitcoin refund without waiting for it).
+static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, int nBtcPort,
+                        int64_t nDeadline, bool fStopMakerAfterTakerLocks, int64_t nBtcSkew,
+                        btfchat::SwapView& makerEnd, btfchat::SwapView& takerEnd)
+{
+    std::string lastM, lastT;
+    int64_t nStart = GetTime(), nMock = 0;
+    bool fMakerGone = false;
+    std::set<std::string> paid;
+    while (GetTime() - nStart < nDeadline)
+    {
+        if (!fMakerGone)
+            maker.Round();
+        taker.Round();
+        // As if the app had been closed and opened again.
+        maker.FromJson(maker.ToJson());
+        taker.FromJson(taker.ToJson());
+
+        std::vector<btfchat::SwapView> vm, vt;
+        maker.List(vm);
+        taker.List(vt);
+        const btfchat::SwapView* m = SwapTestFind(vm);
+        const btfchat::SwapView* t = SwapTestFind(vt);
+        std::string err;
+        if (!fMakerGone)
+            SwapTestLightPerson(maker, m, nBtcPort, paid);
+        SwapTestLightPerson(taker, t, nBtcPort, paid);
+        if (m && m->fNeedsMe && !fMakerGone)
+            maker.Approve(m->id, err);
+        if (t && t->fNeedsMe)
+            taker.Approve(t->id, err);
+        std::string sm = m ? strprintf("%d %s", m->stage, m->status.c_str()) : "-";
+        std::string st = t ? strprintf("%d %s", t->stage, t->status.c_str()) : "-";
+        if (sm != lastM) { printf("    [%4ds] maker: %s\n", (int)(GetTime() - nStart), sm.c_str()); lastM = sm; }
+        if (st != lastT) { printf("    [%4ds] taker: %s\n", (int)(GetTime() - nStart), st.c_str()); lastT = st; }
+        fflush(stdout);
+
+        bool fTakerLocked = t && !t->myTxid.empty();
+        // Gone the moment the taker's side is locked -- before the maker's
+        // next round could read lock2 and redeem.
+        if (fStopMakerAfterTakerLocks && fTakerLocked && !fMakerGone)
+        {
+            printf("    the maker goes away\n");
+            fMakerGone = true;
+        }
+        auto fin = [](const btfchat::SwapView* v) {
+            return v && (v->stage == btfchat::SW_DONE || v->stage == btfchat::SW_REFUNDED ||
+                         v->stage == btfchat::SW_CANCELLED || v->stage == btfchat::SW_FAILED);
+        };
+        if (fMakerGone && fin(t))
+        {
+            // The taker is done; the maker comes back, to find its own refund.
+            printf("    the maker comes back\n");
+            fMakerGone = false;
+            fStopMakerAfterTakerLocks = false;
+        }
+        if (fin(m) && fin(t))
+        {
+            makerEnd = *m;
+            takerEnd = *t;
+            return true;
+        }
+        // Bitcoin blocks, so contracts there confirm; Bitflash makes its own.
+        nlohmann::json addr = SwapTestBtc(nBtcPort, "getnewaddress", nlohmann::json::array(), "/wallet/w");
+        if (nBtcSkew > 0 && fTakerLocked)
+        {
+            nMock = std::max<int64_t>(nMock, GetTime()) + nBtcSkew;
+            // A light client refuses headers more than two hours ahead of
+            // its own clock, as Bitcoin nodes do.
+            if (getenv("CHATSWAP_LIGHT"))
+                nMock = std::min<int64_t>(nMock, GetTime() + 5400);
+            SwapTestBtc(nBtcPort, "setmocktime", nlohmann::json::array({ nMock }));
+        }
+        SwapTestBtc(nBtcPort, "generatetoaddress", nlohmann::json::array({ 1, addr }));
+        Sleep(10000);
+    }
+    std::vector<btfchat::SwapView> vm, vt;
+    maker.List(vm);
+    taker.List(vt);
+    if (!vm.empty()) makerEnd = vm.back();
+    if (!vt.empty()) takerEnd = vt.back();
+    return false;
+}
+} // namespace
+
+static int RunChatSwapSelfTest()
+{
+    printf("chat-swap self-test (testnet Bitflash wallets + Bitcoin Core regtest)\n");
+    SwapTestHost a, b;
+    const char* pszBtc = getenv("CHATSWAP_BTC");
+    if (!IsTestNet() || !SwapTestWallet("CHATSWAP_A", a.wallet) || !SwapTestWallet("CHATSWAP_B", b.wallet) || !pszBtc)
+    {
+        printf("  needs -testnet and CHATSWAP_A, CHATSWAP_B, CHATSWAP_BTC; see selftest.cpp\n");
+        return 1;
+    }
+    int nBtc = atoi(pszBtc);
+    int nFail = 0;
+    a.addr = "alice.btf";
+    b.addr = "bob.btf";
+    a.other = &b;
+    b.other = &a;
+
+    // Each scenario on its own: one that throws does not hide the others.
+    {
+        // ---- 1: Alice gives BTF, Bob gives BTC; both finish
+        try {
+            printf("  1. Alice offers 1 BTF for 0.05 BTC; Bob takes it\n");
+            btfchat::SwapEngine ea(&a), eb(&b);
+            btfchat::SwapOffer o;
+            o.give = "BTF"; o.giveAmount = COIN;
+            o.want = "BTC"; o.wantAmount = 5000000;
+            a.offers["11111111111111111111111111111111"] = o;
+            std::string id, err;
+            nFail += Check(eb.Take(a.addr, "11111111111111111111111111111111", o, id, err), "Bob takes the offer") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(ea, eb, nBtc, 7200, false, 0, m, t);
+            nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
+                           "both sides finish: DONE and DONE") ? 0 : 1;
+            nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
+            double got = tx.value("amount", 0.0);
+            nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's Bitcoin Core wallet got %.8f BTC", got).c_str()) ? 0 : 1;
+            nlohmann::json bt;
+            std::string e2;
+            bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
+                        bt.is_object();
+            double amt = fGot ? bt.value("amount", 0.0) : 0.0;
+            nFail += Check(fGot && amt > 0.98,
+                           strprintf("Bob's Bitflash wallet got %.8f BTF (redeem %s%s%s)", amt, t.redeemTxid.c_str(),
+                                     fGot ? "" : ": ", e2.c_str()).c_str()) ? 0 : 1;
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
+
+        // ---- 2: Bob gives BTC, Alice gives BTF; the other direction
+        try {
+            printf("  2. Bob offers 0.04 BTC for 0.8 BTF; Alice takes it\n");
+            btfchat::SwapEngine ea(&a), eb(&b);
+            a.convo.clear();
+            b.convo.clear();
+            btfchat::SwapOffer o;
+            o.give = "BTC"; o.giveAmount = 4000000;
+            o.want = "BTF"; o.wantAmount = 80000000;
+            b.offers["22222222222222222222222222222222"] = o;
+            std::string id, err;
+            nFail += Check(ea.Take(b.addr, "22222222222222222222222222222222", o, id, err), "Alice takes it") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(eb, ea, nBtc, 7200, false, 0, m, t);
+            nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
+                           "both sides finish the other way round too") ? 0 : 1;
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
+
+        // ---- 3: Alice locks, Bob locks, Alice vanishes: both refund
+        try {
+            printf("  3. Alice offers 0.5 BTF for 0.03 BTC; Bob locks; Alice vanishes\n");
+            btfchat::SwapConfig cfg;
+            // Short locks (test chains only): 6 Bitflash blocks for Alice, 15
+            // minutes of Bitcoin median time for Bob, and the margins to match.
+            cfg.nBtfInitiatorBlocks = 6;
+            cfg.nBtcParticipantSecs = 900;
+            cfg.nTakerMinLeft = 240;
+            cfg.nMakerMinLeft = 60;
+            btfchat::SwapEngine ea(&a, cfg), eb(&b, cfg);
+            a.convo.clear();
+            b.convo.clear();
+            btfchat::SwapOffer o;
+            o.give = "BTF"; o.giveAmount = 50000000;
+            o.want = "BTC"; o.wantAmount = 3000000;
+            a.offers["33333333333333333333333333333333"] = o;
+            std::string id, err;
+            nFail += Check(eb.Take(a.addr, "33333333333333333333333333333333", o, id, err), "Bob takes it") ? 0 : 1;
+            btfchat::SwapView m, t;
+            bool fEnd = SwapTestRun(ea, eb, nBtc, 14400, true, 300, m, t);
+            nFail += Check(fEnd && t.stage == btfchat::SW_REFUNDED && !t.refundTxid.empty(),
+                           "Bob's BTC comes back by itself after its lock") ? 0 : 1;
+            nFail += Check(fEnd && m.stage == btfchat::SW_REFUNDED && !m.refundTxid.empty(),
+                           "and Alice's BTF after hers -- she never showed the secret") ? 0 : 1;
+        } catch (std::exception& e) { nFail += Check(false, e.what()) ? 0 : 1; }
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=swap-wait-payment -- a swap whose Bitcoin contract waits to be paid
+// from another wallet (the light backend). Nothing is locked yet, but the
+// contract exists, so it can neither hang forever nor be dropped while a
+// payment may be on its way. The wallet is a stand-in that answers the audit
+// the way the light backend does.
+namespace
+{
+struct WaitPayHost : public btfchat::SwapHost
+{
+    nlohmann::json audit;                           // our own BTC contract ("00")
+    std::map<std::string, nlohmann::json> audits;   // any other contract, by its hex
+    std::map<std::string, nlohmann::json> finds;    // btcfindsecret/swapfindsecret, by contract
+    nlohmann::json refundParams, redeemParams;
+    int nRefunds = 0, nSteps = 0, nRedeems = 0;
+    std::string lastStep;
+
+    std::string MyAddress() { return "me"; }
+    bool PeerAccepted(const std::string&) { return true; }
+    bool Invite(const std::string&, const std::string&, std::string&) { return true; }
+    bool SendStep(const std::string&, const std::string& text, std::string&) { nSteps++; lastStep = text; return true; }
+    void Contacts(std::vector<std::string>& out) { out.clear(); }
+    void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out.clear(); }
+    bool FindMyOffer(const std::string&, btfchat::SwapOffer&) { return false; }
+    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    {
+        std::string contract = params.is_array() && !params.empty() && params[0].is_string() ? params[0].get<std::string>() : "";
+        if (method == "btcauditcontract" || method == "swapauditcontract")
+        {
+            r = audits.count(contract) ? audits[contract] : audit;
+            return true;
+        }
+        if (method == "btcfindsecret" || method == "swapfindsecret")
+        {
+            r = finds.count(contract) ? finds[contract] : nlohmann::json{ { "spent", false } };
+            return true;
+        }
+        if (method == "btcrefund" || method == "swaprefund") { nRefunds++; refundParams = params; r = { { "txid", std::string(64, 'f') } }; return true; }
+        if (method == "btcredeem")
+        {
+            // As the light client answers: sent, not seen in any memory pool.
+            nRedeems++; redeemParams = params;
+            r = { { "txid", strprintf("%064d", nRedeems) }, { "feeRatePerKvB", 0.0001 }, { "awaitingConfirmation", true } };
+            return true;
+        }
+        if (method == "swapredeem") { nRedeems++; redeemParams = params; r = { { "txid", std::string(64, 'd') } }; return true; }
+        if (method == "btcswapinfo") { r = { { "backend", "light" } }; return true; }
+        err = "not in this test: " + method;
+        return false;
+    }
+    void Changed() {}
+
+    void Unpaid(int64_t nSecondsLeft, int64_t nLockTime)
+    {
+        audit = { { "contractTxid", std::string(64, '0') }, { "vout", 0 }, { "unspent", false },
+                  { "confirmations", 0 }, { "amount", nullptr }, { "secondsUntilRefund", nSecondsLeft },
+                  { "lockTime", nLockTime } };
+    }
+    void Paid(double amount, int64_t nSecondsLeft, int64_t nLockTime)
+    {
+        audit = { { "contractTxid", std::string(64, 'a') }, { "vout", 1 }, { "unspent", true },
+                  { "confirmations", 6 }, { "amount", amount }, { "secondsUntilRefund", nSecondsLeft },
+                  { "lockTime", nLockTime } };
+    }
+};
+
+static std::string WaitPaySwapJson(const std::string& id)
+{
+    nlohmann::json s = { { "id", id }, { "peer", "them" }, { "maker", true },
+                         { "give", "BTC" }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
+                         { "btcDestination", "bcrt1qdestination" }, { "paymentAddress", "2NcontractAddress" },
+                         { "myC", "00" }, { "myTx", "" }, { "myN", -1 }, { "stage", (int)btfchat::SW_WAIT_PAYMENT },
+                         { "ok", true }, { "inv", true }, { "created", GetTime() }, { "updated", GetTime() } };
+    nlohmann::json j = { { "swaps", nlohmann::json::array({ s }) }, { "seen", nlohmann::json::array() } };
+    return j.dump();
+}
+
+static btfchat::SwapView WaitPayView(btfchat::SwapEngine& e)
+{
+    std::vector<btfchat::SwapView> v;
+    e.List(v);
+    return v.empty() ? btfchat::SwapView() : v[0];
+}
+} // namespace
+
+static int RunSwapWaitPaymentSelfTest()
+{
+    int nFail = 0;
+    const std::string id(32, '1');
+    int64_t nNow = GetTime();
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Unpaid(3600, nNow + 3600);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_WAIT_PAYMENT, "unpaid, lock ahead: still waiting for the payment") ? 0 : 1;
+        nFail += Check(v.fCanCancel, "and it can be cancelled") ? 0 : 1;
+        std::string err;
+        nFail += Check(e.Cancel(id, err), "cancel is accepted") ? 0 : 1;
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "cancelled: the contract is still watched, not forgotten") ? 0 : 1;
+        nFail += Check(h.lastStep.find("cancel") != std::string::npos, "the other side is told") ? 0 : 1;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRefunds == 0, "nothing paid: nothing to refund yet") ? 0 : 1;
+
+        // The payment was already on its way when it was cancelled.
+        h.Paid(0.01, 1800, nNow + 1800);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && v.myTxid == std::string(64, 'a'),
+                       "a late payment is adopted for the refund") ? 0 : 1;
+        nFail += Check(h.nRefunds == 0, "and not refunded before its lock") ? 0 : 1;
+        h.Paid(0.01, 0, nNow - 60);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRefunds == 1, "at the lock it comes back") ? 0 : 1;
+        nFail += Check(h.refundParams.size() == 3 && h.refundParams[1] == std::string(64, 'a') + ":1" &&
+                       h.refundParams[2] == "bcrt1qdestination",
+                       "to the person's own Bitcoin address, from the output that was paid") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Unpaid(0, nNow - 3600);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nSteps == 1,
+                       "never paid by its lock: the swap is called off and the other side told") ? 0 : 1;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "still watched for a day past the lock") ? 0 : 1;
+        h.Unpaid(0, nNow - 2 * 86400);
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_CANCELLED && h.nRefunds == 0, "then it ends, with nothing to refund") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Paid(0.02, 7200, nNow + 7200);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && v.myTxid == std::string(64, 'a'),
+                       "a wrong amount paid in: the swap stops and that payment is refunded") ? 0 : 1;
+        std::string err;
+        nFail += Check(!e.Cancel(id, err), "and once something is locked, cancel is refused") ? 0 : 1;
+    }
+
+    {
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id));
+        h.Paid(0.01, 7200, nNow + 7200);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_LOCKED && v.myTxid == std::string(64, 'a') && !v.fCanCancel,
+                       "the exact amount, confirmed: the swap goes on and can no longer be cancelled") ? 0 : 1;
+    }
+
+    // A maker who wants BTC redeems it through the light client, which only
+    // sends: the swap is done when the redeem is in a block, and a redeem that
+    // sits goes out again with twice the fee -- the secret is already public.
+    {
+        const std::string secret(64, 'a'), hash(64, 'c');
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", true },
+                              { "give", "BTF" }, { "ga", 100000000 }, { "want", "BTC" }, { "wa", 1000000 },
+                              { "btcDestination", "bcrt1qdestination" }, { "myRecv", "mvMine" },
+                              { "secret", secret }, { "hash", hash },
+                              { "myC", "22" }, { "myTx", std::string(64, '2') },
+                              { "thC", "11" }, { "thTx", std::string(64, '1') }, { "thN", 0 },
+                              { "stage", (int)btfchat::SW_REDEEMING }, { "ok", true }, { "inv", true },
+                              { "created", nNow }, { "updated", nNow }, { "since", nNow } };
+        std::string state = nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump();
+        WaitPayHost h;
+        h.audits["11"] = { { "recipientIsMine", true }, { "recipient", "mvMine" }, { "secretHash", hash },
+                           { "unspent", true }, { "confirmations", 6 }, { "amount", 0.01 }, { "secondsUntilRefund", 8 * 3600 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(state);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nRedeems == 1 && v.stage == btfchat::SW_REDEEMING && v.status.find("waiting for Bitcoin") != std::string::npos,
+                       "light redeem sent: not done until it confirms") ? 0 : 1;
+        nFail += Check(h.redeemParams.size() == 4 && h.redeemParams[3] == "bcrt1qdestination", "to the person's own address") ? 0 : 1;
+        nFail += Check(h.lastStep.find("redeemed") != std::string::npos, "and the other side is told") ? 0 : 1;
+        h.audits["11"]["secondsUntilRefund"] = 60;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(h.nRedeems == 1 && v.stage == btfchat::SW_REDEEMING,
+                       "before the bump time: no second redeem, and their lock running low cancels nothing") ? 0 : 1;
+
+        btfchat::SwapConfig quick;
+        quick.nRedeemBumpAfter = 0;
+        btfchat::SwapEngine e2(&h, quick);
+        e2.FromJson(e.ToJson());
+        e2.Round();
+        v = WaitPayView(e2);
+        nFail += Check(h.nRedeems == 2 && h.redeemParams.size() == 5 && h.redeemParams[4] == "0.00020000" &&
+                       v.redeemTxid == strprintf("%064d", 2),
+                       "still unconfirmed: sent again at twice the fee rate") ? 0 : 1;
+        h.finds["11"] = { { "spent", true }, { "secret", secret } };
+        e2.Round();
+        v = WaitPayView(e2);
+        nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 2, "in a block: done") ? 0 : 1;
+    }
+
+    // A taker's refund is not the end while the maker can still redeem ours
+    // with the secret instead: until their lock opens, that is watched for.
+    for (int nCase = 0; nCase < 2; nCase++)
+    {
+        const std::string secret(64, 'b');
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false },
+                              { "give", "BTC" }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
+                              { "btcDestination", "bcrt1qdestination" }, { "hash", std::string(64, 'c') },
+                              { "myC", "33" }, { "myTx", std::string(64, '3') }, { "myN", 1 },
+                              { "thC", "44" }, { "thTx", std::string(64, '4') },
+                              { "stage", (int)btfchat::SW_REFUNDING }, { "ok", true }, { "inv", true },
+                              { "created", nNow }, { "updated", nNow } };
+        WaitPayHost h;
+        h.audits["33"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+        h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 100 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump());
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nRefunds == 1 && v.stage == btfchat::SW_REFUNDING && !v.refundTxid.empty(),
+                       "taker refunded ours: still watching while theirs is locked") ? 0 : 1;
+        e.Round();
+        nFail += Check(h.nRefunds == 1, "the refund is not sent twice") ? 0 : 1;
+        if (nCase == 0)
+        {
+            // The maker outbid our refund with a redeem: the secret is out.
+            h.finds["33"] = { { "spent", true }, { "secret", secret } };
+            e.Round();
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 1 && h.redeemParams.size() >= 3 && h.redeemParams[2] == secret,
+                           "ours was taken instead: theirs is taken with the secret") ? 0 : 1;
+        }
+        else
+        {
+            h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 0 } };
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRedeems == 0, "their lock opened: the refund stands, it is over") ? 0 : 1;
+        }
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -4837,8 +7171,32 @@ int RunSelfTest(const std::string& name)
         return RunManagedTorSelfTest();
     if (name == "treasury")
         return RunTreasurySelfTest();
+    if (name == "chat-link")
+        return RunChatLinkSelfTest();
+    if (name == "chat-identity")
+        return RunChatIdentitySelfTest();
+    if (name == "chat-relay")
+        return RunChatRelaySelfTest();
+    if (name == "chat-wallet")
+        return RunChatWalletSelfTest();
+    if (name == "rules-v3")
+        return RunRulesV3SelfTest();
+    if (name == "btc-light")
+        return btclight::SelfTest();
+    if (name == "btc-swap")
+        return RunBtcSwapSelfTest();
+    if (name == "chat-swap")
+        return RunChatSwapSelfTest();
+    if (name == "swap-wait-payment")
+        return RunSwapWaitPaymentSelfTest();
+    if (name == "fee-policy")
+        return RunFeePolicySelfTest();
+    if (name == "invoice")
+        return RunInvoiceSelfTest();
+    if (name == "chat-live")
+        return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

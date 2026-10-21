@@ -11,13 +11,20 @@
 #include <string>
 #include <vector>
 
+// strPassphrase, where these take one, is BIP39's extra word: it is mixed into
+// the seed, so the same twelve words with and without it are two different
+// wallets. It is not a password on a file and there is no way to check it --
+// the wrong one silently produces a valid, empty wallet. "" means none.
+
 // Create a phrase for a wallet that does not have one, install the seed, and
 // show the words once. Refuses if a phrase already exists. Returns 0 on success.
-int CmdNewPhrase();
+int CmdNewPhrase(const std::string& strPassphrase);
 
 // Install the seed a phrase describes, derive forward looking for used
 // addresses, and rescan the chain so their coins appear. Returns 0 on success.
-int CmdRestorePhrase(const std::string& strMnemonic, int nMinDepth = 0);
+int CmdRestorePhrase(const std::string& strMnemonic,
+                     const std::string& strPassphrase,
+                     int nMinDepth = 0);
 
 // Called once per batch with how many addresses have been derived so far and
 // how many transactions the wallet now holds.
@@ -27,6 +34,7 @@ typedef void (*RestoreProgressFn)(void* pArg, int nDerived, int nRecovered);
 // drift apart. Returns false without touching the wallet if the chain is not
 // loaded or the phrase is not valid.
 bool RestoreFromPhrase(const std::string& strMnemonic,
+                       const std::string& strPassphrase,
                        int nMinDepth,
                        RestoreProgressFn fnProgress,
                        void* pArg,

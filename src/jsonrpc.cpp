@@ -22,6 +22,10 @@
 #include "jsonrpc.h"
 #include "tor.h"
 #include "treasury.h"
+#include "swap.h"
+#include "btcswap.h"
+#include "btclight.h"
+#include "invoice.h"
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -71,6 +75,32 @@ bool JsonRpcConfigure(const string& strUser, const string& strPassword, const st
         return false;
     }
     return true;
+}
+
+bool JsonRpcConfigureCookie(const string& strPort)
+{
+    // A fresh random password every start, in a file only this user can read,
+    // for the chat (btfchatwallet.h) or any other local tool. Bitcoin's .cookie,
+    // same shape, so a tool written for that reads this.
+    unsigned char rnd[32];
+    RAND_bytes(rnd, sizeof(rnd));
+    string strPass = HexStr(rnd, rnd + sizeof(rnd), false);
+    OPENSSL_cleanse(rnd, sizeof(rnd));
+
+    string path = GetAppDir() + "/.cookie";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        fprintf(stderr, "-chatwallet: could not write %s\n", path.c_str());
+        return false;
+    }
+#ifndef _WIN32
+    chmod(path.c_str(), 0600);
+#endif
+    string line = "__cookie__:" + strPass + "\n";
+    fwrite(line.data(), 1, line.size(), f);
+    fclose(f);
+    return JsonRpcConfigure("__cookie__", strPass, strPort);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +311,9 @@ static json WalletTxToJson(const CWalletTx& wtx)
     j["confirmations"] = nDepth;
     j["time"]          = (int64)wtx.nTimeReceived;
     j["timereceived"]  = (int64)wtx.nTimeReceived;
+    // Bitcoin Core's name for it: while unconfirmed, can it be replaced
+    // (sped up with bumpfee, or by its sender for a payment to us)?
+    j["bip125-replaceable"] = nDepth > 0 ? "no" : (wtx.SignalsReplacement() ? "yes" : "no");
     if (nDepth > 0)
     {
         j["blockhash"] = wtx.hashBlock.GetHex();
@@ -533,6 +566,96 @@ static json rpc_getbalance(const json& p)
     return ValueFromAmount(nTotal);
 }
 
+// ---- invoices (invoice.h): the shop's own payment gateway ----
+
+// createinvoice <amount> [description] [expiry seconds=3600] [order id]
+static json rpc_createinvoice(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("createinvoice <amount> [description] [expiry seconds, default 3600] [order id]");
+    string strDesc = p.size() >= 2 && p[1].is_string() ? p[1].get<string>() : string();
+    int64 nExpiry = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int64>() : 3600;
+    string strOrder = p.size() >= 4 && p[3].is_string() ? p[3].get<string>() : string();
+    return invoice::Create(AmountFromValue(p[0]), strDesc, nExpiry, strOrder);
+}
+
+static json rpc_getinvoice(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("getinvoice <id>");
+    return invoice::Get(p[0].get<string>());
+}
+
+// listinvoices [status]
+static json rpc_listinvoices(const json& p)
+{
+    return invoice::List(p.size() >= 1 && p[0].is_string() ? p[0].get<string>() : string());
+}
+
+static json rpc_cancelinvoice(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("cancelinvoice <id>");
+    return invoice::Cancel(p[0].get<string>());
+}
+
+// estimatefee -- BTF per 1000 bytes to be in the next block, from what is
+// waiting now. 0: everything waiting fits, the minimum is enough.
+static json rpc_estimatefee(const json&)
+{
+    int64 n = EstimateNextBlockFeePerKB();
+    json j;
+    j["feeRatePerKB"] = ValueFromAmount(n);
+    j["minimumEnough"] = n == 0;
+    CRITICAL_BLOCK(cs_mapTransactions)
+        j["waiting"] = (int)mapTransactions.size();
+    return j;
+}
+
+// settxfee <BTF per 1000 bytes> -- the rate this wallet pays; 0 is the minimum.
+static json rpc_settxfee(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("settxfee <BTF per 1000 bytes>  (0: the minimum)");
+    string s = p[0].is_string() ? p[0].get<string>() : strprintf("%.8f", p[0].get<double>());
+    int64 n = 0;
+    if (!ParseMoney(s.c_str(), n) || n < 0 || n > COIN)
+        throw runtime_error("a rate from 0 to 1 BTF per 1000 bytes");
+    nPayTxFeePerKB = n;
+    CWalletDB().WriteSetting("nPayTxFeePerKB", nPayTxFeePerKB);
+    return true;
+}
+
+// bumpfee <txid> [BTF per 1000 bytes] -- speed up a payment of ours that is
+// still waiting: the same payment again, the extra fee from its change.
+static json rpc_bumpfee(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("bumpfee <txid> [BTF per 1000 bytes]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    int64 nRate = 0;
+    if (p.size() >= 2)
+    {
+        string s = p[1].is_string() ? p[1].get<string>() : strprintf("%.8f", p[1].get<double>());
+        if (!ParseMoney(s.c_str(), nRate) || nRate <= 0 || nRate > COIN)
+            throw runtime_error("a rate above 0 and up to 1 BTF per 1000 bytes");
+    }
+    else
+        nRate = max(EstimateNextBlockFeePerKB(), nPayTxFeePerKB);
+    uint256 newTxid;
+    int64 nOld = 0, nNew = 0;
+    string err;
+    if (!BumpFee(uint256(p[0].get<string>()), nRate, newTxid, nOld, nNew, err))
+        throw runtime_error(err);
+    json j;
+    j["txid"] = newTxid.GetHex();
+    j["replaces"] = p[0];
+    j["oldFee"] = ValueFromAmount(nOld);
+    j["newFee"] = ValueFromAmount(nNew);
+    return j;
+}
+
 static json rpc_sendtoaddress(const json& p)
 {
     if (p.size() < 2 || !p[0].is_string())
@@ -542,6 +665,28 @@ static json rpc_sendtoaddress(const json& p)
     CScript scriptPubKey = ScriptForAddress(p[0].get<string>());
     int64 nValue = AmountFromValue(p[1]);
     CWalletTx wtx;
+    if (!SendMoney(scriptPubKey, nValue, wtx))
+        throw runtime_error("send failed: insufficient balance once the fee is counted");
+    return wtx.GetHash().GetHex();
+}
+
+// sendburn <amount> <data hex>: burn `amount` into an OP_RETURN carrying the
+// data -- provably unspendable, gone from the supply. What a public community
+// listing is (community.h); 80 bytes of data at most, the relay limit.
+static json rpc_sendburn(const json& p)
+{
+    if (p.size() < 2 || !p[1].is_string() || !IsHex(p[1].get<string>()))
+        throw runtime_error("sendburn <amount> <data hex>");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    vector<unsigned char> data = ParseHex(p[1].get<string>());
+    if (data.empty() || data.size() > MAX_OP_RETURN_RELAY)
+        throw runtime_error(strprintf("the data is 1 to %u bytes", MAX_OP_RETURN_RELAY));
+    CScript scriptPubKey;
+    scriptPubKey << OP_RETURN << data;
+    int64 nValue = AmountFromValue(p[0]);
+    CWalletTx wtx;
+    wtx.mapValue["comment"] = "Burned";
     if (!SendMoney(scriptPubKey, nValue, wtx))
         throw runtime_error("send failed: insufficient balance once the fee is counted");
     return wtx.GetHash().GetHex();
@@ -1151,13 +1296,974 @@ static json rpc_settorbridges(const json& p)
     return j;
 }
 
+// ---------------------------------------------------------------------------
+// Atomic swaps (swap.h). Named after Decred's atomicswap commands, so the steps
+// on the Bitflash side read the same as the steps on the Bitcoin side.
+
+static vector<unsigned char> PkhOfAddress(const string& strAddr)
+{
+    uint160 h;
+    bool fScript = false;
+    if (!DecodeAnyAddress(strAddr, h, fScript) || fScript)
+        throw runtime_error("need an ordinary Bitflash address (B...), not a script address");
+    return vector<unsigned char>(h.begin(), h.end());
+}
+
+static void RequireRulesV3()
+{
+    // Before the switch a script-hash output is anyone-can-spend: a contract
+    // funded then could be taken by anybody who read it off the chain.
+    if (!RulesV3Active(GetAdjustedTime()))
+    {
+        if (RulesV3Time() == 0)
+            throw runtime_error("atomic swaps need rules v3, which are not scheduled on this network");
+        time_t t = (time_t)RulesV3Time();
+        char buf[32] = "";
+        struct tm* g = gmtime(&t);
+        if (g)
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", g);
+        throw runtime_error(strprintf("atomic swaps start with rules v3, at block time %u (%s UTC); not before",
+                                      RulesV3Time(), buf));
+    }
+}
+
+static json ContractJson(const swap::Contract& c, const CScript& contract)
+{
+    json j;
+    j["contract"]        = HexStr(contract.begin(), contract.end(), false);
+    j["contractAddress"] = Hash160ToScriptAddress(Hash160(contract));
+    j["recipient"]       = Hash160ToAddress(uint160(c.recipientPkh));
+    j["refundAddress"]   = Hash160ToAddress(uint160(c.refundPkh));
+    j["secretHash"]      = HexStr(c.secretHash.begin(), c.secretHash.end(), false);
+    j["lockTime"]        = c.nLockTime;
+    if (c.nLockTime < (int64)LOCKTIME_THRESHOLD)
+        j["blocksUntilRefund"] = std::max<int64>(0, c.nLockTime - nBestHeight);
+    return j;
+}
+
+// The lock, in blocks from now: the standard one, or on testnet only a shorter
+// one given as the last parameter -- so a refund can be tried in minutes, not a
+// day. On mainnet a short lock is how a participant loses their coins (the
+// initiator waits it out, refunds, and redeems the other side), so there it
+// is not even accepted.
+static int LockBlocksParam(const json& p, size_t nIndex, int nDefault)
+{
+    if (p.size() <= nIndex)
+        return nDefault;
+    if (!IsTestNet())
+        throw runtime_error("the lock length is fixed on mainnet");
+    if (!p[nIndex].is_number_integer() || p[nIndex].get<int>() < 1 || p[nIndex].get<int>() > nDefault)
+        throw runtime_error(strprintf("lock blocks: 1 to %d", nDefault));
+    return p[nIndex].get<int>();
+}
+
+// Fund a contract from this wallet and say where it went.
+static json FundContract(const swap::Contract& c, int64 nValue, const char* pszComment)
+{
+    CScript contract = swap::BuildContract(c);
+    CScript scriptPubKey;
+    scriptPubKey.SetPayToScriptHash(contract);
+    CWalletTx wtx;
+    wtx.mapValue["comment"] = pszComment;
+    if (!SendMoney(scriptPubKey, nValue, wtx))
+        throw runtime_error("send failed: insufficient balance once the fee is counted");
+    json j = ContractJson(c, contract);
+    j["contractTxid"] = wtx.GetHash().GetHex();
+    j["amount"] = ValueFromAmount(nValue);
+    return j;
+}
+
+// A line per swap in the data directory: the secret is the one thing that,
+// lost, cannot be recovered -- and an RPC answer scrolls away.
+static void LogSwap(const json& j)
+{
+    string path = GetAppDir() + "/swaps.log";
+    FILE* f = fopen(path.c_str(), "a");
+    if (!f)
+        return;
+    json line = j;
+    line["time"] = (int64)GetTime();
+    fprintf(f, "%s\n", line.dump().c_str());
+    fclose(f);
+}
+
+// swapinitiate <participant address> <amount>
+static json rpc_swapinitiate(const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string())
+        throw runtime_error("swapinitiate <participant address> <amount> [lock blocks, testnet only]");
+    RequireRulesV3();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+
+    swap::Contract c;
+    c.recipientPkh = PkhOfAddress(p[0].get<string>());
+    vector<unsigned char> vchRefund = GetKeyFromPool();
+    if (vchRefund.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    uint160 hRefund = Hash160(vchRefund);
+    c.refundPkh.assign(hRefund.begin(), hRefund.end());
+
+    vector<unsigned char> secret(swap::SECRET_BYTES);
+    RAND_bytes(&secret[0], (int)secret.size());
+    c.secretHash.resize(32);
+    SHA256(&secret[0], secret.size(), &c.secretHash[0]);
+    c.nLockTime = nBestHeight + LockBlocksParam(p, 2, swap::INITIATOR_LOCK_BLOCKS);
+
+    json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: initiated");
+    j["secret"] = HexStr(secret.begin(), secret.end(), false);
+    j["role"] = "initiator";
+    LogSwap(j);
+    OPENSSL_cleanse(&secret[0], secret.size());
+    return j;
+}
+
+// swapparticipate <initiator address> <amount> <secret hash>
+static json rpc_swapparticipate(const json& p)
+{
+    if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
+        throw runtime_error("swapparticipate <initiator address> <amount> <secret hash> [lock blocks, testnet only]");
+    RequireRulesV3();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+
+    swap::Contract c;
+    c.recipientPkh = PkhOfAddress(p[0].get<string>());
+    string strHash = p[2].get<string>();
+    if (strHash.size() != 64 || !IsHex(strHash))
+        throw runtime_error("the secret hash is 64 hex characters");
+    c.secretHash = ParseHex(strHash);
+    vector<unsigned char> vchRefund = GetKeyFromPool();
+    if (vchRefund.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    uint160 hRefund = Hash160(vchRefund);
+    c.refundPkh.assign(hRefund.begin(), hRefund.end());
+    c.nLockTime = nBestHeight + LockBlocksParam(p, 3, swap::PARTICIPANT_LOCK_BLOCKS);
+
+    json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: participated");
+    j["role"] = "participant";
+    LogSwap(j);
+    return j;
+}
+
+static swap::Contract ContractFromParam(const json& v, CScript& contractOut)
+{
+    if (!v.is_string() || !IsHex(v.get<string>()))
+        throw runtime_error("the contract is given as hex");
+    vector<unsigned char> vch = ParseHex(v.get<string>());
+    contractOut = CScript(vch.begin(), vch.end());
+    swap::Contract c;
+    if (!swap::ParseContract(contractOut, c))
+        throw runtime_error("that is not an atomic swap contract");
+    return c;
+}
+
+// The output of txid that pays the contract, or an error saying why not.
+static void FindContractOutput(const CScript& contract, const uint256& txid,
+                               CTransaction& txOut, unsigned int& nOut)
+{
+    if (!LookupTransaction(txid, txOut))
+        throw runtime_error("contract transaction not found (not in the memory pool and not in the chain)");
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+    for (nOut = 0; nOut < txOut.vout.size(); nOut++)
+        if (txOut.vout[nOut].scriptPubKey == p2sh)
+            return;
+    throw runtime_error("that transaction does not pay this contract");
+}
+
+// Blocks on top of (and including) the one holding txid in the main chain;
+// 0 when it is only in the memory pool or nowhere.
+static int ChainConfirmations(const uint256& txid)
+{
+    CTxIndex txindex;
+    if (!CTxDB("r").ReadTxIndex(txid, txindex))
+        return 0;
+    CBlock block;
+    if (!block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+        return 0;
+    int nDepth = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(block.GetHash());
+        if (mi != mapBlockIndex.end() && mi->second->IsInMainChain())
+            nDepth = 1 + nBestHeight - mi->second->nHeight;
+    }
+    return nDepth;
+}
+
+// swapauditcontract <contract> <contract txid>
+static json rpc_swapauditcontract(const json& p)
+{
+    if (p.size() < 2 || !p[1].is_string())
+        throw runtime_error("swapauditcontract <contract hex> <contract txid>");
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    CTransaction tx;
+    unsigned int n = 0;
+    FindContractOutput(contract, uint256(p[1].get<string>()), tx, n);
+    json j = ContractJson(c, contract);
+    j["contractTxid"] = tx.GetHash().GetHex();
+    j["vout"] = (int)n;
+    j["amount"] = ValueFromAmount(tx.vout[n].nValue);
+    // The other side's contract is not a wallet transaction: count its
+    // confirmations from the block the transaction index puts it in.
+    j["confirmations"] = ChainConfirmations(tx.GetHash());
+    CTxIndex txindex;
+    j["unspent"] = CTxDB("r").ReadTxIndex(tx.GetHash(), txindex) && n < txindex.vSpent.size() &&
+                   txindex.vSpent[n].IsNull();
+    // What a participant must check before locking anything of theirs: that
+    // the coins are to THEIR address and that the lock leaves them time.
+    j["recipientIsMine"] = IsMineAddress(Hash160ToAddress(uint160(c.recipientPkh)));
+    return j;
+}
+
+// The key a contract pays to on the path we take: the recipient's to redeem,
+// the refund key to refund. The same wallet keys sign on either chain.
+static void KeyForContract(const swap::Contract& c, bool fRedeem, CKey& key, vector<unsigned char>& vchPubKey)
+{
+    const vector<unsigned char>& pkh = fRedeem ? c.recipientPkh : c.refundPkh;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        map<uint160, vector<unsigned char> >::iterator mi = mapPubKeys.find(uint160(pkh));
+        if (mi == mapPubKeys.end() || !mapKeys.count(mi->second))
+            throw runtime_error(fRedeem ? "this wallet does not hold the recipient key of that contract"
+                                        : "this wallet does not hold the refund key of that contract");
+        vchPubKey = mi->second;
+        key.SetPrivKey(mapKeys[vchPubKey]);
+    }
+}
+
+extern map<COutPoint, CInPoint> mapNextTx;   // main.cpp: memory-pool spends
+
+// Already spent, in the memory pool or in the chain?
+static bool OutputSpent(const COutPoint& outpoint)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+        if (mapNextTx.count(outpoint))
+            return true;
+    CTxIndex txindex;
+    return CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && outpoint.n < txindex.vSpent.size() &&
+           !txindex.vSpent[outpoint.n].IsNull();
+}
+
+// Spend a contract output: redeem with the secret, or refund after the lock.
+static json SpendContract(const CScript& contract, const swap::Contract& c, const uint256& txid,
+                          const vector<unsigned char>* pSecret)
+{
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    CTransaction txFrom;
+    unsigned int nOut = 0;
+    FindContractOutput(contract, txid, txFrom, nOut);
+    if (OutputSpent(COutPoint(txFrom.GetHash(), nOut)))
+        throw runtime_error("that contract is already spent (redeemed or refunded)");
+
+    vector<unsigned char> vchPubKey;
+    CKey key;
+    KeyForContract(c, pSecret != NULL, key, vchPubKey);
+
+    if (!pSecret)
+    {
+        if (c.nLockTime < (int64)LOCKTIME_THRESHOLD && nBestHeight + 1 <= c.nLockTime)
+            throw runtime_error(strprintf("the refund opens at block %lld; the chain is at %d",
+                                          (long long)c.nLockTime + 1, nBestHeight));
+        if (c.nLockTime >= (int64)LOCKTIME_THRESHOLD && pindexBest &&
+            pindexBest->GetMedianTimePast() <= c.nLockTime)
+            throw runtime_error("the refund lock time has not passed yet");
+    }
+
+    vector<unsigned char> vchTo = GetKeyFromPool();
+    if (vchTo.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    CTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(txFrom.GetHash(), nOut);
+    if (!pSecret)
+    {
+        // CHECKLOCKTIMEVERIFY wants the lock in nLockTime and an input that
+        // does not switch nLockTime off.
+        tx.nLockTime = (unsigned int)c.nLockTime;
+        tx.vin[0].nSequence = 0;
+    }
+    CScript scriptTo;
+    scriptTo << OP_DUP << OP_HASH160 << Hash160(vchTo) << OP_EQUALVERIFY << OP_CHECKSIG;
+    int64 nIn = txFrom.vout[nOut].nValue;
+    int64 nFee = CENT;
+    for (int nPass = 0; nPass < 2; nPass++)
+    {
+        if (nIn <= nFee)
+            throw runtime_error("the contract holds less than the fee to spend it");
+        tx.vout.assign(1, CTxOut(nIn - nFee, scriptTo));
+        tx.vin[0].scriptSig = CScript();
+        uint256 hash = SignatureHash(contract, tx, 0, SIGHASH_ALL);
+        vector<unsigned char> sig;
+        if (!key.Sign(hash, sig))
+            throw runtime_error("signing failed");
+        sig.push_back((unsigned char)SIGHASH_ALL);
+        tx.vin[0].scriptSig = pSecret ? swap::RedeemScriptSig(sig, vchPubKey, *pSecret, contract)
+                                      : swap::RefundScriptSig(sig, vchPubKey, contract);
+        int64 nNeed = tx.GetMinFee();
+        if (nNeed <= nFee)
+            break;
+        nFee = nNeed;
+    }
+    if (!VerifySignature(txFrom, tx, 0, 0, true, true))
+        throw runtime_error(pSecret ? "the redeem does not verify -- is that the right secret?"
+                                    : "the refund does not verify");
+
+    uint256 hash = tx.GetHash();
+    CDataStream ssTx(SER_NETWORK);
+    ssTx << tx;
+    CRITICAL_BLOCK(cs_main)
+    {
+        bool fMissingInputs = false;
+        if (!tx.AcceptTransaction(true, &fMissingInputs))
+            throw runtime_error(fMissingInputs ? "the contract output is not known to this node yet"
+                                               : "the network refused it (already spent?)");
+        AddToWalletIfMine(tx, NULL);
+        RelayMessage(CInv(MSG_TX, hash), ssTx);
+    }
+    json j;
+    j["txid"] = hash.GetHex();
+    j["amount"] = ValueFromAmount(nIn - nFee);
+    j["fee"] = ValueFromAmount(nFee);
+    j["to"] = PubKeyToAddress(vchTo);
+    return j;
+}
+
+// swapredeem <contract> <contract txid> <secret>
+static json rpc_swapredeem(const json& p)
+{
+    if (p.size() < 3 || !p[1].is_string() || !p[2].is_string())
+        throw runtime_error("swapredeem <contract hex> <contract txid> <secret hex>");
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    string strSecret = p[2].get<string>();
+    if (strSecret.size() != 64 || !IsHex(strSecret))
+        throw runtime_error("the secret is 64 hex characters");
+    vector<unsigned char> secret = ParseHex(strSecret);
+    unsigned char h[32];
+    SHA256(&secret[0], secret.size(), h);
+    if (vector<unsigned char>(h, h + 32) != c.secretHash)
+        throw runtime_error("that secret does not match the contract's secret hash");
+    json j = SpendContract(contract, c, uint256(p[1].get<string>()), &secret);
+    LogSwap(json{{"redeemed", j["txid"]}, {"contractAddress", Hash160ToScriptAddress(Hash160(contract))}});
+    return j;
+}
+
+// swaprefund <contract> <contract txid>
+static json rpc_swaprefund(const json& p)
+{
+    if (p.size() < 2 || !p[1].is_string())
+        throw runtime_error("swaprefund <contract hex> <contract txid>");
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    json j = SpendContract(contract, c, uint256(p[1].get<string>()), NULL);
+    LogSwap(json{{"refunded", j["txid"]}, {"contractAddress", Hash160ToScriptAddress(Hash160(contract))}});
+    return j;
+}
+
+extern map<COutPoint, CInPoint> mapNextTx;   // main.cpp: memory-pool spends
+
+// swapfindsecret <contract> <contract txid>
+// Has our contract been spent, and with the secret? Read off this node's own
+// memory pool and chain: whoever waits for the secret needs nobody to send it.
+static json rpc_swapfindsecret(const json& p)
+{
+    if (p.size() < 2 || !p[1].is_string())
+        throw runtime_error("swapfindsecret <contract hex> <contract txid>");
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    CTransaction txFrom;
+    unsigned int n = 0;
+    FindContractOutput(contract, uint256(p[1].get<string>()), txFrom, n);
+    COutPoint outpoint(txFrom.GetHash(), n);
+
+    CTransaction spend;
+    bool fFound = false;
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(outpoint);
+        if (mi != mapNextTx.end() && mi->second.ptx)
+        {
+            spend = *mi->second.ptx;
+            fFound = true;
+        }
+    }
+    if (!fFound)
+    {
+        CTxIndex txindex;
+        if (CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && n < txindex.vSpent.size() &&
+            !txindex.vSpent[n].IsNull() && spend.ReadFromDisk(txindex.vSpent[n]))
+            fFound = true;
+    }
+    json j;
+    j["spent"] = fFound;
+    if (!fFound)
+        return j;
+    j["txid"] = spend.GetHash().GetHex();
+    for (size_t k = 0; k < spend.vin.size(); k++)
+    {
+        vector<unsigned char> secret;
+        if (spend.vin[k].prevout == outpoint && swap::ExtractSecret(spend.vin[k].scriptSig, c.secretHash, secret))
+        {
+            j["secret"] = HexStr(secret.begin(), secret.end(), false);
+            return j;
+        }
+    }
+    j["refunded"] = true;
+    return j;
+}
+
+// swapextractsecret <redeem transaction: txid on this chain, or raw hex from either chain> <secret hash>
+static json rpc_swapextractsecret(const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string() || !p[1].is_string())
+        throw runtime_error("swapextractsecret <redeem txid or raw hex> <secret hash>");
+    string strHash = p[1].get<string>();
+    if (strHash.size() != 64 || !IsHex(strHash))
+        throw runtime_error("the secret hash is 64 hex characters");
+    vector<unsigned char> vchHash = ParseHex(strHash);
+
+    string s = p[0].get<string>();
+    CTransaction tx;
+    if (s.size() == 64 && IsHex(s))
+    {
+        if (!LookupTransaction(uint256(s), tx))
+            throw runtime_error("transaction not found");
+    }
+    else
+    {
+        // A Bitcoin transaction reads as one of ours once its witness, if it
+        // has one, is dropped (btcswap.h); the scriptSigs are what matter.
+        if (!IsHex(s) || !btcswap::ParseTx(ParseHex(s), tx))
+            throw runtime_error("transaction does not decode");
+    }
+    vector<unsigned char> secret;
+    for (size_t i = 0; i < tx.vin.size(); i++)
+        if (swap::ExtractSecret(tx.vin[i].scriptSig, vchHash, secret))
+        {
+            json j;
+            j["secret"] = HexStr(secret.begin(), secret.end(), false);
+            return j;
+        }
+    throw runtime_error("no input of that transaction reveals a secret with that hash");
+}
+
+// ---------------------------------------------------------------------------
+// The Bitcoin half (btcswap.h): this wallet's keys in the contract, Bitcoin
+// Core for the coins and the chain.
+
+static btcswap::Chain RequireBitcoin()
+{
+    btcswap::Chain chain;
+    string err;
+    if (!btcswap::CheckChain(chain, err))
+        throw runtime_error(err);
+    return chain;
+}
+
+static json BtcCall(const string& method, const json& params, size_t nMaxBytes = 4 * 1024 * 1024)
+{
+    json r;
+    string err;
+    if (!btcswap::Call(method, params, r, err, nMaxBytes))
+        throw runtime_error(string(btcswap::UsingLight() ? "Bitcoin light: " : "Bitcoin Core: ") + err);
+    return r;
+}
+
+static string UtcText(int64 t)
+{
+    time_t tt = (time_t)t;
+    char buf[32] = "";
+    struct tm* g = gmtime(&tt);
+    if (g)
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", g);
+    return buf;
+}
+
+// The lock in seconds: the standard one, or on a Bitcoin test chain a
+// shorter one as the last parameter (a refund tried in minutes, not a day).
+static int64 LockSecsParam(const json& p, size_t nIndex, int64 nDefault, const btcswap::Chain& chain)
+{
+    if (p.size() <= nIndex)
+        return nDefault;
+    if (chain.fMain)
+        throw runtime_error("the lock length is fixed on Bitcoin's main chain");
+    if (!p[nIndex].is_number_integer() || p[nIndex].get<int64>() < 60 || p[nIndex].get<int64>() > nDefault)
+        throw runtime_error(strprintf("lock seconds: 60 to %lld", (long long)nDefault));
+    return p[nIndex].get<int64>();
+}
+
+static string BtcAmountText(int64 n)
+{
+    return strprintf("%lld.%08lld", (long long)(n / COIN), (long long)(n % COIN));
+}
+
+static json BtcContractJson(const btcswap::Chain& chain, const swap::Contract& c, const CScript& contract)
+{
+    json j;
+    j["chain"]           = "bitcoin-" + chain.name;
+    j["contract"]        = HexStr(contract.begin(), contract.end(), false);
+    j["contractAddress"] = btcswap::ScriptAddress(chain, contract);
+    j["recipient"]       = btcswap::PkhToAddress(chain, c.recipientPkh);
+    j["refundAddress"]   = btcswap::PkhToAddress(chain, c.refundPkh);
+    j["secretHash"]      = HexStr(c.secretHash.begin(), c.secretHash.end(), false);
+    j["lockTime"]        = c.nLockTime;
+    j["refundOpens"]     = UtcText(c.nLockTime);
+    return j;
+}
+
+// Lock BTC from Bitcoin Core's wallet in a contract whose keys are ours.
+static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c, int64 nValue)
+{
+    CScript contract = swap::BuildContract(c);
+    string strAddr = btcswap::ScriptAddress(chain, contract);
+    if (btcswap::UsingLight())
+    {
+        btclight::Watch(contract);
+        json j = BtcContractJson(chain, c, contract);
+        j["contractTxid"] = ""; j["vout"] = -1;
+        j["amount"] = ValueFromAmount(nValue);
+        j["awaitingPayment"] = true;
+        j["paymentInstructions"] = "pay exactly " + BtcAmountText(nValue) + " BTC to " + strAddr;
+        return j;
+    }
+    json txid = BtcCall("sendtoaddress", json::array({ strAddr, BtcAmountText(nValue) }));
+    if (!txid.is_string())
+        throw runtime_error("Bitcoin Core did not return a transaction id");
+    json wtx = BtcCall("gettransaction", json::array({ txid }));
+    if (!wtx.is_object() || !wtx.contains("hex") || !wtx["hex"].is_string())
+        throw runtime_error("Bitcoin Core did not return the contract transaction");
+    CTransaction tx;
+    if (!btcswap::ParseTx(ParseHex(wtx["hex"].get<string>()), tx))
+        throw runtime_error("the contract transaction does not decode");
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+    int nOut = -1;
+    for (unsigned int i = 0; i < tx.vout.size(); i++)
+        if (tx.vout[i].scriptPubKey == p2sh && tx.vout[i].nValue == nValue)
+            nOut = (int)i;
+    if (nOut < 0)
+        throw runtime_error("Bitcoin Core's transaction does not pay the contract");
+    json j = BtcContractJson(chain, c, contract);
+    j["contractTxid"] = txid;
+    j["contractTx"] = wtx["hex"];
+    j["vout"] = nOut;
+    j["amount"] = ValueFromAmount(nValue);
+    return j;
+}
+
+static swap::Contract BtcNewContract(const btcswap::Chain& chain, const string& strTheirAddr)
+{
+    swap::Contract c;
+    string err;
+    if (!btcswap::AddressToPkh(chain, strTheirAddr, c.recipientPkh, err))
+        throw runtime_error(err);
+    vector<unsigned char> vchRefund = GetKeyFromPool();
+    if (vchRefund.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    uint160 h = Hash160(vchRefund);
+    c.refundPkh.assign(h.begin(), h.end());
+    return c;
+}
+
+// btcswapinfo -- is Bitcoin Core there, on which chain, and what it holds.
+static json rpc_btcswapinfo(const json&)
+{
+    btcswap::Chain chain = RequireBitcoin();
+    json j;
+    j["chain"] = chain.name;
+    j["blocks"] = chain.nBlocks;
+    j["mediantime"] = chain.nMedianTime;
+    json bal;
+    string err;
+    j["backend"] = btcswap::UsingLight() ? "light" : "core";
+    if (btcswap::UsingLight())
+    {
+        json status = BtcCall("getblockchaininfo", json::array());
+        j["light"] = status;
+        j["balance"] = nullptr;
+        j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB());
+        return j;
+    }
+    j["balance"] = btcswap::Call("getbalance", json::array(), bal, err) ? bal : json(nullptr);
+    if (!err.empty())
+        j["walletError"] = err;
+    j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB());
+    return j;
+}
+
+static json rpc_btcvalidatedestination(const json& p)
+{
+    btcswap::Chain chain = RequireBitcoin();
+    if (p.size() != 1 || !p[0].is_string()) throw runtime_error("btcvalidatedestination <Bitcoin address>");
+    CScript script; string err;
+    if (!btclight::Destination(chain, p[0].get<string>(), script, err)) throw runtime_error(err);
+    return json{{"valid",true}};
+}
+
+// btcnewaddress -- a Bitcoin address whose key is in THIS wallet: what to
+// give the other side of a swap to be paid BTC to.
+static json rpc_btcnewaddress(const json&)
+{
+    btcswap::Chain chain = RequireBitcoin();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    vector<unsigned char> vch = GetKeyFromPool();
+    if (vch.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    uint160 h = Hash160(vch);
+    return btcswap::PkhToAddress(chain, vector<unsigned char>(h.begin(), h.end()));
+}
+
+// btcinitiate <their BTC address> <amount> [lock seconds, test chains only]
+static json rpc_btcinitiate(const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string())
+        throw runtime_error("btcinitiate <participant's Bitcoin address> <amount> [lock seconds, test chains only]");
+    btcswap::Chain chain = RequireBitcoin();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    swap::Contract c = BtcNewContract(chain, p[0].get<string>());
+    vector<unsigned char> secret(swap::SECRET_BYTES);
+    RAND_bytes(&secret[0], (int)secret.size());
+    c.secretHash.resize(32);
+    SHA256(&secret[0], secret.size(), &c.secretHash[0]);
+    c.nLockTime = GetTime() + LockSecsParam(p, 2, btcswap::INITIATOR_LOCK_SECS, chain);
+    json j = BtcFundContract(chain, c, AmountFromValue(p[1]));
+    j["secret"] = HexStr(secret.begin(), secret.end(), false);
+    j["role"] = "initiator";
+    LogSwap(j);
+    OPENSSL_cleanse(&secret[0], secret.size());
+    return j;
+}
+
+// btcparticipate <their BTC address> <amount> <secret hash> [lock seconds, test chains only]
+static json rpc_btcparticipate(const json& p)
+{
+    if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
+        throw runtime_error("btcparticipate <initiator's Bitcoin address> <amount> <secret hash> [lock seconds, test chains only]");
+    btcswap::Chain chain = RequireBitcoin();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    string strHash = p[2].get<string>();
+    if (strHash.size() != 64 || !IsHex(strHash))
+        throw runtime_error("the secret hash is 64 hex characters");
+    swap::Contract c = BtcNewContract(chain, p[0].get<string>());
+    c.secretHash = ParseHex(strHash);
+    c.nLockTime = GetTime() + LockSecsParam(p, 3, btcswap::PARTICIPANT_LOCK_SECS, chain);
+    json j = BtcFundContract(chain, c, AmountFromValue(p[1]));
+    j["role"] = "participant";
+    LogSwap(j);
+    return j;
+}
+
+// A contract transaction given as raw hex, or as a txid Bitcoin Core can
+// find (its memory pool, its wallet, or its txindex).
+static CTransaction BtcContractTx(const json& v)
+{
+    if (!v.is_string() || !IsHex(v.get<string>()))
+        throw runtime_error("the contract transaction is given as hex or as a txid");
+    string s = v.get<string>();
+    if (s.size() == 64)
+    {
+        json r;
+        string err;
+        if (btcswap::Call("getrawtransaction", json::array({ s }), r, err) && r.is_string())
+            s = r.get<string>();
+        else if (btcswap::Call("gettransaction", json::array({ s }), r, err) && r.is_object() &&
+                 r.contains("hex") && r["hex"].is_string())
+            s = r["hex"].get<string>();
+        else
+            throw runtime_error("Bitcoin Core does not have that transaction; give its raw hex");
+    }
+    CTransaction tx;
+    if (!btcswap::ParseTx(ParseHex(s), tx))
+        throw runtime_error("the contract transaction does not decode");
+    return tx;
+}
+
+static unsigned int BtcContractOutput(const CTransaction& tx, const CScript& contract)
+{
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+    for (unsigned int i = 0; i < tx.vout.size(); i++)
+        if (tx.vout[i].scriptPubKey == p2sh)
+            return i;
+    throw runtime_error("that transaction does not pay this contract");
+}
+
+// The contract's output as Bitcoin Core sees it. The reference is raw hex, a
+// txid Core can find, or "txid:vout" -- what the chat sends, since a funding
+// transaction can be bigger than a message and Core's own gettxout says all
+// that matters: how much, to which script, how deep. nValue is -1 when Core
+// does not see the output unspent (spent, or not on its chain).
+struct BtcContractOut
+{
+    uint256 txid;
+    unsigned int n = 0;
+    int64 nValue = -1;
+    bool fUnspent = false;
+    int nConfirmations = 0;
+};
+
+static BtcContractOut BtcResolveContract(const json& v, const CScript& contract)
+{
+    BtcContractOut o;
+    if (btcswap::UsingLight())
+    {
+        json found = btclight::Find(contract, v.is_string() ? v.get<string>() : "", false);
+        o.txid = uint256(found["contractTxid"].get<string>());
+        o.n = found["vout"].get<int>() < 0 ? 0 : found["vout"].get<unsigned int>();
+        o.fUnspent = found["unspent"].get<bool>();
+        o.nConfirmations = found["confirmations"].get<int>();
+        if (o.fUnspent) o.nValue = AmountFromValue(found["amount"]);
+        return o;
+    }
+    string s = v.is_string() ? v.get<string>() : string();
+    size_t colon = s.find(':');
+    int64 nFromTx = -1;
+    if (colon == 64 && IsHex(s.substr(0, 64)) && colon + 1 < s.size() &&
+        s.find_first_not_of("0123456789", colon + 1) == string::npos && s.size() - colon <= 7)
+    {
+        o.txid = uint256(s.substr(0, 64));
+        o.n = (unsigned int)atoi(s.c_str() + colon + 1);
+    }
+    else
+    {
+        CTransaction tx = BtcContractTx(v);
+        o.txid = tx.GetHash();
+        o.n = BtcContractOutput(tx, contract);
+        nFromTx = tx.vout[o.n].nValue;
+    }
+    json out = BtcCall("gettxout", json::array({ o.txid.GetHex(), (int)o.n, true }));
+    if (out.is_object())
+    {
+        CScript p2sh;
+        p2sh.SetPayToScriptHash(contract);
+        string strScript = out.contains("scriptPubKey") && out["scriptPubKey"].is_object() &&
+                           out["scriptPubKey"].contains("hex") ? out["scriptPubKey"]["hex"].get<string>() : string();
+        if (strScript != HexStr(p2sh.begin(), p2sh.end(), false))
+            throw runtime_error("that output does not pay this contract");
+        o.fUnspent = true;
+        o.nValue = AmountFromValue(out["value"]);
+        o.nConfirmations = out.contains("confirmations") && out["confirmations"].is_number_integer()
+                               ? out["confirmations"].get<int>() : 0;
+    }
+    else if (nFromTx >= 0)
+        o.nValue = -1;     // the transaction says how much, but Core does not see it unspent
+    return o;
+}
+
+// btcauditcontract <contract> <contract tx hex or txid>
+// What a participant checks before locking anything: the coins are on OUR
+// Bitcoin node's chain, unspent, confirmed, to OUR key, with time left.
+static json rpc_btcauditcontract(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("btcauditcontract <contract hex> <contract transaction hex or txid>");
+    btcswap::Chain chain = RequireBitcoin();
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    BtcContractOut o = BtcResolveContract(p.size() > 1 ? p[1] : json(""), contract);
+    json j = BtcContractJson(chain, c, contract);
+    j["contractTxid"] = o.txid.GetHex();
+    j["vout"] = (int)o.n;
+    // Only what Core sees on its own chain counts: an output it does not see
+    // unspent is worth nothing to this side of the swap, whatever a raw
+    // transaction claims.
+    j["amount"] = o.fUnspent ? json(ValueFromAmount(o.nValue)) : json(nullptr);
+    j["unspent"] = o.fUnspent;
+    j["confirmations"] = o.nConfirmations;
+    j["secondsUntilRefund"] = std::max<int64>(0, c.nLockTime - chain.nMedianTime);
+    j["recipientIsMine"] = IsMineAddress(Hash160ToAddress(uint160(c.recipientPkh)));
+    return j;
+}
+
+static json BtcSpend(const json& p, const vector<unsigned char>* pSecret)
+{
+    btcswap::Chain chain = RequireBitcoin();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    BtcContractOut o = BtcResolveContract(p[1], contract);
+    if (!o.fUnspent)
+        throw runtime_error("the Bitcoin backend does not see that contract output unspent "
+                            "(already redeemed or refunded, or not on this chain)");
+    if (!pSecret && chain.nMedianTime <= c.nLockTime)
+        throw runtime_error(strprintf("the refund opens when Bitcoin's median time passes %s (about %lld minutes)",
+                                      UtcText(c.nLockTime).c_str(),
+                                      (long long)((c.nLockTime - chain.nMedianTime) / 60 + 1)));
+    vector<unsigned char> vchPubKey;
+    CKey key;
+    KeyForContract(c, pSecret != NULL, key, vchPubKey);
+
+    json addr;
+    CScript scriptTo;
+    int64 nFeeRate = btcswap::FeeRatePerKvB();
+    if (btcswap::UsingLight())
+    {
+        size_t destination = pSecret ? 3 : 2;
+        if (p.size() <= destination || !p[destination].is_string())
+            throw runtime_error("Bitcoin light needs your Bitcoin destination address as the last parameter");
+        addr = p[destination];
+        string err;
+        if (!btclight::Destination(chain, addr.get<string>(), scriptTo, err)) throw runtime_error(err);
+        // The light client has no fee estimate and no memory pool to say a
+        // spend went in. A spend that sits unconfirmed is made again with a
+        // higher rate (BTC per 1000 vbytes) after the destination.
+        if (p.size() > destination + 1 && !p[destination + 1].is_null())
+        {
+            nFeeRate = AmountFromValue(p[destination + 1]);
+            if (nFeeRate < 1000 || nFeeRate > COIN / 100)
+                throw runtime_error("fee rate out of range (0.00001 to 0.01 BTC per 1000 vbytes)");
+        }
+    }
+    else
+    {
+        addr = BtcCall("getnewaddress", json::array());
+        json info = BtcCall("getaddressinfo", json::array({ addr }));
+        if (!info.is_object() || !info.contains("scriptPubKey") || !info["scriptPubKey"].is_string())
+            throw runtime_error("Bitcoin Core gave no address to be paid to");
+        vector<unsigned char> vchTo = ParseHex(info["scriptPubKey"].get<string>());
+        scriptTo = CScript(vchTo.begin(), vchTo.end());
+    }
+
+    CTransaction tx;
+    int64 nFee = 0;
+    string err;
+    if (!btcswap::BuildSpend(contract, COutPoint(o.txid, o.n), o.nValue, scriptTo,
+                             key, vchPubKey, pSecret, nFeeRate, tx, nFee, err))
+        throw runtime_error(err);
+    CDataStream ss(SER_NETWORK);
+    ss << tx;
+    string strHex = HexStr(ss.begin(), ss.end(), false);
+    json txid = BtcCall("sendrawtransaction", json::array({ strHex }));
+    json j;
+    j["txid"] = txid;
+    j["tx"] = strHex;
+    j["amount"] = ValueFromAmount(o.nValue - nFee);
+    j["fee"] = ValueFromAmount(nFee);
+    j["feeRatePerKvB"] = ValueFromAmount(nFeeRate);
+    j["to"] = addr;
+    // Core checked it into its memory pool; the light client only sent it.
+    j["awaitingConfirmation"] = btcswap::UsingLight();
+    return j;
+}
+
+// btcredeem <contract> <contract tx hex or txid> <secret>
+static json rpc_btcredeem(const json& p)
+{
+    if (p.size() < 3 || !p[2].is_string())
+        throw runtime_error("btcredeem <contract hex> <contract transaction hex or txid> <secret hex> [Bitcoin destination] [fee rate]");
+    string strSecret = p[2].get<string>();
+    if (strSecret.size() != 64 || !IsHex(strSecret))
+        throw runtime_error("the secret is 64 hex characters");
+    vector<unsigned char> secret = ParseHex(strSecret);
+    json j = BtcSpend(p, &secret);
+    LogSwap(json{{"redeemed", j["txid"]}, {"chain", "bitcoin"}});
+    return j;
+}
+
+// btcrefund <contract> <contract tx hex or txid>
+static json rpc_btcrefund(const json& p)
+{
+    if (p.size() < 2)
+        throw runtime_error("btcrefund <contract hex> <contract transaction hex or txid> [Bitcoin destination] [fee rate]");
+    json j = BtcSpend(p, NULL);
+    LogSwap(json{{"refunded", j["txid"]}, {"chain", "bitcoin"}});
+    return j;
+}
+
+// btcfindsecret <contract> <contract tx hex or txid> [from height]
+// Has the other side redeemed our Bitcoin contract -- and so shown the
+// secret? Looks in Core's memory pool, then in the blocks from `from height`
+// (default: the last 400, more than a 48-hour lock). Without asking anyone:
+// a participant who never hears from the initiator again still gets the
+// secret off the chain.
+static json rpc_btcfindsecret(const json& p)
+{
+    if (p.size() < 2)
+        throw runtime_error("btcfindsecret <contract hex> <contract transaction hex or txid> [from height]");
+    btcswap::Chain chain = RequireBitcoin();
+    CScript contract;
+    swap::Contract c = ContractFromParam(p[0], contract);
+    if (btcswap::UsingLight()) return btclight::Find(contract, p[1].get<string>(), true);
+    BtcContractOut o = BtcResolveContract(p[1], contract);
+    unsigned int n = o.n;
+    string strTxid = o.txid.GetHex();
+    COutPoint outpoint(o.txid, n);
+
+    json j;
+    if (o.fUnspent)
+    {
+        j["spent"] = false;
+        return j;
+    }
+    j["spent"] = true;
+
+    vector<CTransaction> vCandidates;
+    json r;
+    string err;
+    if (btcswap::Call("gettxspendingprevout", json::array({ json::array({ json{{"txid", strTxid}, {"vout", (int)n}} }) }), r, err) &&
+        r.is_array() && !r.empty() && r[0].is_object() && r[0].contains("spendingtxid"))
+    {
+        json raw;
+        CTransaction tx;
+        if (btcswap::Call("getrawtransaction", json::array({ r[0]["spendingtxid"] }), raw, err) && raw.is_string() &&
+            btcswap::ParseTx(ParseHex(raw.get<string>()), tx))
+            vCandidates.push_back(tx);
+    }
+    int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - 400);
+    for (int h = chain.nBlocks; vCandidates.empty() && h >= nFrom; h--)
+    {
+        json hash = BtcCall("getblockhash", json::array({ h }));
+        json raw = BtcCall("getblock", json::array({ hash, 0 }), 64 * 1024 * 1024);
+        vector<CTransaction> txs;
+        if (!raw.is_string() || !btcswap::ParseBlockTxs(ParseHex(raw.get<string>()), txs))
+            throw runtime_error(strprintf("Bitcoin block %d does not decode", h));
+        for (size_t i = 0; i < txs.size(); i++)
+            for (size_t k = 0; k < txs[i].vin.size(); k++)
+                if (txs[i].vin[k].prevout == outpoint)
+                {
+                    vCandidates.push_back(txs[i]);
+                    j["height"] = h;
+                }
+    }
+    if (vCandidates.empty())
+    {
+        j["found"] = false;
+        return j;
+    }
+    const CTransaction& spend = vCandidates[0];
+    j["found"] = true;
+    j["txid"] = spend.GetHash().GetHex();
+    for (size_t k = 0; k < spend.vin.size(); k++)
+    {
+        vector<unsigned char> secret;
+        if (spend.vin[k].prevout == outpoint && swap::ExtractSecret(spend.vin[k].scriptSig, c.secretHash, secret))
+        {
+            j["secret"] = HexStr(secret.begin(), secret.end(), false);
+            return j;
+        }
+    }
+    j["refunded"] = true;     // spent without the secret: the refund path
+    return j;
+}
+
 static json rpc_help(const json&)
 {
     return "getinfo getblockcount getblockhash getblock getnewaddress validateaddress "
-           "getbalance sendtoaddress gettransaction listtransactions listsinceblock "
+           "getbalance sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
+           "gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
-           "gettorinfo settorbridges gettreasuryinfo donate help";
+           "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
+           "btcswapinfo btcnewaddress btcvalidatedestination btcinitiate btcparticipate btcauditcontract btcredeem btcrefund btcfindsecret "
+           "gettorinfo settorbridges gettreasuryinfo donate sendburn help";
 }
 
 struct RpcEntry { const char* name; RpcMethod fn; };
@@ -1172,7 +2278,15 @@ static const RpcEntry kMethods[] = {
     { "validateaddress",  rpc_validateaddress },
     { "getbalance",       rpc_getbalance },
     { "sendtoaddress",    rpc_sendtoaddress },
+    { "estimatefee",      rpc_estimatefee },
+    { "createinvoice",    rpc_createinvoice },
+    { "getinvoice",       rpc_getinvoice },
+    { "listinvoices",     rpc_listinvoices },
+    { "cancelinvoice",    rpc_cancelinvoice },
+    { "settxfee",         rpc_settxfee },
+    { "bumpfee",          rpc_bumpfee },
     { "donate",           rpc_donate },
+    { "sendburn",         rpc_sendburn },
     { "gettreasuryinfo",  rpc_gettreasuryinfo },
     { "gettransaction",   rpc_gettransaction },
     { "listtransactions", rpc_listtransactions },
@@ -1186,6 +2300,22 @@ static const RpcEntry kMethods[] = {
     { "getrawtransaction", rpc_getrawtransaction },
     { "signrawtransaction", rpc_signrawtransaction },
     { "sendrawtransaction", rpc_sendrawtransaction },
+    { "swapinitiate",     rpc_swapinitiate },
+    { "swapparticipate",  rpc_swapparticipate },
+    { "swapauditcontract", rpc_swapauditcontract },
+    { "swapredeem",       rpc_swapredeem },
+    { "swaprefund",       rpc_swaprefund },
+    { "swapextractsecret", rpc_swapextractsecret },
+    { "swapfindsecret",   rpc_swapfindsecret },
+    { "btcswapinfo",      rpc_btcswapinfo },
+    { "btcvalidatedestination", rpc_btcvalidatedestination },
+    { "btcnewaddress",    rpc_btcnewaddress },
+    { "btcinitiate",      rpc_btcinitiate },
+    { "btcparticipate",   rpc_btcparticipate },
+    { "btcauditcontract", rpc_btcauditcontract },
+    { "btcredeem",        rpc_btcredeem },
+    { "btcrefund",        rpc_btcrefund },
+    { "btcfindsecret",    rpc_btcfindsecret },
     { "help",             rpc_help },
 };
 

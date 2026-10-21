@@ -149,6 +149,12 @@ enum opcodetype
     OP_CHECKMULTISIG,
     OP_CHECKMULTISIGVERIFY,
 
+    // Rules v3 (BIP65). The byte Bitcoin uses, so a lock script written for
+    // one chain reads the same on the other -- which is the point of having
+    // it: an atomic swap is the same script on both sides. Before rules v3 this
+    // byte is unknown here and fails any script that runs it.
+    OP_CHECKLOCKTIMEVERIFY = 0xb1,
+
 
     // multi-byte opcodes
     OP_SINGLEBYTE_END = 0xF0,
@@ -288,6 +294,7 @@ inline const char* GetOpName(opcodetype opcode)
     case OP_CHECKSIGVERIFY         : return "OP_CHECKSIGVERIFY";
     case OP_CHECKMULTISIG          : return "OP_CHECKMULTISIG";
     case OP_CHECKMULTISIGVERIFY    : return "OP_CHECKMULTISIGVERIFY";
+    case OP_CHECKLOCKTIMEVERIFY    : return "OP_CHECKLOCKTIMEVERIFY";
 
 
 
@@ -700,8 +707,13 @@ public:
 
 
 
+// fRulesV3 turns on what rules v3 adds inside a script: OP_CHECKLOCKTIMEVERIFY.
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
-                vector<vector<unsigned char> >* pvStackRet=NULL, bool fStrictSigs=false);
+                vector<vector<unsigned char> >* pvStackRet=NULL, bool fStrictSigs=false,
+                bool fRulesV3=false);
+// nLockTime below this is a block height; at or above, a unix time (Bitcoin's
+// split, so a lock means the same on both chains).
+static const unsigned int LOCKTIME_THRESHOLD = 500000000;
 // Rules v2 signature encoding: strict DER (BIP66) and low S (BIP62). Both take
 // the signature as it sits on the stack, hash-type byte included.
 bool IsStrictDERSignature(const vector<unsigned char>& vchSig);
@@ -713,7 +725,11 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
 // this transaction complete": the scriptSig is push-only and satisfies the
 // scriptPubKey; if the scriptPubKey is pay-to-script-hash, the last push is
 // the redeem script, hashes to it, and the pushes before it satisfy it.
-bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn);
+bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
+                      bool fStrictSigs=false, bool fRulesV3=false);
+// Signature operations inside the redeem script a P2SH scriptSig carries
+// (BIP16): counted against the block's limit once rules v3 make them run.
+unsigned int GetP2SHSigOpCount(const CScript& scriptSig);
 // Merge two partial multisig scriptSigs (bare, or the inner part of a P2SH
 // spend) for the same input: every signature from either that verifies
 // against one of the keys is kept, in key order, up to nRequired.
@@ -747,4 +763,8 @@ bool IsMine(const CScript& scriptPubKey);
 bool ExtractPubKey(const CScript& scriptPubKey, bool fMineOnly, vector<unsigned char>& vchPubKeyRet);
 bool ExtractHash160(const CScript& scriptPubKey, uint160& hash160Ret);
 bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int nIn, int nHashType=SIGHASH_ALL, CScript scriptPrereq=CScript());
-bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType=0, bool fStrictSigs=false);
+// fRulesV3: a pay-to-script-hash output is spent by its redeem script, not by
+// whoever presents a script that hashes right (BIP16), and OP_CHECKLOCKTIMEVERIFY
+// is live.
+bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
+                     bool fStrictSigs=false, bool fRulesV3=false);

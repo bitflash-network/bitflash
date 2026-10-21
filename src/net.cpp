@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include "btfaddr.h"
 #include "proxy.h"
+#include "chatdir.h"
 #include "tor.h"
 
 void ThreadReconnectCachedBtfPeers(void* parg);
@@ -54,7 +55,13 @@ static const char pchTestnetMessageStart[4] = { (char)0xce, (char)0xe2, (char)0x
 static bool fTestNet = false;
 char pchMessageStart[4] = { 0xbf, 0x20, 0x5c, 0xfd };
 bool fClient = false;
-uint64 nLocalServices = (fClient ? 0 : NODE_NETWORK);
+#ifdef BITFLASH_CHAT_APP
+// The chat app links the node's code but is not a node: it holds no chain and
+// no chat records, and must not tell anybody it does.
+uint64 nLocalServices = 0;
+#else
+uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT));
+#endif
 CAddress addrLocalHost(0, GetDefaultPort(), nLocalServices);
 unsigned short nListenPort = GetDefaultPort(); // local P2P port (tunable via /port)
 CNode nodeLocalHost(INVALID_SOCKET, CAddress("127.0.0.1", nLocalServices));
@@ -921,6 +928,15 @@ static const BtfSeed* BtfActiveSeeds(size_t& nOut)
     nOut = ARRAYLEN(pszBtfSeedsMainnet); return pszBtfSeedsMainnet;
 }
 
+void BtfSeedOnions(vector<string>& vOut)
+{
+    vOut.clear();
+    size_t n = 0;
+    const BtfSeed* seeds = BtfActiveSeeds(n);
+    for (size_t i = 0; i < n; i++)
+        vOut.push_back(seeds[i].onion);
+}
+
 // Extra seeds from the command line (/btfseed=ADDRESS:ENCHEX, repeatable).
 vector<pair<string, string> > vBtfExtraSeeds;
 
@@ -1158,6 +1174,11 @@ static bool BtfEndpointFitsThisNetwork(const string& strOnion)
     if (!fMainnetBand && !fTestnetBand)
         return true;                       // custom port, not ours to judge
     return IsTestNet() ? fTestnetBand : fMainnetBand;
+}
+
+bool BtfOnionFitsThisNetwork(const string& strOnion)
+{
+    return BtfEndpointFitsThisNetwork(strOnion);
 }
 
 void BtfPexCollect(vector<string>& vDescOut)
@@ -2322,6 +2343,11 @@ bool StartNode(string& strError)
     // Peer discovery over Nostr relays (replaces the old IRC seed)
     if (_beginthread(ThreadNostrSeed, 0, NULL) == -1)
         printf("Error: _beginthread(ThreadNostrSeed) failed\n");
+
+    // The public community directory, read off the chain for the chat apps
+    // that ask (chatdir.h).
+    if (_beginthread(ThreadChatDirectory, 0, NULL) == -1)
+        printf("Error: _beginthread(ThreadChatDirectory) failed\n");
 
     // Anonymous inbound is the Tor hidden service now, not a rendezvous relay:
     // Tor forwards onion connections to our local listener, which accepts them

@@ -28,6 +28,11 @@ bitflash-node -nogui -datadir=/var/lib/bitflash \
 - `-rpcpassword` shorter than sixteen characters is refused.
 - `-rpcpassword=@FILE` reads the secret from a file, so it never appears in
   the process list. Prefer it on any machine other people can log into.
+- `-chatwallet`, with no `-rpcuser`/`-rpcpassword`: the same server, with a
+  fresh random password written to `<datadir>/.cookie` as `__cookie__:<hex>`
+  (bitcoind's cookie). It is how btfchat on the same machine pays and receives
+  through this wallet (`docs/btfchat.md`). Anything running as the same user
+  can read the cookie and spend; off unless asked for.
 
 ## Calling it
 
@@ -58,18 +63,49 @@ null.
 | `validateaddress` | `address` | `isvalid`, and `ismine` when it is |
 | `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards |
 | `sendtoaddress` | `address`, `amount` | txid of the transaction it created and broadcast |
-| `gettransaction` | `txid` | amount, confirmations, block, `details` per output |
+| `gettransaction` | `txid` | amount, confirmations, block, `details` per output, `bip125-replaceable` |
+| `createinvoice` | `amount`, [`description`], [`expirysecs`], [`orderid`] | an invoice for the shop's own gateway: fresh address, payment link, QR as SVG -- `docs/invoices.md` |
+| `getinvoice` | `id` | its status (`waiting`, `partial`, `seen`, `paid`, `expired`, `cancelled`) and what arrived |
+| `listinvoices` | [`status`] | all invoices, or those in one status |
+| `cancelinvoice` | `id` | stop expecting it |
+| `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
+| `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
+| `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
 | `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
 | `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
 | `gettreasuryinfo` | — | `configured`, `network`, `page`; when configured: `required`, `keys`, the `script` decoded, `howToPay`, this node's `treasuryShare` and `poolFeeTo` |
 | `donate` | `amount` | txid of a transaction paying the treasury; the same as `sendtoaddress treasury <amount>` |
+| `sendburn` | `amount`, `datahex` | txid of a transaction burning `amount` into an OP_RETURN carrying the data (1 to 80 bytes): a public community listing, for one |
+| `swapinitiate` | `address`, `amount` | starts an atomic swap: contract, its address and txid, the **secret**, its hash, the lock -- `docs/atomic-swaps.md` |
+| `swapparticipate` | `address`, `amount`, `secrethash` | the other half: contract under someone else's secret hash |
+| `swapauditcontract` | `contract`, `txid` | the terms of a contract and whether it pays this wallet |
+| `swapredeem` | `contract`, `txid`, `secret` | takes the coins with the secret |
+| `swaprefund` | `contract`, `txid` | takes them back after the lock |
+| `swapextractsecret` | `txid` \| `rawhex`, `secrethash` | the secret, from a redeem on this chain or on Bitcoin's |
+| `swapfindsecret` | `contract`, `txid` | whether a contract of ours was spent, and the secret if the spend showed it |
+| `btcswapinfo` | -- | the Bitcoin Core this wallet swaps against (`-btcchain`, `-btcdatadir`...): chain, height, balance, fee rate |
+| `btcnewaddress` | -- | a Bitcoin address whose key is in THIS wallet, to be paid BTC to in a swap |
+| `btcinitiate` | `address`, `amount` | starts a swap on Bitcoin: Core funds the contract; the keys and the secret are this wallet's |
+| `btcparticipate` | `address`, `amount`, `secrethash` | the other half, on Bitcoin |
+| `btcauditcontract` | `contract`, `rawhex` \| `txid` \| `txid:vout` | a Bitcoin contract as this machine's Core sees it: unspent, confirmations, amount, whether it pays us |
+| `btcredeem` | `contract`, ref, `secret` | takes the BTC into a fresh address of Core's wallet |
+| `btcrefund` | `contract`, ref | takes it back after the lock |
+| `btcfindsecret` | `contract`, ref, [`fromheight`] | whether a Bitcoin contract was spent, and the secret |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the
 treasury's multisig script wherever an address is taken (`sendtoaddress`,
 `createrawtransaction` outputs); `docs/treasury.md`.
+
+**Unconfirmed payments can change their txid.** From 1.2.29 the wallet sends
+replaceable (BIP125) so a payment can be sped up, and the same holds for a
+deposit someone makes to you: until it is in a block, its sender may replace
+it with one paying more -- or paying somebody else. Credit deposits on
+confirmations, never on the memory pool, and match a deposit by address and
+amount rather than by the txid first seen. `gettransaction` says
+`bip125-replaceable: yes` while that is possible.
 
 ## The loop an exchange runs
 

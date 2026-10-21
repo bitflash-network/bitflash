@@ -1,7 +1,164 @@
 # btfchat — messaging that burns
 
-*Design document, 2026-09-18. Nothing here is implemented yet; the parts that
-exist in the tree are named where they do. Status of each phase is at the end.*
+*Design document, 2026-09-18. The first section says what 1.2.29 actually
+ships; everything after it is the design the shipped part grows into. Status of
+each phase is at the end.*
+
+## What 1.2.29 ships
+
+- **`btfchat`, a program of its own.** No chain, no wallet balance, no mining:
+  a chat that happens to share the coin's network. Its identity is a `.btf`
+  address grown from the same recovery phrase as the wallet, and its onion
+  service is its own, never the node's.
+- **Live messages go straight to the other person**, over Tor, to their chat
+  onion, in a channel keyed by X25519 and ML-KEM together (`btfchan.cpp`) with
+  a key that moves forward on every message.
+- **Offline messages wait in the Bitflash nodes.** Sealed to the recipient's
+  epoch keys (also X25519 + ML-KEM, rotated daily and destroyed after two
+  days), filed under a tag only the two people can compute, held by every
+  node running 1.2.29 or later for about a day (`chatstore.h`,
+  `chatrelay.h`). If no node can take it, the message stays in the sender's
+  own outbox and goes direct the moment the other side is seen online.
+- **Finding someone needs no server.** A chat identity's signed descriptor
+  (its onion and channel key) is held by the same nodes. The chat app reaches
+  them the way a node does: the onion seeds pinned in the binary, then the
+  signed peer lists every node hands out (`btfchatnet.h`). No Nostr relay, no
+  VPS, nothing of ours or anybody's that has to stay up.
+- **Money inside the conversation.** The chat holds no coins: the person's own
+  Bitflash wallet, started with `-chatwallet`, pays and receives through RPC
+  on 127.0.0.1 (cookie in its data directory). "Ask to be paid" sends a fresh
+  address of that wallet, signed by the chat identity; "pay" pays only an
+  address the contact signed, so nothing between the two can redirect it. An
+  incoming payment shows what *your* wallet sees of it, not what the note
+  claims.
+- **Public communities, with the chain as the directory.** Creating one burns
+  0.01 BTF into an OP_RETURN carrying its name and key; every node reads the
+  chain for listings and hands the list to the chat, and nobody can take one
+  down. Posts are signed, sealed with the room's key, and left with the nodes
+  under a daily tag, collected in the same round as the mailbox.
+- **BTF for BTC, inside the chat.** An offer is a signed post in a community
+  ("100 BTF for 0.001 BTC"); whoever takes it and whoever made it carry an
+  atomic swap through in their conversation, each with their own Bitflash
+  wallet -- and, for the Bitcoin half, their own Bitcoin Core (any current
+  version: the wallet signs, Core only pays and receives). Each side checks
+  the other's contract on its own nodes before locking anything, the secret
+  is read off the chain, and a swap that does not finish refunds itself at
+  its lock. Two presses to lock, nothing else (`btfchatswap.h`,
+  `docs/atomic-swaps.md`).
+- **Spam costs work, not yet coin.** Every record a node stores carries about
+  a second of proof of work, more for bigger ones; nodes ration each
+  connection and cap the memory the chat may use. The burn stamp below is the
+  real answer and has not shipped.
+
+Not in 1.2.29, all described below: burn stamps on every message, fixed-size envelopes, cover
+traffic, ephemeral onions per conversation, the chain-anchored handshake,
+groups with admins (MLS).
+
+## Known attacks on 1.2.29
+
+Written down so nobody has to rediscover them, and so a fix can say which one
+it closes. Each entry: what the attacker does, what stops it, what is left.
+Numbers are from `test_chatstore` and the live runs.
+
+**Flooding the nodes' memory with a GPU.** The work on each record is
+SHA-256 at 20 bits, about 1.2 s on one laptop core, more for bigger records.
+A graphics card pays that a million times over: filling the 8 MB descriptor
+budget took 13,024 records in the test, seconds on a GPU. *Stops it:* a full
+store **refuses** new records instead of evicting old ones, so nothing a node
+already holds is erased. The sender is told at once, the message stays in
+their outbox and goes direct when the other side is seen. *Left:* while the
+flood lasts, and up to a day after (records expire after 26 h), new offline
+messages do not get into the nodes. The per-connection ration (60 records a
+minute) does not help, since Tor gives an attacker as many connections as it
+wants. The fix is a stamp that costs coin (phase 1) or RandomX in place of
+SHA-256.
+
+**Many throwaway identities.** Keys are free, so somebody can publish
+thousands of descriptors and epoch keys. *Stops it:* the same budget and the
+same refusal; an identity already held can always replace its own record,
+because the room its old one leaves is what the new one uses. *Left:* a
+flood can stop **new** identities from being findable until it ages out.
+
+**A node lying about who someone is.** It could answer a lookup with another
+identity's descriptor or epoch keys and read everything sealed to them.
+*Stops it:* both are signed by the identity, and both the node that stores
+them and the client that receives them check the signature against the
+address that was asked for. A node cannot forge one.
+
+**Making an old descriptor win.** Rewrap a validly signed old descriptor with
+a newer record time. *Stops it:* the record time must equal the signed time
+inside (the descriptor's creation time, the epoch's start), so "newest" is
+decided by what the owner signed.
+
+**A node hiding what it holds.** It can answer "nothing" for a tag that has
+envelopes waiting. *Stops it, partly:* every record spreads to every 1.2.29
+node, the client asks two of them and merges, and a sender tries to leave
+every record with two nodes (it counts as left once one has kept it). *Left:* if every node a client can reach
+is the attacker's, it can withhold, though still not forge. A client starts
+from the onion seeds pinned in the binary, so a dead or hostile seed slows
+the first contact; after that the client knows every node the others told it
+about.
+
+**Pushing someone's envelopes out of their tag.** A tag holds at most 64
+envelopes and the oldest goes first. *Stops it:* a tag is computed from the
+two people's keys and changes every day; nobody else can name it, so only the
+pair can fill it.
+
+**What a node learns.** That somebody, over Tor, published or asked for a
+descriptor, or wrote to or read a tag, when, and how big. Not who: the chat
+never connects except through Tor, and a tag names a pair nobody can link to
+addresses. The number of Tor circuits a client opens is countable by whoever
+watches its connection; one circuit per two-minute round is the floor this
+release keeps to.
+
+**Inventory flood between nodes.** A peer announces thousands of record ids
+it never delivers. *Stops it:* nothing new; it is the same exposure 0.1.0 has
+for transactions (each asked-for id costs a little memory until it times
+out). Records themselves are rationed at 6,000 a minute per peer and each
+costs a signature check at most.
+
+**Old nodes.** A 1.2.28 node never sees chat inventory, because it is offered
+only to peers that advertise `NODE_CHAT`. An old node a client reaches still
+hands over its peer list, which may lead to new ones.
+
+**Clocks.** A record more than 2 h in the future is refused; a frame older
+than a day is refused by the replay guard. A machine whose clock is far off
+will see its records refused, and says so.
+
+**A swap step that lies.** The other side says "I locked 1 BTC for you" and
+did not, or locked less, or to another address, or under another secret.
+*Stops it:* nothing is locked or redeemed on the strength of a step. The
+taker's app looks the maker's contract up on the taker's own Bitflash node or
+Bitcoin Core and needs it unspent, confirmed, paying the taker's address the
+agreed amount, with 36 hours left; the maker's app checks the taker's the
+same way, under the maker's own hash, with 6 hours left, before showing the
+secret. A raw transaction in a message is never trusted: Bitcoin is checked
+by `gettxout` on the person's own node.
+
+**Fake coins.** Paying real BTF with Bitcoin from regtest or a test chain,
+which cost nothing. *Stops it:* the wallet refuses a Bitcoin Core on a test
+chain when Bitflash is on mainnet, and the main chain when it is on testnet.
+
+**A maker who takes and runs.** The maker redeems the taker's side (showing
+the secret) and never says so. *Stops it:* the taker's app reads the secret
+off the chain itself (`swapfindsecret`, `btcfindsecret`), so it needs nothing
+from the maker. *Left:* the taker's app has to run at some point in the day
+after; if it stays closed past the maker's lock (48 h from the start), the
+maker can refund too. The app says to stay open while a swap runs.
+
+**A taker who never locks.** *Stops it:* the maker's coins come back by
+themselves at the 48-hour lock; only time is lost. A take nobody accepts, or
+a contract that never confirms, expires before anything of the waiting side
+is locked.
+
+**Somebody else's offer.** A take names the offer by its frame id, and the
+maker's app answers only for offers it posted itself with exactly those
+terms; an offer is signed, so a take goes to whoever really made it.
+
+**A node restarting.** It forgets: the store is memory only, never the disk,
+so a seized machine has nothing to give up. It gets the records back from its
+peers when it reconnects (`getchatinv`). *Left:* a record that only one node
+ever kept, lost before it spread, is gone -- which is why the sender tries two.
 
 ## What it is
 
@@ -174,14 +331,15 @@ and the coin are the same program on a network that only speaks Tor.
 
 ## Phases
 
-| phase | scope | depends on |
-|---|---|---|
-| 0 | `OP_RETURN` standard in relay policy; burn stamp format; `docs` | 1.2.28 (relay policy only, no consensus) |
-| 1 | one-to-one: PQXDH + ratchet + MAC auth, sealed sender, fixed size, burn stamp, chain-anchored handshake, money in messages; wallet tab + RPC | rules v3 shipped; ~3 weeks after |
-| 2 | communities: channels, join/post burns, paid reading, reputation | phase 1 |
-| 3 | cover traffic, ephemeral onions per conversation, node storage market | phase 1 |
-| 4 | groups (MLS, multisig admins) | phase 1; OpenMLS or an equivalent integrated |
-| 5 | Android client | the native app |
+| phase | scope | depends on | status |
+|---|---|---|---|
+| 0 | `OP_RETURN` standard in relay policy; burn stamp format; `docs` | 1.2.28 (relay policy only, no consensus) | shipped in 1.2.28 |
+| 1a | one-to-one over onion; hybrid post-quantum channel; sealed offline envelopes held by the nodes, paid in work; local outbox; money in the conversation through the linked wallet; public communities listed on the chain | 1.2.29 nodes for the offline half and the directory | **1.2.29** |
+| 1 | the rest of one-to-one: fixed size, burn stamp, chain-anchored handshake, money in messages; wallet tab + RPC | rules v3 shipped | design |
+| 2 | communities: channels, join/post burns, paid reading, reputation | phase 1 | design |
+| 3 | cover traffic, ephemeral onions per conversation, node storage market | phase 1 | design |
+| 4 | groups (MLS, multisig admins) | phase 1; OpenMLS or an equivalent integrated | design |
+| 5 | Android client | the native app | design |
 
 ## Open questions
 

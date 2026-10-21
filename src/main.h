@@ -12,6 +12,7 @@ class CTransaction;
 class CBlock;
 class CBlockIndex;
 class CWalletTx;
+class CTxDB;
 class CKeyItem;
 
 // Ceiling on transactions held waiting for a parent that has not arrived.
@@ -47,6 +48,17 @@ static const int64 MAX_MONEY = 21000000 * COIN;
 inline bool MoneyRange(int64 nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
 static const int64 CENT = 1000000;
 static const int COINBASE_MATURITY = 100;
+
+// Fees as a market (relay and mining policy, not consensus: no block is
+// refused for its fees). A transaction says it may be replaced by one paying
+// more (BIP125) with an input below SEQUENCE_FINAL - 1; the wallet sends that
+// way, so a payment stuck behind fuller blocks can be sped up (bumpfee).
+// Miners take transactions by fee per byte. MIN_RELAY_FEE_PER_KB is what a
+// replacement must add on top, per KB of itself, so replacing is never free.
+static const unsigned int SEQUENCE_FINAL = 0xffffffff;
+static const unsigned int SEQUENCE_REPLACEABLE = 0xfffffffd;
+static const int64 MIN_RELAY_FEE_PER_KB = CENT / 10;
+static const unsigned int MAX_REPLACED_TXS = 100;
 
 // Bitflash difficulty floor. The PoW is RandomX (memory-hard), ~1000x slower
 // per hash than SHA-256d, so the target is much easier than Bitcoin's to let a
@@ -244,7 +256,8 @@ std::vector<unsigned int> HDBIP44Path(unsigned int nCoinType,
 // default receiving key is derived immediately, so the next visible address is
 // covered by the phrase. Writes to wallet.dat. Returns false and leaves the
 // wallet untouched if the phrase is not valid.
-bool SetHDSeedFromMnemonic(const string& strMnemonic, string& strErrorRet);
+bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphrase,
+                           string& strErrorRet);
 
 // Derive the receiving child at nIndex for the wallet's active schema and
 // return it as a key. Legacy seeded wallets use m/index'. BIP44 wallets use
@@ -292,6 +305,12 @@ void GetPoolOperatorStats(int& authorizedMiners, int& blocksFound, uint64& round
 void GetPoolWorkerStats(std::vector<PoolWorkerStatView>& out);
 void GetPendingPayouts(std::vector<PendingPayoutView>& out);
 bool ProcessMessages(CNode* pfrom);
+// May this transaction go in the block being built on the current tip? Under
+// rules v3, CTransaction::IsFinalAt at the next height and the tip's median
+// time past; before, the old rule. Every block builder asks this, so none of
+// them can produce a block that AcceptBlock would refuse.
+class CTransaction;
+bool IsFinalForNextBlock(const CTransaction& tx);
 // pnDoS, when given, receives the misbehavior score a failure is worth: 0 for
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
@@ -372,6 +391,29 @@ struct WalletRecoveryAudit
 };
 WalletRecoveryAudit GetWalletRecoveryAudit();
 bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int64& nFeeRequiredRet);
+
+// ---- fees (main.cpp) ----
+// The wallet's fee rate, satoshis per 1000 bytes; 0 means the minimum.
+extern int64 nPayTxFeePerKB;
+inline int64 FeeForSize(int64 nRatePerKB, unsigned int nBytes) { return (nRatePerKB * (int64)nBytes + 999) / 1000; }
+// What a memory-pool transaction pays (its inputs from the pool or the
+// chain). Hold cs_mapTransactions.
+bool GetMempoolTxFee(const CTransaction& tx, CTxDB& txdb, int64& nFeeOut);
+// The memory pool, best fee per byte first: the order a block is filled in.
+// Hold cs_mapTransactions.
+void MempoolByFeeRate(CTxDB& txdb, std::vector<CTransaction*>& vOut);
+// BIP125's two money rules for a replacement, apart from the pool so they
+// can be tested: it pays at least what it replaces plus the relay fee for
+// its own size, and more per byte than each one it replaces.
+bool ReplacementPaysEnough(int64 nNewFee, unsigned int nNewSize,
+                           const std::vector<std::pair<int64, unsigned int> >& vOld, std::string& whyOut);
+// The fee per 1000 bytes to be in the next block, from what is waiting now;
+// 0 when everything waiting would fit (the minimum is enough).
+int64 EstimateNextBlockFeePerKB();
+// Speed up a payment of ours that is still waiting: the same inputs, more
+// fee, taken from its change.
+bool BumpFee(const uint256& txid, int64 nNewRatePerKB, uint256& newTxidOut,
+             int64& nOldFeeOut, int64& nNewFeeOut, std::string& errOut);
 bool CommitTransactionSpent(const CWalletTx& wtxNew);
 bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
 
@@ -713,6 +755,30 @@ public:
         return true;
     }
 
+    // Rules v3: may this transaction be in a block at nBlockHeight, whose
+    // median time past is nBlockTime? Bitcoin's rule: an nLockTime below
+    // LOCKTIME_THRESHOLD is a height, at or above it a unix time, and the
+    // transaction is final once the block is past it -- or when every input
+    // says so with a final nSequence.
+    //
+    // The 0.1.0 rule above was only ever applied by the miner and the wallet:
+    // no block was ever refused for a transaction that was not final, so
+    // nLockTime meant nothing to the chain. That is harmless until a script
+    // relies on it -- OP_CHECKLOCKTIMEVERIFY checks nLockTime, and without
+    // this rule a "refund after block N" could be mined at block 1.
+    bool IsFinalAt(int nBlockHeight, int64 nBlockTime) const
+    {
+        if (nLockTime == 0)
+            return true;
+        int64 nCutoff = nLockTime < LOCKTIME_THRESHOLD ? (int64)nBlockHeight : nBlockTime;
+        if ((int64)nLockTime < nCutoff)
+            return true;
+        foreach(const CTxIn& txin, vin)
+            if (!txin.IsFinal())
+                return false;
+        return true;
+    }
+
     bool IsNewerThan(const CTransaction& old) const
     {
         if (vin.size() != old.vin.size())
@@ -740,6 +806,15 @@ public:
             }
         }
         return fNewer;
+    }
+
+    // BIP125 opt-in: may the sender replace this with a version paying more?
+    bool SignalsReplacement() const
+    {
+        foreach(const CTxIn& txin, vin)
+            if (txin.nSequence < SEQUENCE_FINAL - 1)
+                return true;
+        return false;
     }
 
     bool IsCoinBase() const
@@ -801,6 +876,11 @@ public:
             vector<vector<unsigned char> > vSolutions;
             if (SolverTyped(s, whichType, vSolutions) && whichType == TX_MULTISIG &&
                 vSolutions.size() - 2 <= 3)
+                continue;
+            // From rules v3 on, a script hash is spent by its redeem script,
+            // so paying to one is safe and relayed. That is what an atomic
+            // swap and a 2-of-3 escrow pay to.
+            if (s.IsPayToScriptHash() && RulesV3Active((unsigned int)GetAdjustedTime()))
                 continue;
             return false;
         }
@@ -963,7 +1043,10 @@ public:
     // nBlockTime is the time of the block these inputs are being connected
     // in -- which decides whether rules v2 apply to its signatures. 0 means
     // "not in a block yet" (mempool, template), and the current time stands in.
-    bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0);
+    // pnP2SHSigOps, if given, is incremented by the signature operations inside
+    // the redeem scripts this transaction spends (rules v3 only).
+    bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0,
+                       unsigned int* pnP2SHSigOps=NULL);
     bool ClientConnectInputs();
 
     bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL);

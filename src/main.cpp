@@ -11,6 +11,7 @@
 #endif
 #include "headers.h"
 #include "treasury.h"
+#include "chatrelay.h"  // the chat's records: held, relayed and served here
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -119,6 +120,7 @@ int fGenerateBitcoins;
 // only visible symptom was a suspiciously idle CPU.
 int nMinerThreads = 0;
 int64 nTransactionFee = 0;
+int64 nPayTxFeePerKB = 0;
 CAddress addrIncoming;
 int    nMineMode        = MINE_RELAY;
 bool   fMineModeFromCommandLine = false;
@@ -869,14 +871,22 @@ bool DeriveHDChangeKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
     return true;
 }
 
-bool SetHDSeedFromMnemonic(const string& strMnemonic, string& strErrorRet)
+// strPassphrase is BIP39's optional extra word. It is NOT a lock on the file:
+// it goes into the key derivation, so the same twelve words with two different
+// passphrases are two different wallets, both valid, neither an error. That is
+// the whole point -- the words alone are not enough to spend -- and also the
+// whole danger: a wrong passphrase opens an empty wallet instead of refusing.
+// Callers pass "" when the user did not ask for one, and every call site says
+// so explicitly rather than relying on a default nobody reads.
+bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphrase,
+                           string& strErrorRet)
 {
     string strNormalized;
     if (!bitflash::BIP39ValidateMnemonic(strMnemonic, strNormalized, strErrorRet))
         return false;
 
     vector<unsigned char> vchSeed;
-    if (!bitflash::BIP39MnemonicToSeed(strNormalized, "", vchSeed, strErrorRet))
+    if (!bitflash::BIP39MnemonicToSeed(strNormalized, strPassphrase, vchSeed, strErrorRet))
         return false;
 
     bitflash::BIP32PrivateNode master;
@@ -1579,26 +1589,40 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         if (txdb.ContainsTx(hash))
             return false;
 
-    // Check for conflicts with in-memory transactions
-    CTransaction* ptxOld = NULL;
-    for (int i = 0; i < vin.size(); i++)
+    // Conflicts with what is already waiting: a replacement (BIP125), or not
+    // at all. 0.1.0 let a "newer version" by nSequence replace for free,
+    // which anybody holding the keys could repeat forever at no cost to
+    // themselves and some to every node; a replacement now has to have been
+    // allowed by the original and has to pay for itself.
+    set<uint256> setConflicts;
+    CRITICAL_BLOCK(cs_mapTransactions)
     {
-        COutPoint outpoint = vin[i].prevout;
-        if (mapNextTx.count(outpoint))
+        for (int i = 0; i < vin.size(); i++)
         {
-            // Allow replacing with a newer version of the same transaction
-            if (i != 0)
+            map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(vin[i].prevout);
+            if (mi != mapNextTx.end() && mi->second.ptx)
+                setConflicts.insert(mi->second.ptx->GetHash());
+        }
+        if (!setConflicts.empty())
+        {
+            if (!fCheckInputs)
                 return false;
-            ptxOld = mapNextTx[outpoint].ptx;
-            if (!IsNewerThan(*ptxOld))
-                return false;
-            for (int i = 0; i < vin.size(); i++)
+            if (setConflicts.size() > MAX_REPLACED_TXS)
+                return error("AcceptTransaction() : %s would replace too many transactions", hash.ToString().substr(0,6).c_str());
+            foreach(const uint256& h, setConflicts)
             {
-                COutPoint outpoint = vin[i].prevout;
-                if (!mapNextTx.count(outpoint) || mapNextTx[outpoint].ptx != ptxOld)
-                    return false;
+                const CTransaction& txOld = mapTransactions[h];
+                if (!txOld.SignalsReplacement())
+                    return error("AcceptTransaction() : %s conflicts with %s, which did not allow replacement",
+                                 hash.ToString().substr(0,6).c_str(), h.ToString().substr(0,6).c_str());
+                // Replacing a transaction that others already build on would
+                // drop them too; not taken, so a replacement never takes more
+                // out of the pool than it names.
+                for (unsigned int n = 0; n < txOld.vout.size(); n++)
+                    if (mapNextTx.count(COutPoint(h, n)))
+                        return error("AcceptTransaction() : %s would replace %s, which has unconfirmed children",
+                                     hash.ToString().substr(0,6).c_str(), h.ToString().substr(0,6).c_str());
             }
-            break;
         }
     }
 
@@ -1618,27 +1642,139 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         // The pool is bounded. Past the ceiling only a transaction that
         // pays the full base fee gets in, so a flood of free ones cannot
         // grow memory without limit or crowd out the ones that pay.
-        if (fCheckInputs && !ptxOld && mapTransactions.size() >= MAX_MEMPOOL_TRANSACTIONS
+        if (fCheckInputs && setConflicts.empty() && mapTransactions.size() >= MAX_MEMPOOL_TRANSACTIONS
             && nFees < GetMinFee(false))
             return error("AcceptTransaction() : mempool full (%d), %s pays too little to enter",
                          (int)mapTransactions.size(), hash.ToString().substr(0,6).c_str());
-        if (ptxOld)
+        if (!setConflicts.empty())
         {
-            if (LogAcceptsCategory("net")) printf("mapTransaction.erase(%s) replacing with new version\n", ptxOld->GetHash().ToString().c_str());
-            mapTransactions.erase(ptxOld->GetHash());
+            // The money rules, now that this one's fee is known.
+            vector<pair<int64, unsigned int> > vOld;
+            foreach(const uint256& h, setConflicts)
+            {
+                map<uint256, CTransaction>::iterator mi = mapTransactions.find(h);
+                int64 nOldFee = 0;
+                if (mi == mapTransactions.end() || !GetMempoolTxFee(mi->second, txdb, nOldFee))
+                    return error("AcceptTransaction() : %s: cannot price what it replaces", hash.ToString().substr(0,6).c_str());
+                vOld.push_back(make_pair(nOldFee, (unsigned int)::GetSerializeSize(mi->second, SER_NETWORK)));
+            }
+            string strWhy;
+            if (!ReplacementPaysEnough(nFees, ::GetSerializeSize(*this, SER_NETWORK), vOld, strWhy))
+                return error("AcceptTransaction() : %s: %s", hash.ToString().substr(0,6).c_str(), strWhy.c_str());
+            foreach(const uint256& h, setConflicts)
+            {
+                if (LogAcceptsCategory("net")) printf("AcceptTransaction(): %s replaced by %s\n", h.ToString().substr(0,6).c_str(), hash.ToString().substr(0,6).c_str());
+                // A copy: RemoveFromMemoryPool erases the entry it is called on.
+                CTransaction txOld = mapTransactions[h];
+                txOld.RemoveFromMemoryPool();
+            }
         }
         AddToMemoryPool();
     }
 
-    ///// are we sure this is ok when loading transactions or restoring block txes
-    // If updated, erase old tx from wallet
-    if (ptxOld)
-        EraseFromWallet(ptxOld->GetHash());
+    // What was replaced is gone for good: out of the wallet too, if it was ours.
+    foreach(const uint256& h, setConflicts)
+        EraseFromWallet(h);
 
     if (LogAcceptsCategory("net")) printf("AcceptTransaction(): accepted %s\n", hash.ToString().substr(0,6).c_str());
     return true;
 }
 
+
+// ---- fees ------------------------------------------------------------------
+
+bool GetMempoolTxFee(const CTransaction& tx, CTxDB& txdb, int64& nFeeOut)
+{
+    nFeeOut = 0;
+    if (tx.IsCoinBase())
+        return false;
+    int64 nValueIn = 0;
+    foreach(const CTxIn& txin, tx.vin)
+    {
+        CTransaction txPrev;
+        map<uint256, CTransaction>::iterator mi = mapTransactions.find(txin.prevout.hash);
+        if (mi != mapTransactions.end())
+            txPrev = mi->second;
+        else if (!txdb.ReadDiskTx(txin.prevout.hash, txPrev))
+            return false;
+        if (txin.prevout.n >= txPrev.vout.size())
+            return false;
+        nValueIn += txPrev.vout[txin.prevout.n].nValue;
+    }
+    nFeeOut = nValueIn - tx.GetValueOut();
+    return nFeeOut >= 0;
+}
+
+void MempoolByFeeRate(CTxDB& txdb, vector<CTransaction*>& vOut)
+{
+    // (fee per 1000 bytes, hash) -- the hash only to keep equal rates in a
+    // fixed order, so a rebuilt block template does not reshuffle.
+    vector<pair<pair<int64, uint256>, CTransaction*> > v;
+    v.reserve(mapTransactions.size());
+    for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
+    {
+        int64 nFee = 0;
+        unsigned int nSize = ::GetSerializeSize(mi->second, SER_NETWORK);
+        int64 nRate = GetMempoolTxFee(mi->second, txdb, nFee) && nSize ? nFee * 1000 / nSize : 0;
+        v.push_back(make_pair(make_pair(-nRate, mi->first), &mi->second));
+    }
+    sort(v.begin(), v.end());
+    vOut.clear();
+    for (size_t i = 0; i < v.size(); i++)
+        vOut.push_back(v[i].second);
+}
+
+bool ReplacementPaysEnough(int64 nNewFee, unsigned int nNewSize,
+                           const vector<pair<int64, unsigned int> >& vOld, string& whyOut)
+{
+    int64 nOldFees = 0;
+    for (size_t i = 0; i < vOld.size(); i++)
+    {
+        nOldFees += vOld[i].first;
+        // Per byte, compared without division: new/newsize > old/oldsize.
+        if (nNewFee * (int64)vOld[i].second <= vOld[i].first * (int64)nNewSize)
+        {
+            whyOut = "the replacement pays no more per byte than what it replaces";
+            return false;
+        }
+    }
+    int64 nNeed = nOldFees + FeeForSize(MIN_RELAY_FEE_PER_KB, nNewSize);
+    if (nNewFee < nNeed)
+    {
+        whyOut = strprintf("the replacement pays %s, it needs at least %s (what it replaces plus the relay fee)",
+                           FormatMoney(nNewFee).c_str(), FormatMoney(nNeed).c_str());
+        return false;
+    }
+    return true;
+}
+
+int64 EstimateNextBlockFeePerKB()
+{
+    // What the next block takes: the first 100 transactions under 10 KB free
+    // (GetMinFee's discount), and up to half the size limit in all, in the
+    // order the miners now use. If everything waiting fits, the minimum does;
+    // if not, a little over the rate where the block would cut off.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        CTxDB txdb("r");
+        vector<CTransaction*> v;
+        MempoolByFeeRate(txdb, v);
+        unsigned int nSize = 0;
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            unsigned int n = ::GetSerializeSize(*v[i], SER_NETWORK);
+            if (nSize + n >= MAX_SIZE / 2 || i >= 100)
+            {
+                int64 nFee = 0;
+                int64 nRate = GetMempoolTxFee(*v[i], txdb, nFee) && n ? nFee * 1000 / n : 0;
+                return max(nRate + nRate / 10 + 1, (int64)CENT);
+            }
+            nSize += n;
+        }
+    }
+    return 0;
+}
 
 bool CTransaction::AddToMemoryPool()
 {
@@ -2007,9 +2143,12 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb)
 }
 
 
-bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime)
+bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime,
+                                 unsigned int* pnP2SHSigOps)
 {
-    bool fStrictSigs = RulesV2Active(nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime());
+    unsigned int nRulesTime = nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime();
+    bool fStrictSigs = RulesV2Active(nRulesTime);
+    bool fRulesV3 = RulesV3Active(nRulesTime);
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
     {
@@ -2065,8 +2204,14 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                         return error("ConnectInputs() : tried to spend coinbase at depth %d", nBestHeight - pindex->nHeight);
 
             // Verify signature
-            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs))
+            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
+
+            // Rules v3 runs the redeem script, so its signature operations cost
+            // what any other does and count against the block's cap. Before,
+            // a P2SH scriptSig's last push was data and cost nothing to check.
+            if (fRulesV3 && pnP2SHSigOps && txPrev.vout[prevout.n].scriptPubKey.IsPayToScriptHash())
+                *pnP2SHSigOps += GetP2SHSigOpCount(vin[i].scriptSig);
 
             // Check for conflicts
             if (!txindex.vSpent[prevout.n].IsNull())
@@ -2184,6 +2329,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
+    // CheckBlock already capped the sigops it can see in the scripts; under
+    // rules v3 the redeem scripts run too, and only here are they known.
+    unsigned int nSigOps = 0;
+    foreach(CTransaction& tx, vtx)
+        nSigOps += tx.GetSigOpCount();
     foreach(CTransaction& tx, vtx)
     {
         CDiskTxPos posThisTx(pindex->nFile, pindex->nBlockPos, nTxPos);
@@ -2204,8 +2354,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                                      tx.GetHash().ToString().substr(0,10).c_str());
         }
 
-        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime))
+        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime, &nSigOps))
             return false;
+        if (nSigOps > MAX_BLOCK_SIGOPS)
+            return error("ConnectBlock() : too many signature operations once redeem scripts are counted");
     }
 
     if (vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees))
@@ -2483,6 +2635,13 @@ bool CBlock::CheckBlock(int* pnDoS) const
     return true;
 }
 
+bool IsFinalForNextBlock(const CTransaction& tx)
+{
+    if (!pindexBest || !RulesV3Active((unsigned int)GetAdjustedTime()))
+        return tx.IsFinal();
+    return tx.IsFinalAt(pindexBest->nHeight + 1, pindexBest->GetMedianTimePast());
+}
+
 bool CBlock::AcceptBlock(int* pnDoS)
 {
     if (pnDoS)
@@ -2517,6 +2676,19 @@ bool CBlock::AcceptBlock(int* pnDoS)
         const CScript& cb = vtx[0].vin[0].scriptSig;
         if (cb.size() < expect.size() || !std::equal(expect.begin(), expect.end(), cb.begin()))
             return DoS(pnDoS, 100, error("AcceptBlock() : coinbase does not start with height %d", pindexPrev->nHeight + 1));
+    }
+
+    // Rules v3: every transaction in the block is final at its height and at
+    // the median time past of the block before it (BIP113 -- not this block's
+    // own time, which its miner picks). See CTransaction::IsFinalAt.
+    if (RulesV3Active(nTime))
+    {
+        int nHeight = pindexPrev->nHeight + 1;
+        int64 nCutoff = pindexPrev->GetMedianTimePast();
+        foreach(const CTransaction& tx, vtx)
+            if (!tx.IsFinalAt(nHeight, nCutoff))
+                return DoS(pnDoS, 10, error("AcceptBlock() : transaction %s is not final at height %d",
+                                            tx.GetHash().ToString().substr(0,10).c_str(), nHeight));
     }
 
     // Write block to history file
@@ -2681,6 +2853,24 @@ bool ScanMessageStart(Stream& s)
     }
 }
 
+// The data directory's name, and the one thing that keeps btfchat's wallet,
+// chain and keys away from the miner's by default.
+//
+// A compile-time choice rather than a variable somebody sets at startup: with a
+// variable, any code that touched GetAppDir() before it was set would silently
+// open the wrong directory -- and "the wrong directory" here means the chat app
+// reading the wallet that holds the coins. There is no initialization order to
+// get wrong this way.
+//
+// Both binaries still honour /datadir=PATH, which overrides this entirely.
+#ifdef BITFLASH_CHAT_APP
+static const char* APPDIR_WIN   = "Bitflash-chat";
+static const char* APPDIR_POSIX = ".bitflash-chat";
+#else
+static const char* APPDIR_WIN   = "Bitflash";
+static const char* APPDIR_POSIX = ".bitflash";
+#endif
+
 string GetAppDir()
 {
     string strDir;
@@ -2691,7 +2881,7 @@ string GetAppDir()
 #ifdef _WIN32
     else if (getenv("APPDATA"))
     {
-        strDir = strprintf("%s\\Bitflash", getenv("APPDATA"));
+        strDir = strprintf("%s\\%s", getenv("APPDATA"), APPDIR_WIN);
     }
     else if (getenv("USERPROFILE"))
     {
@@ -2702,12 +2892,12 @@ string GetAppDir()
             fMkdirDone = true;
             _mkdir(strAppData.c_str());
         }
-        strDir = strprintf("%s\\Bitflash", strAppData.c_str());
+        strDir = strprintf("%s\\%s", strAppData.c_str(), APPDIR_WIN);
     }
 #else
     else if (getenv("HOME"))
     {
-        strDir = strprintf("%s/.bitflash", getenv("HOME"));
+        strDir = strprintf("%s/%s", getenv("HOME"), APPDIR_POSIX);
     }
 #endif
     else
@@ -3034,6 +3224,7 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
     case MSG_BLOCK:     return mapBlockIndex.count(inv.hash) || mapOrphanBlocks.count(inv.hash);
     case MSG_REVIEW:    return true;
     case MSG_PRODUCT:   return mapProducts.count(inv.hash);
+    case MSG_CHATREC:   return ChatRelayAlreadyHave(inv);
     }
     // Don't know what it is, just say we already got one
     return true;
@@ -3251,6 +3442,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (!vPexOut.empty())
             pfrom->PushMessage("btfpeers", vPexOut);
 
+        ChatRelayOnVersion(pfrom);
+
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);
     }
 
@@ -3330,6 +3523,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                     block.ReadFromDisk((*mi).second, !pfrom->fClient);
                     pfrom->PushMessage("block", block);
                 }
+            }
+            else if (inv.type == MSG_CHATREC)
+            {
+                // From the chat store, not the relay memory: records live for a
+                // day, the relay memory for fifteen minutes.
+                ChatRelayServeGetData(pfrom, inv);
             }
             else if (inv.IsKnownType())
             {
@@ -3526,6 +3725,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Deliberately no reply. A node old enough not to know "ping" ignores
         // it as an unknown command and would never answer one, so a scheme
         // that required an answer would read every such peer as dead.
+    }
+
+
+    else if (ChatRelayProcessMessage(pfrom, strCommand, vRecv))
+    {
+        // chatrec, chatput, chatget, getchatinv -- see chatrelay.h.
     }
 
 
@@ -4504,19 +4709,23 @@ bool BitcoinMiner(int nThreadId)
         {
             CTxDB txdb("r");
             map<uint256, CTxIndex> mapTestPool;
-            vector<char> vfAlreadyAdded(mapTransactions.size());
+            // Best fee per byte first, so paying more gets a transaction in
+            // sooner; repeated passes still pick up a child whose parent came
+            // later in that order.
+            vector<CTransaction*> vOrder;
+            MempoolByFeeRate(txdb, vOrder);
+            vector<char> vfAlreadyAdded(vOrder.size());
             bool fFoundSomething = true;
             unsigned int nBlockSize = 0;
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)
             {
                 fFoundSomething = false;
-                unsigned int n = 0;
-                for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
+                for (unsigned int n = 0; n < vOrder.size(); n++)
                 {
                     if (vfAlreadyAdded[n])
                         continue;
-                    CTransaction& tx = (*mi).second;
-                    if (tx.IsCoinBase() || !tx.IsFinal())
+                    CTransaction& tx = *vOrder[n];
+                    if (tx.IsCoinBase() || !IsFinalForNextBlock(tx))
                         continue;
 
                     // Transaction fee requirements, mainly only needed for flood control
@@ -5110,11 +5319,13 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                     wtxNew.vout.push_back(CTxOut(nValueIn - nTotalValue, scriptPubKey));
                 }
 
-                // Fill vin
+                // Fill vin. Replaceable (BIP125), so it can be sped up later
+                // with bumpfee; with nLockTime 0 the sequence changes nothing
+                // about when it is final, on any node.
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
                         if (pcoin->vout[nOut].IsMine())
-                            wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
+                            wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut, CScript(), SEQUENCE_REPLACEABLE));
 
                 // Sign
                 int nIn = 0;
@@ -5123,10 +5334,13 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                         if (pcoin->vout[nOut].IsMine())
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                // Check that enough fee is included
-                if (nFee < wtxNew.GetMinFee(true))
+                // Check that enough fee is included: the minimum, or the
+                // wallet's rate for this size if that is more.
+                int64 nNeed = max(wtxNew.GetMinFee(true),
+                                  FeeForSize(nPayTxFeePerKB, ::GetSerializeSize(wtxNew, SER_NETWORK)));
+                if (nFee < nNeed)
                 {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee(true);
+                    nFee = nFeeRequiredRet = nNeed;
                     continue;
                 }
 
@@ -5232,6 +5446,130 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
             return error("SendMoney() : wtxNew.AcceptTransaction() failed");
         }
         wtxNew.RelayWalletTransaction();
+    }
+    MainFrameRepaint();
+    return true;
+}
+
+bool BumpFee(const uint256& txid, int64 nNewRatePerKB, uint256& newTxidOut,
+             int64& nOldFeeOut, int64& nNewFeeOut, string& errOut)
+{
+    newTxidOut = 0;
+    nOldFeeOut = nNewFeeOut = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        CTxDB txdb("r");
+        CWalletTx wtxOld;
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            map<uint256, CWalletTx>::iterator mi = mapWallet.find(txid);
+            if (mi == mapWallet.end())
+            {
+                errOut = "that transaction is not in this wallet";
+                return false;
+            }
+            wtxOld = mi->second;
+        }
+        unsigned int nOldSize = ::GetSerializeSize((CTransaction&)wtxOld, SER_NETWORK);
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            if (!mapTransactions.count(txid))
+            {
+                errOut = "it is not waiting: already in a block, or not in the memory pool";
+                return false;
+            }
+            if (!GetMempoolTxFee(wtxOld, txdb, nOldFeeOut))
+            {
+                errOut = "cannot tell what it pays now";
+                return false;
+            }
+        }
+        if (!wtxOld.SignalsReplacement())
+        {
+            errOut = "it was sent as final, before this wallet sent replaceable transactions; it cannot be sped up";
+            return false;
+        }
+
+        // Every input ours (we have to sign them all again), and some change
+        // to take the extra fee from: CreateTransaction puts it last.
+        map<uint256, CWalletTx> mapPrev;
+        CRITICAL_BLOCK(cs_mapWallet)
+            foreach(const CTxIn& txin, wtxOld.vin)
+            {
+                map<uint256, CWalletTx>::iterator mi = mapWallet.find(txin.prevout.hash);
+                if (mi == mapWallet.end() || txin.prevout.n >= mi->second.vout.size() ||
+                    !mi->second.vout[txin.prevout.n].IsMine())
+                {
+                    errOut = "not every input of it is ours";
+                    return false;
+                }
+                mapPrev[txin.prevout.hash] = mi->second;
+            }
+        int nChange = -1;
+        for (int i = (int)wtxOld.vout.size() - 1; i >= 0; i--)
+            if (wtxOld.vout[i].IsMine())
+            {
+                nChange = i;
+                break;
+            }
+        if (nChange < 0 || wtxOld.vout.size() < 2)
+        {
+            errOut = "it has no change to take a bigger fee from";
+            return false;
+        }
+
+        CTransaction txNew = wtxOld;
+        int64 nFee = nOldFeeOut;
+        for (int nPass = 0; nPass < 16; nPass++)
+        {
+            txNew.vout[nChange].nValue = wtxOld.vout[nChange].nValue - (nFee - nOldFeeOut);
+            if (txNew.vout[nChange].nValue < CENT / 100)
+            {
+                errOut = strprintf("the change (%s) does not cover a fee of %s",
+                                   FormatMoney(wtxOld.vout[nChange].nValue).c_str(), FormatMoney(nFee).c_str());
+                return false;
+            }
+            for (unsigned int i = 0; i < txNew.vin.size(); i++)
+                txNew.vin[i].scriptSig = CScript();
+            for (unsigned int i = 0; i < txNew.vin.size(); i++)
+                if (!SignSignature(mapPrev[txNew.vin[i].prevout.hash], txNew, i))
+                {
+                    errOut = "signing failed";
+                    return false;
+                }
+            unsigned int nSize = ::GetSerializeSize(txNew, SER_NETWORK);
+            // The rate asked for, and BIP125's floor: what it pays now plus the
+            // relay fee for its size, and more per byte than before.
+            int64 nNeed = max(FeeForSize(nNewRatePerKB, nSize),
+                              nOldFeeOut + FeeForSize(MIN_RELAY_FEE_PER_KB, nSize));
+            nNeed = max(nNeed, nOldFeeOut * (int64)nSize / max(1u, nOldSize) + 1);
+            if (nFee >= nNeed && nFee > nOldFeeOut)
+                break;
+            nFee = max(nNeed, nOldFeeOut + 1);
+            if (nPass == 15)
+            {
+                errOut = "could not settle the new fee";
+                return false;
+            }
+        }
+
+        CWalletTx wtxNew(txNew);
+        wtxNew.mapValue = wtxOld.mapValue;
+        wtxNew.fFromMe = true;
+        wtxNew.AddSupportingTransactions(txdb);
+        wtxNew.fTimeReceivedIsTxTime = true;
+        // The pool decides: it takes the replacement out of the old one only
+        // if every rule holds, and nothing in the wallet changes before that.
+        if (!wtxNew.AcceptTransaction())
+        {
+            errOut = "the replacement was refused (see debug.log)";
+            return false;
+        }
+        CRITICAL_BLOCK(cs_mapWallet)
+            AddToWallet(wtxNew);
+        wtxNew.RelayWalletTransaction();
+        newTxidOut = wtxNew.GetHash();
+        nNewFeeOut = nFee;
     }
     MainFrameRepaint();
     return true;

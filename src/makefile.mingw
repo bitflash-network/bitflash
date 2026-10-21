@@ -2,6 +2,13 @@
 # Run from MSYS2 UCRT64: make -f makefile.mingw
 
 CXX = g++
+CC  = gcc
+
+# ML-KEM-1024 (mlkem-native, vendored under mlkem/). It is C99, not C++, and the
+# parameter set is fixed at compile time, so it gets its own flags and its own
+# rule. Its randomness never comes from itself: btfchan feeds the _derand entry
+# points from libsodium, so none of its platform RNG code is compiled in.
+MLKEMFLAGS = -std=c99 -O2 -Wall -Wextra -Imlkem -DMLK_CONFIG_PARAMETER_SET=1024
 
 DEPS      = ../deps
 RANDOMX   = ../RandomX
@@ -38,7 +45,12 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/market.o obj/sha.o obj/nostr.o obj/randomx_pow.o \
             obj/btfaddr.o obj/btfchan.o obj/rpc.o \
             obj/selftest.o obj/bip32.o obj/walletcmd.o obj/wallet_sqlite.o \
-            obj/proxy.o obj/tor.o obj/jsonrpc.o obj/treasury.o
+            obj/proxy.o obj/tor.o obj/jsonrpc.o obj/treasury.o \
+            obj/mlkem.o \
+            obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
+            obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
+            obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/btclight.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
+            obj/community.o obj/chatdir.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
 
@@ -52,7 +64,9 @@ GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
 HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
-          selftest.h walletcmd.h wallet_sqlite.h sockcount.h proxy.h tor.h treasury.h compat.h font_roboto.h jsonrpc.h
+          selftest.h walletcmd.h wallet_sqlite.h sockcount.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h \
+          proxy.h tor.h treasury.h compat.h gui_chat.h font_roboto.h jsonrpc.h
 
 all: bitflash.exe
 
@@ -67,6 +81,10 @@ obj/%.o: %.cpp $(HEADERS)
 obj/sha.o: sha.cpp sha.h
 	mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
+
+obj/mlkem.o: mlkem/mlkem_native.c
+	mkdir -p obj
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 obj/imgui.o:              $(IMGUI_DIR)/imgui.cpp
 	mkdir -p obj
@@ -96,8 +114,48 @@ bitflash.exe: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 	$(CXX) $(CXXFLAGS) -mwindows -o $@ $^ $(LIBS)
 	@echo "Built: bitflash.exe"
 
+
+# ---- btfchat.exe -----------------------------------------------------------
+#
+# The chat as its own program: its own process, its own data directory
+# (%APPDATA%\Bitflash-chat), its own wallet, its own Tor and its own onion
+# address. None of that is the miner's, which is the whole reason it is a
+# separate binary and not a menu item.
+#
+# It is NOT separate source. Every module here is the same file the miner
+# compiles, because two copies of a crypto module means a fix landing in one and
+# being forgotten in the other -- the easiest way to leave a hole open for
+# months.
+#
+# Objects go to obj-chat/ because the same .cpp files are compiled twice, with
+# and without -DBITFLASH_CHAT_APP, and the two must not overwrite each other.
+# gui.o is deliberately absent: the wallet window is not in this binary at all,
+# so there is no second door to the chat identity even by accident.
+
+CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
+
+CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
+            obj-chat/gui_chat.o obj-chat/main_gui.o obj/bitflash_res.o \
+            $(IMGUI_OBJS)
+
+obj-chat/%.o: %.cpp $(HEADERS)
+	mkdir -p obj-chat
+	$(CXX) -c $(CHATFLAGS) -o $@ $<
+
+obj-chat/sha.o: sha.cpp sha.h
+	mkdir -p obj-chat
+	$(CXX) -c $(CHATFLAGS) -O3 -o $@ $<
+
+obj-chat/mlkem.o: mlkem/mlkem_native.c
+	mkdir -p obj-chat
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
+btfchat.exe: $(CHAT_OBJS)
+	$(CXX) $(CHATFLAGS) -mwindows -o $@ $^ $(LIBS)
+	@echo "Built: btfchat.exe"
+
 clean:
-	rm -rf obj bitflash.exe test_bip32.exe test_btfaddr.exe test_btfchan.exe
+	rm -rf obj obj-chat bitflash.exe btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe test_chatswap.exe test_bip21.exe
 
 test_bip32.exe: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto -lcrypt32
@@ -111,14 +169,77 @@ test_btfaddr.exe: test_btfaddr.cpp btfaddr.cpp btfaddr.h
 
 # The encrypted channel every .btf connection runs through. Same story as the
 # address tests: the file was here, nothing ran it.
-test_btfchan.exe: test_btfchan.cpp btfchan.cpp btfchan.h
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp -lsodium
+test_btfchan.exe: test_btfchan.cpp btfchan.cpp btfchan.h obj/mlkem.o
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o -lsodium
 	@echo "Built: test_btfchan.exe"
 
-tests: test_bip32.exe test_btfaddr.exe test_btfchan.exe bitflash.exe
+# btfchat needs bip32 (the chat identity grows from the same recovery phrase as
+# the wallet) and btfaddr (the identity IS a .btf address). It does not link the
+# ML-KEM object: publishing an x25519 public key does not need the KEM, and the
+# channel that does is btfchan's business.
+test_btfchat.exe: test_btfchat.cpp btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchat.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfchat.exe"
+
+# The frame layer: signing, the group admin proof, the replay guard.
+test_btfchatmsg.exe: test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchatmsg.h btfchat.cpp btfchat.h bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatmsg.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfchatmsg.exe"
+
+# The offline path: epoch tags, rotating epoch keys, sealed envelopes. Links the
+# ML-KEM object, because an envelope resting on a relay is the case the
+# post-quantum half exists for.
+test_btfchatbox.exe: test_btfchatbox.cpp btfchatbox.cpp btfchatbox.h btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatbox.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfchatbox.exe"
+
+# The sealed history.
+test_btfchatlog.exe: test_btfchatlog.cpp btfchatlog.cpp btfchatlog.h btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlog.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfchatlog.exe"
+
+# The link: the handshake and framing over an abstract stream, plus the one
+# function that owns the order an incoming frame is taken apart in. The test
+# drives it over a blocking in-memory pipe with the endpoint in a thread, so the
+# protocol is exercised without a socket.
+test_btfchatlink.exe: test_btfchatlink.cpp btfchatlink.cpp btfchatlink.h btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchatlink.cpp btfchatlink.cpp btfchatlog.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_btfchatlink.exe"
+
+# The records the nodes hold for the chat: wire form, proof of work, and every
+# rule about what a node keeps. Pure logic, so no node and no socket.
+test_chatstore.exe: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp
+	$(CXX) $(CXXFLAGS) -o $@ test_chatstore.cpp chatstore.cpp btfchatbox.cpp btfchatmsg.cpp chatswap.cpp btfchat.cpp btfchan.cpp obj/mlkem.o bip32.cpp btfaddr.cpp $(LIBS)
+	@echo "Built: test_chatstore.exe"
+
+# Public communities: the listing format, names, the daily tag, the seal.
+test_community.exe: test_community.cpp community.cpp community.h
+	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
+	@echo "Built: test_community.exe"
+
+# Swaps arranged in the chat: what an offer and each step must look like.
+test_chatswap.exe: test_chatswap.cpp chatswap.cpp chatswap.h
+	$(CXX) $(CXXFLAGS) -o $@ test_chatswap.cpp chatswap.cpp
+	@echo "Built: test_chatswap.exe"
+
+# Payment links (bitflash: URIs, BIP21).
+test_bip21.exe: test_bip21.cpp bip21.cpp bip21.h qrcodegen.cpp qrcodegen.hpp
+	$(CXX) $(CXXFLAGS) -o $@ test_bip21.cpp bip21.cpp qrcodegen.cpp
+	@echo "Built: test_bip21.exe"
+
+tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat.exe test_btfchatmsg.exe test_btfchatbox.exe test_btfchatlog.exe test_btfchatlink.exe test_chatstore.exe test_community.exe test_chatswap.exe test_bip21.exe bitflash.exe
 	./test_bip32.exe
-	./test_btfaddr.exe
 	./test_btfchan.exe
+	./test_btfaddr.exe
+	./test_btfchat.exe
+	./test_btfchatmsg.exe
+	./test_btfchatbox.exe
+	./test_btfchatlog.exe
+	./test_btfchatlink.exe
+	./test_chatstore.exe
+	./test_community.exe
+	./test_chatswap.exe
+	./test_bip21.exe
 	./bitflash.exe -selftest=wallet-keypool
 	./bitflash.exe -selftest=wallet-hd
 	./bitflash.exe -selftest=wallet-format
@@ -138,8 +259,18 @@ tests: test_bip32.exe test_btfaddr.exe test_btfchan.exe bitflash.exe
 	./bitflash.exe -selftest=sigpipe
 	./bitflash.exe -selftest=script-eval
 	./bitflash.exe -selftest=rules-v2
+	./bitflash.exe -selftest=rules-v3
+	./bitflash.exe -selftest=btc-swap
+	./bitflash.exe -selftest=btc-light
+	./bitflash.exe -selftest=swap-wait-payment
+	./bitflash.exe -selftest=fee-policy
+	./bitflash.exe -selftest=invoice
 	./bitflash.exe -selftest=net-hardening
 	./bitflash.exe -selftest=multisig
 	./bitflash.exe -selftest=socks5-proxy
 	./bitflash.exe -selftest=managed-tor
 	./bitflash.exe -selftest=treasury
+	./bitflash.exe -selftest=chat-link
+	./bitflash.exe -selftest=chat-identity
+	./bitflash.exe -selftest=chat-relay
+	./bitflash.exe -selftest=chat-wallet
