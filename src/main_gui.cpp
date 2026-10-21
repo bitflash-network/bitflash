@@ -428,11 +428,10 @@ static void ParseStartupArguments(int argc, char* argv[])
     string poolFeeTo = argval2(argc, argv, "/poolfeeto", "-poolfeeto");
     if (!poolFeeTo.empty())
     {
+        // This used to `return 1` from a void function: gcc let it through
+        // and the node started anyway with the fee going to the default.
         if (poolFeeTo != "treasury" && poolFeeTo != "operator")
-        {
-            printf("-poolfeeto: 'treasury' or 'operator', not '%s'\n", poolFeeTo.c_str());
-            return 1;
-        }
+            StartupRefuse(strprintf("-poolfeeto is 'treasury' or 'operator', not '%s'", poolFeeTo.c_str()), "");
         fPoolFeeToTreasury = poolFeeTo == "treasury";
     }
 
@@ -441,10 +440,8 @@ static void ParseStartupArguments(int argc, char* argv[])
     {
         int n = atoi(treasuryShare.c_str());
         if (n < 0 || n > treasury::SHARE_MAX_PERCENT)
-        {
-            printf("-treasuryshare: 0 to %d percent, not '%s'\n", treasury::SHARE_MAX_PERCENT, treasuryShare.c_str());
-            return 1;
-        }
+            StartupRefuse(strprintf("-treasuryshare is 0 to %d percent, not '%s'", treasury::SHARE_MAX_PERCENT,
+                                    treasuryShare.c_str()), "");
         nTreasurySharePercent = n;
     }
 
