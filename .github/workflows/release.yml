@@ -225,7 +225,8 @@ jobs:
             echo "btfchat still running after 30 s"; ok=1
             kill $C 2>/dev/null || true
           else
-            wait $C; echo "btfchat exited with status $?"; ok=0
+            st=0; wait $C || st=$?
+            echo "btfchat exited with status $st"; ok=0
           fi
           echo "--- its output:"; tail -30 chat.out
           if [ "$ok" = 0 ]; then
