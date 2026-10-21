@@ -152,7 +152,7 @@ bitflash: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
 
 CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
-            obj-chat/gui_chat.o obj-chat/main_gui.o \
+            obj-chat/gui_chat.o obj-chat/chat_terminal.o obj-chat/main_gui.o \
             $(IMGUI_OBJS)
 
 obj-chat/%.o: %.cpp $(HEADERS)
@@ -170,6 +170,28 @@ obj-chat/mlkem.o: mlkem/mlkem_native.c
 btfchat: $(CHAT_OBJS)
 	$(CXX) $(CHATFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: btfchat"
+
+# btfchat with no window at all (chat_terminal.cpp): no ImGui, GLFW or
+# OpenGL, so it starts where there is no screen -- a server over ssh, or the
+# macOS package, which is terminal only by design.
+CHATTERM_OBJS = $(patsubst obj/%,obj-chatterm/%,$(NODE_OBJS)) \
+                obj-chatterm/chat_terminal.o obj-chatterm/main_gui.o obj-chatterm/headless.o
+
+obj-chatterm/%.o: %.cpp $(HEADERS)
+	@mkdir -p obj-chatterm
+	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -o $@ $<
+
+obj-chatterm/sha.o: sha.cpp sha.h
+	@mkdir -p obj-chatterm
+	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
+
+obj-chatterm/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj-chatterm
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
+btfchat-terminal: $(CHATTERM_OBJS)
+	$(CXX) $(CHATFLAGS) -DBITFLASH_NO_GUI -o $@ $^ $(NODE_LIBS)
+	@echo "Built: btfchat-terminal (no window, no libGL needed)"
 
 # ---- headless node ---------------------------------------------------------
 #

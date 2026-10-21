@@ -147,8 +147,8 @@ jobs:
           git remote add origin https://github.com/tevador/RandomX
           git fetch -q --depth 1 origin $RX && git checkout -q --detach FETCH_HEAD
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j3 --target randomx >/dev/null
-      - name: Build the node and btfchat
-        run: make -C src -j3 bitflash-node btfchat SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX
+      - name: Build the node and btfchat (terminal only)
+        run: make -C src -j3 bitflash-node btfchat-terminal SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX
       - name: Tor for macOS, the official bundle, checked against its pinned hash
         run: |
           set -eo pipefail
@@ -166,7 +166,7 @@ jobs:
           V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
           D=Bitflash-$V-macos-arm64
           mkdir -p $D/lib
-          cp src/bitflash-node src/btfchat $D/
+          cp src/bitflash-node $D/ && cp src/btfchat-terminal $D/btfchat   # terminal only, no window
           # Homebrew's libraries go inside, found next to the binaries.
           B=$(brew --prefix)
           dylibbundler -cd -b -x $D/bitflash-node -x $D/btfchat -d $D/lib -p @executable_path/lib/ \
@@ -209,49 +209,30 @@ jobs:
           grep -E "hidden service ready|btfseed: reached|Added time data" dd/debug.log | head -5 || true
           kill $W || true
           [ "${n:-0}" -gt 0 ]
-      - name: btfchat opens its window from Terminal and stays up
-        # GitHub's Macs have a screen; the window is captured for a person to see.
-        timeout-minutes: 3
+      - name: btfchat in Terminal, typed to as a person would
+        # A new identity, the session password typed, the chat's Tor and onion
+        # up, 'me' and 'help' answered, 'quit' leaving cleanly.
+        timeout-minutes: 6
         run: |
           cd try/$D
-          REALHOME=$HOME
           export HOME=$PWD/chat-home && mkdir -p $HOME
-          # As README-macOS.txt tells people to start it.
-          ./btfchat -testnet -managedtor > chat.out 2>&1 &
+          ./btfchat -testnet -newphrase > /dev/null 2>&1    # a throwaway identity
+          mkfifo chat.in
+          ( exec 3<>chat.in; ./btfchat -testnet -managedtor <&3 > chat.out 2>&1 ) &
           C=$!
-          sleep 30
-          screencapture -x $GITHUB_WORKSPACE/btfchat-macos.png || true
-          if kill -0 $C 2>/dev/null; then
-            echo "btfchat still running after 30 s"; ok=1
-            kill $C 2>/dev/null || true
-          else
-            st=0; wait $C || st=$?
-            echo "btfchat exited with status $st"; ok=0
-          fi
-          echo "--- its output:"; tail -30 chat.out
-          if [ "$ok" = 0 ]; then
-            echo "--- this machine's graphics (a virtual Mac may have no GPU):"
-            system_profiler SPDisplaysDataType 2>/dev/null | head -25
-            echo "--- the newest crash report, if macOS wrote one:"
-            r=$(ls -t $REALHOME/Library/Logs/DiagnosticReports/btfchat* /Library/Logs/DiagnosticReports/btfchat* 2>/dev/null | head -1)
-            [ -n "$r" ] && head -120 "$r" || true
-            # GitHub's Macs are virtual machines without a GPU, and GLFW asks
-            # for an accelerated OpenGL, which every Apple silicon Mac has.
-            # When that is the only thing missing -- and the chat got that far
-            # with its Tor, its onion and its wallet up -- it is the machine.
-            if grep -q "Failed to find a suitable pixel format" chat.out &&
-               grep -q "chat service ready" chat.out && grep -q "Wallet backend" chat.out; then
-              echo "::notice::btfchat came up (Tor, chat onion, wallet) and stopped only at the window: this runner has no GPU for OpenGL. The window is proven on a real Mac."
-              ok=1
-            fi
-          fi
-          [ "$ok" = 1 ]
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: macos-screenshot
-          path: btfchat-macos.png
-          if-no-files-found: ignore
+          exec 4>chat.in
+          echo "senha-de-teste-do-mac" >&4
+          for i in $(seq 1 60); do grep -q "you are " chat.out && break; sleep 2; done
+          for i in $(seq 1 20); do echo "me" >&4; sleep 10; grep -q "chat service ready" chat.out && break; done
+          echo "help" >&4; sleep 2
+          echo "quit" >&4
+          for i in $(seq 1 30); do kill -0 $C 2>/dev/null || break; sleep 1; done
+          echo "--- what the person saw:"; grep -v "^\(Oct\|Nov\|Dec\|Jan\) " chat.out | tail -45
+          grep -q "you are [a-z0-9]*\.btf" chat.out
+          grep -q "chat service ready" chat.out
+          grep -q "service: " chat.out
+          grep -q "swap ok N" chat.out              # the help was printed
+          ! kill -0 $C 2>/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: macos

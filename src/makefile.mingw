@@ -135,7 +135,7 @@ bitflash.exe: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
 
 CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
-            obj-chat/gui_chat.o obj-chat/main_gui.o obj/bitflash_res.o \
+            obj-chat/gui_chat.o obj-chat/chat_terminal.o obj-chat/main_gui.o obj/bitflash_res.o \
             $(IMGUI_OBJS)
 
 obj-chat/%.o: %.cpp $(HEADERS)

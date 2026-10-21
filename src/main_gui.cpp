@@ -28,6 +28,7 @@ int RunGUI(int argc, char* argv[]);
 // ImGui in the headless build.
 #ifdef BITFLASH_CHAT_APP
 int RunChatGUI(int argc, char* argv[]);
+int RunChatTerminal(int argc, char* argv[]);   // chat_terminal.cpp
 #endif
 
 // Global definitions (were in ui.cpp, now here)
@@ -1500,6 +1501,26 @@ int main(int argc, char* argv[])
 #else
     if (fGenerateBitcoins)
         StartMinerThreads();
+#endif
+
+#ifdef BITFLASH_CHAT_APP
+    // btfchat in a terminal: always when built without a window (macOS), and
+    // on request elsewhere. A chat has no use for the node's headless loop.
+#ifdef BITFLASH_NO_GUI
+    bool fChatTerminal = true;
+#else
+    bool fChatTerminal = arg(argc,argv,"/terminal") || arg(argc,argv,"-terminal") ||
+                         arg(argc,argv,"/nogui") || arg(argc,argv,"-nogui");
+#endif
+    if (fChatTerminal)
+    {
+        int ret = RunChatTerminal(argc, argv);
+        fShutdown = true;
+        BtfStopManagedTor();
+        DBFlush(true);
+        WalletSQLiteRuntimeClose();
+        return ret;
+    }
 #endif
 
 #ifdef BITFLASH_NO_GUI

@@ -21,15 +21,33 @@ The node (wallet and mining)
 Data lives in ~/.bitflash (btfchat's in ~/.bitflash-chat). Ctrl+C stops it.
 The node answers JSON-RPC on 127.0.0.1 (docs/rpc.md).
 
-btfchat
--------
-The chat links to the node as its wallet, for paying and being paid:
+btfchat (in Terminal, no window)
+--------------------------------
+Once, to make your chat identity (write the twelve words down, on paper):
+
+  ./btfchat -newphrase
+
+Then, with the node as the chat's wallet (for paying and being paid):
 
   ./bitflash-node -managedtor -chatwallet     in one Terminal window
   ./btfchat -managedtor                       in another
 
-btfchat opens its own window; it keeps a separate identity, data
-directory and onion address from the node on purpose.
+btfchat asks for a session password (12 characters or more; the same one
+every time -- a different password is a different identity), then takes
+commands. 'help' lists them all; the everyday ones:
+
+  me                       your address, to give to people
+  invite ADDRESS [note]    ask someone to talk
+  invites / accept ADDR    answer the ones you got (its first letters are enough)
+  chats / open N           your conversations; then just type to send
+  ask 1.5 / pay 1.5        ask to be paid / pay what they asked, in BTF
+  directory / join N       public communities
+  swaps                    BTF-BTC swaps and what each is waiting for
+  quit
+
+Messages, invites and posts are printed as they arrive. The chat keeps a
+separate identity, data directory and onion address from the node on
+purpose.
 
 Mining with XMRig instead
 -------------------------
