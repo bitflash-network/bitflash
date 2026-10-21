@@ -2336,7 +2336,7 @@ bool StartNode(string& strError)
     {
         sockaddr.sin_addr.s_addr = INADDR_ANY;
     }
-    if (bind(hListenSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR)
+    if (::bind(hListenSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR)
     {
         int nErr = WSAGetLastError();
         if (nErr == WSAEADDRINUSE)

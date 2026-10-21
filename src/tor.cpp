@@ -510,7 +510,7 @@ static bool PickLocalPort(unsigned short& portOut, std::string& errOut)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+    if (::bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0)
     {
         errOut = "could not bind local port probe socket";
         goto done;

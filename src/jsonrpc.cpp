@@ -2504,7 +2504,7 @@ void ThreadJsonRpcServer(void* parg)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      // loopback, and only loopback
     addr.sin_port = htons((unsigned short)g_rpcPort);
-    if (bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+    if (::bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0)
     {
         printf("JSON-RPC: could not bind 127.0.0.1:%d\n", g_rpcPort);
         rpc_close(lsock);

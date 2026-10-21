@@ -492,8 +492,9 @@ inline void heapchk()
 // aborted partway through shutting down, so nothing after StopNode() ran. See
 // main_gui.cpp, where DBFlush(true) is now called -- it could never have
 // worked while this abort stood in front of it. Windows is unaffected; there
-// _endthread() is the CRT's and unwinds nothing.
-#ifdef _WIN32
+// _endthread() is the CRT's and unwinds nothing. Neither is macOS: its
+// pthread_exit throws nothing, and its C++ library has no such type.
+#if !(defined(__GLIBC__) && defined(__GLIBCXX__))
 #define CATCH_FORCED_UNWIND
 #else
 #define CATCH_FORCED_UNWIND              \
