@@ -76,15 +76,22 @@ jobs:
         run: |
           if command -v dnf >/dev/null; then dnf -q -y install mesa-libGL libglvnd-glx findutils procps-ng
           else apt-get -qq update && apt-get -qq install -y libgl1 procps; fi
-      - name: Each package loads and passes its self-tests
+      - name: The AppImages load and pass their self-tests
+        # They carry their own libraries: nothing installed but OpenGL.
         run: |
-          set -e
           chmod +x ./*.AppImage ./bitflash-node-*
           ./Bitflash-*-x86_64.AppImage --appimage-extract >/dev/null && mv squashfs-root wallet
           ./BtfChat-*-x86_64.AppImage --appimage-extract >/dev/null && mv squashfs-root chat
-          ./bitflash-node-*-x86_64 -selftest=rules-v3 | tail -1
           ./wallet/AppRun -selftest=rules-v3 | tail -1
           ./chat/AppRun -selftest=rules-v3 | tail -1
+      - name: The headless node, with the libraries its notes name (Debian/Ubuntu)
+        # The node binary uses the system's libraries, so it is for Debian and
+        # Ubuntu, where these package names hold; elsewhere, the AppImage.
+        if: "!startsWith(matrix.image, 'fedora')"
+        run: |
+          apt-get -qq install -y libsodium23 libdb5.3++ libsqlite3-0 \
+            $(apt-cache show libssl3t64 >/dev/null 2>&1 && echo libssl3t64 || echo libssl3)
+          ./bitflash-node-*-x86_64 -selftest=rules-v3 | tail -1
       - name: The bundled Tor runs here
         run: |
           set -e
