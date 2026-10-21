@@ -1583,10 +1583,19 @@ void DrawChatFullWindow()
 
 } // namespace
 
+// GLFW says why it could not make a window or a context; without this the
+// person sees only that it failed.
+static void ChatGlfwError(int code, const char* what)
+{
+    printf("btfchat: GLFW error 0x%x: %s\n", code, what ? what : "?");
+    fflush(stdout);
+}
+
 int RunChatGUI(int argc, char* argv[])
 {
     (void)argc; (void)argv;
 
+    glfwSetErrorCallback(ChatGlfwError);
     if (!glfwInit())
     {
         printf("btfchat: glfwInit() failed -- no display or GL available.\n");

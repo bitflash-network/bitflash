@@ -230,6 +230,8 @@ jobs:
           fi
           echo "--- its output:"; tail -30 chat.out
           if [ "$ok" = 0 ]; then
+            echo "--- this machine's graphics (a virtual Mac may have no GPU):"
+            system_profiler SPDisplaysDataType 2>/dev/null | head -25
             echo "--- the newest crash report, if macOS wrote one:"
             r=$(ls -t $REALHOME/Library/Logs/DiagnosticReports/btfchat* /Library/Logs/DiagnosticReports/btfchat* 2>/dev/null | head -1)
             [ -n "$r" ] && head -120 "$r"
