@@ -15,6 +15,26 @@ SECP_INC    ?= /usr/local/include
 SECP_LIB    ?= /usr/local/lib
 RANDOMX_DIR ?= $(HOME)/RandomX
 
+# macOS (Apple silicon), the same tree with Homebrew's libraries: clang, the
+# keg-only openssl@3 and berkeley-db@5 by their own prefixes, and Apple's
+# OpenGL framework where Linux links libGL.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
+CXX = clang++
+CC  = clang
+PLATFORM_INC = -I$(BREW_PREFIX)/include -I$(BREW_PREFIX)/include/nlohmann \
+               -I$(BREW_PREFIX)/opt/openssl@3/include -I$(BREW_PREFIX)/opt/berkeley-db@5/include \
+               -I$(BREW_PREFIX)/opt/sqlite/include
+PLATFORM_LIB = -L$(BREW_PREFIX)/lib -L$(BREW_PREFIX)/opt/openssl@3/lib \
+               -L$(BREW_PREFIX)/opt/berkeley-db@5/lib -L$(BREW_PREFIX)/opt/sqlite/lib
+GL_LIBS = -lglfw -framework OpenGL -framework Cocoa -framework IOKit
+else
+PLATFORM_INC =
+PLATFORM_LIB =
+GL_LIBS = -lglfw -lGL
+endif
+
 IMGUI_DIR = imgui
 
 # -w used to sit here and suppressed every diagnostic in the build, including
@@ -40,15 +60,15 @@ CXXFLAGS = -std=gnu++14 -O2 $(WARNFLAGS) -fpermissive -pthread \
            -DSECP256K1_STATIC -DBITFLASH_NODE_BUILD \
            -I$(SECP_INC) -I$(RANDOMX_DIR)/src \
            -I/usr/include/nlohmann \
-           -I$(IMGUI_DIR)
+           -I$(IMGUI_DIR) $(PLATFORM_INC)
 FUZZ_CXXFLAGS = $(filter-out -O2,$(CXXFLAGS)) -O1 -g -fno-omit-frame-pointer \
                 -fsanitize=fuzzer-no-link,address,undefined
 FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined
 
 LIBS = -L$(SECP_LIB) -lsecp256k1 \
-       -L$(RANDOMX_DIR)/build -lrandomx \
+       -L$(RANDOMX_DIR)/build -lrandomx $(PLATFORM_LIB) \
        -lsodium -lssl -lcrypto -ldb_cxx -lsqlite3 -lpthread \
-       -lglfw -lGL
+       $(GL_LIBS)
 
 # Every header a .cpp here includes has to be listed, not just the interesting
 # ones. sockcount.h was missing, and it declares a struct that lives in a
@@ -163,7 +183,7 @@ btfchat: $(CHAT_OBJS)
 # without -DBITFLASH_NO_GUI, and the two must not overwrite each other.
 
 NODE_LIBS = -L$(SECP_LIB) -lsecp256k1 \
-            -L$(RANDOMX_DIR)/build -lrandomx \
+            -L$(RANDOMX_DIR)/build -lrandomx $(PLATFORM_LIB) \
             -lsodium -lssl -lcrypto -ldb_cxx -lsqlite3 -lpthread
 
 NODE_ONLY_OBJS = $(patsubst obj/%,obj-node/%,$(NODE_OBJS)) \

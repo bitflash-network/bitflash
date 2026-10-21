@@ -6,6 +6,12 @@ configure, nothing on the clear net.
 
   Windows:  mine.cmd YOUR_BTF_ADDRESS
   Linux:    ./mine.sh YOUR_BTF_ADDRESS
+  macOS:    ./mine.sh YOUR_BTF_ADDRESS   (Apple silicon, M1 and later)
+
+On macOS, in Terminal, once after unpacking (the download is not signed by
+Apple, so macOS holds it until told it is wanted):
+
+  xattr -dr com.apple.quarantine Bitflash-Miner-*-macos-arm64
 
 YOUR_BTF_ADDRESS is a Bitflash payment address: what the Bitflash wallet shows
 under Receive, or what `bitflash -newaddress` prints. It is not a .btf node

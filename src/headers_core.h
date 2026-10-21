@@ -34,7 +34,9 @@ inline int _mkdir(const char* p) { return ::mkdir(p); }
 // ignores SIGPIPE outright, for the writes that do not go through send() --
 // OpenSSL's, on the Nostr connections. Reported, with the first patch, by
 // mischelf.
-#ifdef _WIN32
+#if defined(_WIN32) || !defined(MSG_NOSIGNAL)
+// Windows has no SIGPIPE; macOS has no MSG_NOSIGNAL, and there the SIG_IGN
+// in main() is what keeps a closed peer from ending the process.
 #define BTF_SEND_FLAGS 0
 #else
 #define BTF_SEND_FLAGS MSG_NOSIGNAL
