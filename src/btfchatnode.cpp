@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <deque>
 #include <set>
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 namespace btfchat
 {
@@ -520,6 +523,35 @@ struct OutLink
 static CCriticalSection cs_pool;
 static std::map<std::string, OutLink*> g_mapOutLinks;
 
+// Has the other side closed a pooled link? Nothing is ever sent back on an
+// outgoing link, so anything to read means it ended (EOF or a reset). Asked
+// before reusing one: a write into a closed Tor stream still "succeeds" into
+// the local buffer, and the message would be reported sent and be gone --
+// which a test showed, sending right after the other chat was closed.
+static bool OutLinkClosedByPeer(btf_socket_t s)
+{
+#ifdef _WIN32
+    fd_set r;
+    FD_ZERO(&r);
+    FD_SET(s, &r);
+    timeval tv = { 0, 0 };
+    int n = select(0, &r, NULL, NULL, &tv);
+#else
+    struct pollfd p;
+    p.fd = s;
+    p.events = POLLIN;
+    p.revents = 0;
+    int n = poll(&p, 1, 0);
+#endif
+    if (n == 0)
+        return false;       // nothing to read: still open
+    if (n < 0)
+        return true;
+    char c;
+    int got = recv(s, &c, 1, MSG_PEEK);
+    return got <= 0;        // 0: they closed it; < 0: reset
+}
+
 static void DropOutLink(std::map<std::string, OutLink*>::iterator it)
 {
     it->second->link.Close();
@@ -616,6 +648,12 @@ static bool SendOneFrame(const std::string& peerAddr, const std::string& frameJs
     CRITICAL_BLOCK(cs_pool)
     {
         std::map<std::string, OutLink*>::iterator it = g_mapOutLinks.find(peerAddr);
+        if (it != g_mapOutLinks.end() && OutLinkClosedByPeer(it->second->sock))
+        {
+            printf("btfchat: they closed the connection; dialling again\n");
+            DropOutLink(it);
+            it = g_mapOutLinks.end();
+        }
         if (it != g_mapOutLinks.end())
         {
             SocketStream stream(it->second->sock);

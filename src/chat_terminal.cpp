@@ -756,7 +756,7 @@ void Command(const std::string& line)
     {
         bool fMailbox = false;
         if (btfchat::ChatSendText(g_peer, line, fMailbox, err))
-            Say(fMailbox ? "(they are not online -- left in their mailbox)" : (err.empty() ? "" : "(" + err + ")"));
+            Say(fMailbox ? "(they are not online -- left in their mailbox)" : (err.empty() ? "(sent)" : "(" + err + ")"));
         else
             Say("not sent: " + err);
         return;
