@@ -10,9 +10,9 @@ CPU-only cryptocurrency. A revival of Bitcoin 0.1.0 with RandomX proof of work a
 ![Privacy](https://img.shields.io/badge/addresses-.btf%20anonymous-2ea44f?style=for-the-badge)
 ![Tor](https://img.shields.io/badge/tor-onion%20service-7d4698?style=for-the-badge)
 ![Fair Launch](https://img.shields.io/badge/premine-none-2ea44f?style=for-the-badge)
-[![Discord](https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge)](https://discord.gg/n7B2Eamn3)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge)](https://discord.gg/kcgeg696YE)
 
-**[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/xsYYM3WsdV)**
+**[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/kcgeg696YE)**
 
 </div>
 
