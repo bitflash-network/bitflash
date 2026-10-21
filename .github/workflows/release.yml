@@ -149,13 +149,17 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j3 --target randomx >/dev/null
       - name: Build the node and btfchat
         run: make -C src -j3 bitflash-node btfchat SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX
-      - name: Self-tests on what was built
+      - name: Tor for macOS, the official bundle, checked against its pinned hash
         run: |
           set -eo pipefail
-          for t in rules-v3 network-params swap-wait-payment fee-policy script-eval pow-v2; do
-            ./src/bitflash-node -selftest=$t | tail -1
-          done
-          ./src/btfchat -selftest=rules-v3 | tail -1
+          curl -sfL -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION/tor-expert-bundle-macos-aarch64-$TOR_VERSION.tar.gz
+          echo "$TOR_MAC_SHA256  tor.tar.gz" | shasum -a 256 -c -
+          mkdir -p torx && tar -xzf tor.tar.gz -C torx
+      - name: The whole test suite, as on Windows and Linux
+        # Every unit test program and every self-test of make tests, on the Mac.
+        run: make -C src tests SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX BITFLASH_TOR=$PWD/torx/tor/tor
+        env:
+          BITFLASH_TOR: ${{ github.workspace }}/torx/tor/tor
       - name: The folder people download
         run: |
           set -eo pipefail
@@ -167,10 +171,6 @@ jobs:
           B=$(brew --prefix)
           dylibbundler -cd -b -x $D/bitflash-node -x $D/btfchat -d $D/lib -p @executable_path/lib/ \
             -s $B/lib -s $B/opt/openssl@3/lib -s $B/opt/berkeley-db@5/lib -s $B/opt/sqlite/lib </dev/null >/dev/null
-          # Tor for macOS, the official bundle, checked against its pinned hash.
-          curl -sfL -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION/tor-expert-bundle-macos-aarch64-$TOR_VERSION.tar.gz
-          echo "$TOR_MAC_SHA256  tor.tar.gz" | shasum -a 256 -c -
-          mkdir -p torx && tar -xzf tor.tar.gz -C torx
           cp -R torx/tor $D/tor
           [ -d torx/data ] && mkdir -p $D/tor/data-defaults && cp -R torx/data/. $D/tor/data-defaults/
           cp packaging/macos/README-macOS.txt $D/
@@ -209,6 +209,26 @@ jobs:
           grep -E "hidden service ready|btfseed: reached|Added time data" dd/debug.log | head -5 || true
           kill $W || true
           [ "${n:-0}" -gt 0 ]
+      - name: btfchat opens its window from Terminal and stays up
+        # GitHub's Macs have a screen; the window is captured for a person to see.
+        timeout-minutes: 3
+        run: |
+          cd try/$D
+          export HOME=$PWD/chat-home && mkdir -p $HOME
+          ./btfchat -testnet > chat.out 2>&1 &
+          C=$!
+          sleep 25
+          screencapture -x $GITHUB_WORKSPACE/btfchat-macos.png || true
+          if kill -0 $C 2>/dev/null; then echo "btfchat still running after 25 s"; ok=1; else echo "btfchat exited:"; ok=0; fi
+          tail -20 chat.out
+          kill $C 2>/dev/null || true
+          [ "$ok" = 1 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-screenshot
+          path: btfchat-macos.png
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -337,6 +357,7 @@ jobs:
       - name: SHA256SUMS
         run: |
           cd out
+          rm -f ./*.png   # the test screenshot is for us, not a download
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Open a draft (nothing is public until the founder publishes it)

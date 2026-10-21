@@ -259,7 +259,7 @@ clean:
 	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
-	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto
+	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
 
 # The .btf address tests existed as a file you had to compile by hand, which is
 # the same as not having them: they did not run here and they did not run in CI.
@@ -269,7 +269,7 @@ test_btfaddr: test_btfaddr.cpp btfaddr.cpp btfaddr.h
 # The encrypted channel every .btf connection runs through. Same story as the
 # address tests: the file was here, nothing ran it.
 test_btfchan: test_btfchan.cpp btfchan.cpp btfchan.h obj/mlkem.o
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o -lsodium
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o $(PLATFORM_LIB) -lsodium
 
 # See the note in makefile.mingw: bip32 for the phrase, btfaddr for the address,
 # no ML-KEM object.
@@ -298,7 +298,7 @@ test_chatstore: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfc
 
 # See the note in makefile.mingw.
 test_community: test_community.cpp community.cpp community.h
-	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
+	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp $(PLATFORM_LIB) -lsodium
 
 test_chatswap: test_chatswap.cpp chatswap.cpp chatswap.h
 	$(CXX) $(CXXFLAGS) -o $@ test_chatswap.cpp chatswap.cpp
