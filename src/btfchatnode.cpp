@@ -640,6 +640,38 @@ static OutLink* DialPeer(const std::string& peerAddr, std::string& errOut)
     return out;
 }
 
+// A delivery receipt. A write that went into Tor proves nothing about the
+// other chat: it may have quit a moment ago, before its Tor or ours noticed,
+// and the frame went into a circuit that leads nowhere -- reported sent and
+// lost (a live test did exactly that). So the receiving chat answers every
+// frame it took with this, on the same link, and the sender counts a frame
+// delivered only on its receipt. No receipt in time: not delivered, and the
+// caller leaves it in the mailbox. A frame that arrives both ways is
+// recognised by its id on the other side and shown once.
+static const int RECEIPT_WAIT_SECONDS = 45;
+
+static std::string FrameReceipt(const std::string& frameJson)
+{
+    return "{\"receipt\":\"" + Hash(frameJson.begin(), frameJson.end()).GetHex() + "\"}";
+}
+
+static bool AwaitReceipt(OutLink* l, const std::string& frameJson, std::string& errOut)
+{
+    SocketStream stream(l->sock, RECEIPT_WAIT_SECONDS);
+    std::string js, err;
+    if (!l->link.RecvFrame(stream, js, err))
+    {
+        errOut = "no delivery receipt (" + err + ")";
+        return false;
+    }
+    if (js != FrameReceipt(frameJson))
+    {
+        errOut = "the delivery receipt was for something else";
+        return false;
+    }
+    return true;
+}
+
 static bool SendOneFrame(const std::string& peerAddr, const std::string& frameJson,
                          std::string& errOut)
 {
@@ -657,7 +689,8 @@ static bool SendOneFrame(const std::string& peerAddr, const std::string& frameJs
         if (it != g_mapOutLinks.end())
         {
             SocketStream stream(it->second->sock);
-            if (it->second->link.SendFrame(stream, frameJson, errOut))
+            if (it->second->link.SendFrame(stream, frameJson, errOut) &&
+                AwaitReceipt(it->second, frameJson, errOut))
             {
                 it->second->nLastUsed = GetTime();
                 return true;
@@ -665,8 +698,9 @@ static bool SendOneFrame(const std::string& peerAddr, const std::string& frameJs
             // The other end went away, or Tor dropped the circuit under us.
             // Neither is an error worth showing: dial again and try once more,
             // which is what a person would do without being told.
-            printf("btfchat: the open connection died, dialling again\n");
+            printf("btfchat: the open connection died (%s), dialling again\n", errOut.c_str());
             DropOutLink(it);
+            errOut.clear();
         }
 
         OutLink* fresh = DialPeer(peerAddr, errOut);
@@ -674,7 +708,7 @@ static bool SendOneFrame(const std::string& peerAddr, const std::string& frameJs
             return false;
 
         SocketStream stream(fresh->sock);
-        if (!fresh->link.SendFrame(stream, frameJson, errOut))
+        if (!fresh->link.SendFrame(stream, frameJson, errOut) || !AwaitReceipt(fresh, frameJson, errOut))
         {
             fresh->link.Close();
             closesocket(fresh->sock);
@@ -1429,6 +1463,12 @@ static void ThreadChatServe(void* parg)
             if (fDelivered)
             {
                 printf("btfchat: delivered a frame from %s\n", f.from.c_str());
+                // The receipt the sender waits for before calling it delivered
+                // (FrameReceipt). Only for a frame we took: a refused one gets
+                // no answer, as before.
+                std::string e3;
+                if (!link.SendFrame(stream, FrameReceipt(js), e3))
+                    LogPrint("btfchat", "btfchat: receipt not sent: %s\n", e3.c_str());
                 // They just wrote to us, so they are up right now. If we are
                 // holding anything for them, this is the moment -- not two
                 // minutes from now. Flagged rather than sent from here: dialling
