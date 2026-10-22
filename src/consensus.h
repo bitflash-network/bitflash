@@ -54,4 +54,16 @@ static const unsigned int RULES_V3_TIME_TESTNET = 1792458000;
 unsigned int RulesV3Time();
 bool RulesV3Active(unsigned int nBlockTime);
 
+// The day atomic swaps open in the wallet and in btfchat on mainnet:
+// 2026-12-25 12:00 UTC. Not a consensus rule. Rules v3 still switch on at
+// 2026-11-21, as 1.2.29 shipped them; moving that date in a later release
+// would leave two rule sets live at once, and a swap funded on 1.2.29 open to
+// anyone on the other. Only the launch moves. On testnet swaps open with the
+// rules, as they did.
+static const unsigned int SWAPS_OPEN_TIME_MAINNET = 1798200000;
+
+unsigned int SwapsOpenTimeFor(bool fTestNetwork);
+unsigned int SwapsOpenTime();
+bool SwapsOpen(unsigned int nTime);
+
 #endif
