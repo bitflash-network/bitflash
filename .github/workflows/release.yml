@@ -172,6 +172,7 @@ jobs:
           dylibbundler -cd -b -x $D/bitflash-node -x $D/btfchat -d $D/lib -p @executable_path/lib/ \
             -s $B/lib -s $B/opt/openssl@3/lib -s $B/opt/berkeley-db@5/lib -s $B/opt/sqlite/lib </dev/null >/dev/null
           cp -R torx/tor $D/tor
+          cp -R torx/docs $D/tor/docs        # Tor's licenses and its libraries'
           [ -d torx/data ] && mkdir -p $D/tor/data-defaults && cp -R torx/data/. $D/tor/data-defaults/
           cp packaging/macos/README-macOS.txt $D/
           # Apple silicon runs only signed code; ours had their library paths
@@ -244,6 +245,7 @@ jobs:
     runs-on: macos-14
     env:
       XMRIG_MAC_SHA256: 6ae4eb4216e99a201ae9a3d2c3a7c275207c5165cfc25da1f3d735d6c4829c18
+      XMRIG_LICENSE_SHA256: 589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2
       TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
       TOR_VERSION: 15.0.19
     steps:
@@ -253,6 +255,9 @@ jobs:
           set -eo pipefail
           curl -sfL -o xmrig.tar.gz https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-macos-arm64.tar.gz
           echo "$XMRIG_MAC_SHA256  xmrig.tar.gz" | shasum -a 256 -c -
+          # The macOS archive carries no license; XMRig's own, at the same tag.
+          curl -sfL -o xmrig-LICENSE https://raw.githubusercontent.com/xmrig/xmrig/v6.26.0/LICENSE
+          echo "$XMRIG_LICENSE_SHA256  xmrig-LICENSE" | shasum -a 256 -c -
           curl -sfL -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION/tor-expert-bundle-macos-aarch64-$TOR_VERSION.tar.gz
           echo "$TOR_MAC_SHA256  tor.tar.gz" | shasum -a 256 -c -
       - name: The folder people download
@@ -263,7 +268,9 @@ jobs:
           mkdir -p $D/xmrig $D/tor $D/licenses x t
           tar -xzf xmrig.tar.gz -C x && tar -xzf tor.tar.gz -C t
           cp x/xmrig-6.26.0/xmrig $D/xmrig/
-          cp x/xmrig-6.26.0/LICENSE $D/licenses/XMRIG-LICENSE.txt 2>/dev/null || true
+          cp xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
+          cp t/docs/tor.txt $D/licenses/TOR-LICENSE.txt
+          for f in t/docs/*.txt; do [ "$(basename $f)" = tor.txt ] || cp $f $D/licenses/; done
           cp -R t/tor/. $D/tor/
           rm -rf $D/tor/pluggable_transports
           cp scripts/bitflash-miner/mine.sh scripts/bitflash-miner/README.txt $D/
@@ -295,6 +302,83 @@ jobs:
         with:
           name: macos-miner
           path: Bitflash-Miner-*-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  miner:
+    name: Bitflash Miner for Windows and Linux
+    # The same assembly the build machine did by hand (scripts/bitflash-miner/
+    # build.sh): official XMRig and Tor, every archive checked by hash.
+    runs-on: ubuntu-24.04
+    env:
+      XMRIG_WIN_SHA256: bba8097cb37d9b458a1cb1137876b27cde6740d17fe4ccbc086ba07d87d9e147
+      XMRIG_LINUX_SHA256: fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5
+      XMRIG_LICENSE_SHA256: 589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2
+      TOR_WIN_SHA256: 6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f
+      TOR_LINUX_SHA256: 5a8f19f5f119b5fa2a8fd799a3a532e3236ad36164241800d6302e32f0e1c2a9
+      TOR_VERSION: 15.0.19
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Official XMRig and Tor, checked against their published hashes
+        run: |
+          X=https://github.com/xmrig/xmrig/releases/download/v6.26.0
+          T=https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION
+          curl -sfL -o xw.zip $X/xmrig-6.26.0-windows-x64.zip
+          curl -sfL -o xl.tar.gz $X/xmrig-6.26.0-linux-static-x64.tar.gz
+          curl -sfL -o xmrig-LICENSE https://raw.githubusercontent.com/xmrig/xmrig/v6.26.0/LICENSE
+          curl -sfL -o tw.tar.gz $T/tor-expert-bundle-windows-x86_64-$TOR_VERSION.tar.gz
+          curl -sfL -o tl.tar.gz $T/tor-expert-bundle-linux-x86_64-$TOR_VERSION.tar.gz
+          sha256sum -c <<EOF
+          $XMRIG_WIN_SHA256  xw.zip
+          $XMRIG_LINUX_SHA256  xl.tar.gz
+          $XMRIG_LICENSE_SHA256  xmrig-LICENSE
+          $TOR_WIN_SHA256  tw.tar.gz
+          $TOR_LINUX_SHA256  tl.tar.gz
+          EOF
+      - name: The two folders people download
+        run: |
+          V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
+          mkdir -p xw xl tw tl
+          unzip -q xw.zip -d xw && tar -xzf xl.tar.gz -C xl && tar -xzf tw.tar.gz -C tw && tar -xzf tl.tar.gz -C tl
+          # ---- Windows
+          D=Bitflash-Miner-$V-windows
+          mkdir -p $D/xmrig $D/tor $D/licenses
+          cp xw/xmrig-6.26.0/xmrig.exe xw/xmrig-6.26.0/WinRing0x64.sys $D/xmrig/
+          cp tw/tor/tor.exe $D/tor/
+          cp xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
+          cp tw/docs/tor.txt $D/licenses/TOR-LICENSE.txt
+          for f in tw/docs/*.txt; do [ "$(basename $f)" = tor.txt ] || cp $f $D/licenses/; done
+          cp scripts/bitflash-miner/mine.cmd scripts/bitflash-miner/README.txt $D/
+          sed -i 's/\r*$/\r/' $D/mine.cmd $D/README.txt
+          (cd $D && sha256sum $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
+          zip -qr $D.zip $D
+          # ---- Linux
+          D=Bitflash-Miner-$V-linux
+          mkdir -p $D/xmrig $D/tor $D/licenses
+          cp xl/xmrig-6.26.0/xmrig $D/xmrig/
+          cp tl/tor/tor tl/tor/libevent-2.1.so.7 tl/tor/libcrypto.so.3 tl/tor/libssl.so.3 $D/tor/
+          cp xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
+          cp tl/docs/tor.txt $D/licenses/TOR-LICENSE.txt
+          for f in tl/docs/*.txt; do [ "$(basename $f)" = tor.txt ] || cp $f $D/licenses/; done
+          cp scripts/bitflash-miner/mine.sh scripts/bitflash-miner/README.txt $D/
+          chmod +x $D/mine.sh $D/xmrig/xmrig $D/tor/tor
+          (cd $D && sha256sum $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
+          tar -czf $D.tar.gz $D
+          echo "V=$V" >> $GITHUB_ENV
+      - name: The Linux one runs here
+        run: |
+          mkdir try && tar -xzf Bitflash-Miner-$V-linux.tar.gz -C try && cd try/Bitflash-Miner-$V-linux
+          sha256sum -c SHA256SUMS >/dev/null && echo "its own SHA256SUMS checks"
+          ./xmrig/xmrig --version | head -1
+          LD_LIBRARY_PATH=$PWD/tor ./tor/tor --version | head -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miner
+          path: |
+            Bitflash-Miner-*-windows.zip
+            Bitflash-Miner-*-linux.tar.gz
           if-no-files-found: error
 
   windows:
@@ -349,7 +433,7 @@ jobs:
   draft:
     name: Draft release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, linux-distros, windows, macos, macos-miner]
+    needs: [linux, linux-distros, windows, macos, macos-miner, miner]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
