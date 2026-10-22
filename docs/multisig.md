@@ -64,7 +64,7 @@ as its own, and signs them against the redeem script, so the day the rule is
 live nothing else needs to change. `validateaddress C...` reports `active`.
 
 The rules v3 switch (P2SH, CLTV, lock-time finality, sigops inside redeem
-scripts) is at 2026-10-20 01:00 UTC on testnet and 2026-11-21 12:00 UTC on
+scripts, `OP_VER`/`OP_VERIF`/`OP_VERNOTIF` invalid) is at 2026-10-20 01:00 UTC on testnet and 2026-11-21 12:00 UTC on
 mainnet (`RULES_V3_TIME_TESTNET`/`_MAINNET` in `consensus.h`).
 
 ## RPC reference

@@ -86,6 +86,14 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             opcode == OP_MOD   || opcode == OP_LSHIFT || opcode == OP_RSHIFT)
             return false;
 
+        // OP_VER pushes this node's VERSION and OP_VERIF / OP_VERNOTIF branch
+        // on it: the same script passes on one release and fails on the next,
+        // so a miner could split the network by version. Bitcoin made the
+        // three invalid, even in a branch not taken; rules v3 does the same,
+        // from its fork height so no block before it changes.
+        if (fRulesV3 && (opcode == OP_VER || opcode == OP_VERIF || opcode == OP_VERNOTIF))
+            return false;
+
         // Counted outside fExec for the same reason: the cost of a script must
         // not depend on which branch a signature happens to take. Pushes are
         // exempt because their cost is already bounded by the script's own
@@ -274,6 +282,13 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             case OP_2DROP:
             {
                 // (x1 x2 -- )
+                // 0.1.0 popped without looking: pop_back on an empty stack
+                // corrupts the heap, so any script reaching OP_2DROP with
+                // fewer than two items -- a P2SH redeem script, a mined
+                // output -- crashed every node that evaluated it. Bitcoin
+                // added this check in 0.3.x; found here by fuzz-script.
+                if (stack.size() < 2)
+                    return false;
                 stack.pop_back();
                 stack.pop_back();
             }
@@ -738,11 +753,11 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 valtype& vch = stacktop(-1);
                 valtype vchHash(opcode == OP_RIPEMD160 || opcode == OP_SHA1 || opcode == OP_HASH160 ? 20 : 32);
                 if (opcode == OP_RIPEMD160)
-                    RIPEMD160(&vch[0], vch.size(), &vchHash[0]);
+                    RIPEMD160(HashBegin(vch.begin(), vch.end()), vch.size(), &vchHash[0]);
                 else if (opcode == OP_SHA1)
-                    SHA1(&vch[0], vch.size(), &vchHash[0]);
+                    SHA1(HashBegin(vch.begin(), vch.end()), vch.size(), &vchHash[0]);
                 else if (opcode == OP_SHA256)
-                    SHA256(&vch[0], vch.size(), &vchHash[0]);
+                    SHA256(HashBegin(vch.begin(), vch.end()), vch.size(), &vchHash[0]);
                 else if (opcode == OP_HASH160)
                 {
                     uint160 hash160 = Hash160(vch);
@@ -811,6 +826,11 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
 
                 int nKeysCount = CBigNum(stacktop(-i)).getint();
                 if (nKeysCount < 0)
+                    return false;
+                // More keys than the stack holds fails below anyway; saying so
+                // first keeps i += nKeysCount from overflowing an int on a
+                // count near INT_MAX (undefined, found by fuzz-script).
+                if (nKeysCount > (int)stack.size())
                     return false;
                 int ikey = ++i;
                 i += nKeysCount;

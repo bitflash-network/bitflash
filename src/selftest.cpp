@@ -4639,6 +4639,32 @@ static int RunMultisigSelfTest()
 // The chat's link to a wallet (btfchatwallet.h) against the real RPC server:
 // a wallet started the -chatwallet way, a cookie on disk, and the chat's client
 // asking it for its balance and an address -- over 127.0.0.1, as in use.
+// A loopback port nobody holds right now: the OS picks it. A port drawn from
+// the clock could land on a service of the CI machine, which accepted the
+// chat's request and never answered ("the wallet sent no answer").
+static int FreeLoopbackPort()
+{
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET)
+        return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    int nPort = 0;
+    if (::bind(s, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+        getsockname(s, (struct sockaddr*)&addr, &addrLen) == 0)
+        nPort = ntohs(addr.sin_port);
+    closesocket(s);
+    return nPort;
+}
+
 static int RunChatWalletSelfTest()
 {
     printf("chat-wallet self-test\n");
@@ -4659,7 +4685,7 @@ static int RunChatWalletSelfTest()
         return 1;
     }
 
-    int nPort = 30000 + (int)(GetTime() % 20000);
+    int nPort = FreeLoopbackPort();
     nFail += Check(JsonRpcConfigureCookie(strprintf("%d", nPort)), "-chatwallet configures the RPC with a cookie") ? 0 : 1;
     std::string cookiePath = GetAppDir() + "/.cookie";
     std::string cookie;
@@ -4715,7 +4741,7 @@ static int RunChatWalletSelfTest()
     nFail += Check(!fLinked && st.find("refused the cookie") != std::string::npos,
                    "a wrong cookie is refused, and the chat says so") ? 0 : 1;
 
-    btfchat::WalletLinkConfigure(tmp, nPort == 65535 ? 1 : nPort + 1);
+    btfchat::WalletLinkConfigure(tmp, FreeLoopbackPort());
     fLinked = btfchat::WalletLinked(st);
     nFail += Check(!fLinked && st.find("not answering") != std::string::npos,
                    "no wallet on the port: the chat says it is not answering") ? 0 : 1;
@@ -4846,6 +4872,41 @@ static int RunRulesV3SelfTest()
         empty << OP_CHECKLOCKTIMEVERIFY;
         CTransaction s2 = t;
         nFail += Check(!EvalScript(empty, s2, 0, 0, NULL, true, true), "CLTV on an empty stack fails") ? 0 : 1;
+
+        // OP_2DROP used to pop an empty stack: heap corruption, a crash in
+        // every node that evaluated the script.
+        CScript drop0, drop1, drop2;
+        drop0 << OP_2DROP << OP_1;
+        drop1 << OP_1 << OP_2DROP << OP_1;
+        drop2 << OP_1 << OP_1 << OP_2DROP << OP_1;
+        nFail += Check(!EvalScript(drop0, s2, 0, 0, NULL, true, true), "OP_2DROP on an empty stack fails") ? 0 : 1;
+        nFail += Check(!EvalScript(drop1, s2, 0, 0, NULL, true, true), "OP_2DROP on one item fails") ? 0 : 1;
+        nFail += Check(EvalScript(drop2, s2, 0, 0, NULL, true, true), "OP_2DROP on two items still works") ? 0 : 1;
+
+        // OP_VER and friends answer differently on every release: invalid
+        // under rules v3, even in a branch that is not taken.
+        CScript ver, verif, skipped;
+        ver << OP_VER << OP_DROP << OP_1;
+        verif << OP_1 << OP_VERIF << OP_1 << OP_ELSE << OP_1 << OP_ENDIF;
+        skipped << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1;
+        nFail += Check(EvalScript(ver, s2, 0, 0, NULL, true, false), "OP_VER still runs before rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(ver, s2, 0, 0, NULL, true, true), "OP_VER fails under rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(verif, s2, 0, 0, NULL, true, true), "OP_VERIF fails under rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(skipped, s2, 0, 0, NULL, true, true), "OP_VERNOTIF fails even in a branch not taken") ? 0 : 1;
+
+        // A key count near INT_MAX used to overflow the index arithmetic.
+        CScript manyKeys;
+        manyKeys << OP_1 << std::vector<unsigned char>{0xff, 0xff, 0xff, 0x7f} << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript(manyKeys, s2, 0, 0, NULL, true, true), "OP_CHECKMULTISIG with INT_MAX keys fails") ? 0 : 1;
+
+        // Hashing nothing hashes a blank byte's address, not &v[0] of an empty
+        // vector; the digest must not change.
+        std::vector<unsigned char> none;
+        nFail += Check(Hash(none.begin(), none.end()).GetHex() ==
+                       "56944c5d3f98413ef45cf54545538103cc9f298e0575820ad3591376e2e0f65d",
+                       "the hash of nothing is unchanged") ? 0 : 1;
+        nFail += Check(Hash160(none).GetHex() == "cb9f3b7c6fb1cf2c13a40637c189bdd066a272b4",
+                       "and so is the Hash160 of nothing") ? 0 : 1;
     }
 
     // ---- lock-time finality in blocks
