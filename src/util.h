@@ -519,11 +519,21 @@ inline void heapchk()
 
 
 
+// &pbegin[0] of an empty range points at nothing: undefined, even with a
+// length of zero (the fuzzer's sanitizer flags it). Bitcoin hashes a blank
+// byte's address instead; the digest is the same.
+template<typename T>
+inline const unsigned char* HashBegin(const T pbegin, const T pend)
+{
+    static const unsigned char pblank[1] = {};
+    return pbegin == pend ? pblank : (const unsigned char*)&pbegin[0];
+}
+
 template<typename T1>
 inline uint256 Hash(const T1 pbegin, const T1 pend)
 {
     uint256 hash1;
-    SHA256((unsigned char*)&pbegin[0], (pend - pbegin) * sizeof(pbegin[0]), (unsigned char*)&hash1);
+    SHA256(HashBegin(pbegin, pend), (pend - pbegin) * sizeof(pbegin[0]), (unsigned char*)&hash1);
     uint256 hash2;
     SHA256((unsigned char*)&hash1, sizeof(hash1), (unsigned char*)&hash2);
     return hash2;
@@ -536,8 +546,8 @@ inline uint256 Hash(const T1 p1begin, const T1 p1end,
     uint256 hash1;
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
-    SHA256_Update(&ctx, (unsigned char*)&p1begin[0], (p1end - p1begin) * sizeof(p1begin[0]));
-    SHA256_Update(&ctx, (unsigned char*)&p2begin[0], (p2end - p2begin) * sizeof(p2begin[0]));
+    SHA256_Update(&ctx, HashBegin(p1begin, p1end), (p1end - p1begin) * sizeof(p1begin[0]));
+    SHA256_Update(&ctx, HashBegin(p2begin, p2end), (p2end - p2begin) * sizeof(p2begin[0]));
     SHA256_Final((unsigned char*)&hash1, &ctx);
     uint256 hash2;
     SHA256((unsigned char*)&hash1, sizeof(hash1), (unsigned char*)&hash2);
@@ -552,9 +562,9 @@ inline uint256 Hash(const T1 p1begin, const T1 p1end,
     uint256 hash1;
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
-    SHA256_Update(&ctx, (unsigned char*)&p1begin[0], (p1end - p1begin) * sizeof(p1begin[0]));
-    SHA256_Update(&ctx, (unsigned char*)&p2begin[0], (p2end - p2begin) * sizeof(p2begin[0]));
-    SHA256_Update(&ctx, (unsigned char*)&p3begin[0], (p3end - p3begin) * sizeof(p3begin[0]));
+    SHA256_Update(&ctx, HashBegin(p1begin, p1end), (p1end - p1begin) * sizeof(p1begin[0]));
+    SHA256_Update(&ctx, HashBegin(p2begin, p2end), (p2end - p2begin) * sizeof(p2begin[0]));
+    SHA256_Update(&ctx, HashBegin(p3begin, p3end), (p3end - p3begin) * sizeof(p3begin[0]));
     SHA256_Final((unsigned char*)&hash1, &ctx);
     uint256 hash2;
     SHA256((unsigned char*)&hash1, sizeof(hash1), (unsigned char*)&hash2);
@@ -576,7 +586,7 @@ uint256 SerializeHash(const T& obj, int nType=SER_GETHASH, int nVersion=VERSION)
 inline uint160 Hash160(const vector<unsigned char>& vch)
 {
     uint256 hash1;
-    SHA256(&vch[0], vch.size(), (unsigned char*)&hash1);
+    SHA256(HashBegin(vch.begin(), vch.end()), vch.size(), (unsigned char*)&hash1);
     uint160 hash2;
     RIPEMD160((unsigned char*)&hash1, sizeof(hash1), (unsigned char*)&hash2);
     return hash2;

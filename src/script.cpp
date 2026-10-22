@@ -827,6 +827,11 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 int nKeysCount = CBigNum(stacktop(-i)).getint();
                 if (nKeysCount < 0)
                     return false;
+                // More keys than the stack holds fails below anyway; saying so
+                // first keeps i += nKeysCount from overflowing an int on a
+                // count near INT_MAX (undefined, found by fuzz-script).
+                if (nKeysCount > (int)stack.size())
+                    return false;
                 int ikey = ++i;
                 i += nKeysCount;
                 if (stack.size() < i)

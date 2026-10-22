@@ -4867,6 +4867,20 @@ static int RunRulesV3SelfTest()
         nFail += Check(!EvalScript(ver, s2, 0, 0, NULL, true, true), "OP_VER fails under rules v3") ? 0 : 1;
         nFail += Check(!EvalScript(verif, s2, 0, 0, NULL, true, true), "OP_VERIF fails under rules v3") ? 0 : 1;
         nFail += Check(!EvalScript(skipped, s2, 0, 0, NULL, true, true), "OP_VERNOTIF fails even in a branch not taken") ? 0 : 1;
+
+        // A key count near INT_MAX used to overflow the index arithmetic.
+        CScript manyKeys;
+        manyKeys << OP_1 << std::vector<unsigned char>{0xff, 0xff, 0xff, 0x7f} << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript(manyKeys, s2, 0, 0, NULL, true, true), "OP_CHECKMULTISIG with INT_MAX keys fails") ? 0 : 1;
+
+        // Hashing nothing hashes a blank byte's address, not &v[0] of an empty
+        // vector; the digest must not change.
+        std::vector<unsigned char> none;
+        nFail += Check(Hash(none.begin(), none.end()).GetHex() ==
+                       "56944c5d3f98413ef45cf54545538103cc9f298e0575820ad3591376e2e0f65d",
+                       "the hash of nothing is unchanged") ? 0 : 1;
+        nFail += Check(Hash160(none).GetHex() == "cb9f3b7c6fb1cf2c13a40637c189bdd066a272b4",
+                       "and so is the Hash160 of nothing") ? 0 : 1;
     }
 
     // ---- lock-time finality in blocks
