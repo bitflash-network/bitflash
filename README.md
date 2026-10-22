@@ -49,8 +49,9 @@ For a plain SOCKS5 proxy without Tor-specific defaults, use
 **Atomic swaps, BTF for BTC.** Either both sides get paid or both get their
 coins back; no exchange, no escrow, no server. The Bitcoin side runs on your
 own Bitcoin Core, or on a Bitcoin light client built into the wallet, over its
-own Tor. Swaps switch on with rules v3, a soft fork on mainnet at
-**2026-11-21 12:00 UTC**. See [atomic swaps](docs/atomic-swaps.md).
+own Tor. Swaps open on mainnet on **2026-12-25 12:00 UTC**, on top of rules
+v3, a soft fork on mainnet at 2026-11-21 12:00 UTC. See
+[atomic swaps](docs/atomic-swaps.md).
 
 **btfchat.** Messages, money and swaps between `.btf` addresses. Offline
 messages wait in the Bitflash nodes themselves, sealed for the recipient; no

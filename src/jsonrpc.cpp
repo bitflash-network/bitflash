@@ -1309,21 +1309,25 @@ static vector<unsigned char> PkhOfAddress(const string& strAddr)
     return vector<unsigned char>(h.begin(), h.end());
 }
 
-static void RequireRulesV3()
+static void RequireSwapsOpen()
 {
-    // Before the switch a script-hash output is anyone-can-spend: a contract
-    // funded then could be taken by anybody who read it off the chain.
-    if (!RulesV3Active(GetAdjustedTime()))
+    // Swaps wait for rules v3: before the switch a script-hash output is
+    // anyone-can-spend, and a contract funded then could be taken by anybody
+    // who read it off the chain. On mainnet they also wait for their launch
+    // day, after the rules (consensus.h, SWAPS_OPEN_TIME_MAINNET). The
+    // Bitcoin half waits too, so nobody locks bitcoin into a swap whose
+    // Bitflash half cannot be made.
+    if (!SwapsOpen(GetAdjustedTime()))
     {
-        if (RulesV3Time() == 0)
+        if (SwapsOpenTime() == 0)
             throw runtime_error("atomic swaps need rules v3, which are not scheduled on this network");
-        time_t t = (time_t)RulesV3Time();
+        time_t t = (time_t)SwapsOpenTime();
         char buf[32] = "";
         struct tm* g = gmtime(&t);
         if (g)
             strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", g);
-        throw runtime_error(strprintf("atomic swaps start with rules v3, at block time %u (%s UTC); not before",
-                                      RulesV3Time(), buf));
+        throw runtime_error(strprintf("atomic swaps open at %s UTC (time %u); not before",
+                                      buf, SwapsOpenTime()));
     }
 }
 
@@ -1392,7 +1396,7 @@ static json rpc_swapinitiate(const json& p)
 {
     if (p.size() < 2 || !p[0].is_string())
         throw runtime_error("swapinitiate <participant address> <amount> [lock blocks, testnet only]");
-    RequireRulesV3();
+    RequireSwapsOpen();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
 
@@ -1423,7 +1427,7 @@ static json rpc_swapparticipate(const json& p)
 {
     if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
         throw runtime_error("swapparticipate <initiator address> <amount> <secret hash> [lock blocks, testnet only]");
-    RequireRulesV3();
+    RequireSwapsOpen();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
 
@@ -1923,6 +1927,7 @@ static json rpc_btcinitiate(const json& p)
 {
     if (p.size() < 2 || !p[0].is_string())
         throw runtime_error("btcinitiate <participant's Bitcoin address> <amount> [lock seconds, test chains only]");
+    RequireSwapsOpen();
     btcswap::Chain chain = RequireBitcoin();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
@@ -1945,6 +1950,7 @@ static json rpc_btcparticipate(const json& p)
 {
     if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
         throw runtime_error("btcparticipate <initiator's Bitcoin address> <amount> <secret hash> [lock seconds, test chains only]");
+    RequireSwapsOpen();
     btcswap::Chain chain = RequireBitcoin();
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");

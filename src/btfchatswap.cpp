@@ -1141,6 +1141,19 @@ void ChatSwapList(std::vector<SwapView>& out) { g_engine.List(out); }
 
 static bool WalletCanSwap(const std::string& a, const std::string& b, std::string& err)
 {
+    // The wallet refuses before the launch day too; saying so here keeps an
+    // offer nobody can take out of the community.
+    if (!SwapsOpen((unsigned int)GetTime()))
+    {
+        time_t t = (time_t)SwapsOpenTime();
+        char buf[32] = "";
+        struct tm* g = gmtime(&t);
+        if (g)
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", g);
+        err = SwapsOpenTime() == 0 ? std::string("atomic swaps are not scheduled on this network")
+                                   : strprintf("atomic swaps open at %s UTC", buf);
+        return false;
+    }
     json r;
     if (!WalletRpc("getinfo", json::array(), r, err))
         return false;

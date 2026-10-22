@@ -58,6 +58,25 @@ bool RulesV3Active(unsigned int nBlockTime)
     return t != 0 && nBlockTime >= t;
 }
 
+unsigned int SwapsOpenTimeFor(bool fTestNetwork)
+{
+    unsigned int t = fTestNetwork ? RULES_V3_TIME_TESTNET : RULES_V3_TIME_MAINNET;
+    if (t == 0 || fTestNetwork)
+        return t;
+    return t > SWAPS_OPEN_TIME_MAINNET ? t : SWAPS_OPEN_TIME_MAINNET;
+}
+
+unsigned int SwapsOpenTime()
+{
+    return SwapsOpenTimeFor(IsTestNet());
+}
+
+bool SwapsOpen(unsigned int nTime)
+{
+    unsigned int t = SwapsOpenTime();
+    return t != 0 && RulesV3Active(nTime) && nTime >= t;
+}
+
 bool RulesV2Active(unsigned int nBlockTime)
 {
     return nBlockTime >= RulesV2Time();

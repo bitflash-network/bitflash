@@ -4772,6 +4772,17 @@ static int RunRulesV3SelfTest()
     printf("rules-v3 self-test\n");
     int nFail = 0;
 
+    // ---- the launch day of swaps: a date, not a rule
+    nFail += Check(SwapsOpenTimeFor(false) == 1798200000,
+                   "mainnet swaps open at 2026-12-25 12:00 UTC") ? 0 : 1;
+    nFail += Check(RULES_V3_TIME_MAINNET == 1795262400,
+                   "while rules v3 still switch on at 2026-11-21 12:00 UTC, as 1.2.29 shipped") ? 0 : 1;
+    nFail += Check(SwapsOpenTimeFor(true) == RULES_V3_TIME_TESTNET,
+                   "testnet swaps open with the rules") ? 0 : 1;
+    if (!IsTestNet())
+        nFail += Check(!SwapsOpen(1798200000 - 1) && SwapsOpen(1798200000),
+                       "and not a second before") ? 0 : 1;
+
     CKey keyA, keyB;
     keyA.MakeNewKey();
     keyB.MakeNewKey();

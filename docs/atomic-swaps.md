@@ -4,7 +4,8 @@ Two people who do not trust each other trade BTF for BTC without an exchange,
 an escrow, a server or a custodian. Either both get paid, or both get their
 coins back. Needs rules v3, which make pay-to-script-hash and
 `OP_CHECKLOCKTIMEVERIFY` live: on testnet from 2026-10-20 01:00 UTC, on
-mainnet from **2026-11-21 12:00 UTC** (see `consensus.h`).
+mainnet from 2026-11-21 12:00 UTC. On mainnet, swaps open in the wallet and
+in btfchat on **2026-12-25 12:00 UTC** (1.2.30 and later; see `consensus.h`).
 
 There are three ways to do one, from easiest to most manual:
 
@@ -223,7 +224,9 @@ against his Core; Alice uses the Bitflash wallet:
   wallet up as you would for BTF.
 - **Before rules v3 every swap command refuses.** Until then a script-hash
   output is anyone-can-spend: a funded contract could be taken by whoever read
-  it off the chain.
+  it off the chain. On mainnet they keep refusing until the launch on
+  2026-12-25 12:00 UTC, the Bitcoin half included, and btfchat does not post
+  or take offers before then.
 
 ## Reference
 
