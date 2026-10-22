@@ -1465,13 +1465,22 @@ static void ThreadManagedTorWatchdog(void*)
 #ifdef BITFLASH_CHAT_APP
         // No peer-to-peer node here: counting peers would count zero forever and
         // send this watchdog up the bridge ladder on a network where Tor is
-        // perfectly fine. What proves Tor works for the chat is a discovery relay
-        // answering over it.
+        // perfectly fine. What proves Tor works for the chat is a Bitflash node
+        // answering over it, or Tor itself saying it finished bootstrapping --
+        // which it cannot on a network that blocks its relays.
         CRITICAL_BLOCK(cs_managedTor)
-            fAnyPeer = g_fTorNetworkReached;
+            fAnyPeer = g_fTorNetworkReached || g_torBootstrapPct >= 100;
 #else
+        // A peer proves it; so does Tor finishing its bootstrap. Without the
+        // second, a node whose peers were all unreachable for a few minutes --
+        // every one of them stuck on bridges after a reboot, say -- decided Tor
+        // was blocked, moved itself onto snowflake for good (last-working) and
+        // became one more onion nobody could reach. Seen on every service of
+        // the 202 after the reboot of 21/10.
         CRITICAL_BLOCK(cs_vNodes)
             fAnyPeer = !vNodes.empty();
+        CRITICAL_BLOCK(cs_managedTor)
+            fAnyPeer = fAnyPeer || g_torBootstrapPct >= 100;
 #endif
         std::string mode = BtfTorTransportMode();
 
@@ -1587,17 +1596,15 @@ static void ThreadManagedTorHostname(void*)
                 }
                 printf("Managed Tor chat service ready: %s\n",
                        BtfManagedTorChatOnion().c_str());
-                // Tor just created a hidden service. That does not happen on a
-                // Tor that cannot reach the network, so it is proof -- and it
-                // arrives in well under a minute, where waiting for a discovery
-                // relay to answer can take longer than the watchdog's patience.
-                //
-                // Without this the watchdog declared "Tor is blocked" at 241 s on
-                // a machine whose Tor had just published an onion service, and
-                // restarted it onto bridges -- which is what made the relays
-                // unreachable, which kept the watchdog convinced. Measured, not
-                // theorised: the restart lands exactly 241 s after startup.
-                BtfTorNoteNetworkReached();
+                // This used to count as proof that Tor reached the network. It is
+                // not: a v3 service's hostname is written from its keys the moment
+                // Tor starts, with no network at all. On a network that blocks
+                // Tor's relays the chat then believed itself connected, never
+                // climbed the bridge ladder, and sat at "Connecting to a relay"
+                // while the wallet beside it moved to bridges and connected. The
+                // watchdog now waits for Tor's own bootstrap to finish (or a node
+                // to answer) -- which a working Tor reaches well within its
+                // patience, so the old false "blocked at 241 s" does not return.
             }
         }
 
