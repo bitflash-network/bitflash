@@ -4639,6 +4639,32 @@ static int RunMultisigSelfTest()
 // The chat's link to a wallet (btfchatwallet.h) against the real RPC server:
 // a wallet started the -chatwallet way, a cookie on disk, and the chat's client
 // asking it for its balance and an address -- over 127.0.0.1, as in use.
+// A loopback port nobody holds right now: the OS picks it. A port drawn from
+// the clock could land on a service of the CI machine, which accepted the
+// chat's request and never answered ("the wallet sent no answer").
+static int FreeLoopbackPort()
+{
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET)
+        return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    int nPort = 0;
+    if (::bind(s, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+        getsockname(s, (struct sockaddr*)&addr, &addrLen) == 0)
+        nPort = ntohs(addr.sin_port);
+    closesocket(s);
+    return nPort;
+}
+
 static int RunChatWalletSelfTest()
 {
     printf("chat-wallet self-test\n");
@@ -4659,7 +4685,7 @@ static int RunChatWalletSelfTest()
         return 1;
     }
 
-    int nPort = 30000 + (int)(GetTime() % 20000);
+    int nPort = FreeLoopbackPort();
     nFail += Check(JsonRpcConfigureCookie(strprintf("%d", nPort)), "-chatwallet configures the RPC with a cookie") ? 0 : 1;
     std::string cookiePath = GetAppDir() + "/.cookie";
     std::string cookie;
@@ -4715,7 +4741,7 @@ static int RunChatWalletSelfTest()
     nFail += Check(!fLinked && st.find("refused the cookie") != std::string::npos,
                    "a wrong cookie is refused, and the chat says so") ? 0 : 1;
 
-    btfchat::WalletLinkConfigure(tmp, nPort == 65535 ? 1 : nPort + 1);
+    btfchat::WalletLinkConfigure(tmp, FreeLoopbackPort());
     fLinked = btfchat::WalletLinked(st);
     nFail += Check(!fLinked && st.find("not answering") != std::string::npos,
                    "no wallet on the port: the chat says it is not answering") ? 0 : 1;
