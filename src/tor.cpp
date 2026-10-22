@@ -1471,8 +1471,16 @@ static void ThreadManagedTorWatchdog(void*)
         CRITICAL_BLOCK(cs_managedTor)
             fAnyPeer = g_fTorNetworkReached || g_torBootstrapPct >= 100;
 #else
+        // A peer proves it; so does Tor finishing its bootstrap. Without the
+        // second, a node whose peers were all unreachable for a few minutes --
+        // every one of them stuck on bridges after a reboot, say -- decided Tor
+        // was blocked, moved itself onto snowflake for good (last-working) and
+        // became one more onion nobody could reach. Seen on every service of
+        // the 202 after the reboot of 21/10.
         CRITICAL_BLOCK(cs_vNodes)
             fAnyPeer = !vNodes.empty();
+        CRITICAL_BLOCK(cs_managedTor)
+            fAnyPeer = fAnyPeer || g_torBootstrapPct >= 100;
 #endif
         std::string mode = BtfTorTransportMode();
 
