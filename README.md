@@ -349,7 +349,7 @@ build plus a Tor client and a launcher.
 
 ```
 mine.cmd YOUR_BTF_ADDRESS        Windows
-./mine.sh YOUR_BTF_ADDRESS       Linux
+./mine.sh YOUR_BTF_ADDRESS       Linux, macOS (Apple silicon)
 ```
 
 It starts a private Tor and runs XMRig through it to the pool's onion; Ctrl+C
