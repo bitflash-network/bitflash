@@ -646,7 +646,7 @@ windows-tor` to require the extra signature check.
 | Pool server | Built-in — second port on the node's own onion |
 | Wallet recovery | Twelve-word phrase (BIP39 + BIP32 + BIP44, coin type 4346950), plus file backup |
 | Wallet storage | SQLite `wallet.sqlite` by default, or Berkeley DB `wallet.dat` |
-| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, lock-time finality by median time; soft fork on mainnet at 2026-11-21 12:00 UTC |
+| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, lock-time finality by median time, `OP_VER`/`OP_VERIF`/`OP_VERNOTIF` invalid; soft fork on mainnet at 2026-11-21 12:00 UTC |
 | Platforms | Windows, Linux (x86_64), macOS (Apple silicon, Terminal only) |
 
 The halving interval is the number most people get wrong coming from Bitcoin.
