@@ -134,6 +134,8 @@ public:
 
     bool SetPubKey(const vector<unsigned char>& vchPubKey)
     {
+        if (vchPubKey.empty())   // &vchPubKey[0] would point at nothing
+            return false;
         const unsigned char* pbegin = &vchPubKey[0];
         if (!o2i_ECPublicKey(&pkey, &pbegin, vchPubKey.size()))
             return false;
@@ -201,6 +203,8 @@ public:
 
     bool Verify(uint256 hash, const vector<unsigned char>& vchSig)
     {
+        if (vchSig.empty())      // no signature verifies, and &vchSig[0] would be undefined
+            return false;
         // -1 = error, 0 = bad sig, 1 = good
         if (ECDSA_verify(0, (unsigned char*)&hash, sizeof(hash), &vchSig[0], vchSig.size(), pkey) != 1)
             return false;
