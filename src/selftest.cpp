@@ -3869,7 +3869,7 @@ static bool RunSocks5HandshakeProbe(std::string& errOut)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+    if (::bind(listener, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
         listen(listener, 1) != 0)
     {
         closesocket(listener);
@@ -3996,7 +3996,7 @@ static int RunSigpipeSelfTest()
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
     bool fUp = listener != INVALID_SOCKET
-        && bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && ::bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
         && listen(listener, 1) == 0;
 #ifdef _WIN32
     int addrLen = sizeof(addr);
@@ -5162,7 +5162,7 @@ static int RunChatLinkSelfTest()
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
     bool fUp = listener != INVALID_SOCKET
-        && bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && ::bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
         && listen(listener, 1) == 0;
 #ifdef _WIN32
     int addrLen = sizeof(addr);

@@ -182,7 +182,7 @@ bool ChatListen(unsigned short port, btf_socket_t& sockOut, std::string& errOut)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
 
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+    if (::bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
         listen(s, 8) != 0)
     {
         closesocket(s);

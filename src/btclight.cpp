@@ -15,6 +15,9 @@
 #ifdef _WIN32
 #include <io.h>
 #endif
+#ifdef __APPLE__
+#include <crt_externs.h>
+#endif
 
 using json = nlohmann::json;
 namespace btclight
@@ -735,6 +738,10 @@ static std::vector<std::string> ConfiguredPeers()
         }
         else arg += *c;
     }
+#elif defined(__APPLE__)
+    // No /proc on macOS; the C runtime keeps the original argv.
+    char** argv = *_NSGetArgv();
+    for (int i = 0, n = *_NSGetArgc(); i < n; ++i) if (argv[i]) args.push_back(argv[i]);
 #else
     std::ifstream input("/proc/self/cmdline", std::ios::binary);
     std::string arg;

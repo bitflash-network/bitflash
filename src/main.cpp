@@ -4547,7 +4547,7 @@ void ThreadStratumBridge(void*)
     addr.sin_addr.s_addr = nBind;
     addr.sin_port = htons((unsigned short)nStratumBridgePort);
 
-    if (bind(listener, (sockaddr*)&addr, sizeof(addr)) != 0 ||
+    if (::bind(listener, (sockaddr*)&addr, sizeof(addr)) != 0 ||
         listen(listener, 16) != 0)
     {
         printf("Stratum bridge: could not listen on %s:%d\n",

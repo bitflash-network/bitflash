@@ -1583,10 +1583,19 @@ void DrawChatFullWindow()
 
 } // namespace
 
+// GLFW says why it could not make a window or a context; without this the
+// person sees only that it failed.
+static void ChatGlfwError(int code, const char* what)
+{
+    printf("btfchat: GLFW error 0x%x: %s\n", code, what ? what : "?");
+    fflush(stdout);
+}
+
 int RunChatGUI(int argc, char* argv[])
 {
     (void)argc; (void)argv;
 
+    glfwSetErrorCallback(ChatGlfwError);
     if (!glfwInit())
     {
         printf("btfchat: glfwInit() failed -- no display or GL available.\n");
@@ -1595,6 +1604,10 @@ int RunChatGUI(int argc, char* argv[])
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    // macOS gives a core profile above 2.1 only when asked forward-compatible.
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 
     GLFWwindow* window = glfwCreateWindow(880, 600, "btfchat", NULL, NULL);
     if (!window)

@@ -2325,7 +2325,7 @@ static void AcceptLoopFn(void*)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // loopback only -- reached via Tor
     addr.sin_port = htons(poolPort);
-    if (bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    if (::bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         LogPrint("pool", "[pool] could not bind pool listener 127.0.0.1:%u\n", (unsigned)poolPort);
         sock_close(lsock);
         return;

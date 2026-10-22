@@ -117,6 +117,186 @@ jobs:
           kill $W || true
           [ "${n:-0}" -gt 0 ]
 
+  macos:
+    name: macOS package (Apple silicon)
+    # Terminal only, no .app: the headless node (wallet, solo mining, the
+    # chat's wallet) and btfchat, with Tor and the libraries they use inside
+    # the folder. Built and tried on GitHub's Apple silicon machines.
+    runs-on: macos-14
+    env:
+      TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
+      TOR_VERSION: 15.0.19
+    steps:
+      - uses: actions/checkout@v5
+      - name: Homebrew libraries
+        run: brew install openssl@3 berkeley-db@5 libsodium sqlite glfw boost nlohmann-json cmake dylibbundler
+      - name: secp256k1 and RandomX, at the commits the other builds pin
+        run: |
+          set -e
+          SECP=$(sed -n 's/^SECP256K1_COMMIT *:= *//p' Makefile)
+          RX=$(sed -n 's/^RANDOMX_COMMIT *:= *//p' Makefile)
+          git init -q ~/secp && cd ~/secp
+          git remote add origin https://github.com/bitcoin-core/secp256k1
+          git fetch -q --depth 1 origin $SECP && git checkout -q --detach FETCH_HEAD
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON \
+            -DSECP256K1_ENABLE_MODULE_EXTRAKEYS=ON -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_CTIME_TESTS=OFF -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=$HOME/deps >/dev/null
+          cmake --build build -j3 >/dev/null && cmake --install build >/dev/null
+          git init -q ~/RandomX && cd ~/RandomX
+          git remote add origin https://github.com/tevador/RandomX
+          git fetch -q --depth 1 origin $RX && git checkout -q --detach FETCH_HEAD
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j3 --target randomx >/dev/null
+      - name: Build the node and btfchat (terminal only)
+        run: make -C src -j3 bitflash-node btfchat-terminal SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX
+      - name: Tor for macOS, the official bundle, checked against its pinned hash
+        run: |
+          set -eo pipefail
+          curl -sfL -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION/tor-expert-bundle-macos-aarch64-$TOR_VERSION.tar.gz
+          echo "$TOR_MAC_SHA256  tor.tar.gz" | shasum -a 256 -c -
+          mkdir -p torx && tar -xzf tor.tar.gz -C torx
+      - name: The whole test suite, as on Windows and Linux
+        # Every unit test program and every self-test of make tests, on the Mac.
+        run: make -C src tests SECP_INC=$HOME/deps/include SECP_LIB=$HOME/deps/lib RANDOMX_DIR=$HOME/RandomX BITFLASH_TOR=$PWD/torx/tor/tor
+        env:
+          BITFLASH_TOR: ${{ github.workspace }}/torx/tor/tor
+      - name: The folder people download
+        run: |
+          set -eo pipefail
+          V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
+          D=Bitflash-$V-macos-arm64
+          mkdir -p $D/lib
+          cp src/bitflash-node $D/ && cp src/btfchat-terminal $D/btfchat   # terminal only, no window
+          # Homebrew's libraries go inside, found next to the binaries.
+          B=$(brew --prefix)
+          dylibbundler -cd -b -x $D/bitflash-node -x $D/btfchat -d $D/lib -p @executable_path/lib/ \
+            -s $B/lib -s $B/opt/openssl@3/lib -s $B/opt/berkeley-db@5/lib -s $B/opt/sqlite/lib </dev/null >/dev/null
+          cp -R torx/tor $D/tor
+          [ -d torx/data ] && mkdir -p $D/tor/data-defaults && cp -R torx/data/. $D/tor/data-defaults/
+          cp packaging/macos/README-macOS.txt $D/
+          # Apple silicon runs only signed code; ours had their library paths
+          # just rewritten, so they are signed again (ad hoc: no Apple account).
+          # Tor keeps the Tor Project's own signature.
+          for f in $D/bitflash-node $D/btfchat $D/lib/*.dylib; do codesign --force -s - "$f"; done
+          echo "--- what the binaries load (nothing from Homebrew may remain):"
+          otool -L $D/bitflash-node $D/btfchat | grep -v ":$"
+          ! otool -L $D/bitflash-node $D/btfchat | grep -q /opt/homebrew
+          tar -czf $D.tar.gz $D
+          echo "D=$D" >> $GITHUB_ENV
+      - name: The folder works without Homebrew
+        run: |
+          set -eo pipefail
+          # Homebrew out of the way, as on a Mac that never had it.
+          brew_prefix=$(brew --prefix)
+          sudo mv "$brew_prefix" "$brew_prefix.away"
+          trap 'sudo mv "$brew_prefix.away" "$brew_prefix"' EXIT
+          mkdir -p try && tar -xzf $D.tar.gz -C try && cd try/$D
+          ./bitflash-node -selftest=rules-v3 | tail -1
+          ./btfchat -selftest=rules-v3 | tail -1
+          DYLD_LIBRARY_PATH=$PWD/tor ./tor/tor --version | head -1
+      - name: A fresh node finds the network over its own Tor
+        timeout-minutes: 8
+        run: |
+          cd try/$D
+          mkdir -p dd
+          ./bitflash-node -nogui -managedtor -debug=net -datadir=$PWD/dd > n.out 2>&1 &
+          W=$!
+          for i in $(seq 1 72); do
+            sleep 5
+            n=$(grep -c "Added time data" dd/debug.log 2>/dev/null || true)
+            if [ "${n:-0}" -gt 0 ]; then echo "peer after $((i*5)) s"; break; fi
+          done
+          grep -E "hidden service ready|btfseed: reached|Added time data" dd/debug.log | head -5 || true
+          kill $W || true
+          [ "${n:-0}" -gt 0 ]
+      - name: btfchat in Terminal, typed to as a person would
+        # A new identity, the session password typed, the chat's Tor and onion
+        # up, 'me' and 'help' answered, 'quit' leaving cleanly.
+        timeout-minutes: 6
+        run: |
+          cd try/$D
+          export HOME=$PWD/chat-home && mkdir -p $HOME
+          ./btfchat -testnet -newphrase > /dev/null 2>&1    # a throwaway identity
+          mkfifo chat.in
+          ( exec 3<>chat.in; ./btfchat -testnet -managedtor <&3 > chat.out 2>&1 ) &
+          C=$!
+          exec 4>chat.in
+          echo "senha-de-teste-do-mac" >&4
+          for i in $(seq 1 60); do grep -q "you are " chat.out && break; sleep 2; done
+          for i in $(seq 1 20); do echo "me" >&4; sleep 10; grep -q "chat service ready" chat.out && break; done
+          echo "help" >&4; sleep 2
+          echo "quit" >&4
+          for i in $(seq 1 30); do kill -0 $C 2>/dev/null || break; sleep 1; done
+          echo "--- what the person saw:"; grep -v "^\(Oct\|Nov\|Dec\|Jan\) " chat.out | tail -45
+          grep -q "you are [a-z0-9]*\.btf" chat.out
+          grep -q "chat service ready" chat.out
+          grep -q "service: " chat.out
+          grep -q "swap ok N" chat.out              # the help was printed
+          ! kill -0 $C 2>/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: Bitflash-*-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  macos-miner:
+    name: Bitflash Miner for macOS (Apple silicon)
+    runs-on: macos-14
+    env:
+      XMRIG_MAC_SHA256: 6ae4eb4216e99a201ae9a3d2c3a7c275207c5165cfc25da1f3d735d6c4829c18
+      TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
+      TOR_VERSION: 15.0.19
+    steps:
+      - uses: actions/checkout@v5
+      - name: Official XMRig and Tor, checked against their published hashes
+        run: |
+          set -eo pipefail
+          curl -sfL -o xmrig.tar.gz https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-macos-arm64.tar.gz
+          echo "$XMRIG_MAC_SHA256  xmrig.tar.gz" | shasum -a 256 -c -
+          curl -sfL -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/$TOR_VERSION/tor-expert-bundle-macos-aarch64-$TOR_VERSION.tar.gz
+          echo "$TOR_MAC_SHA256  tor.tar.gz" | shasum -a 256 -c -
+      - name: The folder people download
+        run: |
+          set -eo pipefail
+          V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
+          D=Bitflash-Miner-$V-macos-arm64
+          mkdir -p $D/xmrig $D/tor $D/licenses x t
+          tar -xzf xmrig.tar.gz -C x && tar -xzf tor.tar.gz -C t
+          cp x/xmrig-6.26.0/xmrig $D/xmrig/
+          cp x/xmrig-6.26.0/LICENSE $D/licenses/XMRIG-LICENSE.txt 2>/dev/null || true
+          cp -R t/tor/. $D/tor/
+          rm -rf $D/tor/pluggable_transports
+          cp scripts/bitflash-miner/mine.sh scripts/bitflash-miner/README.txt $D/
+          chmod +x $D/mine.sh $D/xmrig/xmrig $D/tor/tor
+          (cd $D && shasum -a 256 $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
+          tar -czf $D.tar.gz $D
+          echo "D=$D" >> $GITHUB_ENV
+      - name: XMRig and Tor run here
+        run: |
+          set -eo pipefail
+          mkdir try && tar -xzf $D.tar.gz -C try && cd try/$D
+          ./xmrig/xmrig --version | head -1
+          DYLD_LIBRARY_PATH=$PWD/tor ./tor/tor --version | head -1
+      - name: The launcher reaches the pool over Tor (report only)
+        # The pool is one machine of ours; its being down must not stop a
+        # release, so this reports and never fails the job.
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          cd try/$D
+          # A testnet payout address: what is checked is the path to the pool.
+          ./mine.sh BJ9V4GqJboC3ibUvGTgJYZzZ7TxQh9eS3D testnet -t 1 --log-file=xm.log --no-color >/dev/null 2>&1 &
+          M=$!
+          for i in $(seq 1 48); do sleep 5; grep -q "new job" xm.log 2>/dev/null && break; done
+          kill $M 2>/dev/null; sleep 2
+          echo "--- pool's answer:"; grep -E "use pool|new job" xm.log | head -3
+          grep -q "new job" xm.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-miner
+          path: Bitflash-Miner-*-macos-arm64.tar.gz
+          if-no-files-found: error
+
   windows:
     name: Windows package
     runs-on: windows-latest
@@ -169,7 +349,7 @@ jobs:
   draft:
     name: Draft release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, linux-distros, windows]
+    needs: [linux, linux-distros, windows, macos, macos-miner]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -181,6 +361,7 @@ jobs:
       - name: SHA256SUMS
         run: |
           cd out
+          rm -f ./*.png   # the test screenshot is for us, not a download
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Open a draft (nothing is public until the founder publishes it)

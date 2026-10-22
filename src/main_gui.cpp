@@ -28,6 +28,7 @@ int RunGUI(int argc, char* argv[]);
 // ImGui in the headless build.
 #ifdef BITFLASH_CHAT_APP
 int RunChatGUI(int argc, char* argv[]);
+int RunChatTerminal(int argc, char* argv[]);   // chat_terminal.cpp
 #endif
 
 // Global definitions (were in ui.cpp, now here)
@@ -428,11 +429,10 @@ static void ParseStartupArguments(int argc, char* argv[])
     string poolFeeTo = argval2(argc, argv, "/poolfeeto", "-poolfeeto");
     if (!poolFeeTo.empty())
     {
+        // This used to `return 1` from a void function: gcc let it through
+        // and the node started anyway with the fee going to the default.
         if (poolFeeTo != "treasury" && poolFeeTo != "operator")
-        {
-            printf("-poolfeeto: 'treasury' or 'operator', not '%s'\n", poolFeeTo.c_str());
-            return 1;
-        }
+            StartupRefuse(strprintf("-poolfeeto is 'treasury' or 'operator', not '%s'", poolFeeTo.c_str()), "");
         fPoolFeeToTreasury = poolFeeTo == "treasury";
     }
 
@@ -441,10 +441,8 @@ static void ParseStartupArguments(int argc, char* argv[])
     {
         int n = atoi(treasuryShare.c_str());
         if (n < 0 || n > treasury::SHARE_MAX_PERCENT)
-        {
-            printf("-treasuryshare: 0 to %d percent, not '%s'\n", treasury::SHARE_MAX_PERCENT, treasuryShare.c_str());
-            return 1;
-        }
+            StartupRefuse(strprintf("-treasuryshare is 0 to %d percent, not '%s'", treasury::SHARE_MAX_PERCENT,
+                                    treasuryShare.c_str()), "");
         nTreasurySharePercent = n;
     }
 
@@ -1503,6 +1501,26 @@ int main(int argc, char* argv[])
 #else
     if (fGenerateBitcoins)
         StartMinerThreads();
+#endif
+
+#ifdef BITFLASH_CHAT_APP
+    // btfchat in a terminal: always when built without a window (macOS), and
+    // on request elsewhere. A chat has no use for the node's headless loop.
+#ifdef BITFLASH_NO_GUI
+    bool fChatTerminal = true;
+#else
+    bool fChatTerminal = arg(argc,argv,"/terminal") || arg(argc,argv,"-terminal") ||
+                         arg(argc,argv,"/nogui") || arg(argc,argv,"-nogui");
+#endif
+    if (fChatTerminal)
+    {
+        int ret = RunChatTerminal(argc, argv);
+        fShutdown = true;
+        BtfStopManagedTor();
+        DBFlush(true);
+        WalletSQLiteRuntimeClose();
+        return ret;
+    }
 #endif
 
 #ifdef BITFLASH_NO_GUI

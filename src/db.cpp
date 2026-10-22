@@ -2443,6 +2443,67 @@ static bool EncryptWalletPersistSQLite(
     return true;
 }
 
+// Zero every copy of the given secrets in a closed database file.
+//
+// Berkeley DB writes whole pages, and the unused part of a page is whatever
+// was in the cache buffer before -- which, while rewriting a wallet in the
+// same environment, can be a page of the wallet being replaced. On macOS the
+// encrypted rewrite was measured to keep the plaintext HD master key and chain
+// code in that slack (Bitcoin Core's source carries the same warning). Every
+// live record in the rewritten file is encrypted, so a plaintext secret found
+// in it can only be slack, and zeroing it changes nothing Berkeley DB reads.
+// Returns how many copies were zeroed, or -1 if the file could not be read or
+// written back.
+static int ScrubSecretsInFile(const string& strPath, const vector<vector<unsigned char> >& vSecrets)
+{
+    FILE* f = fopen(strPath.c_str(), "r+b");
+    if (!f)
+        return -1;
+    vector<unsigned char> data;
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        data.insert(data.end(), buf, buf + n);
+    int nZeroed = 0;
+    for (size_t i = 0; i < vSecrets.size(); i++)
+    {
+        const vector<unsigned char>& s = vSecrets[i];
+        if (s.size() < 16)
+            continue;
+        vector<unsigned char>::iterator it = data.begin();
+        while ((it = search(it, data.end(), s.begin(), s.end())) != data.end())
+        {
+            size_t off = it - data.begin();
+            memset(&data[off], 0, s.size());
+            if (fseek(f, (long)off, SEEK_SET) != 0 || fwrite(&data[off], 1, s.size(), f) != s.size())
+            {
+                fclose(f);
+                SecureClearBytes(data);
+                return -1;
+            }
+            nZeroed++;
+            it = data.begin() + off + s.size();
+        }
+    }
+    fflush(f);
+#ifndef _WIN32
+    fsync(fileno(f));
+#endif
+    fclose(f);
+    SecureClearBytes(data);
+    return nZeroed;
+}
+
+// The 32-byte secret inside a DER private key: the first OCTET STRING of
+// length 32 (04 20 ...). Remnants of a key in slack may hold only that part.
+static vector<unsigned char> PrivateScalarOf(const CPrivKey& vchPriv)
+{
+    for (size_t i = 0; i + 34 <= vchPriv.size(); i++)
+        if (vchPriv[i] == 0x04 && vchPriv[i + 1] == 0x20)
+            return vector<unsigned char>(vchPriv.begin() + i + 2, vchPriv.begin() + i + 34);
+    return vector<unsigned char>();
+}
+
 bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& strErrorRet)
 {
     strBackupRet.clear();
@@ -2482,6 +2543,24 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
         strErrorRet = "wallet has no private keys to encrypt";
         return false;
     }
+
+    // What must not survive in plaintext anywhere in the rewritten file
+    // (ScrubSecretsInFile). Wiped on every way out of this function.
+    struct ScrubList
+    {
+        vector<vector<unsigned char> > v;
+        ~ScrubList() { for (size_t i = 0; i < v.size(); i++) SecureClearBytes(v[i]); }
+    } scrub;
+    for (map<vector<unsigned char>, CPrivKey>::const_iterator mi = mapPlainKeys.begin();
+         mi != mapPlainKeys.end(); ++mi)
+    {
+        scrub.v.push_back(vector<unsigned char>(mi->second.begin(), mi->second.end()));
+        scrub.v.push_back(PrivateScalarOf(mi->second));
+    }
+    if (!vchPlainHDMaster.empty())
+        scrub.v.push_back(vchPlainHDMaster);
+    if (!vchPlainHDChainCode.empty())
+        scrub.v.push_back(vchPlainHDChainCode);
 
     CKeyingMaterial vchMasterKey;
     vchMasterKey.resize(32);
@@ -2664,6 +2743,18 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
     // before replacing files on Windows; the command exits immediately after
     // this, and tests verify reload through a fresh process.
     DBFlush(true);
+
+    // Before the rewritten file becomes the wallet: no plaintext key, HD
+    // master or chain code may sit in its page slack.
+    int nScrubbed = ScrubSecretsInFile(strTempPath, scrub.v);
+    if (nScrubbed < 0)
+    {
+        strErrorRet = "could not check the encrypted wallet for leftover plaintext; nothing was changed";
+        remove(strTempPath.c_str());
+        return false;
+    }
+    if (nScrubbed > 0)
+        printf("EncryptWallet() : zeroed %d plaintext remnant(s) in page slack of the rewritten file\n", nScrubbed);
 
     string strWalletPath = GetAppDir() + "/wallet.dat";
     string strBackupPath = WalletEncryptBackupPathFor("wallet.dat");

@@ -19,6 +19,15 @@
 #include <unistd.h>
 extern char** environ;
 #endif
+#ifdef __APPLE__
+#include <libproc.h>
+#include <mach-o/dyld.h>
+#include <stdlib.h>
+// The variable the dynamic loader reads for the libraries next to tor.
+#define BTF_LIB_PATH_VAR "DYLD_LIBRARY_PATH"
+#else
+#define BTF_LIB_PATH_VAR "LD_LIBRARY_PATH"
+#endif
 
 static CCriticalSection cs_managedTor;
 static bool g_fManagedTor = false;
@@ -501,7 +510,7 @@ static bool PickLocalPort(unsigned short& portOut, std::string& errOut)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+    if (::bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0)
     {
         errOut = "could not bind local port probe socket";
         goto done;
@@ -536,6 +545,17 @@ static std::string ExecutableDir()
         return ".";
     std::string s = path;
     size_t slash = s.find_last_of("\\/");
+    if (slash == std::string::npos)
+        return ".";
+    return s.substr(0, slash);
+#elif defined(__APPLE__)
+    char raw[4096] = {0};
+    uint32_t size = sizeof(raw);
+    char path[PATH_MAX] = {0};
+    if (_NSGetExecutablePath(raw, &size) != 0 || !realpath(raw, path))
+        return ".";
+    std::string s = path;
+    size_t slash = s.find_last_of('/');
     if (slash == std::string::npos)
         return ".";
     return s.substr(0, slash);
@@ -1222,6 +1242,19 @@ static void KillStaleManagedTor(const std::string& torrcPath)
     }
     CloseHandle(h);
 #else
+#ifdef __APPLE__
+    // No /proc: the pid has to be a program named tor, and it has to be ours
+    // (the pid file sits in our own data directory, so it is our last Tor
+    // unless the pid was reused -- by something that is not tor).
+    {
+        char exe[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((int)pid, exe, sizeof(exe)) <= 0)
+            return;
+        std::string s = exe;
+        if (s.size() < 4 || s.compare(s.size() - 4, 4, "/tor") != 0)
+            return;   // pid reused by something else
+    }
+#else
     std::string cmdline;
     {
         FILE* f = fopen(strprintf("/proc/%ld/cmdline", pid).c_str(), "rb");
@@ -1235,6 +1268,7 @@ static void KillStaleManagedTor(const std::string& torrcPath)
     }
     if (cmdline.find(torrcPath) == std::string::npos)
         return;   // pid reused by something else
+#endif
     printf("managed Tor: a Tor from an earlier run (pid %ld) still holds the data directory; stopping it\n", pid);
     kill((pid_t)pid, SIGTERM);
     for (int i = 0; i < 50 && kill((pid_t)pid, 0) == 0; i++)
@@ -1282,18 +1316,19 @@ static bool StartTorProcess(const std::string& torPath, const std::string& torrc
             torDir = torPath.substr(0, slash);
     }
     bool fHaveLdPath = false;
+    const std::string strVar = std::string(BTF_LIB_PATH_VAR) + "=";
     for (char** e = environ; e && *e; e++)
     {
-        if (!torDir.empty() && strncmp(*e, "LD_LIBRARY_PATH=", 16) == 0)
+        if (!torDir.empty() && strncmp(*e, strVar.c_str(), strVar.size()) == 0)
         {
-            envStrings.push_back("LD_LIBRARY_PATH=" + torDir + ":" + std::string(*e + 16));
+            envStrings.push_back(strVar + torDir + ":" + std::string(*e + strVar.size()));
             fHaveLdPath = true;
         }
         else
             envStrings.push_back(*e);
     }
     if (!torDir.empty() && !fHaveLdPath)
-        envStrings.push_back("LD_LIBRARY_PATH=" + torDir);
+        envStrings.push_back(strVar + torDir);
     std::vector<const char*> envpTor;
     for (size_t i = 0; i < envStrings.size(); i++)
         envpTor.push_back(envStrings[i].c_str());

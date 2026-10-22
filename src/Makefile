@@ -15,6 +15,26 @@ SECP_INC    ?= /usr/local/include
 SECP_LIB    ?= /usr/local/lib
 RANDOMX_DIR ?= $(HOME)/RandomX
 
+# macOS (Apple silicon), the same tree with Homebrew's libraries: clang, the
+# keg-only openssl@3 and berkeley-db@5 by their own prefixes, and Apple's
+# OpenGL framework where Linux links libGL.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
+CXX = clang++
+CC  = clang
+PLATFORM_INC = -I$(BREW_PREFIX)/include -I$(BREW_PREFIX)/include/nlohmann \
+               -I$(BREW_PREFIX)/opt/openssl@3/include -I$(BREW_PREFIX)/opt/berkeley-db@5/include \
+               -I$(BREW_PREFIX)/opt/sqlite/include
+PLATFORM_LIB = -L$(BREW_PREFIX)/lib -L$(BREW_PREFIX)/opt/openssl@3/lib \
+               -L$(BREW_PREFIX)/opt/berkeley-db@5/lib -L$(BREW_PREFIX)/opt/sqlite/lib
+GL_LIBS = -lglfw -framework OpenGL -framework Cocoa -framework IOKit
+else
+PLATFORM_INC =
+PLATFORM_LIB =
+GL_LIBS = -lglfw -lGL
+endif
+
 IMGUI_DIR = imgui
 
 # -w used to sit here and suppressed every diagnostic in the build, including
@@ -40,15 +60,15 @@ CXXFLAGS = -std=gnu++14 -O2 $(WARNFLAGS) -fpermissive -pthread \
            -DSECP256K1_STATIC -DBITFLASH_NODE_BUILD \
            -I$(SECP_INC) -I$(RANDOMX_DIR)/src \
            -I/usr/include/nlohmann \
-           -I$(IMGUI_DIR)
+           -I$(IMGUI_DIR) $(PLATFORM_INC)
 FUZZ_CXXFLAGS = $(filter-out -O2,$(CXXFLAGS)) -O1 -g -fno-omit-frame-pointer \
                 -fsanitize=fuzzer-no-link,address,undefined
 FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined
 
 LIBS = -L$(SECP_LIB) -lsecp256k1 \
-       -L$(RANDOMX_DIR)/build -lrandomx \
+       -L$(RANDOMX_DIR)/build -lrandomx $(PLATFORM_LIB) \
        -lsodium -lssl -lcrypto -ldb_cxx -lsqlite3 -lpthread \
-       -lglfw -lGL
+       $(GL_LIBS)
 
 # Every header a .cpp here includes has to be listed, not just the interesting
 # ones. sockcount.h was missing, and it declares a struct that lives in a
@@ -132,7 +152,7 @@ bitflash: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
 
 CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
-            obj-chat/gui_chat.o obj-chat/main_gui.o \
+            obj-chat/gui_chat.o obj-chat/chat_terminal.o obj-chat/main_gui.o \
             $(IMGUI_OBJS)
 
 obj-chat/%.o: %.cpp $(HEADERS)
@@ -151,6 +171,28 @@ btfchat: $(CHAT_OBJS)
 	$(CXX) $(CHATFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: btfchat"
 
+# btfchat with no window at all (chat_terminal.cpp): no ImGui, GLFW or
+# OpenGL, so it starts where there is no screen -- a server over ssh, or the
+# macOS package, which is terminal only by design.
+CHATTERM_OBJS = $(patsubst obj/%,obj-chatterm/%,$(NODE_OBJS)) \
+                obj-chatterm/chat_terminal.o obj-chatterm/main_gui.o obj-chatterm/headless.o
+
+obj-chatterm/%.o: %.cpp $(HEADERS)
+	@mkdir -p obj-chatterm
+	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -o $@ $<
+
+obj-chatterm/sha.o: sha.cpp sha.h
+	@mkdir -p obj-chatterm
+	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
+
+obj-chatterm/mlkem.o: mlkem/mlkem_native.c
+	@mkdir -p obj-chatterm
+	$(CC) -c $(MLKEMFLAGS) -o $@ $<
+
+btfchat-terminal: $(CHATTERM_OBJS)
+	$(CXX) $(CHATFLAGS) -DBITFLASH_NO_GUI -o $@ $^ $(NODE_LIBS)
+	@echo "Built: btfchat-terminal (no window, no libGL needed)"
+
 # ---- headless node ---------------------------------------------------------
 #
 # Same node, built without ImGui, GLFW or OpenGL. Linking the GUI made the
@@ -163,7 +205,7 @@ btfchat: $(CHAT_OBJS)
 # without -DBITFLASH_NO_GUI, and the two must not overwrite each other.
 
 NODE_LIBS = -L$(SECP_LIB) -lsecp256k1 \
-            -L$(RANDOMX_DIR)/build -lrandomx \
+            -L$(RANDOMX_DIR)/build -lrandomx $(PLATFORM_LIB) \
             -lsodium -lssl -lcrypto -ldb_cxx -lsqlite3 -lpthread
 
 NODE_ONLY_OBJS = $(patsubst obj/%,obj-node/%,$(NODE_OBJS)) \
@@ -239,7 +281,7 @@ clean:
 	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
-	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp -lssl -lcrypto
+	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
 
 # The .btf address tests existed as a file you had to compile by hand, which is
 # the same as not having them: they did not run here and they did not run in CI.
@@ -249,7 +291,7 @@ test_btfaddr: test_btfaddr.cpp btfaddr.cpp btfaddr.h
 # The encrypted channel every .btf connection runs through. Same story as the
 # address tests: the file was here, nothing ran it.
 test_btfchan: test_btfchan.cpp btfchan.cpp btfchan.h obj/mlkem.o
-	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o -lsodium
+	$(CXX) $(CXXFLAGS) -o $@ test_btfchan.cpp btfchan.cpp obj/mlkem.o $(PLATFORM_LIB) -lsodium
 
 # See the note in makefile.mingw: bip32 for the phrase, btfaddr for the address,
 # no ML-KEM object.
@@ -278,7 +320,7 @@ test_chatstore: test_chatstore.cpp chatstore.cpp chatstore.h btfchatbox.cpp btfc
 
 # See the note in makefile.mingw.
 test_community: test_community.cpp community.cpp community.h
-	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp -lsodium
+	$(CXX) $(CXXFLAGS) -o $@ test_community.cpp community.cpp $(PLATFORM_LIB) -lsodium
 
 test_chatswap: test_chatswap.cpp chatswap.cpp chatswap.h
 	$(CXX) $(CXXFLAGS) -o $@ test_chatswap.cpp chatswap.cpp
