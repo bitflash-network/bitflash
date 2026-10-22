@@ -44,6 +44,25 @@ see [Tor mode](docs/tor.md).
 For a plain SOCKS5 proxy without Tor-specific defaults, use
 `-socks=HOST:PORT`.
 
+### Trade, talk and get paid, with nobody in the middle
+
+**Atomic swaps, BTF for BTC.** Either both sides get paid or both get their
+coins back; no exchange, no escrow, no server. The Bitcoin side runs on your
+own Bitcoin Core, or on a Bitcoin light client built into the wallet, over its
+own Tor. Swaps switch on with rules v3, a soft fork on mainnet at
+**2026-11-21 12:00 UTC**. See [atomic swaps](docs/atomic-swaps.md).
+
+**btfchat.** Messages, money and swaps between `.btf` addresses. Offline
+messages wait in the Bitflash nodes themselves, sealed for the recipient; no
+relay and no account. Public communities are listed on the chain, and swap
+offers are posted in them. With a window, or `btfchat -terminal`. See
+[btfchat](docs/btfchat.md).
+
+**Payments.** Payment links and QR codes (BIP21), fees per size with a
+"speed up" for a stuck payment (BIP125), and invoices for a shop that are only
+its own node: a fresh address, the link, the QR and a signed webhook when it
+is paid. See [invoices](docs/invoices.md).
+
 ---
 
 ## Quick start
@@ -56,6 +75,21 @@ install, no configuration — it connects automatically and starts syncing.
 **Windows:** extract the `-windows-with-tor.zip` and run `Bitflash.exe`. Tor is
 bundled and a managed Tor instance starts automatically, so onion transport
 works with no separate install. Pass `-nomanagedtor` to turn it off.
+
+**macOS (Apple silicon, M1 and later):** from Terminal, no app to install.
+Unpack `-macos-arm64.tar.gz`, then, once:
+
+```bash
+xattr -dr com.apple.quarantine Bitflash-*-macos-arm64
+cd Bitflash-*-macos-arm64 && ./bitflash-node -managedtor
+```
+
+`README-macOS.txt` in the folder covers mining and btfchat.
+
+**btfchat** is its own program beside the wallet: `BtfChat.exe` on Windows, the
+`BtfChat-*.AppImage` on Linux, `./btfchat` on macOS. It needs a recovery phrase
+of its own once (`btfchat -newphrase`) and the wallet started with
+`-chatwallet` for paying and being paid.
 
 Every release ships a `SHA256SUMS` covering the assets. Verifying takes a second
 and is worth doing:
@@ -612,6 +646,8 @@ windows-tor` to require the extra signature check.
 | Pool server | Built-in — second port on the node's own onion |
 | Wallet recovery | Twelve-word phrase (BIP39 + BIP32 + BIP44, coin type 4346950), plus file backup |
 | Wallet storage | SQLite `wallet.sqlite` by default, or Berkeley DB `wallet.dat` |
+| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, lock-time finality by median time; soft fork on mainnet at 2026-11-21 12:00 UTC |
+| Platforms | Windows, Linux (x86_64), macOS (Apple silicon, Terminal only) |
 
 The halving interval is the number most people get wrong coming from Bitcoin.
 Same 210,000 blocks, but at two minutes instead of ten, so it arrives in about
