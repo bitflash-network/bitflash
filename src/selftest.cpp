@@ -4846,6 +4846,16 @@ static int RunRulesV3SelfTest()
         empty << OP_CHECKLOCKTIMEVERIFY;
         CTransaction s2 = t;
         nFail += Check(!EvalScript(empty, s2, 0, 0, NULL, true, true), "CLTV on an empty stack fails") ? 0 : 1;
+
+        // OP_2DROP used to pop an empty stack: heap corruption, a crash in
+        // every node that evaluated the script.
+        CScript drop0, drop1, drop2;
+        drop0 << OP_2DROP << OP_1;
+        drop1 << OP_1 << OP_2DROP << OP_1;
+        drop2 << OP_1 << OP_1 << OP_2DROP << OP_1;
+        nFail += Check(!EvalScript(drop0, s2, 0, 0, NULL, true, true), "OP_2DROP on an empty stack fails") ? 0 : 1;
+        nFail += Check(!EvalScript(drop1, s2, 0, 0, NULL, true, true), "OP_2DROP on one item fails") ? 0 : 1;
+        nFail += Check(EvalScript(drop2, s2, 0, 0, NULL, true, true), "OP_2DROP on two items still works") ? 0 : 1;
     }
 
     // ---- lock-time finality in blocks

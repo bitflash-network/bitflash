@@ -274,6 +274,13 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             case OP_2DROP:
             {
                 // (x1 x2 -- )
+                // 0.1.0 popped without looking: pop_back on an empty stack
+                // corrupts the heap, so any script reaching OP_2DROP with
+                // fewer than two items -- a P2SH redeem script, a mined
+                // output -- crashed every node that evaluated it. Bitcoin
+                // added this check in 0.3.x; found here by fuzz-script.
+                if (stack.size() < 2)
+                    return false;
                 stack.pop_back();
                 stack.pop_back();
             }
