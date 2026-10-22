@@ -86,6 +86,14 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             opcode == OP_MOD   || opcode == OP_LSHIFT || opcode == OP_RSHIFT)
             return false;
 
+        // OP_VER pushes this node's VERSION and OP_VERIF / OP_VERNOTIF branch
+        // on it: the same script passes on one release and fails on the next,
+        // so a miner could split the network by version. Bitcoin made the
+        // three invalid, even in a branch not taken; rules v3 does the same,
+        // from its fork height so no block before it changes.
+        if (fRulesV3 && (opcode == OP_VER || opcode == OP_VERIF || opcode == OP_VERNOTIF))
+            return false;
+
         // Counted outside fExec for the same reason: the cost of a script must
         // not depend on which branch a signature happens to take. Pushes are
         // exempt because their cost is already bounded by the script's own

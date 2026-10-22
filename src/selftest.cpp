@@ -4856,6 +4856,17 @@ static int RunRulesV3SelfTest()
         nFail += Check(!EvalScript(drop0, s2, 0, 0, NULL, true, true), "OP_2DROP on an empty stack fails") ? 0 : 1;
         nFail += Check(!EvalScript(drop1, s2, 0, 0, NULL, true, true), "OP_2DROP on one item fails") ? 0 : 1;
         nFail += Check(EvalScript(drop2, s2, 0, 0, NULL, true, true), "OP_2DROP on two items still works") ? 0 : 1;
+
+        // OP_VER and friends answer differently on every release: invalid
+        // under rules v3, even in a branch that is not taken.
+        CScript ver, verif, skipped;
+        ver << OP_VER << OP_DROP << OP_1;
+        verif << OP_1 << OP_VERIF << OP_1 << OP_ELSE << OP_1 << OP_ENDIF;
+        skipped << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1;
+        nFail += Check(EvalScript(ver, s2, 0, 0, NULL, true, false), "OP_VER still runs before rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(ver, s2, 0, 0, NULL, true, true), "OP_VER fails under rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(verif, s2, 0, 0, NULL, true, true), "OP_VERIF fails under rules v3") ? 0 : 1;
+        nFail += Check(!EvalScript(skipped, s2, 0, 0, NULL, true, true), "OP_VERNOTIF fails even in a branch not taken") ? 0 : 1;
     }
 
     // ---- lock-time finality in blocks
