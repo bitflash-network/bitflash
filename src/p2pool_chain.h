@@ -20,6 +20,10 @@ static const unsigned int RETARGET_SHARES = 720;    // the share target looks ba
 static const int MAX_UNCLE_DEPTH = 3;               // an uncle is at most 3 shares older
 static const int64 MAX_SHARE_FUTURE = 120;          // seconds a share's time may run ahead
 static const int MAX_MAIN_LAG = 3;                  // main blocks a share may be mined behind
+// What a node hands a peer that is starting: enough of its line that the
+// newest RETARGET_SHARES can be checked in full, with a whole window and a
+// whole retarget behind each.
+static const unsigned int HISTORY_SHARES = WINDOW_SHARES + RETARGET_SHARES + 2 * MAX_UNCLE_DEPTH + 10;
 
 // What the share chain needs from the main chain. The node answers from its
 // block index; tests answer from a table.
@@ -52,8 +56,26 @@ public:
     // Verify a share in context and keep it. A share whose parent is not
     // here is refused with *pfMissingParent set, so the caller can ask a
     // peer for the parent and offer the share again.
+    // fHistory: the share comes from a peer's history, not fresh off a
+    // miner, so it may sit on a main block far behind the tip.
     bool Add(const Share& s, const MainView& main, string& errOut,
-             bool* pfMissingParent = NULL, bool* pfBlock = NULL);
+             bool* pfMissingParent = NULL, bool* pfBlock = NULL, bool fHistory = false);
+
+    // A share too deep in a peer's history for its own window to be here:
+    // kept on its work, commitment and merkle branch alone, never on a
+    // payout it cannot check. Only while the chain is being filled from a
+    // peer, below the shares that are checked in full.
+    bool AddTrusted(const Share& s, string& errOut);
+
+    // Part of a peer's history, oldest first, from a line whose tip is at
+    // nTipHeight: the newest RETARGET_SHARES, which have a whole window and a
+    // whole retarget behind them, are checked in full; the deeper ones on
+    // their work alone. False on a share bad in itself.
+    bool AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut);
+
+    // The line behind the tip, HISTORY_SHARES deep, with the uncles it names,
+    // oldest first: what a starting peer is sent.
+    void History(vector<Share>& out) const;
 
     bool Has(const uint256& id) const { return mapShares.count(id) != 0; }
     uint256 Tip() const { return hashTip; }

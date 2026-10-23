@@ -84,6 +84,11 @@ struct Share
 // and a coinbase paying exactly ComputePayouts(window, its own total) with a
 // total of at least the subsidy. On success fBlockOut says whether the work
 // also meets nBits, which makes the share a Bitflash block.
+// The checks that need no window: share data bounds, the commitment, the
+// merkle branch, the targets and the RandomX work (unless !fCheckPoW).
+bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
+                    bool fCheckPoW = true);
+
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
                 const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW = true);
 

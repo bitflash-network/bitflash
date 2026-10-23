@@ -12,6 +12,7 @@
 #include "headers.h"
 #include "treasury.h"
 #include "chatrelay.h"  // the chat's records: held, relayed and served here
+#include "p2pool_net.h"  // the P2Pool share chain: held, checked and relayed here
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -3443,6 +3444,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushMessage("btfpeers", vPexOut);
 
         ChatRelayOnVersion(pfrom);
+        P2PoolOnVersion(pfrom);
 
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);
     }
@@ -3731,6 +3733,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (ChatRelayProcessMessage(pfrom, strCommand, vRecv))
     {
         // chatrec, chatput, chatget, getchatinv -- see chatrelay.h.
+    }
+
+
+    else if (P2PoolProcessMessage(pfrom, strCommand, vRecv))
+    {
+        // p2pshare, p2pgetsh, p2psync, p2pshares -- see p2pool_net.h.
     }
 
 

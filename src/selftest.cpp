@@ -5152,6 +5152,97 @@ static int RunP2PoolChainSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-sync: a starting node takes a peer's history -----------------
+static int RunP2PoolSyncSelfTest()
+{
+    printf("p2pool-sync self-test\n");
+    int nFail = 0;
+    string err;
+
+    TestMainView main;
+    main.nBits = 0x1d00ffff;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    CBigNum bnFloor;
+    bnFloor.SetCompact(0x207fffff);
+    auto script = [](unsigned char tag) {
+        vector<unsigned char> s;
+        s.push_back(0x76); s.push_back(0xa9); s.push_back(20);
+        for (int i = 0; i < 20; i++) s.push_back(tag);
+        s.push_back(0x88); s.push_back(0xac);
+        return s;
+    };
+
+    // A running chain, longer than a history, with an uncle every 50 shares.
+    p2pool::ShareChain a(bnFloor, false);
+    unsigned int nShares = p2pool::HISTORY_SHARES + 200;
+    unsigned int t = (unsigned int)main.nNow - 10 * nShares - 100;
+    uint256 prev = 0;
+    bool fBuilt = true;
+    for (unsigned int i = 0; i < nShares && fBuilt; i++)
+    {
+        vector<uint256> uncles;
+        if (i % 50 == 2)
+            uncles = a.UncleCandidates(prev);
+        p2pool::Share s = ChainShare(a, main, prev, script((unsigned char)(1 + i % 7)), t + 10 * i, uncles);
+        fBuilt = a.Add(s, main, err);
+        if (fBuilt && i % 50 == 0 && prev != 0)
+        {
+            // A sibling of this share, to be named as an uncle two shares on.
+            p2pool::Share sib = ChainShare(a, main, prev, script(9), t + 10 * i + 1);
+            fBuilt = a.Add(sib, main, err);
+        }
+        prev = s.GetId();
+    }
+    if (!fBuilt) printf("       %s\n", err.c_str());
+    vector<p2pool::Share> hist;
+    a.History(hist);
+    nFail += Check(fBuilt && hist.size() >= p2pool::HISTORY_SHARES,
+                   strprintf("a running chain of %u shares hands over %u, uncles included", nShares,
+                             (unsigned)hist.size()).c_str()) ? 0 : 1;
+
+    // A starting node takes it in messages of 400.
+    p2pool::ShareChain b(bnFloor, false);
+    int nTipHeight = a.Height(a.Tip());
+    bool fSynced = true;
+    for (size_t i = 0; i < hist.size() && fSynced; i += 400)
+    {
+        vector<p2pool::Share> part(hist.begin() + i, hist.begin() + std::min(hist.size(), i + 400));
+        fSynced = b.AddHistory(part, nTipHeight, main, err);
+    }
+    if (!fSynced) printf("       %s\n", err.c_str());
+    nFail += Check(fSynced && b.Tip() == a.Tip(), "it ends on the same tip") ? 0 : 1;
+
+    // And from there checks the next share in full, exactly as the running node does.
+    p2pool::Share next = ChainShare(a, main, a.Tip(), script(3), t + 10 * nShares + 5);
+    bool fA = a.Add(next, main, err);
+    bool fB = b.Add(next, main, err);
+    if (!fB) printf("       %s\n", err.c_str());
+    nFail += Check(fA && fB && a.Tip() == b.Tip(), "the next share is accepted by both, paying the same window") ? 0 : 1;
+
+    // A history whose recent part pays the wrong miners is refused.
+    p2pool::ShareChain c(bnFloor, false);
+    vector<p2pool::Share> forged = hist;
+    p2pool::Share& f = forged[forged.size() - 10];
+    std::swap(f.coinbase.vout[0].scriptPubKey, f.coinbase.vout[1].scriptPubKey);
+    f.hashMerkleRoot = f.coinbase.GetHash();
+    bool fForged = true;
+    for (size_t i = 0; i < forged.size() && fForged; i += 400)
+    {
+        vector<p2pool::Share> part(forged.begin() + i, forged.begin() + std::min(forged.size(), i + 400));
+        fForged = c.AddHistory(part, nTipHeight, main, err);
+    }
+    nFail += Check(!fForged && err.find("does not pay the window") != string::npos,
+                   "a history with a recent share paying the wrong miners is refused") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -7656,6 +7747,8 @@ int RunSelfTest(const std::string& name)
         return RunChatRelaySelfTest();
     if (name == "chat-wallet")
         return RunChatWalletSelfTest();
+    if (name == "p2pool-sync")
+        return RunP2PoolSyncSelfTest();
     if (name == "p2pool-chain")
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")

@@ -57,8 +57,8 @@ CBlock Share::Header() const
     return b;
 }
 
-bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW)
+bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
+                    bool fCheckPoW)
 {
     fBlockOut = false;
     errOut.clear();
@@ -96,6 +96,14 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
             return Fail(errOut, "RandomX work does not meet the share target");
         fBlockOut = CBigNum(hashPoW) <= bnBlock;
     }
+    return true;
+}
+
+bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW)
+{
+    if (!CheckShareWork(share, bnFloor, fBlockOut, errOut, fCheckPoW))
+        return false;
 
     // It pays the window exactly, and pays at least the subsidy.
     int64 nTotal = 0;

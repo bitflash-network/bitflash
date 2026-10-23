@@ -216,7 +216,8 @@ vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
     return v;
 }
 
-bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool* pfMissingParent, bool* pfBlock)
+bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool* pfMissingParent, bool* pfBlock,
+                     bool fHistory)
 {
     if (pfMissingParent) *pfMissingParent = false;
     if (pfBlock) *pfBlock = false;
@@ -245,7 +246,7 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool*
     unsigned int nNextBits;
     if (!main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
         return Fail(errOut, "mined on a main block this node does not have");
-    if (nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
+    if (!fHistory && nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
         return Fail(errOut, "mined on a stale main block");
     if (s.nBits != nNextBits)
         return Fail(errOut, "wrong main-chain bits");
@@ -299,13 +300,91 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool*
     return true;
 }
 
+bool ShareChain::AddTrusted(const Share& s, string& errOut)
+{
+    const ShareData& d = s.data;
+    uint256 id = s.GetId();
+    if (Has(id))
+        return Fail(errOut, "already have this share");
+    bool fBlock;
+    if (!CheckShareWork(s, bnFloor, fBlock, errOut, fCheckPoW))
+        return false;
+    // Linked to what is here when its parent is; the deepest one of a
+    // history has no parent here, and starts the line.
+    const Entry* parent = d.hashPrevShare == 0 ? NULL : Get(d.hashPrevShare);
+    if (parent && (int)d.nShareHeight != parent->nHeight + 1)
+        return Fail(errOut, "wrong share height");
+
+    Entry e;
+    e.share = s;
+    e.nHeight = (int)d.nShareHeight;
+    e.work = WorkOf(d.nShareBits);
+    e.bnChainWork = parent ? parent->bnChainWork : CBigNum(0);
+    e.bnChainWork += CBigNum((uint64)e.work);
+    for (size_t i = 0; i < d.vUncles.size(); i++)
+        if (const Entry* u = Get(d.vUncles[i]))
+            e.bnChainWork += CBigNum((uint64)u->work);
+    mapShares[id] = e;
+    const Entry* tip = Get(hashTip);
+    if (!tip || e.bnChainWork > tip->bnChainWork)
+        hashTip = id;
+    return true;
+}
+
+bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut)
+{
+    for (size_t i = 0; i < part.size(); i++)
+    {
+        const Share& s = part[i];
+        string err;
+        bool fOk = (int)s.data.nShareHeight < nTipHeight - (int)RETARGET_SHARES
+                 ? AddTrusted(s, err)
+                 : Add(s, main, err, NULL, NULL, true);
+        if (!fOk && err != "already have this share")
+        {
+            errOut = strprintf("share at height %u: %s", s.data.nShareHeight, err.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+void ShareChain::History(vector<Share>& out) const
+{
+    out.clear();
+    set<uint256> seen;
+    vector<const Entry*> v;
+    uint256 cur = hashTip;
+    for (unsigned int n = 0; n < HISTORY_SHARES && cur != 0; n++)
+    {
+        const Entry* e = Get(cur);
+        if (!e)
+            break;
+        if (seen.insert(cur).second)
+            v.push_back(e);
+        for (size_t i = 0; i < e->share.data.vUncles.size(); i++)
+        {
+            const Entry* u = Get(e->share.data.vUncles[i]);
+            if (u && seen.insert(e->share.data.vUncles[i]).second)
+                v.push_back(u);
+        }
+        cur = e->share.data.hashPrevShare;
+    }
+    // Oldest first, a parent always before its children.
+    std::stable_sort(v.begin(), v.end(), [](const Entry* a, const Entry* b) { return a->nHeight < b->nHeight; });
+    for (size_t i = 0; i < v.size(); i++)
+        out.push_back(v[i]->share);
+}
+
 // Keep what a window, a retarget and the uncle rules can still reach.
 void ShareChain::Prune()
 {
     const Entry* tip = Get(hashTip);
     if (!tip)
         return;
-    int nKeep = (int)(WINDOW_SHARES > RETARGET_SHARES ? WINDOW_SHARES : RETARGET_SHARES) + MAX_UNCLE_DEPTH + 10;
+    // HISTORY_SHARES covers the window and the retarget, and is what a
+    // starting peer is sent.
+    int nKeep = (int)HISTORY_SHARES + 10;
     int nCut = tip->nHeight - nKeep;
     if (nCut <= 0)
         return;
