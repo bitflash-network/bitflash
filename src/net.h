@@ -669,6 +669,7 @@ public:
     bool fInbound;
     bool fNetworkNode;
     bool fDisconnect;
+    bool fDandelion;   // said "stemok": takes stem-phase transactions (dandelion.h)
 protected:
     int nRefCount;
 public:
@@ -743,6 +744,7 @@ public:
         fInbound = fInboundIn;
         fNetworkNode = false;
         fDisconnect = false;
+        fDandelion = false;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

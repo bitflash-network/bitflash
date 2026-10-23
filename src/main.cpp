@@ -13,6 +13,7 @@
 #include "treasury.h"
 #include "chatrelay.h"  // the chat's records: held, relayed and served here
 #include "p2pool_net.h"  // the P2Pool share chain: held, checked and relayed here
+#include "dandelion.h"   // stem-phase transactions: whose they are stays hidden
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -1980,7 +1981,9 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
         if (!txdb.ContainsTx(hash))
         {
             if (LogAcceptsCategory("net")) printf("Relaying wtx %s\n", hash.ToString().substr(0,6).c_str());
-            RelayMessage(CInv(MSG_TX, hash), (CTransaction)*this);
+            // Our own: into the Dandelion stem, so the peer that hears it
+            // first cannot tell it started here (dandelion.h).
+            DandelionRelayOwn((CTransaction)*this);
         }
     }
 }
@@ -3448,6 +3451,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         ChatRelayOnVersion(pfrom);
         P2PoolOnVersion(pfrom);
+        DandelionOnVersion(pfrom);
 
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);
     }
@@ -3494,6 +3498,9 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             if (fShutdown)
                 return true;
             pfrom->AddInventoryKnown(inv);
+            // Announced by a peer: whatever we held in a stem has fluffed.
+            if (inv.type == MSG_TX)
+                DandelionSeenFluffed(inv.hash);
 
             bool fAlreadyHave = AlreadyHave(txdb, inv);
             if (LogAcceptsCategory("net")) printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
@@ -3594,6 +3601,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         CInv inv(MSG_TX, tx.GetHash());
         pfrom->AddInventoryKnown(inv);
+        DandelionSeenFluffed(inv.hash);
 
         // A coinbase on its own, or a transaction that fails the shape checks,
         // is not something an honest node relays: it validates first.
@@ -3742,6 +3750,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (P2PoolProcessMessage(pfrom, strCommand, vRecv))
     {
         // p2pshare, p2pgetsh, p2psync, p2pshares -- see p2pool_net.h.
+    }
+
+
+    else if (DandelionProcessMessage(pfrom, strCommand, vRecv))
+    {
+        // stemok, stemtx -- see dandelion.h.
     }
 
 

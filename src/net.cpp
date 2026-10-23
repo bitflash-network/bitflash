@@ -10,6 +10,7 @@
 #undef snprintf
 #endif
 #include "headers.h"
+#include "dandelion.h"
 #include <thread>          // hardware_concurrency, for the miner thread count
 #ifdef _WIN32
 #include <winsock2.h>
@@ -2151,6 +2152,7 @@ void ThreadMessageHandler2(void* parg)
         }
 
         WarnIfBehind();
+        DandelionTick();   // fluff whatever is past its embargo (dandelion.h)
 
         // Wait and allow messages to bunch up
         vfThreadRunning[2] = false;
