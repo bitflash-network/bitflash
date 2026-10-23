@@ -81,7 +81,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h sigcheck.h \
           proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -96,7 +96,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
             obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/btclight.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
-            obj/community.o obj/chatdir.o
+            obj/community.o obj/chatdir.o obj/sigcheck.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
 
@@ -264,6 +264,22 @@ fuzz-script: $(FUZZ_SCRIPT_OBJS)
 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: fuzz-script"
 
+obj-fuzz/fuzz_sigcheck.o: fuzz_sigcheck.cpp $(HEADERS)
+	@mkdir -p obj-fuzz
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-sigcheck: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_sigcheck.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-sigcheck"
+
+# OpenSSL and libsecp256k1 on the same mutated signatures; a disagreement aborts.
+fuzz-sigcheck-smoke: fuzz-sigcheck
+	@mkdir -p ../work/fuzz-corpus/sigcheck
+	@printf '\000\000\001\001' > ../work/fuzz-corpus/sigcheck/flip-sig
+	@printf '\030\001\040\001' > ../work/fuzz-corpus/sigcheck/flip-key
+	./fuzz-sigcheck -runs=20000 ../work/fuzz-corpus/sigcheck
+
 fuzz-net-message-smoke: fuzz-net-message
 	@mkdir -p ../work/fuzz-corpus/net-message
 	@printf '\277\040\134\375ping\000\000\000\000\000\000\000\000\000\000\000\000' > ../work/fuzz-corpus/net-message/ping-header
@@ -278,7 +294,7 @@ fuzz-script-smoke: fuzz-script
 	./fuzz-script -runs=128 ../work/fuzz-corpus/script
 
 clean:
-	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -359,6 +375,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=script-eval
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
+	./bitflash-node -selftest=sigcheck
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light
 	./bitflash-node -selftest=swap-wait-payment
@@ -374,4 +391,4 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-relay
 	./bitflash-node -selftest=chat-wallet
 
-.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke
+.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke
