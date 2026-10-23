@@ -10,6 +10,7 @@
 #include "bip32.h"
 #include "proxy.h"
 #include "selftest.h"
+#include "p2pool_share.h"
 #ifndef _WIN32
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
@@ -4763,6 +4764,147 @@ static std::vector<unsigned char> SelfTestSign(CKey& key, const CScript& scriptC
     return sig;
 }
 
+// ---- p2pool-share: a share stands or falls on its own --------------------
+
+// A share mined on an easy target: three earlier shares in the window and
+// this one, a coinbase committing to the share data and paying the window,
+// one more transaction so the merkle branch is not empty.
+static p2pool::Share MakeTestShare(const vector<p2pool::WindowShare>& window, unsigned int nShareBits,
+                                   unsigned int nBits, int nHeight)
+{
+    p2pool::Share s;
+    s.data.hashPrevShare = Hash(BEGIN(nHeight), END(nHeight));
+    s.data.nShareHeight = 4;
+    s.data.nShareBits = nShareBits;
+    s.data.payoutScript = window.back().payoutScript;
+
+    vector<p2pool::Payout> pay;
+    string err;
+    p2pool::ComputePayouts(window, CBlock().GetBlockValue(nHeight, 0), pay, err);
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig << nHeight << p2pool::CommitmentPush(s.data.GetHash());
+    for (size_t i = 0; i < pay.size(); i++)
+        cb.vout.push_back(CTxOut(pay[i].value, CScript(pay[i].script.begin(), pay[i].script.end())));
+
+    CTransaction other;
+    other.vin.resize(1);
+    other.vin[0].prevout = COutPoint(Hash(BEGIN(nBits), END(nBits)), 0);
+    other.vout.push_back(CTxOut(COIN, cb.vout[0].scriptPubKey));
+
+    CBlock b;
+    b.vtx.push_back(cb);
+    b.vtx.push_back(other);
+    s.nVersion = 1;
+    s.hashPrevBlock = Hash(BEGIN(nShareBits), END(nShareBits));
+    s.hashMerkleRoot = b.BuildMerkleTree();
+    s.vMerkleBranch = b.GetMerkleBranch(0);
+    s.nTime = (unsigned int)GetTime();
+    s.nBits = nBits;
+    s.coinbase = cb;
+
+    CBigNum bnShare;
+    bnShare.SetCompact(nShareBits);
+    for (s.nNonce = 0; CBigNum(s.Header().GetPoWHash()) > bnShare; s.nNonce++)
+        ;
+    return s;
+}
+
+static int RunP2PoolShareSelfTest()
+{
+    printf("p2pool-share self-test\n");
+    int nFail = 0;
+    RandomXInit();
+
+    CKey a, b, c;
+    a.MakeNewKey(); b.MakeNewKey(); c.MakeNewKey();
+    auto pay = [](const CKey& k) {
+        CScript s;
+        s << OP_DUP << OP_HASH160 << Hash160(k.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+        return vector<unsigned char>(s.begin(), s.end());
+    };
+    vector<p2pool::WindowShare> window;
+    p2pool::WindowShare w;
+    w.payoutScript = pay(a); w.work = 300; window.push_back(w);
+    w.payoutScript = pay(b); w.work = 300; window.push_back(w);
+    w.payoutScript = pay(a); w.work = 300; window.push_back(w);
+    w.payoutScript = pay(c); w.work = 300; window.push_back(w);   // this share
+
+    const unsigned int EASY = 0x207fffff, HARD = 0x1d00ffff;
+    const int HEIGHT = 61000;
+    CBigNum bnFloor;
+    bnFloor.SetCompact(EASY);
+
+    p2pool::Share s = MakeTestShare(window, EASY, HARD, HEIGHT);
+    bool fBlock = true;
+    string err;
+    nFail += Check(p2pool::CheckShare(s, window, HEIGHT, bnFloor, fBlock, err) && !fBlock,
+                   "a share that pays its window and meets its target is valid, and is not a block") ? 0 : 1;
+    if (!err.empty()) printf("       %s\n", err.c_str());
+
+    CDataStream ss(SER_NETWORK);
+    ss << s;
+    p2pool::Share back;
+    ss >> back;
+    nFail += Check(back.GetId() == s.GetId() && back.data.GetHash() == s.data.GetHash() &&
+                   p2pool::CheckShare(back, window, HEIGHT, bnFloor, fBlock, err),
+                   "it survives the wire unchanged") ? 0 : 1;
+
+    p2pool::Share t = s;
+    t.coinbase.vout[0].nValue -= 1;
+    t.coinbase.vout[1].nValue += 1;
+    nFail += Check(!p2pool::CheckShare(t, window, HEIGHT, bnFloor, fBlock, err),
+                   "moving one satoshi between miners is refused") ? 0 : 1;
+
+    t = s;
+    t.data.payoutScript = pay(b);
+    nFail += Check(!p2pool::CheckShare(t, window, HEIGHT, bnFloor, fBlock, err),
+                   "share data the coinbase did not commit to is refused") ? 0 : 1;
+
+    t = s;
+    t.vMerkleBranch[0] = Hash(BEGIN(HEIGHT), END(HEIGHT));
+    nFail += Check(!p2pool::CheckShare(t, window, HEIGHT, bnFloor, fBlock, err),
+                   "a coinbase that is not in the merkle root is refused") ? 0 : 1;
+
+    CBigNum bnHarderFloor;
+    bnHarderFloor.SetCompact(0x1e00ffff);
+    nFail += Check(!p2pool::CheckShare(s, window, HEIGHT, bnHarderFloor, fBlock, err),
+                   "a share target easier than the floor is refused") ? 0 : 1;
+
+    t = s;
+    t.nNonce++;
+    while (CBigNum(t.Header().GetPoWHash()) <= CBigNum().SetCompact(EASY))
+        t.nNonce++;
+    nFail += Check(!p2pool::CheckShare(t, window, HEIGHT, bnFloor, fBlock, err),
+                   "work that misses the share target is refused") ? 0 : 1;
+
+    t = s;
+    t.data.vUncles.assign(3, s.GetId());
+    nFail += Check(!p2pool::CheckShare(t, window, HEIGHT, bnFloor, fBlock, err),
+                   "more than two uncles is refused") ? 0 : 1;
+
+    t = s;
+    t.coinbase.vin[0].scriptSig << p2pool::CommitmentPush(s.data.GetHash());
+    uint256 h;
+    nFail += Check(!p2pool::FindCommitment(t.coinbase, h),
+                   "a coinbase with two commitments carries none") ? 0 : 1;
+
+    p2pool::Share u = s;
+    u.coinbase.vout.clear();
+    nFail += Check(!p2pool::CheckShare(u, window, HEIGHT, bnFloor, fBlock, err),
+                   "a coinbase paying less than the subsidy is refused") ? 0 : 1;
+
+    p2pool::Share blk = MakeTestShare(window, EASY, EASY, HEIGHT);
+    nFail += Check(p2pool::CheckShare(blk, window, HEIGHT, bnFloor, fBlock, err) && fBlock,
+                   "a share whose work also meets the block target is a block") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -7267,6 +7409,8 @@ int RunSelfTest(const std::string& name)
         return RunChatRelaySelfTest();
     if (name == "chat-wallet")
         return RunChatWalletSelfTest();
+    if (name == "p2pool-share")
+        return RunP2PoolShareSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
     if (name == "btc-light")
