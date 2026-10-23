@@ -10,6 +10,7 @@
 #include "bip32.h"
 #include "proxy.h"
 #include "selftest.h"
+#include "sigcheck.h"
 #ifndef _WIN32
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
@@ -4767,6 +4768,167 @@ static std::vector<unsigned char> SelfTestSign(CKey& key, const CScript& scriptC
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
 // suite checks the rule itself whatever date consensus.h holds.
+// ---- sigcheck: libsecp256k1 must answer exactly as OpenSSL did -----------
+
+// r and s of a DER signature, big-endian, leading zeros stripped.
+static bool SigDerSplit(const vector<unsigned char>& der, vector<unsigned char>& r, vector<unsigned char>& s)
+{
+    if (der.size() < 8 || der[0] != 0x30 || der[1] != der.size() - 2 || der[2] != 0x02)
+        return false;
+    size_t rl = der[3];
+    if (4 + rl + 2 > der.size() || der[4 + rl] != 0x02)
+        return false;
+    size_t sl = der[5 + rl];
+    if (6 + rl + sl != der.size())
+        return false;
+    r.assign(der.begin() + 4, der.begin() + 4 + rl);
+    s.assign(der.begin() + 6 + rl, der.end());
+    while (r.size() > 1 && r[0] == 0) r.erase(r.begin());
+    while (s.size() > 1 && s[0] == 0) s.erase(s.begin());
+    return true;
+}
+
+static vector<unsigned char> SigDerJoin(const vector<unsigned char>& r, const vector<unsigned char>& s)
+{
+    vector<unsigned char> rr = r, ss = s;
+    if (rr[0] & 0x80) rr.insert(rr.begin(), 0);
+    if (ss[0] & 0x80) ss.insert(ss.begin(), 0);
+    vector<unsigned char> der;
+    der.push_back(0x30);
+    der.push_back((unsigned char)(4 + rr.size() + ss.size()));
+    der.push_back(0x02); der.push_back((unsigned char)rr.size()); der.insert(der.end(), rr.begin(), rr.end());
+    der.push_back(0x02); der.push_back((unsigned char)ss.size()); der.insert(der.end(), ss.begin(), ss.end());
+    return der;
+}
+
+// The twin of a signature: S' = n - S, which OpenSSL also verifies.
+static vector<unsigned char> SigHighS(const vector<unsigned char>& der)
+{
+    static const unsigned char n[32] = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+        0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41 };
+    vector<unsigned char> r, s;
+    if (!SigDerSplit(der, r, s) || s.size() > 32)
+        return der;
+    unsigned char s32[32] = {0}, out[32];
+    memcpy(s32 + 32 - s.size(), &s[0], s.size());
+    int borrow = 0;
+    for (int i = 31; i >= 0; i--)
+    {
+        int d = (int)n[i] - (int)s32[i] - borrow;
+        borrow = d < 0;
+        out[i] = (unsigned char)(d + (borrow ? 256 : 0));
+    }
+    vector<unsigned char> s2(out, out + 32);
+    while (s2.size() > 1 && s2[0] == 0) s2.erase(s2.begin());
+    return SigDerJoin(r, s2);
+}
+
+// 04|X|Y as 02/03|X, and as the hybrid 06/07|X|Y.
+static vector<unsigned char> PubCompressed(const vector<unsigned char>& full)
+{
+    vector<unsigned char> c(full.begin(), full.begin() + 33);
+    c[0] = (full[64] & 1) ? 0x03 : 0x02;
+    return c;
+}
+
+static vector<unsigned char> PubHybrid(const vector<unsigned char>& full)
+{
+    vector<unsigned char> h = full;
+    h[0] = (full[64] & 1) ? 0x07 : 0x06;
+    return h;
+}
+
+static bool SigOpenSsl(const uint256& hash, const vector<unsigned char>& sig, const vector<unsigned char>& pub)
+{
+    return CKey::Verify(pub, hash, sig);
+}
+
+static int RunSigCheckSelfTest()
+{
+    printf("sigcheck self-test\n");
+    int nFail = 0;
+    SigCheckSelfTest();
+
+    int nCases = 0, nDisagree = 0, nTrueBoth = 0;
+    std::string firstDisagreement;
+    auto both = [&](const uint256& h, const vector<unsigned char>& sig, const vector<unsigned char>& pub,
+                    const char* what) {
+        bool a = SigOpenSsl(h, sig, pub);
+        bool b = SigCheckEcdsa((const unsigned char*)&h, sig, pub);
+        nCases++;
+        if (a && b) nTrueBoth++;
+        if (a != b)
+        {
+            nDisagree++;
+            if (firstDisagreement.empty())
+                firstDisagreement = strprintf("%s: OpenSSL %d, libsecp256k1 %d", what, a, b);
+        }
+        return b;
+    };
+
+    bool fLow = true, fHigh = true, fComp = true, fHyb = true, fWrong = true;
+    for (int k = 0; k < 48; k++)
+    {
+        CKey key;
+        key.MakeNewKey();
+        vector<unsigned char> pub = key.GetPubKey();
+        uint256 hash;
+        RAND_bytes((unsigned char*)&hash, sizeof(hash));
+        vector<unsigned char> sig;
+        if (!key.Sign(hash, sig))
+        {
+            nFail++;
+            continue;
+        }
+        fLow  &= both(hash, sig, pub, "low S");
+        fHigh &= both(hash, SigHighS(sig), pub, "high S");
+        fComp &= both(hash, sig, PubCompressed(pub), "compressed key");
+        fHyb  &= both(hash, sig, PubHybrid(pub), "hybrid key");
+        uint256 other = hash;
+        ((unsigned char*)&other)[k % 32] ^= 0x01;
+        fWrong &= !both(other, sig, pub, "another hash");
+
+        vector<unsigned char> longer = sig; longer.push_back(0x00);
+        both(hash, longer, pub, "a trailing byte");
+        vector<unsigned char> shorter(sig.begin(), sig.end() - 1);
+        both(hash, shorter, pub, "one byte short");
+        vector<unsigned char> wrongHyb = PubHybrid(pub); wrongHyb[0] ^= 0x01;
+        both(hash, sig, wrongHyb, "hybrid key with the wrong parity");
+
+        // Every byte of the signature and of the key, flipped one at a time.
+        for (size_t i = 0; i < sig.size(); i++)
+        {
+            vector<unsigned char> m = sig;
+            m[i] ^= (unsigned char)(1 << (i % 8));
+            both(hash, m, pub, "a flipped signature byte");
+        }
+        for (size_t i = 0; i < pub.size(); i += 3)
+        {
+            vector<unsigned char> m = pub;
+            m[i] ^= (unsigned char)(1 << (i % 8));
+            both(hash, sig, m, "a flipped key byte");
+        }
+    }
+
+    nFail += Check(fLow, "a low-S signature verifies") ? 0 : 1;
+    nFail += Check(fHigh, "its high-S twin verifies too, as with OpenSSL (blocks before rules v2 carry them)") ? 0 : 1;
+    nFail += Check(fComp && fHyb, "compressed and hybrid keys verify") ? 0 : 1;
+    nFail += Check(fWrong, "a signature for another hash does not") ? 0 : 1;
+    nFail += Check(nDisagree == 0, strprintf("OpenSSL and libsecp256k1 agree on all %d cases (%d valid)",
+                                              nCases, nTrueBoth).c_str()) ? 0 : 1;
+    if (nDisagree)
+        printf("       %d disagreements; first: %s\n", nDisagree, firstDisagreement.c_str());
+    uint256 zero = 0;
+    nFail += Check(!SigCheckEcdsa((const unsigned char*)&zero, vector<unsigned char>(), vector<unsigned char>(1, 2)),
+                   "an empty signature fails") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 static int RunRulesV3SelfTest()
 {
     printf("rules-v3 self-test\n");
@@ -7269,6 +7431,8 @@ int RunSelfTest(const std::string& name)
         return RunChatWalletSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
+    if (name == "sigcheck")
+        return RunSigCheckSelfTest();
     if (name == "btc-light")
         return btclight::SelfTest();
     if (name == "btc-swap")

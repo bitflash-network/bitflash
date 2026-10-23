@@ -3,6 +3,7 @@
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "headers.h"
+#include "sigcheck.h"
 
 bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs);
 
@@ -1043,10 +1044,6 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
     if (fStrictSigs && (!IsStrictDERSignature(vchSig) || !IsLowSSignature(vchSig)))
         return false;
 
-    CKey key;
-    if (!key.SetPubKey(vchPubKey))
-        return false;
-
     // Hash type is one byte tacked on to the end of the signature
     if (vchSig.empty())
         return false;
@@ -1056,10 +1053,11 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
         return false;
     vchSig.pop_back();
 
-    if (key.Verify(SignatureHash(scriptCode, txTo, nIn, nHashType), vchSig))
-        return true;
-
-    return false;
+    // libsecp256k1, not OpenSSL (sigcheck.h). The key used to be parsed
+    // before the hash type was read; both orders refuse the same inputs, and
+    // a bad key costs nothing here before the hash is computed.
+    uint256 hash = SignatureHash(scriptCode, txTo, nIn, nHashType);
+    return SigCheckEcdsa((const unsigned char*)&hash, vchSig, vchPubKey);
 }
 
 
