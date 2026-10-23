@@ -50,7 +50,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
             obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/btclight.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
-            obj/community.o obj/chatdir.o obj/p2pool.o obj/p2pool_share.o obj/p2pool_chain.o obj/p2pool_net.o
+            obj/community.o obj/chatdir.o obj/p2pool.o obj/p2pool_share.o obj/p2pool_chain.o obj/p2pool_net.o obj/sigcheck.o
 
 GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
 
@@ -65,7 +65,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
           proxy.h tor.h treasury.h compat.h gui_chat.h font_roboto.h jsonrpc.h
 
 all: bitflash.exe
@@ -268,6 +268,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=p2pool-share
 	./bitflash.exe -selftest=p2pool-chain
 	./bitflash.exe -selftest=p2pool-sync
+	./bitflash.exe -selftest=sigcheck
 	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=btc-light
 	./bitflash.exe -selftest=swap-wait-payment

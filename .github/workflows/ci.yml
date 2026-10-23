@@ -34,6 +34,9 @@ jobs:
       - name: Run script fuzz smoke
         run: make fuzz-script-smoke
 
+      - name: Run signature-verifier differential fuzz (OpenSSL vs libsecp256k1)
+        run: make fuzz-sigcheck-smoke
+
   windows-ucrt64:
     name: Windows UCRT64 selftests
     runs-on: windows-latest
