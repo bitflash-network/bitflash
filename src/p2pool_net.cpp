@@ -141,6 +141,7 @@ static void RelayShare(const Share& s, CNode* pfrom)
 static bool Innocent(const string& err)
 {
     return err == "already have this share" || err == "unknown parent share" ||
+           err == "an unknown uncle" ||
            err == "mined on a main block this node does not have" ||
            err == "mined on a stale main block" ||
            err == "the payout window reaches shares this node does not have";
@@ -158,10 +159,11 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
         Share cur = todo.back();
         todo.pop_back();
         string err;
-        bool fMissing = false, fBlock = false;
+        vector<uint256> vMissing;
+        bool fBlock = false;
         bool fOk;
         CRITICAL_BLOCK(cs_p2pool)
-            fOk = P2PoolChain().Add(cur, main, err, &fMissing, &fBlock, fHistory);
+            fOk = P2PoolChain().Add(cur, main, err, &vMissing, &fBlock, fHistory);
         if (fOk)
         {
             LogPrint("p2pool", "p2pool: share %s height %u accepted%s\n",
@@ -180,12 +182,21 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
                 mapOrphanShares.erase(it);
             }
         }
-        else if (fMissing)
+        else if (!vMissing.empty())
         {
+            // Waits on the first share it lacks; if more are missing when that
+            // one comes, it waits again on the next. Every one is asked for now.
             if (mapOrphanShares.size() < MAX_ORPHAN_SHARES)
-                mapOrphanShares[cur.data.hashPrevShare].push_back(cur);
+            {
+                vector<Share>& v = mapOrphanShares[vMissing[0]];
+                bool fQueued = false;
+                for (size_t i = 0; i < v.size() && !fQueued; i++)
+                    fQueued = v[i].GetId() == cur.GetId();
+                if (!fQueued)
+                    v.push_back(cur);
+            }
             if (pfrom)
-                pfrom->PushMessage("p2pgetsh", vector<uint256>(1, cur.data.hashPrevShare));
+                pfrom->PushMessage("p2pgetsh", vMissing);
         }
         else if (!Innocent(err))
         {
@@ -246,17 +257,15 @@ bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& v
             pfrom->Misbehaving(20);
             return true;
         }
+        // Any share held, on any line: what is asked for is usually an uncle
+        // or a fork, which the tip's own line does not contain.
         vector<Share> vOut;
         CRITICAL_BLOCK(cs_p2pool)
         {
-            vector<Share> history;
-            P2PoolChain().History(history);
-            map<uint256, const Share*> byId;
-            for (size_t i = 0; i < history.size(); i++)
-                byId[history[i].GetId()] = &history[i];
+            Share s;
             for (size_t i = 0; i < vIds.size(); i++)
-                if (byId.count(vIds[i]))
-                    vOut.push_back(*byId[vIds[i]]);
+                if (P2PoolChain().GetShare(vIds[i], s))
+                    vOut.push_back(s);
         }
         foreach(const Share& s, vOut)
             pfrom->PushMessage("p2pshare", s);

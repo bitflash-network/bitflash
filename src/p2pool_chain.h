@@ -58,13 +58,17 @@ public:
     explicit ShareChain(const CBigNum& bnFloorIn, bool fCheckPoWIn = true)
         : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn) {}
 
-    // Verify a share in context and keep it. A share whose parent is not
-    // here is refused with *pfMissingParent set, so the caller can ask a
-    // peer for the parent and offer the share again.
+    // Verify a share in context and keep it. A share whose parent or uncles
+    // are not here is refused with their ids in *pvMissing, so the caller
+    // can ask a peer for them and offer the share again: a missing share is
+    // something not received yet, not something wrong.
     // fHistory: the share comes from a peer's history, not fresh off a
     // miner, so it may sit on a main block far behind the tip.
     bool Add(const Share& s, const MainView& main, string& errOut,
-             bool* pfMissingParent = NULL, bool* pfBlock = NULL, bool fHistory = false);
+             vector<uint256>* pvMissing = NULL, bool* pfBlock = NULL, bool fHistory = false);
+
+    // A share this node holds, on any line: what a peer asking for it gets.
+    bool GetShare(const uint256& id, Share& out) const;
 
     // A share too deep in a peer's history for its own window to be here:
     // kept on its work, commitment and merkle branch alone, never on a

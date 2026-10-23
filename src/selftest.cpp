@@ -5058,13 +5058,14 @@ static int RunP2PoolChainSelfTest()
         bad.hashMerkleRoot = bad.coinbase.GetHash();
         nFail += Check(!chain.Add(bad, main, err) && err == "wrong share height", "a wrong share height is refused") ? 0 : 1;
 
-        bool fMissing = false;
+        vector<uint256> vMissing;
         p2pool::Share orphan = ChainShare(chain, main, line[4], A, t + 62);
         orphan.data.hashPrevShare = Hash(BEGIN(t), END(t));
         orphan.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << p2pool::CommitmentPush(orphan.data.GetHash());
         orphan.hashMerkleRoot = orphan.coinbase.GetHash();
-        nFail += Check(!chain.Add(orphan, main, err, &fMissing) && fMissing,
-                       "a share whose parent is unknown is refused, asking for the parent") ? 0 : 1;
+        nFail += Check(!chain.Add(orphan, main, err, &vMissing) && vMissing.size() == 1 &&
+                       vMissing[0] == orphan.data.hashPrevShare,
+                       "a share whose parent is unknown is refused, naming the parent to ask for") ? 0 : 1;
 
         p2pool::Share bits = ChainShare(chain, main, line[4], A, t + 63);
         bits.data.nShareBits = 0x1f00ffff;
@@ -5104,6 +5105,18 @@ static int RunP2PoolChainSelfTest()
         p2pool::Share s3 = ChainShare(chain, main, s2a.GetId(), C, t + 30, cand);
         nFail += Check(chain.Add(s3, main, err), "a share naming it as uncle is accepted") ? 0 : 1;
         if (!err.empty()) printf("       %s\n", err.c_str());
+
+        // A node that never received that uncle: the share waits for it,
+        // asking for it by id, and is taken once it arrives. Refusing it as
+        // bad split two testnet nodes onto separate share chains.
+        p2pool::ShareChain lagging(bnFloor, false);
+        lagging.Add(s0, main, err); lagging.Add(s1, main, err); lagging.Add(s2a, main, err);
+        vector<uint256> vMissingUncle;
+        bool fWaits = !lagging.Add(s3, main, err, &vMissingUncle) && err == "an unknown uncle" &&
+                      vMissingUncle.size() == 1 && vMissingUncle[0] == s2b.GetId();
+        bool fThen = lagging.Add(s2b, main, err) && lagging.Add(s3, main, err) && lagging.Tip() == s3.GetId();
+        nFail += Check(fWaits && fThen,
+                       "a node missing the uncle asks for it by id, then takes the share") ? 0 : 1;
 
         p2pool::ShareData d;
         d.hashPrevShare = s3.GetId();

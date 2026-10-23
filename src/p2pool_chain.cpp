@@ -174,9 +174,11 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
     out.clear();
     // One share and its uncles: 80% of each uncle's work to the uncle, the
     // rest to the share that named it. Integer split, nothing lost.
+    // False when an uncle it names is not here: skipping it would pay a
+    // different list from every node that has it, and refuse their shares.
     struct Credit
     {
-        static void Share(vector<WindowShare>& v, const vector<unsigned char>& script, uint64_t work,
+        static bool Share(vector<WindowShare>& v, const vector<unsigned char>& script, uint64_t work,
                           const vector<uint256>& uncles, const ShareChain& c)
         {
             uint64_t bonus = 0;
@@ -184,7 +186,7 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
             {
                 const Entry* u = c.Get(uncles[i]);
                 if (!u)
-                    continue;
+                    return false;
                 uint64_t paid = u->work / 5 * 4 + (u->work % 5) * 4 / 5;
                 WindowShare w;
                 w.payoutScript = u->share.data.payoutScript;
@@ -196,10 +198,12 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
             w.payoutScript = script;
             w.work = work + bonus;
             v.push_back(w);
+            return true;
         }
     };
 
-    Credit::Share(out, d.payoutScript, nOwnWork, d.vUncles, *this);
+    if (!Credit::Share(out, d.payoutScript, nOwnWork, d.vUncles, *this))
+        return Fail(errOut, "the payout window reaches shares this node does not have");
     uint256 cur = d.hashPrevShare;
     for (unsigned int n = 1; n < WINDOW_SHARES && cur != 0; n++)
     {
@@ -209,7 +213,8 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
         const Entry* e = Get(cur);
         if (!e)
             return Fail(errOut, "the payout window reaches shares this node does not have");
-        Credit::Share(out, e->share.data.payoutScript, e->work, e->share.data.vUncles, *this);
+        if (!Credit::Share(out, e->share.data.payoutScript, e->work, e->share.data.vUncles, *this))
+            return Fail(errOut, "the payout window reaches shares this node does not have");
         cur = e->share.data.hashPrevShare;
     }
     if (out.empty())
@@ -238,27 +243,48 @@ vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
     return v;
 }
 
-bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool* pfMissingParent, bool* pfBlock,
+bool ShareChain::GetShare(const uint256& id, Share& out) const
+{
+    const Entry* e = Get(id);
+    if (!e)
+        return false;
+    out = e->share;
+    return true;
+}
+
+bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock,
                      bool fHistory)
 {
-    if (pfMissingParent) *pfMissingParent = false;
+    if (pvMissing) pvMissing->clear();
     if (pfBlock) *pfBlock = false;
     const ShareData& d = s.data;
     uint256 id = s.GetId();
     if (Has(id))
         return Fail(errOut, "already have this share");
 
-    // Its place in the share chain.
-    const Entry* parent = NULL;
-    if (d.hashPrevShare != 0)
+    // Everything it names must be here first: its parent and its uncles.
+    // A peer that named an uncle we never received did nothing wrong; it was
+    // scored for it once, and two honest nodes ended up banning each other
+    // onto separate share chains.
+    if (d.vUncles.size() <= MAX_UNCLES)
     {
-        parent = Get(d.hashPrevShare);
-        if (!parent)
+        vector<uint256> vMissing;
+        if (d.hashPrevShare != 0 && !Has(d.hashPrevShare))
+            vMissing.push_back(d.hashPrevShare);
+        for (size_t i = 0; i < d.vUncles.size(); i++)
+            if (!Has(d.vUncles[i]) &&
+                std::find(vMissing.begin(), vMissing.end(), d.vUncles[i]) == vMissing.end())
+                vMissing.push_back(d.vUncles[i]);
+        if (!vMissing.empty())
         {
-            if (pfMissingParent) *pfMissingParent = true;
-            return Fail(errOut, "unknown parent share");
+            if (pvMissing) *pvMissing = vMissing;
+            return Fail(errOut, d.hashPrevShare != 0 && !Has(d.hashPrevShare) ? "unknown parent share"
+                                                                              : "an unknown uncle");
         }
     }
+
+    // Its place in the share chain.
+    const Entry* parent = d.hashPrevShare != 0 ? Get(d.hashPrevShare) : NULL;
     int nHeight = parent ? parent->nHeight + 1 : 0;
     if ((int)d.nShareHeight != nHeight)
         return Fail(errOut, "wrong share height");
