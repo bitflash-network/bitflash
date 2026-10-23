@@ -50,8 +50,17 @@ data. The PoW therefore cannot be lifted from one share chain onto another.
 
 **Valid share:** the header hashes (RandomX, the main chain's own PoW v2) under
 the share target; the coinbase outputs equal the payout list computed from the
-parent; the parent is known; the timestamp is sane; the main-chain fields
-point at a block the node has, at most a few blocks behind its tip.
+parent; the parent and uncles are known (a missing one is fetched, never
+held against the sender); the timestamp is sane; the bits are right for the
+main block it was mined on, or, when the node lacks that block, the coinbase
+states its height.
+
+How far behind the main tip a share was mined does **not** decide its
+validity: that would depend on when the share arrived, and two honest nodes
+would disagree about the same share. On testnet that is exactly what split two
+nodes, over an uncle fetched minutes after it was mined. Work on an old main
+block is still work the window pays; mining on the tip is the miner's own
+interest, and a node's templates are always on its tip.
 
 **Share target:** retargets every share over the last 720 shares to keep 10
 seconds per share, never below a floor (spam) nor above the main difficulty.

@@ -252,8 +252,7 @@ bool ShareChain::GetShare(const uint256& id, Share& out) const
     return true;
 }
 
-bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock,
-                     bool fHistory)
+bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock)
 {
     if (pvMissing) pvMissing->clear();
     if (pfBlock) *pfBlock = false;
@@ -289,26 +288,28 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vecto
     if ((int)d.nShareHeight != nHeight)
         return Fail(errOut, "wrong share height");
 
-    // Its place in the main chain: a fresh share on a block we have, recent,
-    // with the right bits. A share from history keeps its worth whatever
-    // became of the block it was mined on -- orphaned since, or never seen
-    // here -- so it needs only the height its coinbase states (rules v2).
+    // Its place in the main chain. On a block this node has, the bits must be
+    // that block's; on one it does not have -- orphaned since, or never seen
+    // here -- the height its coinbase states (rules v2) is enough. How far
+    // behind the tip that block is does not decide anything: it would make a
+    // share's validity depend on when it arrived, and two honest nodes would
+    // disagree about the same share. That split two testnet nodes, when an
+    // uncle fetched minutes after it was mined was refused as stale and every
+    // share naming it waited forever. Work on an old block is still work the
+    // window pays; mining on the tip is the miner's own interest, and this
+    // node's templates are always on its tip.
     int nPrevHeight;
     unsigned int nNextBits;
     if (main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
     {
-        if (!fHistory && nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
-            return Fail(errOut, "mined on a stale main block");
         if (s.nBits != nNextBits)
             return Fail(errOut, "wrong main-chain bits");
     }
     else
     {
-        if (!fHistory)
-            return Fail(errOut, "mined on a main block this node does not have");
         int nHeight;
         if (!CoinbaseHeight(s.coinbase, nHeight) || nHeight < 1)
-            return Fail(errOut, "a history share whose coinbase states no height");
+            return Fail(errOut, "a share whose coinbase states no height");
         nPrevHeight = nHeight - 1;
     }
 
@@ -400,7 +401,7 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
         string err;
         bool fOk = (int)s.data.nShareHeight < nTipHeight - (int)RETARGET_SHARES
                  ? AddTrusted(s, err)
-                 : Add(s, main, err, NULL, NULL, true);
+                 : Add(s, main, err);
         if (!fOk && err != "already have this share")
         {
             errOut = strprintf("share at height %u: %s", s.data.nShareHeight, err.c_str());

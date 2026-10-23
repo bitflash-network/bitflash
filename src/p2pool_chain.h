@@ -19,7 +19,6 @@ static const unsigned int SHARES_PER_BLOCK = 12;    // 120 s blocks / 10 s share
 static const unsigned int RETARGET_SHARES = 720;    // the share target looks back this far
 static const int MAX_UNCLE_DEPTH = 3;               // an uncle is at most 3 shares older
 static const int64 MAX_SHARE_FUTURE = 120;          // seconds a share's time may run ahead
-static const int MAX_MAIN_LAG = 3;                  // main blocks a share may be mined behind
 // What a node hands a peer that is starting: enough of its line that the
 // newest RETARGET_SHARES can be checked in full, with a whole window and a
 // whole retarget behind each.
@@ -62,10 +61,8 @@ public:
     // are not here is refused with their ids in *pvMissing, so the caller
     // can ask a peer for them and offer the share again: a missing share is
     // something not received yet, not something wrong.
-    // fHistory: the share comes from a peer's history, not fresh off a
-    // miner, so it may sit on a main block far behind the tip.
     bool Add(const Share& s, const MainView& main, string& errOut,
-             vector<uint256>* pvMissing = NULL, bool* pfBlock = NULL, bool fHistory = false);
+             vector<uint256>* pvMissing = NULL, bool* pfBlock = NULL);
 
     // A share this node holds, on any line: what a peer asking for it gets.
     bool GetShare(const uint256& id, Share& out) const;

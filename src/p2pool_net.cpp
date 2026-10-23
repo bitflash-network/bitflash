@@ -142,8 +142,6 @@ static bool Innocent(const string& err)
 {
     return err == "already have this share" || err == "unknown parent share" ||
            err == "an unknown uncle" ||
-           err == "mined on a main block this node does not have" ||
-           err == "mined on a stale main block" ||
            err == "the payout window reaches shares this node does not have";
 }
 
@@ -163,7 +161,7 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
         bool fBlock = false;
         bool fOk;
         CRITICAL_BLOCK(cs_p2pool)
-            fOk = P2PoolChain().Add(cur, main, err, &vMissing, &fBlock, fHistory);
+            fOk = P2PoolChain().Add(cur, main, err, &vMissing, &fBlock);
         if (fOk)
         {
             LogPrint("p2pool", "p2pool: share %s height %u accepted%s\n",

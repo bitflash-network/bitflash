@@ -5079,9 +5079,12 @@ static int RunP2PoolChainSelfTest()
         pay2.hashMerkleRoot = pay2.coinbase.GetHash();
         nFail += Check(!chain.Add(pay2, main, err) && err == "the coinbase does not pay the window", "a share paying the window wrongly is refused") ? 0 : 1;
 
+        // Work on an old main block is still work: when a share arrives must
+        // not decide whether it is valid, or two honest nodes disagree.
         p2pool::Share stale = ChainShare(chain, main, line[4], A, t + 65);
         stale.hashPrevBlock = main.BlockAt(60990);
-        nFail += Check(!chain.Add(stale, main, err) && err == "mined on a stale main block", "a share mined on a stale main block is refused") ? 0 : 1;
+        p2pool::ShareChain staleProbe = chain;
+        nFail += Check(staleProbe.Add(stale, main, err), "a share mined on an old main block is accepted") ? 0 : 1;
 
         p2pool::Share future = ChainShare(chain, main, line[4], A, (unsigned int)main.nNow + 600);
         nFail += Check(!chain.Add(future, main, err) && err == "share time too far in the future", "a share from ten minutes ahead is refused") ? 0 : 1;
@@ -5249,12 +5252,19 @@ static int RunP2PoolSyncSelfTest()
     if (!fSynced) printf("       %s\n", err.c_str());
     nFail += Check(fSynced && b.Tip() == a.Tip(), "it ends on the same tip, though it never saw their main block") ? 0 : 1;
 
-    // That leniency is for history only: fresh off a miner, the main block
-    // must be one this node has.
+    // The same for a fresh share: a main block this node lacks does not make
+    // it wait -- the coinbase states the height -- but a coinbase that states
+    // none is refused.
     p2pool::Share fresh = ChainShare(a, main, a.Tip(), script(4), t + 10 * nShares + 2);
     p2pool::ShareChain probe = b;
-    nFail += Check(!probe.Add(fresh, mainB, err) && err == "mined on a main block this node does not have",
-                   "a fresh share on a main block this node lacks waits") ? 0 : 1;
+    nFail += Check(probe.Add(fresh, mainB, err),
+                   "a fresh share on a main block this node lacks is taken on its coinbase height") ? 0 : 1;
+    p2pool::Share noheight = fresh;
+    noheight.coinbase.vin[0].scriptSig = CScript() << p2pool::CommitmentPush(noheight.data.GetHash());
+    noheight.hashMerkleRoot = noheight.coinbase.GetHash();
+    p2pool::ShareChain probe2 = b;
+    nFail += Check(!probe2.Add(noheight, mainB, err) && err == "a share whose coinbase states no height",
+                   "and one whose coinbase states no height is refused") ? 0 : 1;
 
     // And from there checks the next share in full, exactly as the running node does.
     p2pool::Share next = ChainShare(a, main, a.Tip(), script(3), t + 10 * nShares + 5);
