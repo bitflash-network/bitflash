@@ -41,6 +41,9 @@ public:
 // Expected hashes to meet a target, capped at 2^64-1: a share's weight.
 uint64_t WorkOf(unsigned int nBits);
 
+// The block height a coinbase states in its first push (rules v2, BIP34).
+bool CoinbaseHeight(const CTransaction& coinbase, int& nHeightOut);
+
 // The share target of a chain's first RETARGET_SHARES shares: the block
 // target made SHARES_PER_BLOCK times easier, never easier than the floor.
 unsigned int ShareBitsFromMain(unsigned int nMainBits, const CBigNum& bnFloor);

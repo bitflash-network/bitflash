@@ -33,6 +33,10 @@ bool P2PoolSubmitShare(const p2pool::Share& share, string& errOut, bool* pfBlock
 extern CCriticalSection cs_p2pool;
 p2pool::ShareChain& P2PoolChain();
 
+// At startup, once the block index is loaded: read the share chain this node
+// saved in p2pool.dat (every two minutes while it runs).
+void P2PoolInit();
+
 // The main chain as the share chain sees it, from the block index. Callers
 // hold cs_main.
 class NodeMainView : public p2pool::MainView

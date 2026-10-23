@@ -5220,17 +5220,28 @@ static int RunP2PoolSyncSelfTest()
                    strprintf("a running chain of %u shares hands over %u, uncles included", nShares,
                              (unsigned)hist.size()).c_str()) ? 0 : 1;
 
-    // A starting node takes it in messages of 400.
+    // A starting node takes it in messages of 400 -- one that has never seen
+    // the main block all that history was mined on (orphaned since, say):
+    // the shares keep their worth, and their coinbases state the height.
+    TestMainView mainB = main;
+    mainB.heights.erase(main.BlockAt(main.nTip));
     p2pool::ShareChain b(bnFloor, false);
     int nTipHeight = a.Height(a.Tip());
     bool fSynced = true;
     for (size_t i = 0; i < hist.size() && fSynced; i += 400)
     {
         vector<p2pool::Share> part(hist.begin() + i, hist.begin() + std::min(hist.size(), i + 400));
-        fSynced = b.AddHistory(part, nTipHeight, main, err);
+        fSynced = b.AddHistory(part, nTipHeight, mainB, err);
     }
     if (!fSynced) printf("       %s\n", err.c_str());
-    nFail += Check(fSynced && b.Tip() == a.Tip(), "it ends on the same tip") ? 0 : 1;
+    nFail += Check(fSynced && b.Tip() == a.Tip(), "it ends on the same tip, though it never saw their main block") ? 0 : 1;
+
+    // That leniency is for history only: fresh off a miner, the main block
+    // must be one this node has.
+    p2pool::Share fresh = ChainShare(a, main, a.Tip(), script(4), t + 10 * nShares + 2);
+    p2pool::ShareChain probe = b;
+    nFail += Check(!probe.Add(fresh, mainB, err) && err == "mined on a main block this node does not have",
+                   "a fresh share on a main block this node lacks waits") ? 0 : 1;
 
     // And from there checks the next share in full, exactly as the running node does.
     p2pool::Share next = ChainShare(a, main, a.Tip(), script(3), t + 10 * nShares + 5);

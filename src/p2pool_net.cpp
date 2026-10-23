@@ -14,12 +14,98 @@ static const size_t MAX_ORPHAN_SHARES = 256;
 static const size_t MAX_GETSH = 500;
 static const size_t SHARES_PER_MESSAGE = 400;
 
+// The share chain lives in p2pool.dat between runs: what History() returns,
+// oldest first, read back the way a peer's history is (work alone for the
+// deep end, in full for the newest RETARGET_SHARES). Without it a restart
+// started a new chain at height 0 until a peer answered.
+static string P2PoolFile()
+{
+    return GetAppDir() + "/p2pool.dat";
+}
+
+static void LoadShares(ShareChain& chain)
+{
+    vector<Share> v;
+    int nTipHeight = 0;
+    try
+    {
+        CAutoFile file(fopen(P2PoolFile().c_str(), "rb"));
+        if (!file)
+            return;
+        file >> nTipHeight >> v;
+    }
+    catch (std::exception& e)
+    {
+        printf("p2pool: %s unreadable (%s); starting from peers\n", P2PoolFile().c_str(), e.what());
+        return;
+    }
+    NodeMainView main;   // the caller holds cs_main
+    string err;
+    if (!chain.AddHistory(v, nTipHeight, main, err))
+        printf("p2pool: saved share chain refused (%s); starting from peers\n", err.c_str());
+    printf("p2pool: %u shares loaded, tip at height %d\n", (unsigned)chain.Size(), chain.Height(chain.Tip()));
+}
+
+static void SaveShares(const ShareChain& chain)
+{
+    vector<Share> v;
+    chain.History(v);
+    int nTipHeight = chain.Height(chain.Tip());
+    string tmp = P2PoolFile() + ".new";
+    {
+        CAutoFile file(fopen(tmp.c_str(), "wb"));
+        if (!file)
+            return;
+        file << nTipHeight << v;
+    }
+    // Windows will not rename over an existing file.
+    remove(P2PoolFile().c_str());
+    rename(tmp.c_str(), P2PoolFile().c_str());
+}
+
 ShareChain& P2PoolChain()
 {
     static ShareChain* pChain = NULL;
     if (!pChain)
         pChain = new ShareChain(bnProofOfWorkLimit);
     return *pChain;
+}
+
+void P2PoolInit()
+{
+    // cs_main before cs_p2pool, the order every other caller takes them in.
+    CRITICAL_BLOCK(cs_main)
+        CRITICAL_BLOCK(cs_p2pool)
+            LoadShares(P2PoolChain());
+}
+
+// Under cs_p2pool.
+static void MaybeSaveShares()
+{
+    static int64 nLastSave = 0;
+    if (GetTime() - nLastSave < 120)
+        return;
+    nLastSave = GetTime();
+    SaveShares(P2PoolChain());
+}
+
+// A share that is also a block: what its coinbase pays, so every node -- not
+// only the finder's -- can be audited against its own share chain.
+static void LogBlockPayouts(const Share& s)
+{
+    int nHeight = 0;
+    CoinbaseHeight(s.coinbase, nHeight);
+    printf("p2pool: share %s is a block on main height %d; its coinbase pays:\n",
+           s.GetId().ToString().substr(0, 12).c_str(), nHeight);
+    foreach(const CTxOut& o, s.coinbase.vout)
+    {
+        uint160 h;
+        vector<vector<unsigned char> > vSol;
+        txnouttype type;
+        string strTo = SolverTyped(o.scriptPubKey, type, vSol) && type == TX_PUBKEYHASH
+                     ? Hash160ToAddress(uint160(vSol[0])) : HexStr(o.scriptPubKey.begin(), o.scriptPubKey.end());
+        printf("p2pool:   %s %s\n", FormatMoney(o.nValue).c_str(), strTo.c_str());
+    }
 }
 
 bool NodeMainView::BlockInfo(const uint256& hash, int& nHeightOut, unsigned int& nNextBitsOut) const
@@ -81,6 +167,10 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
             LogPrint("p2pool", "p2pool: share %s height %u accepted%s\n",
                      cur.GetId().ToString().substr(0, 12).c_str(), cur.data.nShareHeight,
                      fBlock ? " (it is a block)" : "");
+            if (fBlock)
+                LogBlockPayouts(cur);
+            CRITICAL_BLOCK(cs_p2pool)
+                MaybeSaveShares();
             if (!fHistory)
                 RelayShare(cur, pfrom);
             map<uint256, vector<Share> >::iterator it = mapOrphanShares.find(cur.GetId());
@@ -111,9 +201,17 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
 bool P2PoolSubmitShare(const Share& share, string& errOut, bool* pfBlock)
 {
     NodeMainView main;
-    bool fOk;
+    bool fOk, fBlock = false;
     CRITICAL_BLOCK(cs_p2pool)
-        fOk = P2PoolChain().Add(share, main, errOut, NULL, pfBlock);
+    {
+        fOk = P2PoolChain().Add(share, main, errOut, NULL, &fBlock);
+        if (fOk)
+            MaybeSaveShares();
+    }
+    if (pfBlock)
+        *pfBlock = fBlock;
+    if (fOk && fBlock)
+        LogBlockPayouts(share);
     if (fOk)
         RelayShare(share, NULL);
     return fOk;

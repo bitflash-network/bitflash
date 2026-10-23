@@ -42,6 +42,28 @@ unsigned int ShareBitsFromMain(unsigned int nMainBits, const CBigNum& bnFloor)
     return bn.GetCompact();
 }
 
+// The block height a coinbase states in its first push (rules v2, BIP34).
+bool CoinbaseHeight(const CTransaction& coinbase, int& nHeightOut)
+{
+    if (!coinbase.IsCoinBase())
+        return false;
+    const CScript& s = coinbase.vin[0].scriptSig;
+    CScript::const_iterator pc = s.begin();
+    opcodetype op;
+    vector<unsigned char> push;
+    if (!s.GetOp(pc, op, push))
+        return false;
+    if (op >= OP_1 && op <= OP_16)
+    {
+        nHeightOut = (int)op - (int)(OP_1 - 1);
+        return true;
+    }
+    if (push.empty() || push.size() > 4)
+        return false;
+    nHeightOut = CBigNum(push).getint();
+    return true;
+}
+
 const ShareChain::Entry* ShareChain::Get(const uint256& id) const
 {
     map<uint256, Entry>::const_iterator it = mapShares.find(id);
@@ -241,15 +263,28 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool*
     if ((int)d.nShareHeight != nHeight)
         return Fail(errOut, "wrong share height");
 
-    // Its place in the main chain: on a block we have, recent, right bits.
+    // Its place in the main chain: a fresh share on a block we have, recent,
+    // with the right bits. A share from history keeps its worth whatever
+    // became of the block it was mined on -- orphaned since, or never seen
+    // here -- so it needs only the height its coinbase states (rules v2).
     int nPrevHeight;
     unsigned int nNextBits;
-    if (!main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
-        return Fail(errOut, "mined on a main block this node does not have");
-    if (!fHistory && nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
-        return Fail(errOut, "mined on a stale main block");
-    if (s.nBits != nNextBits)
-        return Fail(errOut, "wrong main-chain bits");
+    if (main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
+    {
+        if (!fHistory && nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
+            return Fail(errOut, "mined on a stale main block");
+        if (s.nBits != nNextBits)
+            return Fail(errOut, "wrong main-chain bits");
+    }
+    else
+    {
+        if (!fHistory)
+            return Fail(errOut, "mined on a main block this node does not have");
+        int nHeight;
+        if (!CoinbaseHeight(s.coinbase, nHeight) || nHeight < 1)
+            return Fail(errOut, "a history share whose coinbase states no height");
+        nPrevHeight = nHeight - 1;
+    }
 
     // Time: after the median of the last 11 shares, not far in the future.
     if ((int64)s.nTime > main.Now() + MAX_SHARE_FUTURE)

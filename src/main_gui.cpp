@@ -12,6 +12,7 @@
 #include "treasury.h"
 #include "walletcmd.h"
 #include "jsonrpc.h"
+#include "p2pool_net.h"
 #include <thread>          // hardware_concurrency, to sanity-check /genproclimit
 #ifndef _WIN32
 #include <csignal>
@@ -1081,6 +1082,9 @@ int main(int argc, char* argv[])
                           "but never delete wallet.dat, which holds your keys.");
         return 1;
     }
+    // The share chain this node kept (p2pool.dat); every node relays shares,
+    // so every node keeps it, mining or not.
+    P2PoolInit();
 #endif
 
     printf("Loading wallet...\n");
