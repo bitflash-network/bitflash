@@ -58,7 +58,7 @@ CBlock Share::Header() const
 }
 
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut)
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW)
 {
     fBlockOut = false;
     errOut.clear();
@@ -89,10 +89,13 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
     if (bnShare < bnBlock)
         return Fail(errOut, "share target harder than the block's");
 
-    uint256 hashPoW = share.Header().GetPoWHash();
-    if (CBigNum(hashPoW) > bnShare)
-        return Fail(errOut, "RandomX work does not meet the share target");
-    fBlockOut = CBigNum(hashPoW) <= bnBlock;
+    if (fCheckPoW)
+    {
+        uint256 hashPoW = share.Header().GetPoWHash();
+        if (CBigNum(hashPoW) > bnShare)
+            return Fail(errOut, "RandomX work does not meet the share target");
+        fBlockOut = CBigNum(hashPoW) <= bnBlock;
+    }
 
     // It pays the window exactly, and pays at least the subsidy.
     int64 nTotal = 0;

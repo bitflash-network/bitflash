@@ -10,7 +10,7 @@
 #include "bip32.h"
 #include "proxy.h"
 #include "selftest.h"
-#include "p2pool_share.h"
+#include "p2pool_chain.h"
 #ifndef _WIN32
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
@@ -4905,6 +4905,253 @@ static int RunP2PoolShareSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-chain: which line, which target, who is paid -----------------
+
+// A main chain of fixed blocks, enough for the share chain to place shares.
+class TestMainView : public p2pool::MainView
+{
+public:
+    map<uint256, int> heights;
+    unsigned int nBits;
+    int nTip;
+    int64 nNow;
+    bool BlockInfo(const uint256& hash, int& nHeightOut, unsigned int& nNextBitsOut) const
+    {
+        map<uint256, int>::const_iterator it = heights.find(hash);
+        if (it == heights.end())
+            return false;
+        nHeightOut = it->second;
+        nNextBitsOut = nBits;
+        return true;
+    }
+    int TipHeight() const { return nTip; }
+    int64 Now() const { return nNow; }
+    uint256 BlockAt(int h) const
+    {
+        for (map<uint256, int>::const_iterator it = heights.begin(); it != heights.end(); ++it)
+            if (it->second == h)
+                return it->first;
+        return 0;
+    }
+};
+
+// A share on 'parent' that pays exactly what the chain says it must. The
+// RandomX work is not done: this chain is built with fCheckPoW off.
+static p2pool::Share ChainShare(const p2pool::ShareChain& chain, const TestMainView& main, const uint256& parent,
+                                const vector<unsigned char>& payout, unsigned int nTime,
+                                const vector<uint256>& uncles = vector<uint256>())
+{
+    p2pool::Share s;
+    s.data.hashPrevShare = parent;
+    s.data.nShareHeight = parent == 0 ? 0 : chain.Height(parent) + 1;
+    s.data.vUncles = uncles;
+    s.data.payoutScript = payout;
+    s.data.nShareBits = chain.NextShareBits(parent, main.nBits);
+
+    vector<p2pool::WindowShare> window;
+    vector<p2pool::Payout> pay;
+    string err;
+    chain.WindowFor(s.data, p2pool::WorkOf(s.data.nShareBits), window, err);
+    p2pool::ComputePayouts(window, CBlock().GetBlockValue(main.nTip + 1, 0), pay, err);
+
+    s.coinbase.vin.resize(1);
+    s.coinbase.vin[0].prevout.SetNull();
+    s.coinbase.vin[0].scriptSig << (main.nTip + 1) << (int64)nTime << p2pool::CommitmentPush(s.data.GetHash());
+    for (size_t i = 0; i < pay.size(); i++)
+        s.coinbase.vout.push_back(CTxOut(pay[i].value, CScript(pay[i].script.begin(), pay[i].script.end())));
+    s.nVersion = 1;
+    s.hashPrevBlock = main.BlockAt(main.nTip);
+    s.hashMerkleRoot = s.coinbase.GetHash();
+    s.nTime = nTime;
+    s.nBits = main.nBits;
+    s.nNonce = 0;
+    return s;
+}
+
+static int RunP2PoolChainSelfTest()
+{
+    printf("p2pool-chain self-test\n");
+    int nFail = 0;
+    string err;
+
+    TestMainView main;
+    main.nBits = 0x1d00ffff;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    CBigNum bnFloor;
+    bnFloor.SetCompact(0x207fffff);
+
+    auto script = [](unsigned char tag) {
+        vector<unsigned char> s;
+        s.push_back(0x76); s.push_back(0xa9); s.push_back(20);
+        for (int i = 0; i < 20; i++) s.push_back(tag);
+        s.push_back(0x88); s.push_back(0xac);
+        return s;
+    };
+    const vector<unsigned char> A = script(1), B = script(2), C = script(3);
+
+    // ---- a line, a fork, the heavier side wins
+    {
+        p2pool::ShareChain chain(bnFloor, false);
+        unsigned int t = (unsigned int)main.nNow - 5000;
+        p2pool::Share s0 = ChainShare(chain, main, 0, A, t);
+        nFail += Check(chain.Add(s0, main, err) && chain.Tip() == s0.GetId() && chain.Height(s0.GetId()) == 0,
+                       "the first share starts the chain") ? 0 : 1;
+        uint256 prev = s0.GetId();
+        vector<uint256> line(1, prev);
+        for (int i = 1; i <= 4; i++)
+        {
+            p2pool::Share s = ChainShare(chain, main, prev, i % 2 ? B : A, t + 10 * i);
+            if (!chain.Add(s, main, err)) { printf("       %s\n", err.c_str()); nFail++; }
+            prev = s.GetId();
+            line.push_back(prev);
+        }
+        nFail += Check(chain.Tip() == line[4] && chain.Height(line[4]) == 4, "four more on it: the tip is the fifth") ? 0 : 1;
+
+        p2pool::ShareData d;
+        d.hashPrevShare = line[4];
+        d.payoutScript = C;
+        vector<p2pool::WindowShare> w;
+        vector<p2pool::Payout> pay;
+        bool fWin = chain.WindowFor(d, 100, w, err) && p2pool::ComputePayouts(w, 50 * COIN, pay, err);
+        int64 nSum = 0;
+        for (size_t i = 0; i < pay.size(); i++) nSum += pay[i].value;
+        nFail += Check(fWin && w.size() == 6 && pay.size() == 3 && nSum == 50 * COIN,
+                       "a share on that tip pays the five before it and itself, the whole block") ? 0 : 1;
+
+        // A rival branch from the third share, two shares longer: it wins.
+        uint256 fork = line[2];
+        for (int i = 0; i < 3; i++)
+        {
+            p2pool::Share s = ChainShare(chain, main, fork, C, t + 25 + 10 * i);
+            if (!chain.Add(s, main, err)) { printf("       %s\n", err.c_str()); nFail++; }
+            fork = s.GetId();
+        }
+        nFail += Check(chain.Tip() == fork, "a branch with more work takes the tip") ? 0 : 1;
+
+        p2pool::Share dup = ChainShare(chain, main, line[4], A, t + 60);
+        chain.Add(dup, main, err);
+        nFail += Check(!chain.Add(dup, main, err) && err == "already have this share", "the same share twice is refused") ? 0 : 1;
+
+        p2pool::Share bad = ChainShare(chain, main, line[4], A, t + 61);
+        bad.data.nShareHeight = 9;
+        bad.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << p2pool::CommitmentPush(bad.data.GetHash());
+        bad.hashMerkleRoot = bad.coinbase.GetHash();
+        nFail += Check(!chain.Add(bad, main, err) && err == "wrong share height", "a wrong share height is refused") ? 0 : 1;
+
+        bool fMissing = false;
+        p2pool::Share orphan = ChainShare(chain, main, line[4], A, t + 62);
+        orphan.data.hashPrevShare = Hash(BEGIN(t), END(t));
+        orphan.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << p2pool::CommitmentPush(orphan.data.GetHash());
+        orphan.hashMerkleRoot = orphan.coinbase.GetHash();
+        nFail += Check(!chain.Add(orphan, main, err, &fMissing) && fMissing,
+                       "a share whose parent is unknown is refused, asking for the parent") ? 0 : 1;
+
+        p2pool::Share bits = ChainShare(chain, main, line[4], A, t + 63);
+        bits.data.nShareBits = 0x1f00ffff;
+        bits.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << p2pool::CommitmentPush(bits.data.GetHash());
+        bits.hashMerkleRoot = bits.coinbase.GetHash();
+        nFail += Check(!chain.Add(bits, main, err) && err == "wrong share target", "a share target the chain did not set is refused") ? 0 : 1;
+
+        p2pool::Share pay2 = ChainShare(chain, main, line[4], A, t + 64);
+        pay2.coinbase.vout[0].nValue -= 1;
+        pay2.coinbase.vout[1].nValue += 1;
+        pay2.hashMerkleRoot = pay2.coinbase.GetHash();
+        nFail += Check(!chain.Add(pay2, main, err) && err == "the coinbase does not pay the window", "a share paying the window wrongly is refused") ? 0 : 1;
+
+        p2pool::Share stale = ChainShare(chain, main, line[4], A, t + 65);
+        stale.hashPrevBlock = main.BlockAt(60990);
+        nFail += Check(!chain.Add(stale, main, err) && err == "mined on a stale main block", "a share mined on a stale main block is refused") ? 0 : 1;
+
+        p2pool::Share future = ChainShare(chain, main, line[4], A, (unsigned int)main.nNow + 600);
+        nFail += Check(!chain.Add(future, main, err) && err == "share time too far in the future", "a share from ten minutes ahead is refused") ? 0 : 1;
+
+        p2pool::Share old = ChainShare(chain, main, line[4], A, t);
+        nFail += Check(!chain.Add(old, main, err) && err == "share time not after the median of the last 11", "a share timed before the median of its line is refused") ? 0 : 1;
+    }
+
+    // ---- uncles
+    {
+        p2pool::ShareChain chain(bnFloor, false);
+        unsigned int t = (unsigned int)main.nNow - 5000;
+        p2pool::Share s0 = ChainShare(chain, main, 0, A, t);       chain.Add(s0, main, err);
+        p2pool::Share s1 = ChainShare(chain, main, s0.GetId(), A, t + 10); chain.Add(s1, main, err);
+        p2pool::Share s2a = ChainShare(chain, main, s1.GetId(), A, t + 20); chain.Add(s2a, main, err);
+        p2pool::Share s2b = ChainShare(chain, main, s1.GetId(), B, t + 21); chain.Add(s2b, main, err);
+        vector<uint256> cand = chain.UncleCandidates(s2a.GetId());
+        nFail += Check(cand.size() == 1 && cand[0] == s2b.GetId(),
+                       "the share found beside the parent is offered as an uncle") ? 0 : 1;
+
+        p2pool::Share s3 = ChainShare(chain, main, s2a.GetId(), C, t + 30, cand);
+        nFail += Check(chain.Add(s3, main, err), "a share naming it as uncle is accepted") ? 0 : 1;
+        if (!err.empty()) printf("       %s\n", err.c_str());
+
+        p2pool::ShareData d;
+        d.hashPrevShare = s3.GetId();
+        d.payoutScript = C;
+        vector<p2pool::WindowShare> w;
+        chain.WindowFor(d, 0 + 1, w, err);
+        uint64_t nB = 0, nWork = p2pool::WorkOf(s2b.data.nShareBits);
+        for (size_t i = 0; i < w.size(); i++)
+            if (w[i].payoutScript == B) nB += w[i].work;
+        nFail += Check(nB == nWork / 5 * 4 + (nWork % 5) * 4 / 5, "the uncle is paid 80% of its work") ? 0 : 1;
+
+        p2pool::Share again = ChainShare(chain, main, s3.GetId(), A, t + 40, vector<uint256>(1, s2b.GetId()));
+        nFail += Check(!chain.Add(again, main, err) && err == "an uncle already paid as one", "an uncle already paid cannot be named again") ? 0 : 1;
+        p2pool::Share anc = ChainShare(chain, main, s3.GetId(), A, t + 41, vector<uint256>(1, s2a.GetId()));
+        nFail += Check(!chain.Add(anc, main, err) && err == "an uncle that is an ancestor", "an ancestor cannot be an uncle") ? 0 : 1;
+
+        uint256 prev = s3.GetId();
+        for (int i = 0; i < 3; i++)
+        {
+            p2pool::Share s = ChainShare(chain, main, prev, A, t + 50 + 10 * i);
+            chain.Add(s, main, err);
+            prev = s.GetId();
+        }
+        p2pool::Share s2c = ChainShare(chain, main, s1.GetId(), B, t + 22);
+        chain.Add(s2c, main, err);
+        p2pool::Share late = ChainShare(chain, main, prev, A, t + 90, vector<uint256>(1, s2c.GetId()));
+        nFail += Check(!chain.Add(late, main, err) && err == "an uncle too old or not older", "an uncle more than three shares old is refused") ? 0 : 1;
+    }
+
+    // ---- the share target follows the pace
+    {
+        unsigned int nInit = p2pool::ShareBitsFromMain(main.nBits, bnFloor);
+        CBigNum bnInit;
+        bnInit.SetCompact(nInit);
+        for (int pace = 0; pace < 2; pace++)
+        {
+            p2pool::ShareChain chain(bnFloor, false);
+            unsigned int nSpacing = pace == 0 ? 5 : 50;
+            unsigned int t = (unsigned int)main.nNow - 50 * p2pool::RETARGET_SHARES - 100;
+            uint256 prev = 0;
+            bool fOk = true;
+            for (unsigned int i = 0; i < p2pool::RETARGET_SHARES && fOk; i++)
+            {
+                p2pool::Share s = ChainShare(chain, main, prev, (i % 3) ? A : B, t + nSpacing * i);
+                fOk = chain.Add(s, main, err);
+                prev = s.GetId();
+            }
+            if (!fOk) printf("       %s\n", err.c_str());
+            CBigNum bnNext;
+            bnNext.SetCompact(chain.NextShareBits(prev, main.nBits));
+            if (pace == 0)
+                nFail += Check(fOk && bnNext * 2 <= bnInit + bnInit / 1000 && bnNext * 2 >= bnInit - bnInit / 1000,
+                               "720 shares at 5 s instead of 10: the target halves") ? 0 : 1;
+            else
+                nFail += Check(fOk && bnNext * 4 <= bnInit * 16 + bnInit / 100 && bnNext >= bnInit * 4 - bnInit / 100,
+                               "720 shares at 50 s: the target eases, by four at most") ? 0 : 1;
+        }
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -7409,6 +7656,8 @@ int RunSelfTest(const std::string& name)
         return RunChatRelaySelfTest();
     if (name == "chat-wallet")
         return RunChatWalletSelfTest();
+    if (name == "p2pool-chain")
+        return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")
         return RunP2PoolShareSelfTest();
     if (name == "rules-v3")

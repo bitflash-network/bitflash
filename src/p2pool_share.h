@@ -85,7 +85,7 @@ struct Share
 // total of at least the subsidy. On success fBlockOut says whether the work
 // also meets nBits, which makes the share a Bitflash block.
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut);
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW = true);
 
 } // namespace p2pool
 

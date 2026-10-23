@@ -1,0 +1,321 @@
+// Copyright (c) 2026 Bitflash developers
+// Distributed under the MIT/X11 software license.
+
+#include "headers.h"
+#include "p2pool_chain.h"
+
+#include <algorithm>
+
+namespace p2pool
+{
+
+static bool Fail(string& errOut, const char* why)
+{
+    errOut = why;
+    return false;
+}
+
+uint64_t WorkOf(unsigned int nBits)
+{
+    CBigNum bnTarget;
+    bnTarget.SetCompact(nBits);
+    if (bnTarget <= 0)
+        return 0;
+    CBigNum bnWork = (CBigNum(1) << 256) / (bnTarget + 1);
+    CBigNum bnMax((uint64)0xFFFFFFFFFFFFFFFFULL);
+    if (bnWork > bnMax)
+        return 0xFFFFFFFFFFFFFFFFULL;
+    uint256 w = bnWork.getuint256();
+    uint64_t n = 0;
+    for (int i = 7; i >= 0; i--)
+        n = (n << 8) | w.begin()[i];
+    return n;
+}
+
+unsigned int ShareBitsFromMain(unsigned int nMainBits, const CBigNum& bnFloor)
+{
+    CBigNum bn;
+    bn.SetCompact(nMainBits);
+    bn *= SHARES_PER_BLOCK;
+    if (bn > bnFloor)
+        bn = bnFloor;
+    return bn.GetCompact();
+}
+
+const ShareChain::Entry* ShareChain::Get(const uint256& id) const
+{
+    map<uint256, Entry>::const_iterator it = mapShares.find(id);
+    return it == mapShares.end() ? NULL : &it->second;
+}
+
+int ShareChain::Height(const uint256& id) const
+{
+    const Entry* e = Get(id);
+    return e ? e->nHeight : -1;
+}
+
+// Is 'id' on the line ending at 'from', within nDepth steps back (0: from itself)?
+bool ShareChain::OnLine(const uint256& id, const uint256& from, int nDepth) const
+{
+    uint256 cur = from;
+    for (int i = 0; i <= nDepth && cur != 0; i++)
+    {
+        if (cur == id)
+            return true;
+        const Entry* e = Get(cur);
+        if (!e)
+            return false;
+        cur = e->share.data.hashPrevShare;
+    }
+    return false;
+}
+
+// Has a share on the line ending at 'from', within nDepth, already named it?
+bool ShareChain::UncleTaken(const uint256& uncle, const uint256& from, int nDepth) const
+{
+    uint256 cur = from;
+    for (int i = 0; i <= nDepth && cur != 0; i++)
+    {
+        const Entry* e = Get(cur);
+        if (!e)
+            return false;
+        const vector<uint256>& v = e->share.data.vUncles;
+        if (std::find(v.begin(), v.end(), uncle) != v.end())
+            return true;
+        cur = e->share.data.hashPrevShare;
+    }
+    return false;
+}
+
+bool ShareChain::CheckUncles(const ShareData& d, const uint256& parent, int nHeight, string& errOut) const
+{
+    for (size_t i = 0; i < d.vUncles.size(); i++)
+    {
+        const uint256& u = d.vUncles[i];
+        if (std::count(d.vUncles.begin(), d.vUncles.end(), u) != 1)
+            return Fail(errOut, "an uncle named twice");
+        const Entry* e = Get(u);
+        if (!e)
+            return Fail(errOut, "an unknown uncle");
+        if (e->nHeight >= nHeight || e->nHeight < nHeight - MAX_UNCLE_DEPTH)
+            return Fail(errOut, "an uncle too old or not older");
+        // A sibling of the line, not a share on it: its parent is on the
+        // line, it is not.
+        if (OnLine(u, parent, MAX_UNCLE_DEPTH))
+            return Fail(errOut, "an uncle that is an ancestor");
+        if (!OnLine(e->share.data.hashPrevShare, parent, MAX_UNCLE_DEPTH))
+            return Fail(errOut, "an uncle off this line");
+        if (UncleTaken(u, parent, MAX_UNCLE_DEPTH))
+            return Fail(errOut, "an uncle already paid as one");
+    }
+    return true;
+}
+
+unsigned int ShareChain::NextShareBits(const uint256& parent, unsigned int nMainBits) const
+{
+    const Entry* p = Get(parent);
+    if (!p || p->nHeight + 1 < (int)RETARGET_SHARES)
+        return ShareBitsFromMain(nMainBits, bnFloor);
+
+    // The mean target of the last RETARGET_SHARES shares, scaled by how much
+    // faster or slower than SHARE_SPACING they came, by at most 4 either way.
+    CBigNum bnSum = 0;
+    const Entry* e = p;
+    const Entry* first = p;
+    for (unsigned int i = 0; i < RETARGET_SHARES && e; i++)
+    {
+        CBigNum bn;
+        bn.SetCompact(e->share.data.nShareBits);
+        bnSum += bn;
+        first = e;
+        e = Get(e->share.data.hashPrevShare);
+    }
+    int64 nExpected = (int64)(RETARGET_SHARES - 1) * SHARE_SPACING;
+    int64 nActual = (int64)p->share.nTime - (int64)first->share.nTime;
+    if (nActual < nExpected / 4) nActual = nExpected / 4;
+    if (nActual > nExpected * 4) nActual = nExpected * 4;
+
+    CBigNum bnNew = bnSum / (int64)RETARGET_SHARES;
+    bnNew *= nActual;
+    bnNew /= nExpected;
+
+    // Never easier than the floor, never harder than a block.
+    CBigNum bnMain;
+    bnMain.SetCompact(nMainBits);
+    if (bnNew > bnFloor) bnNew = bnFloor;
+    if (bnNew < bnMain) bnNew = bnMain;
+    return bnNew.GetCompact();
+}
+
+bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowShare>& out, string& errOut) const
+{
+    out.clear();
+    // One share and its uncles: 80% of each uncle's work to the uncle, the
+    // rest to the share that named it. Integer split, nothing lost.
+    struct Credit
+    {
+        static void Share(vector<WindowShare>& v, const vector<unsigned char>& script, uint64_t work,
+                          const vector<uint256>& uncles, const ShareChain& c)
+        {
+            uint64_t bonus = 0;
+            for (size_t i = 0; i < uncles.size(); i++)
+            {
+                const Entry* u = c.Get(uncles[i]);
+                if (!u)
+                    continue;
+                uint64_t paid = u->work / 5 * 4 + (u->work % 5) * 4 / 5;
+                WindowShare w;
+                w.payoutScript = u->share.data.payoutScript;
+                w.work = paid;
+                if (w.work) v.push_back(w);
+                bonus += u->work - paid;
+            }
+            WindowShare w;
+            w.payoutScript = script;
+            w.work = work + bonus;
+            v.push_back(w);
+        }
+    };
+
+    Credit::Share(out, d.payoutScript, nOwnWork, d.vUncles, *this);
+    uint256 cur = d.hashPrevShare;
+    for (unsigned int n = 1; n < WINDOW_SHARES && cur != 0; n++)
+    {
+        // A hole in the window means this node has not synced enough share
+        // history to know what the share must pay; guessing would make it
+        // disagree with nodes that have.
+        const Entry* e = Get(cur);
+        if (!e)
+            return Fail(errOut, "the payout window reaches shares this node does not have");
+        Credit::Share(out, e->share.data.payoutScript, e->work, e->share.data.vUncles, *this);
+        cur = e->share.data.hashPrevShare;
+    }
+    if (out.empty())
+        return Fail(errOut, "empty window");
+    return true;
+}
+
+vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
+{
+    vector<uint256> v;
+    const Entry* p = Get(parent);
+    if (!p)
+        return v;
+    int nHeight = p->nHeight + 1;
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end() && v.size() < MAX_UNCLES; ++it)
+    {
+        const Entry& e = it->second;
+        if (e.nHeight >= nHeight || e.nHeight < nHeight - MAX_UNCLE_DEPTH)
+            continue;
+        if (OnLine(it->first, parent, MAX_UNCLE_DEPTH) ||
+            !OnLine(e.share.data.hashPrevShare, parent, MAX_UNCLE_DEPTH) ||
+            UncleTaken(it->first, parent, MAX_UNCLE_DEPTH))
+            continue;
+        v.push_back(it->first);
+    }
+    return v;
+}
+
+bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, bool* pfMissingParent, bool* pfBlock)
+{
+    if (pfMissingParent) *pfMissingParent = false;
+    if (pfBlock) *pfBlock = false;
+    const ShareData& d = s.data;
+    uint256 id = s.GetId();
+    if (Has(id))
+        return Fail(errOut, "already have this share");
+
+    // Its place in the share chain.
+    const Entry* parent = NULL;
+    if (d.hashPrevShare != 0)
+    {
+        parent = Get(d.hashPrevShare);
+        if (!parent)
+        {
+            if (pfMissingParent) *pfMissingParent = true;
+            return Fail(errOut, "unknown parent share");
+        }
+    }
+    int nHeight = parent ? parent->nHeight + 1 : 0;
+    if ((int)d.nShareHeight != nHeight)
+        return Fail(errOut, "wrong share height");
+
+    // Its place in the main chain: on a block we have, recent, right bits.
+    int nPrevHeight;
+    unsigned int nNextBits;
+    if (!main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
+        return Fail(errOut, "mined on a main block this node does not have");
+    if (nPrevHeight + MAX_MAIN_LAG < main.TipHeight())
+        return Fail(errOut, "mined on a stale main block");
+    if (s.nBits != nNextBits)
+        return Fail(errOut, "wrong main-chain bits");
+
+    // Time: after the median of the last 11 shares, not far in the future.
+    if ((int64)s.nTime > main.Now() + MAX_SHARE_FUTURE)
+        return Fail(errOut, "share time too far in the future");
+    if (parent)
+    {
+        vector<unsigned int> times;
+        const Entry* e = parent;
+        for (int i = 0; i < 11 && e; i++)
+        {
+            times.push_back(e->share.nTime);
+            e = Get(e->share.data.hashPrevShare);
+        }
+        std::sort(times.begin(), times.end());
+        if (s.nTime <= times[times.size() / 2])
+            return Fail(errOut, "share time not after the median of the last 11");
+    }
+
+    if (d.nShareBits != NextShareBits(d.hashPrevShare, s.nBits))
+        return Fail(errOut, "wrong share target");
+    if (!CheckUncles(d, d.hashPrevShare, nHeight, errOut))
+        return false;
+
+    uint64_t nWork = WorkOf(d.nShareBits);
+    vector<WindowShare> window;
+    if (!WindowFor(d, nWork, window, errOut))
+        return false;
+    bool fBlock = false;
+    if (!CheckShare(s, window, nPrevHeight + 1, bnFloor, fBlock, errOut, fCheckPoW))
+        return false;
+
+    Entry e;
+    e.share = s;
+    e.nHeight = nHeight;
+    e.work = nWork;
+    e.bnChainWork = parent ? parent->bnChainWork : CBigNum(0);
+    e.bnChainWork += CBigNum((uint64)nWork);
+    for (size_t i = 0; i < d.vUncles.size(); i++)
+        e.bnChainWork += CBigNum((uint64)Get(d.vUncles[i])->work);
+    mapShares[id] = e;
+
+    // Most work wins; on a tie the line seen first stays.
+    const Entry* tip = Get(hashTip);
+    if (!tip || e.bnChainWork > tip->bnChainWork)
+        hashTip = id;
+    if (pfBlock) *pfBlock = fBlock;
+    Prune();
+    return true;
+}
+
+// Keep what a window, a retarget and the uncle rules can still reach.
+void ShareChain::Prune()
+{
+    const Entry* tip = Get(hashTip);
+    if (!tip)
+        return;
+    int nKeep = (int)(WINDOW_SHARES > RETARGET_SHARES ? WINDOW_SHARES : RETARGET_SHARES) + MAX_UNCLE_DEPTH + 10;
+    int nCut = tip->nHeight - nKeep;
+    if (nCut <= 0)
+        return;
+    for (map<uint256, Entry>::iterator it = mapShares.begin(); it != mapShares.end();)
+    {
+        if (it->second.nHeight < nCut)
+            mapShares.erase(it++);
+        else
+            ++it;
+    }
+}
+
+} // namespace p2pool
