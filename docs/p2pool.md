@@ -68,10 +68,14 @@ uncles pays.
 The coinbase of every template pays the last **2160 shares** (about 6 hours at
 10 s), each in proportion to its difficulty, grouped by payout key:
 
-- one output per distinct payout key, sorted by key, so every node builds the
-  identical transaction;
-- an amount under 0.001 BTF is not paid this block; it stays in the window
-  and is paid by a later block. No coin is lost, nothing is held by anyone;
+- one output per distinct payout script, sorted by script bytes, so every
+  node builds the identical transaction;
+- each output is `floor(value x work / total work)`, in 128-bit integers, no
+  floating point; the satoshis rounding leaves (fewer than one per output) go
+  to the script with the most work. The outputs add up to the block value
+  exactly (`p2pool::ComputePayouts`, `test_p2pool`);
+- no dust floor is needed: at 50 BTF a block and 2160 shares, one share is
+  worth about 0.023 BTF;
 - the block finder gets no bonus. There is nothing to race for;
 - a treasury share (see `treasury.md`), when the operator of a node chose one,
   is that node's own choice and comes out of its own shares only.

@@ -328,7 +328,10 @@ test_chatswap: test_chatswap.cpp chatswap.cpp chatswap.h
 test_bip21: test_bip21.cpp bip21.cpp bip21.h qrcodegen.cpp qrcodegen.hpp
 	$(CXX) $(CXXFLAGS) -o $@ test_bip21.cpp bip21.cpp qrcodegen.cpp
 
-tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 bitflash-node
+test_p2pool: test_p2pool.cpp p2pool.cpp p2pool.h
+	$(CXX) $(CXXFLAGS) -o $@ test_p2pool.cpp p2pool.cpp
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 test_p2pool bitflash-node
 	./test_bip32
 	./test_btfchan
 	./test_btfaddr
@@ -341,6 +344,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./test_community
 	./test_chatswap
 	./test_bip21
+	./test_p2pool
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
