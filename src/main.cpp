@@ -132,6 +132,9 @@ string strPoolStatusFile;
 string strPoolRoundsFile;
 double dPoolFeePercent   = 0.0;
 bool   fStratumBridge    = false;
+bool   fP2PoolMode       = false;
+unsigned short nP2PoolPort = 3333;
+string strP2PoolPayTo;
 int    nStratumBridgePort = 3333;
 string strStratumBridgeBind = "127.0.0.1";
 

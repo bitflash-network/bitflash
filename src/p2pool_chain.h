@@ -50,8 +50,10 @@ class ShareChain
 public:
     // fCheckPoW false skips only the RandomX check, for tests of the chain
     // logic; CheckShare's own selftest covers the work.
+    // hashTip spelled out: uint256 does not zero itself, and a chain with no
+    // shares must answer 0 for its tip, not whatever the memory held.
     explicit ShareChain(const CBigNum& bnFloorIn, bool fCheckPoWIn = true)
-        : bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn) {}
+        : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn) {}
 
     // Verify a share in context and keep it. A share whose parent is not
     // here is refused with *pfMissingParent set, so the caller can ask a

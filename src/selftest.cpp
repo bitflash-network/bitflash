@@ -4993,6 +4993,22 @@ static int RunP2PoolChainSelfTest()
     };
     const vector<unsigned char> A = script(1), B = script(2), C = script(3);
 
+    // ---- an empty chain: tip 0, and a first share's window is the share alone.
+    // On the heap, over memory filled with garbage first: uint256 does not
+    // zero itself, and the miner found a nonzero tip in an empty chain once.
+    {
+        void* p = ::operator new(sizeof(p2pool::ShareChain));
+        memset(p, 0xA5, sizeof(p2pool::ShareChain));
+        p2pool::ShareChain* empty = new (p) p2pool::ShareChain(bnFloor, false);
+        p2pool::ShareData d;
+        d.payoutScript = A;
+        vector<p2pool::WindowShare> w;
+        nFail += Check(empty->Tip() == 0 && d.hashPrevShare == 0 && empty->WindowFor(d, 5, w, err) && w.size() == 1,
+                       "an empty chain has tip 0, and a first share pays itself alone") ? 0 : 1;
+        empty->~ShareChain();
+        ::operator delete(p);
+    }
+
     // ---- a line, a fork, the heavier side wins
     {
         p2pool::ShareChain chain(bnFloor, false);

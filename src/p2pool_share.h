@@ -23,6 +23,9 @@ struct ShareData
     unsigned int nShareBits;          // compact share target
     vector<unsigned char> payoutScript;
 
+    // uint256 does not zero itself: a default ShareData starts a chain.
+    ShareData() : hashPrevShare(0), nShareHeight(0), nShareBits(0) {}
+
     IMPLEMENT_SERIALIZE
     (
         READWRITE(hashPrevShare);
@@ -56,6 +59,8 @@ struct Share
     CTransaction coinbase;
     vector<uint256> vMerkleBranch;    // from the coinbase (index 0) to the root
     ShareData data;
+
+    Share() : nVersion(1), hashPrevBlock(0), hashMerkleRoot(0), nTime(0), nBits(0), nNonce(0) {}
 
     IMPLEMENT_SERIALIZE
     (
