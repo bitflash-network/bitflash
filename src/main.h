@@ -1203,7 +1203,8 @@ public:
     bool AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs=true);
     bool AcceptWalletTransaction() { CTxDB txdb("r"); return AcceptWalletTransaction(txdb); }
 
-    void RelayWalletTransaction(CTxDB& txdb);
+    // fResend: the ten-minute offer again of what has not confirmed (dandelion.h)
+    void RelayWalletTransaction(CTxDB& txdb, bool fResend=false);
     void RelayWalletTransaction() { CTxDB txdb("r"); RelayWalletTransaction(txdb); }
 };
 

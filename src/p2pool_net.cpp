@@ -9,10 +9,20 @@ using namespace p2pool;
 CCriticalSection cs_p2pool;
 
 // Shares whose parent has not arrived, by parent id; tried again when it does.
+// MAX_ORPHAN_SHARES caps the shares held, not the parents waited on: every
+// one of them may be tried, with a RandomX hash, the moment its parent comes.
 static map<uint256, vector<Share> > mapOrphanShares;
+static size_t nOrphanShares = 0;
 static const size_t MAX_ORPHAN_SHARES = 256;
 static const size_t MAX_GETSH = 500;
 static const size_t SHARES_PER_MESSAGE = 400;
+// A share is a block header, a coinbase paying at most one output per share
+// of the window, and a merkle branch; this is several times what that takes.
+static const size_t MAX_SHARE_BYTES = 256 * 1024;
+static const size_t MAX_MERKLE_BRANCH = 32;
+// A peer gets our history once in this long; it is the biggest thing this
+// code sends, and asking is cheap.
+static const int64 SYNC_SERVE_INTERVAL = 10 * 60;
 
 // The share chain lives in p2pool.dat between runs: what History() returns,
 // oldest first, read back the way a peer's history is (work alone for the
@@ -132,17 +142,29 @@ static void RelayShare(const Share& s, CNode* pfrom)
 {
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
-            if (pnode != pfrom)
+            // Not before its version: the framing is not settled until then.
+            if (pnode != pfrom && pnode->nVersion != 0)
                 pnode->PushMessage("p2pshare", s);
 }
 
 // Refusals that say nothing bad about the sender: it may simply be ahead of
-// us, or a moment behind.
+// us, or a moment behind, or see a main chain this node does not. A clock
+// and a main chain are this node's own, so what they refuse is no fault of a
+// peer that saw it differently and passed it on (p2pool_chain.cpp marks
+// those "here:").
 static bool Innocent(const string& err)
 {
     return err == "already have this share" || err == "unknown parent share" ||
            err == "an unknown uncle" ||
-           err == "the payout window reaches shares this node does not have";
+           err == "the payout window reaches shares this node does not have" ||
+           err.compare(0, 5, "here:") == 0;
+}
+
+// Cheap checks a share must pass before anything else is spent on it.
+static bool ShareSane(const Share& s)
+{
+    return ::GetSerializeSize(s, SER_NETWORK) <= MAX_SHARE_BYTES &&
+           s.vMerkleBranch.size() <= MAX_MERKLE_BRANCH;
 }
 
 // Add a share and whatever was waiting for it. Returns false only on a
@@ -177,6 +199,7 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
             if (it != mapOrphanShares.end())
             {
                 todo.insert(todo.end(), it->second.begin(), it->second.end());
+                nOrphanShares -= it->second.size();
                 mapOrphanShares.erase(it);
             }
         }
@@ -184,15 +207,27 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
         {
             // Waits on the first share it lacks; if more are missing when that
             // one comes, it waits again on the next. Every one is asked for now.
-            if (mapOrphanShares.size() < MAX_ORPHAN_SHARES)
+            //
+            // Held only if its own work is real: a share's RandomX hash needs
+            // nothing but the share, and without this check anybody could
+            // queue shares by the thousand for free, each to be hashed later.
+            bool fBlock;
+            string errWork;
+            if (nOrphanShares < MAX_ORPHAN_SHARES && CheckShareWork(cur, bnProofOfWorkLimit, fBlock, errWork))
             {
                 vector<Share>& v = mapOrphanShares[vMissing[0]];
                 bool fQueued = false;
+                uint256 id = cur.GetId();
                 for (size_t i = 0; i < v.size() && !fQueued; i++)
-                    fQueued = v[i].GetId() == cur.GetId();
+                    fQueued = v[i].GetId() == id;
                 if (!fQueued)
+                {
                     v.push_back(cur);
+                    nOrphanShares++;
+                }
             }
+            else if (!errWork.empty() && fFirst)
+                fGood = false;   // no work behind it: the sender made it up
             if (pfrom)
                 pfrom->PushMessage("p2pgetsh", vMissing);
         }
@@ -228,11 +263,17 @@ bool P2PoolSubmitShare(const Share& share, string& errOut, bool* pfBlock)
 
 void P2PoolOnVersion(CNode* pfrom)
 {
-    bool fEmpty;
+    // Every peer while the chain is short of a history, not only the first:
+    // the line with the most work wins, so one peer's history -- honest or
+    // not -- cannot keep out a better one.
+    bool fShort;
     CRITICAL_BLOCK(cs_p2pool)
-        fEmpty = P2PoolChain().Size() == 0;
-    if (fEmpty)
+        fShort = P2PoolChain().Size() < HISTORY_SHARES;
+    if (fShort)
+    {
+        pfrom->fP2PoolSyncAsked = true;
         pfrom->PushMessage("p2psync");
+    }
 }
 
 bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv)
@@ -241,7 +282,7 @@ bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& v
     {
         Share s;
         vRecv >> s;
-        if (!AcceptShare(s, pfrom, false))
+        if (!ShareSane(s) || !AcceptShare(s, pfrom, false))
             pfrom->Misbehaving(20);
         return true;
     }
@@ -272,6 +313,10 @@ bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& v
 
     if (strCommand == "p2psync")
     {
+        // A few bytes in, a whole history out: once per peer per interval.
+        if (pfrom->nP2PoolSyncServed && GetTime() - pfrom->nP2PoolSyncServed < SYNC_SERVE_INTERVAL)
+            return true;
+        pfrom->nP2PoolSyncServed = GetTime();
         vector<Share> history;
         int nTipHeight;
         CRITICAL_BLOCK(cs_p2pool)
@@ -298,17 +343,35 @@ bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& v
             pfrom->Misbehaving(20);
             return true;
         }
+        // A history is what this node asks a peer for, not something a peer
+        // may push: only from one we asked, and no more than one history.
+        if (!pfrom->fP2PoolSyncAsked)
+            return true;
+        pfrom->nP2PoolHistoryRecv += part.size();
+        if (pfrom->nP2PoolHistoryRecv > HISTORY_SHARES + 2 * SHARES_PER_MESSAGE)
+        {
+            pfrom->fP2PoolSyncAsked = false;
+            return true;
+        }
+        int nTop = 0;
+        foreach(const Share& s, part)
+        {
+            if (!ShareSane(s))
+            {
+                pfrom->Misbehaving(20);
+                return true;
+            }
+            nTop = std::max(nTop, (int)s.data.nShareHeight);
+        }
+        // Which shares are deep enough to take on their work alone depends on
+        // the tip height the peer states; it cannot state one further above
+        // what it sends than a history reaches.
+        nTipHeight = std::min(nTipHeight, nTop + (int)HISTORY_SHARES);
         NodeMainView main;
         string err;
         bool fOk = true;
         CRITICAL_BLOCK(cs_p2pool)
-        {
-            // Only while this node is starting: a history is what it asks
-            // for, not something a peer may push on a running chain.
-            if (P2PoolChain().Size() >= HISTORY_SHARES)
-                return true;
             fOk = P2PoolChain().AddHistory(part, nTipHeight, main, err);
-        }
         if (!fOk)
         {
             LogPrint("p2pool", "p2pool: history refused: %s\n", err.c_str());

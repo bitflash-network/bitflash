@@ -1964,7 +1964,7 @@ void ReacceptWalletTransactions()
 }
 
 
-void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
+void CWalletTx::RelayWalletTransaction(CTxDB& txdb, bool fResend)
 {
     // Unconfirmed transactions this one spends. They used to be announced
     // straight from here, which named this node as their source to every
@@ -1981,7 +1981,7 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
             if (LogAcceptsCategory("net")) printf("Relaying wtx %s\n", hash.ToString().substr(0,6).c_str());
             // Our own: into the Dandelion stem, so the peer that hears it
             // first cannot tell it started here (dandelion.h).
-            DandelionRelayOwn((CTransaction)*this, vParents);
+            DandelionRelayOwn((CTransaction)*this, vParents, fResend);
         }
     }
 }
@@ -2005,10 +2005,14 @@ void RelayWalletTransactions()
             CWalletTx& wtx = item.second;
             mapSorted.insert(make_pair(wtx.nTimeReceived, &wtx));
         }
+        // Only what this wallet sent. Offering again what others paid us told
+        // every peer which unconfirmed payments this node cares about, in
+        // one batch every ten minutes; the sender is the one to resend.
         foreach(PAIRTYPE(const unsigned int, CWalletTx*)& item, mapSorted)
         {
             CWalletTx& wtx = *item.second;
-            wtx.RelayWalletTransaction(txdb);
+            if (wtx.fFromMe)
+                wtx.RelayWalletTransaction(txdb, true);
         }
     }
 }
@@ -3225,7 +3229,10 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 {
     switch (inv.type)
     {
-    case MSG_TX:        return mapTransactions.count(inv.hash) || txdb.ContainsTx(inv.hash);
+    // A transaction under a Dandelion embargo here is asked for like one we
+    // lack: otherwise not asking is the answer to "who has it?" (dandelion.h).
+    case MSG_TX:        return (mapTransactions.count(inv.hash) && !DandelionEmbargoed(inv.hash)) ||
+                               txdb.ContainsTx(inv.hash);
     case MSG_BLOCK:     return mapBlockIndex.count(inv.hash) || mapOrphanBlocks.count(inv.hash);
     case MSG_REVIEW:    return true;
     case MSG_PRODUCT:   return mapProducts.count(inv.hash);
@@ -3496,9 +3503,6 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             if (fShutdown)
                 return true;
             pfrom->AddInventoryKnown(inv);
-            // Announced by a peer: whatever we held in a stem has fluffed.
-            if (inv.type == MSG_TX)
-                DandelionSeenFluffed(inv.hash);
 
             bool fAlreadyHave = AlreadyHave(txdb, inv);
             if (LogAcceptsCategory("net")) printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
@@ -3599,7 +3603,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         CInv inv(MSG_TX, tx.GetHash());
         pfrom->AddInventoryKnown(inv);
-        DandelionSeenFluffed(inv.hash);
+        DandelionSeenFluffed(tx);
 
         // A coinbase on its own, or a transaction that fails the shape checks,
         // is not something an honest node relays: it validates first.
@@ -3618,7 +3622,16 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (tx.AcceptTransaction(true, &fMissingInputs))
         {
             AddToWalletIfMine(tx, NULL);
-            RelayMessage(inv, vMsg);
+            // A child of a transaction still under our embargo is not passed
+            // on yet: nodes without the parent could not, and relaying it
+            // would show who holds the parent. Others relay it once the
+            // parent is out.
+            bool fParentEmbargoed = false;
+            foreach(const CTxIn& txin, tx.vin)
+                if (DandelionEmbargoed(txin.prevout.hash))
+                    fParentEmbargoed = true;
+            if (!fParentEmbargoed)
+                RelayMessage(inv, vMsg);
             mapAlreadyAskedFor.erase(inv);
             vWorkQueue.push_back(inv.hash);
 

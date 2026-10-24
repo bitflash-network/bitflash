@@ -55,11 +55,16 @@ static CCriticalSection cs_dandelion;
 static Router g_router;
 
 // Transactions this node put in a stem, with the time it fluffs them itself
-// unless someone else has by then.
+// unless someone else has by then. nRound is -1 for a stem hop, or which
+// connection of its own this was for one of our own transactions: when that
+// embargo runs out the transaction gets another, never an announcement under
+// this node's name, until ONESHOT_ROUNDS have gone.
 struct StemTx
 {
     CTransaction tx;
     int64 nEmbargo;
+    int nRound;
+    StemTx() : nEmbargo(0), nRound(-1) {}
 };
 static map<uint256, StemTx> mapStem;
 static const size_t MAX_STEM = 1000;
@@ -211,7 +216,12 @@ bool DandelionSendOneShot(const vector<CTransaction>& vtx, const string& strHost
     // Not in vNodes: nothing the node sends to its peers -- inventory, peer
     // lists, chat, shares -- can reach this connection. The CNode only frames
     // messages; the socket stays ours.
-    CNode node(INVALID_SOCKET, addrYou, false);
+    //
+    // Built as if inbound for one reason: its version message then carries
+    // the network-adjusted time, not this machine's own clock. A peer that
+    // also holds a long-lived connection from us has measured that clock's
+    // error, and the same error here would tie the two together.
+    CNode node(INVALID_SOCKET, addrYou, true);
     bool fOk = SendAll(s, node);
     SetRecvTimeoutMs(s, 1000);
 
@@ -325,15 +335,23 @@ bool DandelionSendOneShot(const vector<CTransaction>& vtx, const string& strHost
     return fSent;
 }
 
+struct OneShotJob
+{
+    vector<CTransaction> vtx;
+    int nRound;
+    int64 nDelaySpread;
+};
+
 static void ThreadOneShot(void* parg)
 {
-    vector<CTransaction> vtx = *(vector<CTransaction>*)parg;
-    delete (vector<CTransaction>*)parg;
+    OneShotJob job = *(OneShotJob*)parg;
+    delete (OneShotJob*)parg;
+    const vector<CTransaction>& vtx = job.vtx;
     uint256 hash = vtx.back().GetHash();
 
     // Not the instant the wallet made it: a transaction that appears the
     // moment someone clicks Send says when they clicked.
-    int64 nWake = GetTime() + ONESHOT_DELAY_MIN_SECONDS + (int64)GetRand(ONESHOT_DELAY_SPREAD_SECONDS + 1);
+    int64 nWake = GetTime() + ONESHOT_DELAY_MIN_SECONDS + (int64)GetRand(job.nDelaySpread + 1);
     while (!fShutdown && GetTime() < nWake)
         Sleep(250);
 
@@ -375,6 +393,7 @@ static void ThreadOneShot(void* parg)
                     StemTx st;
                     st.tx = tx;
                     st.nEmbargo = GetTime() + EMBARGO_MIN_SECONDS + (int64)GetRand(EMBARGO_SPREAD_SECONDS + 1);
+                    st.nRound = job.nRound;
                     mapStem[h] = st;
                 }
             }
@@ -387,37 +406,58 @@ static void ThreadOneShot(void* parg)
         setOneShotPending.erase(hash);
 }
 
-void DandelionRelayOwn(const CTransaction& tx, const vector<CTransaction>& vParents)
+// A connection of its own for vtx, round nRound. False when it is already on
+// its way. Under neither lock.
+static bool LaunchOneShot(const vector<CTransaction>& vtx, int nRound,
+                          int64 nDelaySpread = ONESHOT_DELAY_SPREAD_SECONDS)
 {
-    vector<CTransaction> vtx = vParents;
-    vtx.push_back(tx);
-    if (!BtfTorProxyEnabled())
-    {
-        foreach(const CTransaction& t, vtx)
-            StemOwn(t);
-        return;
-    }
-    uint256 hash = tx.GetHash();
+    uint256 hash = vtx.back().GetHash();
     CRITICAL_BLOCK(cs_oneshot)
     {
         // The wallet offers its unconfirmed transactions again every ten
         // minutes; one connection at a time for each.
         if (setOneShotPending.count(hash))
-            return;
+            return false;
         CRITICAL_BLOCK(cs_dandelion)
             if (mapStem.count(hash))
-                return;
+                return false;
         setOneShotPending.insert(hash);
     }
-    vector<CTransaction>* pvtx = new vector<CTransaction>(vtx);
-    if (_beginthread(ThreadOneShot, 0, pvtx) == (uintptr_t)-1)
+    OneShotJob* pjob = new OneShotJob;
+    pjob->vtx = vtx;
+    pjob->nRound = nRound;
+    pjob->nDelaySpread = nDelaySpread;
+    if (_beginthread(ThreadOneShot, 0, pjob) == (uintptr_t)-1)
     {
-        delete pvtx;
+        delete pjob;
         CRITICAL_BLOCK(cs_oneshot)
             setOneShotPending.erase(hash);
-        foreach(const CTransaction& t, vtx)
-            StemOwn(t);
+        return false;
     }
+    return true;
+}
+
+void DandelionRelayOwn(const CTransaction& tx, const vector<CTransaction>& vParents, bool fResend)
+{
+    vector<CTransaction> vtx = vParents;
+    vtx.push_back(tx);
+    if (BtfTorProxyEnabled())
+    {
+        // A resend leaves any time in the next ten minutes, each on its own
+        // clock, so the wallet's unconfirmed transactions do not go out
+        // together and name each other.
+        if (LaunchOneShot(vtx, 0, fResend ? ONESHOT_RESEND_SPREAD_SECONDS : ONESHOT_DELAY_SPREAD_SECONDS))
+            return;
+        // Already on its way, or embargoed: nothing more to do now.
+        CRITICAL_BLOCK(cs_oneshot)
+            if (setOneShotPending.count(tx.GetHash()))
+                return;
+        CRITICAL_BLOCK(cs_dandelion)
+            if (mapStem.count(tx.GetHash()))
+                return;
+    }
+    foreach(const CTransaction& t, vtx)
+        StemOwn(t);
 }
 
 void DandelionOnVersion(CNode* pfrom)
@@ -425,10 +465,28 @@ void DandelionOnVersion(CNode* pfrom)
     pfrom->PushMessage("stemok");
 }
 
-void DandelionSeenFluffed(const uint256& hash)
+bool DandelionEmbargoed(const uint256& hash)
 {
+    CRITICAL_BLOCK(cs_oneshot)
+        if (setOneShotPending.count(hash))
+            return true;
     CRITICAL_BLOCK(cs_dandelion)
-        mapStem.erase(hash);
+        if (mapStem.count(hash))
+            return true;
+    return false;
+}
+
+void DandelionSeenFluffed(const CTransaction& tx)
+{
+    // The transaction itself arrived from the network, not only word of it:
+    // whatever we held in a stem is out. Pass it on like anyone would --
+    // a relay that dropped it and announced it only to us must not be able
+    // to bury it in our embargo.
+    bool fHeld = false;
+    CRITICAL_BLOCK(cs_dandelion)
+        fHeld = mapStem.erase(tx.GetHash()) > 0;
+    if (fHeld)
+        Fluff(tx);
 }
 
 void DandelionTick()
@@ -438,6 +496,8 @@ void DandelionTick()
         return;
     nLast = GetTime();
     vector<CTransaction> vDue;
+    vector<StemTx> vAgain;
+    bool fTor = BtfTorProxyEnabled();
     CRITICAL_BLOCK(cs_dandelion)
     {
         RenewEpochIfDue();
@@ -445,12 +505,24 @@ void DandelionTick()
         {
             if (it->second.nEmbargo <= GetTime())
             {
-                vDue.push_back(it->second.tx);
+                if (fTor && it->second.nRound >= 0 && it->second.nRound + 1 < ONESHOT_ROUNDS)
+                    vAgain.push_back(it->second);
+                else
+                    vDue.push_back(it->second.tx);
                 mapStem.erase(it++);
             }
             else
                 ++it;
         }
+    }
+    // One of ours that nobody passed on: another connection of its own, to
+    // another peer, rather than an announcement under this node's name.
+    foreach(const StemTx& st, vAgain)
+    {
+        LogPrint("dandelion", "dandelion: %s embargo over, sending it again over its own circuit\n",
+                 st.tx.GetHash().ToString().substr(0, 10).c_str());
+        if (!LaunchOneShot(vector<CTransaction>(1, st.tx), st.nRound + 1))
+            vDue.push_back(st.tx);
     }
     // A stem that died on the way: fluff it ourselves, so it is never lost.
     foreach(const CTransaction& tx, vDue)
@@ -477,18 +549,22 @@ bool DandelionProcessMessage(CNode* pfrom, const string& strCommand, CDataStream
         pfrom->Misbehaving(100);
         return true;
     }
+    // Malformed in itself: the sender could have known.
+    if (!tx.CheckTransaction())
+    {
+        pfrom->Misbehaving(10);
+        return true;
+    }
     uint256 hash = tx.GetHash();
     CTxDB txdb("r");
     if (mapTransactions.count(hash) || txdb.ContainsTx(hash))
         return true;   // already have it: a loop in the stem, or it fluffed
-    bool fMissingInputs = false;
-    if (!tx.AcceptTransaction(txdb, true, &fMissingInputs))
-    {
-        // An orphan cannot be judged; anything else was invalid.
-        if (!fMissingInputs)
-            pfrom->Misbehaving(10);
+    // Anything else that keeps it out -- a full pool, a fee this node wants
+    // more for, an input a block spent a moment ago -- says nothing bad
+    // about a peer that only passed it on, and the plain tx path does not
+    // punish those either.
+    if (!tx.AcceptTransaction(txdb, true))
         return true;
-    }
     CRITICAL_BLOCK(cs_dandelion)
     {
         RenewEpochIfDue();

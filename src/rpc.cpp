@@ -117,8 +117,15 @@ static std::vector<unsigned char> P2PoolPayoutScript()
     }
     if (vchScript.empty() || GetTime() - nChosenAt > 24 * 60 * 60)
     {
+        // A locked wallet has no key to hand out and returns an empty one;
+        // hashing that would pay every block to a key nobody holds. Keep the
+        // last good key, or none: no script, no templates, and the miner is
+        // told why (P2PoolCoinbase).
+        vector<unsigned char> vchPubKey = GetKeyFromPool();
+        if (vchPubKey.empty())
+            return vchScript;
         CScript s;
-        s << OP_DUP << OP_HASH160 << Hash160(GetKeyFromPool()) << OP_EQUALVERIFY << OP_CHECKSIG;
+        s << OP_DUP << OP_HASH160 << Hash160(vchPubKey) << OP_EQUALVERIFY << OP_CHECKSIG;
         vchScript.assign(s.begin(), s.end());
         nChosenAt = GetTime();
     }
@@ -148,7 +155,10 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
             !p2pool::ComputePayouts(window, block.GetBlockValue(nHeight, nFees), pay, err))
         {
             LogPrint("pool", "[p2pool] no template: %s\n",
-                     d.payoutScript.empty() ? "-p2poolpayto is not a Bitflash address" : err.c_str());
+                     d.payoutScript.empty()
+                         ? (strP2PoolPayTo.empty() ? "the wallet is locked and has no key to pay; unlock it or give -p2poolpayto"
+                                                   : "-p2poolpayto is not a Bitflash address")
+                         : err.c_str());
             return false;
         }
     }

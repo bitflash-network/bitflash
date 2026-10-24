@@ -675,6 +675,11 @@ public:
     bool fNetworkNode;
     bool fDisconnect;
     bool fDandelion;   // said "stemok": takes stem-phase transactions (dandelion.h)
+    // P2Pool history (p2pool_net.cpp): when we last sent this peer ours, whether
+    // we asked it for its own, and how many shares of history it has sent.
+    int64 nP2PoolSyncServed;
+    bool fP2PoolSyncAsked;
+    unsigned int nP2PoolHistoryRecv;
 protected:
     int nRefCount;
 public:
@@ -750,6 +755,9 @@ public:
         fNetworkNode = false;
         fDisconnect = false;
         fDandelion = false;
+        nP2PoolSyncServed = 0;
+        fP2PoolSyncAsked = false;
+        nP2PoolHistoryRecv = 0;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

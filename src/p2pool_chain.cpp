@@ -254,6 +254,19 @@ bool ShareChain::GetShare(const uint256& id, Share& out) const
 
 bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock)
 {
+    bool fLocalView = false;
+    if (AddInContext(s, main, errOut, pvMissing, pfBlock, fLocalView))
+        return true;
+    // Judged without the main block it was mined on: what it was refused for
+    // may be right on a node that has that block.
+    if (fLocalView && errOut.compare(0, 5, "here:") != 0)
+        errOut = "here: " + errOut;
+    return false;
+}
+
+bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errOut,
+                              vector<uint256>* pvMissing, bool* pfBlock, bool& fLocalView)
+{
     if (pvMissing) pvMissing->clear();
     if (pfBlock) *pfBlock = false;
     const ShareData& d = s.data;
@@ -282,6 +295,12 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vecto
         }
     }
 
+    // Bounded: past MAX_CHAIN_SHARES only the tip's own line grows. Siblings
+    // at the floor target cost little to mine, and every one is kept until
+    // the line moves past its height.
+    if (mapShares.size() >= MAX_CHAIN_SHARES && d.hashPrevShare != hashTip)
+        return Fail(errOut, "here: the share chain is full; only the tip's line grows");
+
     // Its place in the share chain.
     const Entry* parent = d.hashPrevShare != 0 ? Get(d.hashPrevShare) : NULL;
     int nHeight = parent ? parent->nHeight + 1 : 0;
@@ -302,8 +321,10 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vecto
     unsigned int nNextBits;
     if (main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
     {
+        // A node with that block off its main chain never gets here, and
+        // takes the share; this one refuses. Neither is the sender's fault.
         if (s.nBits != nNextBits)
-            return Fail(errOut, "wrong main-chain bits");
+            return Fail(errOut, "here: wrong main-chain bits");
     }
     else
     {
@@ -311,11 +332,13 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vecto
         if (!CoinbaseHeight(s.coinbase, nHeight) || nHeight < 1)
             return Fail(errOut, "a share whose coinbase states no height");
         nPrevHeight = nHeight - 1;
+        fLocalView = true;
     }
 
-    // Time: after the median of the last 11 shares, not far in the future.
+    // Time: after the median of the last 11 shares, not far in the future
+    // -- by this node's clock, which is nobody else's.
     if ((int64)s.nTime > main.Now() + MAX_SHARE_FUTURE)
-        return Fail(errOut, "share time too far in the future");
+        return Fail(errOut, "here: share time too far in the future");
     if (parent)
     {
         vector<unsigned int> times;
@@ -340,6 +363,10 @@ bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vecto
     if (!WindowFor(d, nWork, window, errOut))
         return false;
     bool fBlock = false;
+    // From here on the share is judged on itself -- its work, its coinbase
+    // against a window every node with these shares computes the same -- and
+    // a refusal is the sender's to answer for, main block known or not.
+    fLocalView = false;
     if (!CheckShare(s, window, nPrevHeight + 1, bnFloor, fBlock, errOut, fCheckPoW))
         return false;
 

@@ -23,6 +23,9 @@ static const int64 MAX_SHARE_FUTURE = 120;          // seconds a share's time ma
 // newest RETARGET_SHARES can be checked in full, with a whole window and a
 // whole retarget behind each.
 static const unsigned int HISTORY_SHARES = WINDOW_SHARES + RETARGET_SHARES + 2 * MAX_UNCLE_DEPTH + 10;
+// Shares held at most, every line counted: room for several histories; past
+// it, only a share that extends the tip is taken.
+static const size_t MAX_CHAIN_SHARES = 4 * HISTORY_SHARES;
 
 // What the share chain needs from the main chain. The node answers from its
 // block index; tests answer from a table.
@@ -61,6 +64,8 @@ public:
     // are not here is refused with their ids in *pvMissing, so the caller
     // can ask a peer for them and offer the share again: a missing share is
     // something not received yet, not something wrong.
+    // A refusal that rests on this node's own view -- its clock, its main
+    // chain -- starts "here:", so a peer that saw it differently is not blamed.
     bool Add(const Share& s, const MainView& main, string& errOut,
              vector<uint256>* pvMissing = NULL, bool* pfBlock = NULL);
 
@@ -115,6 +120,8 @@ private:
     const Entry* Get(const uint256& id) const;
     bool OnLine(const uint256& id, const uint256& from, int nDepth) const;
     bool UncleTaken(const uint256& uncle, const uint256& from, int nDepth) const;
+    bool AddInContext(const Share& s, const MainView& main, string& errOut,
+                      vector<uint256>* pvMissing, bool* pfBlock, bool& fLocalView);
     bool CheckUncles(const ShareData& d, const uint256& parent, int nHeight, string& errOut) const;
     void Prune();
 };

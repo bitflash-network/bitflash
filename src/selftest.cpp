@@ -5318,7 +5318,7 @@ static int RunP2PoolChainSelfTest()
         nFail += Check(staleProbe.Add(stale, main, err), "a share mined on an old main block is accepted") ? 0 : 1;
 
         p2pool::Share future = ChainShare(chain, main, line[4], A, (unsigned int)main.nNow + 600);
-        nFail += Check(!chain.Add(future, main, err) && err == "share time too far in the future", "a share from ten minutes ahead is refused") ? 0 : 1;
+        nFail += Check(!chain.Add(future, main, err) && err == "here: share time too far in the future", "a share from ten minutes ahead is refused, as this node's own call") ? 0 : 1;
 
         p2pool::Share old = ChainShare(chain, main, line[4], A, t);
         nFail += Check(!chain.Add(old, main, err) && err == "share time not after the median of the last 11", "a share timed before the median of its line is refused") ? 0 : 1;

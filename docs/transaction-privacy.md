@@ -56,9 +56,35 @@ do not leave over any connection the node keeps:
   the node to every peer.)
 - If no peer can be reached this way (three tries), the transaction goes into
   the ordinary stem through the node's own relays.
+- If the peer it went to drops it, nobody else holds an embargo for it, and
+  ours would announce it under this node's name. So when our embargo runs out
+  it gets another connection of its own, to another peer, up to three rounds;
+  only after that does the node announce it itself.
+- The wallet offers its own unconfirmed transactions again every ten minutes,
+  as Bitcoin's does. Each resend leaves at its own random moment within those
+  ten minutes, so they do not go out together and tie each other to one
+  wallet. Payments the wallet *received* are no longer resent at all: that
+  told every peer which unconfirmed payments this node cared about.
 
 Without Tor (plain SOCKS5 or a direct connection), credentials mean nothing to
 the proxy, and the node uses the ordinary stem.
+
+## Asking around does not find it
+
+A spy that has a transaction can announce it (`inv`) to every node and watch
+who does not ask for it: a node that already holds it would not. That would
+find the stem, and its start. A node holding a transaction under an embargo
+(in a stem, or on its way out on a connection of its own) asks for it like a
+node that lacks it.
+
+Hearing of it is not enough to end an embargo, either. Only the transaction
+itself arriving as a plain `tx` does, and then the node passes it on. A relay
+that drops a stem transaction and announces it only to the hops before it
+cannot bury it that way.
+
+A child spending an output of a transaction still under our embargo is not
+passed on by us until the parent is out, since relaying it would show who
+holds the parent.
 
 ## 3. A random delay
 
@@ -72,7 +98,13 @@ wallet makes them, picked at random each time.
   about *where* a transaction came from, not *what* is in it.
 - Spending outputs together still links them on the chain.
 - A peer can see the time and best height in the version message, like on any
-  connection.
+  connection. The one-shot connection sends the network-adjusted time, not
+  this machine's clock, so a clock error a peer has measured on one of our
+  long-lived connections does not show here.
+- A stem hop keeps the transaction in its memory pool (BIP156 keeps a separate
+  stem pool). Probing that pool needs a validly signed transaction spending
+  the same coins or the outputs of this one, so only the payer or a payee can
+  try it.
 
 ## For developers
 

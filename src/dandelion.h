@@ -38,11 +38,15 @@ static const unsigned int RELAYS_PER_EPOCH = 2;
 // own (dandelion.cpp), a few random seconds after the wallet made it.
 static const int64_t ONESHOT_DELAY_MIN_SECONDS = 2;
 static const int64_t ONESHOT_DELAY_SPREAD_SECONDS = 10;
+static const int64_t ONESHOT_RESEND_SPREAD_SECONDS = 540;
 static const int ONESHOT_CONNECT_SECONDS = 120;
 static const int64_t ONESHOT_HANDSHAKE_SECONDS = 60;
 static const int64_t ONESHOT_STEMOK_WAIT_SECONDS = 5;
 static const size_t ONESHOT_MAX_READ = 4 * 1024 * 1024;
 static const int ONESHOT_TRIES = 3;
+// Connections of its own one of our transactions gets, an embargo apart,
+// before this node announces it under its own name.
+static const int ONESHOT_ROUNDS = 3;
 
 // The routing of one node, with peers as opaque ids (0 = this node itself).
 // Pure: the network glue feeds it peers and coins, tests feed it numbers.
@@ -87,7 +91,9 @@ class CAddress;
 // be reached that way: into the stem, or fluffed when no relay takes it.
 // vParents: unconfirmed transactions it spends that may not have spread yet;
 // they travel with it, ahead of it.
-void DandelionRelayOwn(const CTransaction& tx, const std::vector<CTransaction>& vParents);
+// fResend: the wallet offering an unconfirmed one again; it leaves any time
+// in the next ONESHOT_RESEND_SPREAD_SECONDS instead of within seconds.
+void DandelionRelayOwn(const CTransaction& tx, const std::vector<CTransaction>& vParents, bool fResend = false);
 // One such connection: version, then each of vtx as "stemtx" (or "tx" to a
 // peer that never says stemok), then close. strHow says what happened.
 // Exposed for the tests.
@@ -97,8 +103,13 @@ bool DandelionSendOneShot(const std::vector<CTransaction>& vtx, const std::strin
 bool DandelionProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStream& vRecv);
 // After the version handshake.
 void DandelionOnVersion(CNode* pfrom);
-// A transaction seen fluffed (an inv or tx from a peer): its embargo is over.
-void DandelionSeenFluffed(const uint256& hash);
+// A transaction that arrived as a plain tx from a peer: its embargo is over,
+// and if we held it, we pass it on. An inv alone does not count: a peer
+// could announce it and never deliver, and bury it.
+void DandelionSeenFluffed(const CTransaction& tx);
+// In a stem of ours or on its way out: this node answers for it as if it did
+// not have it, so a spy asking around cannot find where it is held.
+bool DandelionEmbargoed(const uint256& hash);
 // Fluff what is past its embargo; renew the epoch. Called often, cheap.
 void DandelionTick();
 #endif
