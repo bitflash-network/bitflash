@@ -36,7 +36,10 @@ LIBS = -L$(DEPS)/lib -lsecp256k1 \
        -lglfw3 -lopengl32 -lgdi32 \
        -lkernel32 -luser32 -lcomdlg32 -lwinspool -lwinmm \
        -lshell32 -lcomctl32 -lole32 -loleaut32 -luuid \
-       -lrpcrt4 -ladvapi32 -lws2_32 -lmswsock -lcrypt32
+       -lrpcrt4 -ladvapi32 -lws2_32 -lmswsock -lcrypt32 \
+       -Wl,--no-insert-timestamp
+# --no-insert-timestamp: the linker otherwise writes the build time into every
+# .exe, and two builds of one commit can never match (reproducible builds).
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
