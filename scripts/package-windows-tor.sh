@@ -53,7 +53,7 @@ need() {
 
 need sha256sum
 need tar
-need zip
+need python3
 
 download() {
   local url="$1"
@@ -178,9 +178,12 @@ directory, not inside this release directory.
 EOF
 
 rm -f "$OUT_ZIP_ABS"
+# Byte for byte the same zip from the same files: sorted entries, the
+# commit's time on every one (scripts/reproducible-archive.py).
 (
   cd "$BUNDLE_PARENT"
-  zip -qr "$OUT_ZIP_ABS" "$BUNDLE_NAME"
+  SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}" \
+    python3 "$ROOT/scripts/reproducible-archive.py" zip "$OUT_ZIP_ABS" "$BUNDLE_NAME"
 )
 
 echo "Bundled Tor Expert Bundle ${TOR_VERSION}"
