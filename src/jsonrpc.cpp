@@ -26,6 +26,7 @@
 #include "btcswap.h"
 #include "btclight.h"
 #include "invoice.h"
+#include "dandelion.h"
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -1199,8 +1200,6 @@ static json rpc_sendrawtransaction(const json& p)
         throw runtime_error("sendrawtransaction <hex>");
     CTransaction tx = TxFromHexParam(p[0]);
     uint256 hash = tx.GetHash();
-    CDataStream ssTx(SER_NETWORK);
-    ssTx << tx;
     CRITICAL_BLOCK(cs_main)
     {
         CTransaction txHave;
@@ -1213,7 +1212,9 @@ static json rpc_sendrawtransaction(const json& p)
                                                    : "transaction rejected (invalid, non-standard, or already spent inputs)");
             AddToWalletIfMine(tx, NULL);
         }
-        RelayMessage(CInv(MSG_TX, hash), ssTx);
+        // Like the wallet's own: Dandelion, not an announcement from here
+        // that names this node as where it started (dandelion.h).
+        DandelionRelayOwn(tx, vector<CTransaction>());
     }
     return hash.GetHex();
 }
@@ -1617,8 +1618,6 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
                                     : "the refund does not verify");
 
     uint256 hash = tx.GetHash();
-    CDataStream ssTx(SER_NETWORK);
-    ssTx << tx;
     CRITICAL_BLOCK(cs_main)
     {
         bool fMissingInputs = false;
@@ -1626,7 +1625,7 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
             throw runtime_error(fMissingInputs ? "the contract output is not known to this node yet"
                                                : "the network refused it (already spent?)");
         AddToWalletIfMine(tx, NULL);
-        RelayMessage(CInv(MSG_TX, hash), ssTx);
+        DandelionRelayOwn(tx, vector<CTransaction>());
     }
     json j;
     j["txid"] = hash.GetHex();
