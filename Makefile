@@ -11,6 +11,21 @@
 
 ROOT    := $(shell pwd)
 NPROC   := $(shell nproc 2>/dev/null || echo 2)
+
+# Reproducible packages: every file in an archive or AppImage carries the
+# commit's time, not the build's, so two builds of one commit can match.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+export SOURCE_DATE_EPOCH
+
+# The AppImage tools, pinned. They used to come from the "continuous" release
+# with no hash: whoever could change that page chose what went into every
+# AppImage, and no two builds were made with the same tool.
+APPIMAGETOOL        := /tmp/appimagetool-1.9.1
+APPIMAGETOOL_URL    := https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+APPIMAGETOOL_SHA256 := ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+APPIMAGE_RUNTIME        := /tmp/appimage-runtime-20251108
+APPIMAGE_RUNTIME_URL    := https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+APPIMAGE_RUNTIME_SHA256 := 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 SUDO    := $(shell [ "$$(id -u)" = "0" ] && echo "" || echo "sudo")
 VERSION := 1.2.23
 
@@ -98,12 +113,28 @@ gui:
 	$(MAKE) -C src -f Makefile bitflash -j$(NPROC)
 	strip src/bitflash
 
-appimage: gui
+# Fetch the pinned AppImage tool and runtime, and refuse them unless their
+# hashes are the ones above.
+appimage-tools:
+	@for pair in "$(APPIMAGETOOL)|$(APPIMAGETOOL_URL)|$(APPIMAGETOOL_SHA256)" \
+	             "$(APPIMAGE_RUNTIME)|$(APPIMAGE_RUNTIME_URL)|$(APPIMAGE_RUNTIME_SHA256)"; do \
+	  f=$${pair%%|*}; rest=$${pair#*|}; url=$${rest%%|*}; want=$${rest#*|}; \
+	  if [ ! -f "$$f" ] || [ "$$(sha256sum "$$f" | cut -d' ' -f1)" != "$$want" ]; then \
+	    wget -q "$$url" -O "$$f.part" || exit 1; \
+	    got=$$(sha256sum "$$f.part" | cut -d' ' -f1); \
+	    if [ "$$got" != "$$want" ]; then echo "hash mismatch for $$url: $$got" >&2; rm -f "$$f.part"; exit 1; fi; \
+	    mv "$$f.part" "$$f"; \
+	  fi; \
+	done; chmod +x $(APPIMAGETOOL)
+
+# Every file in an AppDir gets the commit's time before it is packed.
+define appimage_pack
+	@find $(1) -exec touch -h -d @$(SOURCE_DATE_EPOCH) {} +
+	@ARCH=x86_64 $(APPIMAGETOOL) --no-appstream --runtime-file $(APPIMAGE_RUNTIME) $(1) $(2) 2>&1 | grep -E "^Built|^Error" || true
+endef
+
+appimage: gui appimage-tools
 	@echo "==> building AppImage"
-	@if [ ! -x /tmp/appimagetool ]; then \
-	  wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
-	    -O /tmp/appimagetool && chmod +x /tmp/appimagetool; \
-	fi
 	@rm -rf /tmp/bitflash.AppDir
 	@mkdir -p /tmp/bitflash.AppDir/usr/bin \
 	          /tmp/bitflash.AppDir/usr/lib \
@@ -132,8 +163,7 @@ import shutil; shutil.copy('/tmp/bitflash.AppDir/bitflash.png', \
 	  echo "==> bundling Tor into the AppImage"; \
 	  ./scripts/bundle-tor-linux.sh /tmp/bitflash.AppDir/usr/bin; \
 	fi
-	@ARCH=x86_64 /tmp/appimagetool --no-appstream /tmp/bitflash.AppDir \
-	  $(ROOT)/Bitflash-$(VERSION)-x86_64.AppImage 2>&1 | grep -E "^Built|^Error" || true
+	$(call appimage_pack,/tmp/bitflash.AppDir,$(ROOT)/Bitflash-$(VERSION)-x86_64.AppImage)
 	@echo "Built: Bitflash-$(VERSION)-x86_64.AppImage"
 
 # Release AppImage: same as `appimage` but with managed Tor and the obfs4 /
@@ -154,12 +184,8 @@ btfchat-linux: deps-linux
 	strip src/btfchat
 	@echo "Built: src/btfchat"
 
-btfchat-appimage: btfchat-linux
+btfchat-appimage: btfchat-linux appimage-tools
 	@echo "==> building the btfchat AppImage"
-	@if [ ! -x /tmp/appimagetool ]; then \
-	  wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
-	    -O /tmp/appimagetool && chmod +x /tmp/appimagetool; \
-	fi
 	@rm -rf /tmp/btfchat.AppDir
 	@mkdir -p /tmp/btfchat.AppDir/usr/bin \
 	          /tmp/btfchat.AppDir/usr/lib \
@@ -187,8 +213,7 @@ import shutil; shutil.copy('/tmp/btfchat.AppDir/btfchat.png', \
 	  echo "==> bundling Tor into the btfchat AppImage"; \
 	  ./scripts/bundle-tor-linux.sh /tmp/btfchat.AppDir/usr/bin; \
 	fi
-	@ARCH=x86_64 /tmp/appimagetool --no-appstream /tmp/btfchat.AppDir \
-	  $(ROOT)/BtfChat-$(VERSION)-x86_64.AppImage 2>&1 | grep -E "^Built|^Error" || true
+	$(call appimage_pack,/tmp/btfchat.AppDir,$(ROOT)/BtfChat-$(VERSION)-x86_64.AppImage)
 	@echo "Built: BtfChat-$(VERSION)-x86_64.AppImage"
 
 # The shipping one: managed Tor and the pluggable transports bundled in. btfchat
@@ -293,6 +318,6 @@ sign-checksums:
 verify-release:
 	./scripts/verify-release.sh $(if $(TAG),$(TAG),latest)
 
-.PHONY: linux windows windows-tor clean gui appimage appimage-tor \
+.PHONY: linux windows windows-tor clean gui appimage appimage-tor appimage-tools \
         tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke checksums sign-checksums verify-release \
         deps-linux deps-windows deps-apt deps-secp256k1 deps-randomx

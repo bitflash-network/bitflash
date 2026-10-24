@@ -182,7 +182,7 @@ jobs:
           echo "--- what the binaries load (nothing from Homebrew may remain):"
           otool -L $D/bitflash-node $D/btfchat | grep -v ":$"
           ! otool -L $D/bitflash-node $D/btfchat | grep -q /opt/homebrew
-          tar -czf $D.tar.gz $D
+          python3 scripts/reproducible-archive.py tar.gz $D.tar.gz $D
           echo "D=$D" >> $GITHUB_ENV
       - name: The folder works without Homebrew
         run: |
@@ -276,7 +276,7 @@ jobs:
           cp scripts/bitflash-miner/mine.sh scripts/bitflash-miner/README.txt $D/
           chmod +x $D/mine.sh $D/xmrig/xmrig $D/tor/tor
           (cd $D && shasum -a 256 $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
-          tar -czf $D.tar.gz $D
+          python3 scripts/reproducible-archive.py tar.gz $D.tar.gz $D
           echo "D=$D" >> $GITHUB_ENV
       - name: XMRig and Tor run here
         run: |
@@ -353,7 +353,7 @@ jobs:
           cp scripts/bitflash-miner/mine.cmd scripts/bitflash-miner/README.txt $D/
           sed -i 's/\r*$/\r/' $D/mine.cmd $D/README.txt
           (cd $D && sha256sum $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
-          zip -qr $D.zip $D
+          python3 scripts/reproducible-archive.py zip $D.zip $D
           # ---- Linux
           D=Bitflash-Miner-$V-linux
           mkdir -p $D/xmrig $D/tor $D/licenses
@@ -365,7 +365,7 @@ jobs:
           cp scripts/bitflash-miner/mine.sh scripts/bitflash-miner/README.txt $D/
           chmod +x $D/mine.sh $D/xmrig/xmrig $D/tor/tor
           (cd $D && sha256sum $(find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort) > SHA256SUMS)
-          tar -czf $D.tar.gz $D
+          python3 scripts/reproducible-archive.py tar.gz $D.tar.gz $D
           echo "V=$V" >> $GITHUB_ENV
       - name: The Linux one runs here
         run: |
@@ -397,6 +397,7 @@ jobs:
             git
             make
             zip
+            python
             unzip
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-glfw
