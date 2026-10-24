@@ -124,6 +124,7 @@ static void Stem(const CTransaction& tx, uint64_t from)
                 pRelay->PushMessage("stemtx", tx);
     if (!pRelay)
     {
+        LogPrint("dandelion", "dandelion: %s has no relay to go to, fluffing\n", hash.ToString().substr(0, 10).c_str());
         Fluff(tx);
         return;
     }
@@ -492,7 +493,10 @@ bool DandelionProcessMessage(CNode* pfrom, const string& strCommand, CDataStream
     {
         RenewEpochIfDue();
         if (Router::Fluff((unsigned int)GetRand(100)))
+        {
+            LogPrint("dandelion", "dandelion: %s from the stem, fluffing here\n", hash.ToString().substr(0, 10).c_str());
             Fluff(tx);
+        }
         else
             Stem(tx, PeerId(pfrom));
     }
