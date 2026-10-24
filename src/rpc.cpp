@@ -193,6 +193,14 @@ static bool RebuildJob()
                 vector<char> vfAlreadyAdded(vOrder.size());
                 bool fFoundSomething = true;
                 unsigned int sz = 0;
+                // The block's time before its contents, as in BitcoinMiner:
+                // it was 0 here, so the rules were the clock's.
+                block.nTime = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
+                                  (unsigned int)GetAdjustedTime());
+                // Under MAX_BLOCK_SIGOPS, P2SH included, as ConnectBlock
+                // counts. This builder did not count at all, and its blocks
+                // are mined and submitted for real.
+                unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount();
                 while (fFoundSomething && sz < MAX_SIZE / 2)
                 {
                     fFoundSomething = false;
@@ -203,9 +211,16 @@ static bool RebuildJob()
                         CTransaction& tx = *vOrder[n];
                         if (tx.IsCoinBase() || !IsFinalForNextBlock(tx)) continue;
                         map<uint256, CTxIndex> tmp(pool);
-                        if (!tx.ConnectInputs(txdb, tmp, CDiskTxPos(1,1,1), 0, nFees,
-                                              false, true, tx.GetMinFee(block.vtx.size() < 100), block.nTime))
+                        int64 nFeesTmp = nFees;
+                        unsigned int nTxSigOps = tx.GetSigOpCount();
+                        if (!tx.ConnectInputs(txdb, tmp, CDiskTxPos(1,1,1), 0, nFeesTmp,
+                                              false, true, tx.GetMinFee(block.vtx.size() < 100), block.nTime,
+                                              &nTxSigOps))
                             continue;
+                        if (nBlockSigOps + nTxSigOps > MAX_BLOCK_SIGOPS)
+                            continue;
+                        nBlockSigOps += nTxSigOps;
+                        nFees = nFeesTmp;
                         swap(pool, tmp);
                         block.vtx.push_back(tx);
                         sz += ::GetSerializeSize(tx, SER_NETWORK);
