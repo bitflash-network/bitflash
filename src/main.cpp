@@ -1629,12 +1629,20 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     // Check against previous transactions
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
-    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false))
+    unsigned int nSigOps = GetSigOpCount(RulesV4Active((unsigned int)GetAdjustedTime()));
+    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false, 0, 0, &nSigOps))
     {
         if (pfMissingInputs)
             *pfMissingInputs = true;
         return error("AcceptTransaction() : ConnectInputs failed %s", hash.ToString().substr(0,6).c_str());
     }
+    // Relay policy: no one transaction may take more than a fifth of a
+    // block's signature operations (Bitcoin's MAX_STANDARD_TX_SIGOPS). One
+    // that could never fit in a block would otherwise sit in the pool for
+    // good, and a builder that did not count would put it in a block the
+    // network rejects.
+    if (nSigOps > MAX_BLOCK_SIGOPS / 5)
+        return error("AcceptTransaction() : %s has %u signature operations", hash.ToString().substr(0,6).c_str(), nSigOps);
 
     // Store transaction in memory
     CRITICAL_BLOCK(cs_mapTransactions)
@@ -2144,24 +2152,34 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb)
 
 
 // The block a transaction index entry points into. The index keeps where a
-// transaction sits on disk, not its height, and BIP68 needs the height. Kept
-// up to date by scanning for the blocks it has not seen yet, so nothing that
-// adds a block index entry has to remember it. Under cs_main.
+// transaction sits on disk, not its height, and BIP68 needs the height.
+//
+// A cache over mapBlockIndex, rebuilt from scratch on any miss: a block
+// index entry is also deleted (a block that fails to connect), so neither
+// the count of entries nor any pointer kept from before can say the cache is
+// current. A hit is believed only if that entry is still in mapBlockIndex,
+// at that position. Misses come from blocks added since the last rebuild,
+// about one rebuild per new block. Under cs_main.
 static CBlockIndex* BlockIndexAtDiskPos(unsigned int nFile, unsigned int nBlockPos)
 {
-    static map<pair<unsigned int, unsigned int>, CBlockIndex*> mapByPos;
-    static size_t nSeen = 0;
+    static map<pair<unsigned int, unsigned int>, uint256> mapByPos;
     pair<unsigned int, unsigned int> key(nFile, nBlockPos);
-    map<pair<unsigned int, unsigned int>, CBlockIndex*>::iterator it = mapByPos.find(key);
-    if (it != mapByPos.end())
-        return it->second;
-    if (nSeen == mapBlockIndex.size())
-        return NULL;
-    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
-        mapByPos[make_pair(mi->second->nFile, mi->second->nBlockPos)] = mi->second;
-    nSeen = mapBlockIndex.size();
-    it = mapByPos.find(key);
-    return it == mapByPos.end() ? NULL : it->second;
+    for (int nPass = 0; nPass < 2; nPass++)
+    {
+        map<pair<unsigned int, unsigned int>, uint256>::iterator it = mapByPos.find(key);
+        if (it != mapByPos.end())
+        {
+            map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(it->second);
+            if (mi != mapBlockIndex.end() && mi->second->nFile == nFile && mi->second->nBlockPos == nBlockPos)
+                return mi->second;
+        }
+        if (nPass == 1)
+            break;
+        mapByPos.clear();
+        for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+            mapByPos[make_pair(mi->second->nFile, mi->second->nBlockPos)] = mi->first;
+    }
+    return NULL;
 }
 
 // BIP68 for one input: is the relative lock its nSequence states over by the
@@ -2261,7 +2279,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
 
             // Rules v4 (BIP68): in a version 2 transaction, an input's
             // nSequence can say "not until this long after the coin was mined".
-            if (fRulesV4 && nVersion >= 2 && !SequenceLockPasses(vin[i], txindex,
+            if (fRulesV4 && (unsigned int)nVersion >= 2 && !SequenceLockPasses(vin[i], txindex,
                                                                        !fFound || txindex.pos == CDiskTxPos(1,1,1), pindexPrev))
                 return fMiner ? false : error("ConnectInputs() : %s input %d is under a relative lock",
                                               GetHash().ToString().substr(0,6).c_str(), i);
@@ -4784,6 +4802,9 @@ bool BitcoinMiner(int nThreadId)
             // The same count ConnectBlock caps at MAX_BLOCK_SIGOPS, so this
             // miner never builds a block the network has to reject: scripts,
             // plus the redeem scripts rules v3 run.
+            // The block's time first: the rules its transactions are checked
+            // under follow from it, and it was still 0 here.
+            pblock->nTime = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
             bool fSigOpsV4 = RulesV4Active(pblock->nTime);
             unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)
@@ -4855,6 +4876,7 @@ bool BitcoinMiner(int nThreadId)
         // Keyed for the version this block's nTime selects. The first block
         // after the switch pays for the other dataset once.
         int nPoWVersion = PoWVersionAt(pblock->nTime);
+        bool fRulesV4Built = RulesV4Active(pblock->nTime);
         if (!RandomXFastReady(nPoWVersion))
         {
             unsigned int nThreads = std::thread::hardware_concurrency();
@@ -4951,6 +4973,8 @@ bool BitcoinMiner(int nThreadId)
                 pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
                 if (PoWVersionAt(pblock->nTime) != nPoWVersion)
                     break;          // the switch happened under us: rebuild, keyed for v2
+                if (RulesV4Active(pblock->nTime) != fRulesV4Built)
+                    break;          // rules v4 switched on under us: rebuild under them
             }
         }
         RandomXDestroyMinerVM(rxvm);

@@ -738,7 +738,15 @@ static const unsigned int SEQUENCE_LOCKTIME_MASK = 0x0000ffff;
 static const int SEQUENCE_LOCKTIME_GRANULARITY = 9;   // 2^9 = 512 seconds
 // The hash OP_CHECKTEMPLATEVERIFY compares with: BIP119's, without the
 // scriptSigs field (docs/rules-v4.md).
-uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn);
+// The two hashes of the whole transaction it is made of, kept for one script
+// run so a script of many OP_CHECKTEMPLATEVERIFY hashes the transaction once.
+struct CtvHashCache
+{
+    bool fReady;
+    uint256 hashSequences, hashOutputs;
+    CtvHashCache() : fReady(false) {}
+};
+uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache* pCache = NULL);
 // Rules v2 signature encoding: strict DER (BIP66) and low S (BIP62). Both take
 // the signature as it sits on the stack, hash-type byte included.
 bool IsStrictDERSignature(const vector<unsigned char>& vchSig);

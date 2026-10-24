@@ -5378,6 +5378,22 @@ static int RunRulesV4SelfTest()
     nFail += Check(!Csv::Run(t, 11, true), "CSV 11 against nSequence 10 fails") ? 0 : 1;
     nFail += Check(!Csv::Run(t, TYPE | 10, true), "a time lock is not met by a height nSequence") ? 0 : 1;
     nFail += Check(!Csv::Run(t, -1, true), "a negative argument fails") ? 0 : 1;
+    {
+        // Negative zero is zero (Bitcoin's CScriptNum), not 128 or the
+        // disable flag read off the raw bytes.
+        CScript s1, s2;
+        s1 << std::vector<unsigned char>(1, 0x80) << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        unsigned char nz[4] = {0, 0, 0, 0x80};
+        s2 << std::vector<unsigned char>(nz, nz + 4) << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        CTransaction v1 = t;
+        v1.nVersion = 1;
+        nFail += Check(EvalScript(s1, t, 0, 0, NULL, true, true, true) &&
+                       !EvalScript(s2, v1, 0, 0, NULL, true, true, true),
+                       "a negative zero argument is 0: met by nSequence 10, and not a reserved pass in a version 1 tx") ? 0 : 1;
+        CTransaction neg = t;
+        neg.nVersion = -1;
+        nFail += Check(Csv::Run(neg, 10, true), "a negative version counts as a large one, as in Bitcoin") ? 0 : 1;
+    }
     t.vin[0].nSequence = (unsigned int)(TYPE | 5);
     nFail += Check(Csv::Run(t, TYPE | 5, true) && !Csv::Run(t, 5, true),
                    "time against time passes, height against time fails") ? 0 : 1;
@@ -5427,8 +5443,33 @@ static int RunRulesV4SelfTest()
                        SequenceLockPasses(in, coin, false, chain[24]),
                        "a 5-block lock on a coin of block 20: not in block 24, in block 25") ? 0 : 1;
         in.nSequence = 0;
-        nFail += Check(SequenceLockPasses(in, coin, false, chain[19]) || true,
-                       "a zero lock is no lock") ? 0 : 1;
+        nFail += Check(SequenceLockPasses(in, coin, false, chain[19]),
+                       "a zero lock is no lock, even a block early") ? 0 : 1;
+        {
+            // A block that fails to connect leaves the index again; the
+            // lookup must still find a block added after it, at the same
+            // count of entries as before (the review case: a cache judged
+            // by size never looked).
+            CBlockIndex* pBad = new CBlockIndex();
+            pBad->nHeight = 40; pBad->nFile = 77; pBad->nBlockPos = 5000; pBad->pprev = chain.back();
+            uint256 hBad = Hash(BEGIN(pBad->nBlockPos), END(pBad->nBlockPos));
+            mapBlockIndex[hBad] = pBad;
+            CTxIndex atBad(CDiskTxPos(77, 5000, 0), 1);
+            bool fFoundBad = SequenceLockPasses(in, atBad, false, pBad);
+            mapBlockIndex.erase(hBad);
+            delete pBad;
+            CBlockIndex* pGood = new CBlockIndex();
+            pGood->nHeight = 40; pGood->nFile = 77; pGood->nBlockPos = 6000; pGood->pprev = chain.back();
+            uint256 hGood = Hash(BEGIN(pGood->nBlockPos), END(pGood->nBlockPos));
+            mapBlockIndex[hGood] = pGood;
+            CTxIndex atGood(CDiskTxPos(77, 6000, 0), 1);
+            CTxIndex atGone(CDiskTxPos(77, 5000, 0), 1);
+            nFail += Check(fFoundBad && SequenceLockPasses(in, atGood, false, pGood) &&
+                           !SequenceLockPasses(in, atGone, false, pGood),
+                           "a block deleted from the index and one added after it: the new one is found, the old one is not") ? 0 : 1;
+            mapBlockIndex.erase(hGood);
+            delete pGood;
+        }
         // Time: from the median time past of block 19; 3 units = 1536 s.
         in.nSequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 3;
         int64 nBase = chain[19]->GetMedianTimePast();

@@ -1169,7 +1169,11 @@ static json rpc_signrawtransaction(const json& p)
             }
         }
         txin.scriptSig = scriptSigNew;
-        if (!VerifyScriptP2SH(txin.scriptSig, scriptPubKey, tx, i))
+        // Under the rules a block made now would be checked by, so a lock
+        // script (CLTV, CSV, CTV) counts as complete once it is.
+        unsigned int nNow = (unsigned int)GetAdjustedTime();
+        if (!VerifyScriptP2SH(txin.scriptSig, scriptPubKey, tx, i, RulesV2Active(nNow), RulesV3Active(nNow),
+                              RulesV4Active(nNow)))
         {
             fComplete = false;
             json e; e["vout"] = (int)i; e["error"] = "input does not verify yet (more signatures needed, or keys not held)";

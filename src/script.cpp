@@ -49,19 +49,28 @@ static uint256 Sha256Of(const CDataStream& ss)
     return hash;
 }
 
-uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn)
+uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache* pCache)
 {
     // BIP119's DefaultCheckTemplateVerifyHash without the scriptSigs field
     // (docs/rules-v4.md). Single SHA-256 throughout, fixed-width little-endian
     // integers, outputs as they are serialized.
-    CDataStream ssSeq(SER_NETWORK), ssOut(SER_NETWORK), ss(SER_NETWORK);
-    foreach(const CTxIn& txin, tx.vin)
-        ssSeq << txin.nSequence;
-    foreach(const CTxOut& txout, tx.vout)
-        ssOut << txout;
+    CtvHashCache local;
+    CtvHashCache& c = pCache ? *pCache : local;
+    if (!c.fReady)
+    {
+        CDataStream ssSeq(SER_NETWORK), ssOut(SER_NETWORK);
+        foreach(const CTxIn& txin, tx.vin)
+            ssSeq << txin.nSequence;
+        foreach(const CTxOut& txout, tx.vout)
+            ssOut << txout;
+        c.hashSequences = Sha256Of(ssSeq);
+        c.hashOutputs = Sha256Of(ssOut);
+        c.fReady = true;
+    }
+    CDataStream ss(SER_NETWORK);
     ss << tx.nVersion << tx.nLockTime;
-    ss << (unsigned int)tx.vin.size() << Sha256Of(ssSeq);
-    ss << (unsigned int)tx.vout.size() << Sha256Of(ssOut);
+    ss << (unsigned int)tx.vin.size() << c.hashSequences;
+    ss << (unsigned int)tx.vout.size() << c.hashOutputs;
     ss << nIn;
     return Sha256Of(ss);
 }
@@ -77,6 +86,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
     vector<bool> vfExec;
     vector<valtype> stack;
     vector<valtype> altstack;
+    CtvHashCache ctvCache;   // OP_CHECKTEMPLATEVERIFY hashes txTo once per run
     unsigned int nOpCount = 0;
     if (pvStackRet)
         pvStackRet->clear();
@@ -221,19 +231,24 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 const valtype& vch = stacktop(-1);
                 if (vch.size() > 5)
                     return false;
-                if (CBigNum(vch) < 0)
+                CBigNum bnSeq(vch);
+                if (bnSeq < 0)
                     return false;
-                // The low 32 bits, read straight from the little-endian
-                // bytes: the number is not negative, so no sign bit is among
-                // them, and nothing above bit 31 means anything here.
+                // The low 32 bits of the number, from its canonical encoding:
+                // the bytes as pushed could be a negative zero (0x80), which
+                // is 0 to Bitcoin and must be 0 here, not 128. Nothing above
+                // bit 31 means anything to this rule.
+                valtype vchSeq = bnSeq.getvch();
                 unsigned int nScript = 0;
-                for (size_t k = 0; k < vch.size() && k < 4; k++)
-                    nScript |= (unsigned int)vch[k] << (8 * k);
+                for (size_t k = 0; k < vchSeq.size() && k < 4; k++)
+                    nScript |= (unsigned int)vchSeq[k] << (8 * k);
                 // Disable flag in the script's number: reserved for later
                 // rules, so it passes, as in Bitcoin.
                 if (nScript & SEQUENCE_LOCKTIME_DISABLE_FLAG)
                     break;
-                if (txTo.nVersion < 2)
+                // Unsigned, as Bitcoin compares it: a negative version is a
+                // large one there, and must be here.
+                if ((unsigned int)txTo.nVersion < 2)
                     return false;
                 unsigned int nTxSeq = txTo.vin[nIn].nSequence;
                 if (nTxSeq & SEQUENCE_LOCKTIME_DISABLE_FLAG)
@@ -260,7 +275,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 const valtype& vch = stacktop(-1);
                 if (vch.size() == 32)
                 {
-                    uint256 hash = CheckTemplateHash(txTo, nIn);
+                    uint256 hash = CheckTemplateHash(txTo, nIn, &ctvCache);
                     if (memcmp(&vch[0], hash.begin(), 32) != 0)
                         return false;
                 }
