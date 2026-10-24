@@ -2143,12 +2143,68 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb)
 }
 
 
+// The block a transaction index entry points into. The index keeps where a
+// transaction sits on disk, not its height, and BIP68 needs the height. Kept
+// up to date by scanning for the blocks it has not seen yet, so nothing that
+// adds a block index entry has to remember it. Under cs_main.
+static CBlockIndex* BlockIndexAtDiskPos(unsigned int nFile, unsigned int nBlockPos)
+{
+    static map<pair<unsigned int, unsigned int>, CBlockIndex*> mapByPos;
+    static size_t nSeen = 0;
+    pair<unsigned int, unsigned int> key(nFile, nBlockPos);
+    map<pair<unsigned int, unsigned int>, CBlockIndex*>::iterator it = mapByPos.find(key);
+    if (it != mapByPos.end())
+        return it->second;
+    if (nSeen == mapBlockIndex.size())
+        return NULL;
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        mapByPos[make_pair(mi->second->nFile, mi->second->nBlockPos)] = mi->second;
+    nSeen = mapBlockIndex.size();
+    it = mapByPos.find(key);
+    return it == mapByPos.end() ? NULL : it->second;
+}
+
+// BIP68 for one input: is the relative lock its nSequence states over by the
+// block after pindexPrev? txindex is where the coin it spends sits. fUnmined:
+// the coin is not in a block yet, and counts as mined in that next block.
+bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmined,
+                               const CBlockIndex* pindexPrev)
+{
+    if (txin.nSequence & SEQUENCE_LOCKTIME_DISABLE_FLAG)
+        return true;
+    if (!pindexPrev)
+        return false;
+    int nNextHeight = pindexPrev->nHeight + 1;
+    int nCoinHeight = nNextHeight;
+    int64 nCoinTime = pindexPrev->GetMedianTimePast();
+    if (!fUnmined)
+    {
+        CBlockIndex* pindexCoin = BlockIndexAtDiskPos(txindex.pos.nFile, txindex.pos.nBlockPos);
+        if (!pindexCoin)
+            return error("SequenceLockPasses() : no block at %u:%u", txindex.pos.nFile, txindex.pos.nBlockPos);
+        nCoinHeight = pindexCoin->nHeight;
+        // Time is measured from the median time past of the block before the
+        // coin's, as in Bitcoin: the coin's own block time is its miner's say.
+        const CBlockIndex* pindexBase = pindexCoin->pprev ? pindexCoin->pprev : pindexCoin;
+        nCoinTime = pindexBase->GetMedianTimePast();
+    }
+    int64 nValue = txin.nSequence & SEQUENCE_LOCKTIME_MASK;
+    if (txin.nSequence & SEQUENCE_LOCKTIME_TYPE_FLAG)
+        return pindexPrev->GetMedianTimePast() >= nCoinTime + (nValue << SEQUENCE_LOCKTIME_GRANULARITY);
+    return nNextHeight >= nCoinHeight + nValue;
+}
+
 bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime,
-                                 unsigned int* pnP2SHSigOps)
+                                 unsigned int* pnP2SHSigOps, const CBlockIndex* pindexPrev)
 {
     unsigned int nRulesTime = nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime();
     bool fStrictSigs = RulesV2Active(nRulesTime);
     bool fRulesV3 = RulesV3Active(nRulesTime);
+    bool fRulesV4 = RulesV4Active(nRulesTime);
+    // The block this one would follow: the block's parent when connecting a
+    // block, the tip for the mempool and the miner.
+    if (!pindexPrev)
+        pindexPrev = pindexBest;
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
     {
@@ -2203,15 +2259,22 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                     if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
                         return error("ConnectInputs() : tried to spend coinbase at depth %d", nBestHeight - pindex->nHeight);
 
+            // Rules v4 (BIP68): in a version 2 transaction, an input's
+            // nSequence can say "not until this long after the coin was mined".
+            if (fRulesV4 && nVersion >= 2 && !SequenceLockPasses(vin[i], txindex,
+                                                                       !fFound || txindex.pos == CDiskTxPos(1,1,1), pindexPrev))
+                return fMiner ? false : error("ConnectInputs() : %s input %d is under a relative lock",
+                                              GetHash().ToString().substr(0,6).c_str(), i);
+
             // Verify signature
-            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3))
+            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3, fRulesV4))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
 
             // Rules v3 runs the redeem script, so its signature operations cost
             // what any other does and count against the block's cap. Before,
             // a P2SH scriptSig's last push was data and cost nothing to check.
             if (fRulesV3 && pnP2SHSigOps && txPrev.vout[prevout.n].scriptPubKey.IsPayToScriptHash())
-                *pnP2SHSigOps += GetP2SHSigOpCount(vin[i].scriptSig);
+                *pnP2SHSigOps += GetP2SHSigOpCount(vin[i].scriptSig, fRulesV4);
 
             // Check for conflicts
             if (!txindex.vSpent[prevout.n].IsNull())
@@ -2333,7 +2396,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     // rules v3 the redeem scripts run too, and only here are they known.
     unsigned int nSigOps = 0;
     foreach(CTransaction& tx, vtx)
-        nSigOps += tx.GetSigOpCount();
+        nSigOps += tx.GetSigOpCount(RulesV4Active(nTime));
     foreach(CTransaction& tx, vtx)
     {
         CDiskTxPos posThisTx(pindex->nFile, pindex->nBlockPos, nTxPos);
@@ -2354,7 +2417,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                                      tx.GetHash().ToString().substr(0,10).c_str());
         }
 
-        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime, &nSigOps))
+        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime, &nSigOps,
+                              pindex->pprev))
             return false;
         if (nSigOps > MAX_BLOCK_SIGOPS)
             return error("ConnectBlock() : too many signature operations once redeem scripts are counted");
@@ -2602,7 +2666,7 @@ bool CBlock::CheckBlock(int* pnDoS) const
     // expensive for everyone else to reject.
     unsigned int nSigOps = 0;
     foreach(const CTransaction& tx, vtx)
-        nSigOps += tx.GetSigOpCount();
+        nSigOps += tx.GetSigOpCount(RulesV4Active(nTime));
     if (nSigOps > MAX_BLOCK_SIGOPS)
         return DoS(pnDoS, 100, error("CheckBlock() : out-of-bounds signature operation count"));
 
@@ -4717,6 +4781,11 @@ bool BitcoinMiner(int nThreadId)
             vector<char> vfAlreadyAdded(vOrder.size());
             bool fFoundSomething = true;
             unsigned int nBlockSize = 0;
+            // The same count ConnectBlock caps at MAX_BLOCK_SIGOPS, so this
+            // miner never builds a block the network has to reject: scripts,
+            // plus the redeem scripts rules v3 run.
+            bool fSigOpsV4 = RulesV4Active(pblock->nTime);
+            unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)
             {
                 fFoundSomething = false;
@@ -4734,8 +4803,15 @@ bool BitcoinMiner(int nThreadId)
                     int64 nMinFee = tx.GetMinFee(pblock->vtx.size() < 100);
 
                     map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
-                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), 0, nFees, false, true, nMinFee, pblock->nTime))
+                    int64 nFeesTmp = nFees;
+                    unsigned int nTxSigOps = tx.GetSigOpCount(fSigOpsV4);
+                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), 0, nFeesTmp, false, true, nMinFee, pblock->nTime,
+                                          &nTxSigOps))
                         continue;
+                    if (nBlockSigOps + nTxSigOps > MAX_BLOCK_SIGOPS)
+                        continue;
+                    nBlockSigOps += nTxSigOps;
+                    nFees = nFeesTmp;
                     swap(mapTestPool, mapTestPoolTmp);
 
                     pblock->vtx.push_back(tx);

@@ -311,6 +311,12 @@ bool ProcessMessages(CNode* pfrom);
 // them can produce a block that AcceptBlock would refuse.
 class CTransaction;
 bool IsFinalForNextBlock(const CTransaction& tx);
+// Rules v4 (BIP68): whether one input's relative lock is over in the block
+// after pindexPrev. fUnmined: the coin it spends is not in a block yet.
+class CTxIndex;
+class CTxIn;
+bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmined,
+                        const CBlockIndex* pindexPrev);
 // pnDoS, when given, receives the misbehavior score a failure is worth: 0 for
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
@@ -822,13 +828,14 @@ public:
         return (vin.size() == 1 && vin[0].prevout.IsNull());
     }
 
-    unsigned int GetSigOpCount() const
+    // fRulesV4: OP_CHECKSIGFROMSTACK counts too (script.h).
+    unsigned int GetSigOpCount(bool fRulesV4=false) const
     {
         unsigned int n = 0;
         foreach(const CTxIn& txin, vin)
-            n += txin.scriptSig.GetSigOpCount();
+            n += txin.scriptSig.GetSigOpCount(fRulesV4);
         foreach(const CTxOut& txout, vout)
-            n += txout.scriptPubKey.GetSigOpCount();
+            n += txout.scriptPubKey.GetSigOpCount(fRulesV4);
         return n;
     }
 
@@ -1045,8 +1052,10 @@ public:
     // "not in a block yet" (mempool, template), and the current time stands in.
     // pnP2SHSigOps, if given, is incremented by the signature operations inside
     // the redeem scripts this transaction spends (rules v3 only).
+    // pindexPrev: the block the one being built or connected follows (NULL:
+    // the tip). Rules v4 measure relative locks against it.
     bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0,
-                       unsigned int* pnP2SHSigOps=NULL);
+                       unsigned int* pnP2SHSigOps=NULL, const CBlockIndex* pindexPrev=NULL);
     bool ClientConnectInputs();
 
     bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL);

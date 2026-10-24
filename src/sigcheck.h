@@ -18,6 +18,12 @@
 bool SigCheckEcdsa(const unsigned char* hash32, const std::vector<unsigned char>& vchSig,
                    const std::vector<unsigned char>& vchPubKey);
 
+// BIP340 Schnorr, for OP_CHECKSIGFROMSTACK (rules v4): a 64-byte signature
+// over a message of any length (BIP340 allows any), by a 32-byte x-only key.
+// False for any other sizes; the caller decides what those mean.
+bool SigCheckSchnorr(const std::vector<unsigned char>& vchSig, const std::vector<unsigned char>& vchMsg,
+                     const std::vector<unsigned char>& vchPubKey);
+
 // libsecp256k1's own self test, once, before the first verification.
 bool SigCheckSelfTest();
 

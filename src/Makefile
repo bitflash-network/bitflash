@@ -375,6 +375,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=script-eval
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
+	./bitflash-node -selftest=rules-v4
 	./bitflash-node -selftest=sigcheck
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light
