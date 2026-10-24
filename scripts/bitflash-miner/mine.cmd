@@ -6,7 +6,8 @@ title Bitflash Miner
 rem Bitflash Miner: XMRig over Tor, straight to the pool's hidden service.
 rem   mine.cmd YOUR_BTF_ADDRESS            mainnet
 rem   mine.cmd YOUR_BTF_ADDRESS testnet    testnet pool (testnet address!)
-rem Anything after those two is passed to XMRig, e.g. -t 4 to use 4 threads.
+rem   mine.cmd p2pool                      P2Pool: your own node, no pool at all
+rem Anything after those is passed to XMRig, e.g. -t 4 to use 4 threads.
 rem Double-clicked with no address, it asks for one.
 
 set POOL=mddjuyuctouv62eqdaofvwf4timxxmp72d2ghmc6qp5mdey6f5au56id.onion:8436
@@ -25,6 +26,7 @@ exit /b 1
 :have_xmrig
 set ADDR=%~1
 set REST=
+if /i "%ADDR%"=="p2pool" goto p2pool
 if not "%ADDR%"=="" goto from_args
 
 echo.
@@ -33,12 +35,14 @@ echo.
 echo   Paste your Bitflash payment address -- the one the wallet shows under
 echo   Receive, or -newaddress prints. Not a .btf address. The pool pays to it.
 echo   Add a space and the word testnet after it to mine the testnet pool.
+echo   Or type p2pool to mine through your own node started with -p2pool.
 echo.
 set /p LINE=  address:
 for /f "tokens=1,* delims= " %%a in ("%LINE%") do (
   set ADDR=%%a
   set REST=%%b
 )
+if /i "%ADDR%"=="p2pool" goto p2pool
 if not "%REST%"=="" goto have_addr
 echo.
 echo   Which network? Mainnet is the real coin (RandomX miners from 2026-09-21
@@ -111,6 +115,30 @@ if exist tor-data\tor.pid (
   taskkill /PID %TORPID% /F >nul 2>&1
   del tor-data\tor.pid >nul 2>&1
 )
+echo.
+echo   XMRig stopped.
+pause
+endlocal
+exit /b 0
+
+rem P2Pool: XMRig talks to this machine's own node, so there is nobody to
+rem reach over Tor and no address to give: the node pays an address of its own
+rem wallet. P2POOL_PORT if the node was started with another -p2poolport.
+:p2pool
+set EXTRA=
+shift
+:p2pool_args
+if "%~1"=="" goto p2pool_run
+set EXTRA=%EXTRA% %1
+shift
+goto p2pool_args
+:p2pool_run
+if "%P2POOL_PORT%"=="" set P2POOL_PORT=3333
+echo.
+echo   P2Pool: mining through your own node at 127.0.0.1:%P2POOL_PORT%
+echo   (start it first: Bitflash.exe -p2pool)
+echo.
+xmrig\xmrig.exe -a rx/0 -o 127.0.0.1:%P2POOL_PORT% -u p2pool -p x --retries=100000 --retry-pause=5 %EXTRA%
 echo.
 echo   XMRig stopped.
 pause

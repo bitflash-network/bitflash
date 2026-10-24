@@ -2,7 +2,8 @@
 # Bitflash Miner: XMRig over Tor, straight to the pool's hidden service.
 #   ./mine.sh YOUR_BTF_ADDRESS            mainnet
 #   ./mine.sh YOUR_BTF_ADDRESS testnet    testnet pool (testnet address!)
-# Anything after those two is passed to XMRig, e.g. -t 4 to use 4 threads.
+#   ./mine.sh p2pool                      P2Pool: your own node, no pool at all
+# Anything after those is passed to XMRig, e.g. -t 4 to use 4 threads.
 cd "$(dirname "$0")" || exit 1
 
 POOL=mddjuyuctouv62eqdaofvwf4timxxmp72d2ghmc6qp5mdey6f5au56id.onion:8436
@@ -12,13 +13,29 @@ if [ -z "$1" ]; then
     cat <<EOF
 
   usage: ./mine.sh YOUR_BTF_ADDRESS [testnet] [xmrig options]
+         ./mine.sh p2pool [xmrig options]
 
   YOUR_BTF_ADDRESS is a Bitflash payment address -- the kind the Bitflash
   wallet shows under Receive, or -newaddress prints. Not a .btf address.
   The pool pays out to it. Fee 1%.
 
+  p2pool: mine through your own Bitflash node started with -p2pool. No pool,
+  no operator, no fee: every block pays its miners directly, and your node
+  pays you at an address of its own wallet. See README.txt.
+
 EOF
     exit 1
+fi
+
+# P2Pool: XMRig talks to this machine's own node; there is nobody to reach
+# over Tor. P2POOL_PORT if the node was started with another -p2poolport.
+if [ "$1" = "p2pool" ]; then
+    shift
+    PORT=${P2POOL_PORT:-3333}
+    echo "P2Pool: mining through your own node at 127.0.0.1:$PORT"
+    echo "(start it first: bitflash-node -p2pool, or the wallet with -p2pool)"
+    echo
+    exec ./xmrig/xmrig -a rx/0 -o "127.0.0.1:$PORT" -u p2pool -p x --retries=100000 --retry-pause=5 "$@"
 fi
 ADDR=$1; shift
 if [ "$1" = "testnet" ]; then
