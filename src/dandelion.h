@@ -20,6 +20,7 @@
 #ifndef BITFLASH_DANDELION_H
 #define BITFLASH_DANDELION_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <map>
 #include <vector>
@@ -32,6 +33,16 @@ static const int FLUFF_PERCENT = 10;
 static const int64_t EMBARGO_MIN_SECONDS = 30;
 static const int64_t EMBARGO_SPREAD_SECONDS = 30;
 static const unsigned int RELAYS_PER_EPOCH = 2;
+
+// Our own transactions, with Tor: each over a connection and circuit of its
+// own (dandelion.cpp), a few random seconds after the wallet made it.
+static const int64_t ONESHOT_DELAY_MIN_SECONDS = 2;
+static const int64_t ONESHOT_DELAY_SPREAD_SECONDS = 10;
+static const int ONESHOT_CONNECT_SECONDS = 120;
+static const int64_t ONESHOT_HANDSHAKE_SECONDS = 60;
+static const int64_t ONESHOT_STEMOK_WAIT_SECONDS = 5;
+static const size_t ONESHOT_MAX_READ = 4 * 1024 * 1024;
+static const int ONESHOT_TRIES = 3;
 
 // The routing of one node, with peers as opaque ids (0 = this node itself).
 // Pure: the network glue feeds it peers and coins, tests feed it numbers.
@@ -69,8 +80,19 @@ class CNode;
 class CTransaction;
 class CDataStream;
 
-// Our own new transaction: into the stem, or fluffed when no relay takes it.
-void DandelionRelayOwn(const CTransaction& tx);
+class CAddress;
+
+// Our own new transaction. With Tor: a few seconds later, over a connection
+// and circuit of its own to a random peer. Without Tor, or when no peer can
+// be reached that way: into the stem, or fluffed when no relay takes it.
+// vParents: unconfirmed transactions it spends that may not have spread yet;
+// they travel with it, ahead of it.
+void DandelionRelayOwn(const CTransaction& tx, const std::vector<CTransaction>& vParents);
+// One such connection: version, then each of vtx as "stemtx" (or "tx" to a
+// peer that never says stemok), then close. strHow says what happened.
+// Exposed for the tests.
+bool DandelionSendOneShot(const std::vector<CTransaction>& vtx, const std::string& strHost, unsigned short nPort,
+                          const CAddress& addrYou, const std::string& strIsolation, std::string& strHow);
 // "stemok" and "stemtx"; false when strCommand is neither. Under cs_main.
 bool DandelionProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStream& vRecv);
 // After the version handshake.

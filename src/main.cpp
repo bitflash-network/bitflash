@@ -1966,15 +1966,13 @@ void ReacceptWalletTransactions()
 
 void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
 {
+    // Unconfirmed transactions this one spends. They used to be announced
+    // straight from here, which named this node as their source to every
+    // peer; now they travel with it, ahead of it (dandelion.h).
+    vector<CTransaction> vParents;
     foreach(const CMerkleTx& tx, vtxPrev)
-    {
-        if (!tx.IsCoinBase())
-        {
-            uint256 hash = tx.GetHash();
-            if (!txdb.ContainsTx(hash))
-                RelayMessage(CInv(MSG_TX, hash), (CTransaction)tx);
-        }
-    }
+        if (!tx.IsCoinBase() && !txdb.ContainsTx(tx.GetHash()))
+            vParents.push_back((CTransaction)tx);
     if (!IsCoinBase())
     {
         uint256 hash = GetHash();
@@ -1983,7 +1981,7 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
             if (LogAcceptsCategory("net")) printf("Relaying wtx %s\n", hash.ToString().substr(0,6).c_str());
             // Our own: into the Dandelion stem, so the peer that hears it
             // first cannot tell it started here (dandelion.h).
-            DandelionRelayOwn((CTransaction)*this);
+            DandelionRelayOwn((CTransaction)*this, vParents);
         }
     }
 }

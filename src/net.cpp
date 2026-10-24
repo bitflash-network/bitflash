@@ -1084,6 +1084,42 @@ static bool BtfAlreadyConnected(const string& strBtfAddr)
     return false;
 }
 
+bool BtfPickBroadcastPeer(const set<string>& setSkip, string& strBtfAddrOut, string& strOnionOut,
+                          CAddress& addrOut)
+{
+    strBtfAddrOut.clear();
+    strOnionOut.clear();
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+    string strSelf = BtfLocalAddress();
+    vector<const CachedBtfPeer*> vFresh, vConnected;
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        string strNorm;
+        if (!p.fVerified || p.btfAddr == strSelf || setSkip.count(p.btfAddr) ||
+            !btf::NormalizeOnionEndpoint(p.onion, strNorm) || !BtfOnionFitsThisNetwork(strNorm) ||
+            BtfIsBanned(p.btfAddr))
+            continue;
+        (BtfAlreadyConnected(p.btfAddr) ? vConnected : vFresh).push_back(&p);
+    }
+    // A stranger first: a peer we are connected to already knows this node,
+    // and timing alone might tie the two connections together.
+    const vector<const CachedBtfPeer*>& vFrom = vFresh.empty() ? vConnected : vFresh;
+    if (vFrom.empty())
+        return false;
+    const CachedBtfPeer* p = vFrom[GetRand(vFrom.size())];
+    unsigned char pk[32];
+    if (!btf::ParseAddress(p->btfAddr, pk))
+        return false;
+    // The address every dial of ours names, so the version message reads
+    // like any other connection from a Bitflash node.
+    addrOut = BtfMarkerAddr(pk);
+    strBtfAddrOut = p->btfAddr;
+    btf::NormalizeOnionEndpoint(p->onion, strOnionOut);
+    return true;
+}
+
 static bool BtfDialDue(const string& strBtfAddr)
 {
     CRITICAL_BLOCK(cs_btfDialSched)

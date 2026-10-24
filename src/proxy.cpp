@@ -290,13 +290,19 @@ static SOCKET ConnectDirect(const std::string& host, unsigned short port,
     return s;
 }
 
+// strIsolation, when not empty, goes out as the SOCKS5 username and password
+// (RFC 1929). The proxy does not check them; Tor uses them to keep the stream
+// off every circuit opened with other credentials (IsolateSOCKSAuth, on by
+// default and in the managed torrc).
 static bool Socks5Connect(SOCKET s, const std::string& destHost,
-                          unsigned short destPort)
+                          unsigned short destPort,
+                          const std::string& strIsolation = std::string())
 {
-    if (destHost.empty() || destHost.size() > 255)
+    if (destHost.empty() || destHost.size() > 255 || strIsolation.size() > 255)
         return false;
 
-    unsigned char hello[3] = { 0x05, 0x01, 0x00 }; // SOCKS5, one method, no auth
+    const unsigned char nMethod = strIsolation.empty() ? 0x00 : 0x02;
+    unsigned char hello[3] = { 0x05, 0x01, nMethod }; // SOCKS5, one method
     if (!WriteN(s, hello, sizeof(hello)))
     {
         error("SOCKS5 hello write failed for %s:%u\n",
@@ -310,12 +316,30 @@ static bool Socks5Connect(SOCKET s, const std::string& destHost,
               destHost.c_str(), (unsigned)destPort);
         return false;
     }
-    if (choice[0] != 0x05 || choice[1] != 0x00)
+    if (choice[0] != 0x05 || choice[1] != nMethod)
     {
-        error("SOCKS5 proxy rejected no-auth method for %s:%u (version=0x%02x method=0x%02x)\n",
+        error("SOCKS5 proxy rejected %s method for %s:%u (version=0x%02x method=0x%02x)\n",
+              nMethod ? "username/password" : "no-auth",
               destHost.c_str(), (unsigned)destPort,
               (unsigned)choice[0], (unsigned)choice[1]);
         return false;
+    }
+    if (nMethod == 0x02)
+    {
+        std::vector<unsigned char> auth;
+        auth.push_back(0x01); // subnegotiation version
+        auth.push_back((unsigned char)strIsolation.size());
+        auth.insert(auth.end(), strIsolation.begin(), strIsolation.end());
+        auth.push_back((unsigned char)strIsolation.size());
+        auth.insert(auth.end(), strIsolation.begin(), strIsolation.end());
+        unsigned char status[2] = { 0, 0xff };
+        if (!WriteN(s, &auth[0], (int)auth.size()) || !ReadN(s, status, sizeof(status)) ||
+            status[1] != 0x00)
+        {
+            error("SOCKS5 username/password step failed for %s:%u\n",
+                  destHost.c_str(), (unsigned)destPort);
+            return false;
+        }
     }
 
     std::vector<unsigned char> req;
@@ -414,6 +438,37 @@ SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
     if (s == INVALID_SOCKET)
         return INVALID_SOCKET;
     if (!Socks5Connect(s, destHost, destPort))
+    {
+        BtfCloseSocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+SOCKET BtfConnectSocketIsolated(const std::string& destHost, unsigned short destPort,
+                                int nSockSite, int nTimeoutSecs,
+                                const std::string& strIsolation)
+{
+    std::string proxyHost;
+    unsigned short proxyPort = 0;
+    bool fTorProxy = false;
+    CRITICAL_BLOCK(cs_socks5)
+    {
+        fTorProxy = g_fSocks5Proxy && g_fTorProxy;
+        proxyHost = g_socks5Host;
+        proxyPort = g_socks5Port;
+    }
+    // Only Tor gives credentials a meaning; a plain SOCKS5 proxy would at
+    // best ignore them and at worst refuse the method.
+    if (!fTorProxy || strIsolation.empty())
+        return INVALID_SOCKET;
+
+    if (nTimeoutSecs > 0 && nTimeoutSecs < TOR_CONNECT_TIMEOUT_SECS)
+        nTimeoutSecs = TOR_CONNECT_TIMEOUT_SECS;
+    SOCKET s = ConnectDirect(proxyHost, proxyPort, nSockSite, nTimeoutSecs);
+    if (s == INVALID_SOCKET)
+        return INVALID_SOCKET;
+    if (!Socks5Connect(s, destHost, destPort, strIsolation))
     {
         BtfCloseSocket(s);
         return INVALID_SOCKET;

@@ -30,5 +30,11 @@ std::string BtfSocks5ProxyName();
 
 SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
                         int nSockSite, int nTimeoutSecs);
+// Through Tor only, on a circuit of its own: strIsolation goes out as SOCKS5
+// credentials, and Tor never puts streams with different credentials on the
+// same circuit. INVALID_SOCKET when the proxy is not Tor.
+SOCKET BtfConnectSocketIsolated(const std::string& destHost, unsigned short destPort,
+                                int nSockSite, int nTimeoutSecs,
+                                const std::string& strIsolation);
 
 #endif

@@ -12,6 +12,7 @@
 #include "selftest.h"
 #include "p2pool_chain.h"
 #include "sigcheck.h"
+#include "dandelion.h"
 #ifndef _WIN32
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
 #endif
@@ -4145,6 +4146,236 @@ static int RunSocks5ProxySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// What one mock connection saw: the SOCKS5 credentials, the CONNECT target,
+// and the transactions that arrived after the version exchange.
+struct OneShotSeen
+{
+    std::string err, user, host, command;
+    unsigned short port;
+    std::vector<uint256> vHashes;
+    OneShotSeen() : port(0) {}
+};
+
+// Tor and the peer in one: the SOCKS5 server side with username/password, and
+// behind it a Bitflash node that sends its version, a message nobody asked
+// for, and "stemok" only when fStemOk.
+static void OneShotMockPeer(SOCKET listener, bool fStemOk, size_t nExpectTx, OneShotSeen& seen)
+{
+    SOCKET s = accept(listener, NULL, NULL);
+    if (s == INVALID_SOCKET)
+    {
+        seen.err = "accept failed";
+        return;
+    }
+    SelfTestSetSocketTimeout(s, 20);
+    unsigned char hello[3] = {0,0,0};
+    unsigned char choice[2] = {0x05, 0x02};
+    unsigned char ul = 0, pl = 0, ver = 0;
+    std::string pass;
+    if (!SelfTestReadN(s, hello, 3) || hello[0] != 0x05 || hello[1] != 0x01 || hello[2] != 0x02 ||
+        !SelfTestWriteN(s, choice, 2) || !SelfTestReadN(s, &ver, 1) || ver != 0x01 ||
+        !SelfTestReadN(s, &ul, 1))
+    {
+        seen.err = "no username/password greeting";
+        closesocket(s);
+        return;
+    }
+    seen.user.resize(ul);
+    if ((ul && !SelfTestReadN(s, &seen.user[0], ul)) || !SelfTestReadN(s, &pl, 1))
+    {
+        seen.err = "short credentials";
+        closesocket(s);
+        return;
+    }
+    pass.resize(pl);
+    if (pl && !SelfTestReadN(s, &pass[0], pl))
+    {
+        seen.err = "short password";
+        closesocket(s);
+        return;
+    }
+    unsigned char authOk[2] = {0x01, 0x00};
+    unsigned char hdr[5] = {0,0,0,0,0};
+    if (pass != seen.user || !SelfTestWriteN(s, authOk, 2) || !SelfTestReadN(s, hdr, 5) ||
+        hdr[0] != 0x05 || hdr[1] != 0x01 || hdr[3] != 0x03)
+    {
+        seen.err = "bad credentials or CONNECT";
+        closesocket(s);
+        return;
+    }
+    std::vector<unsigned char> rest((size_t)hdr[4] + 2);
+    unsigned char reply[10] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
+    if (!SelfTestReadN(s, &rest[0], (int)rest.size()) || !SelfTestWriteN(s, reply, 10))
+    {
+        seen.err = "CONNECT target";
+        closesocket(s);
+        return;
+    }
+    seen.host.assign((const char*)&rest[0], hdr[4]);
+    seen.port = ((unsigned short)rest[hdr[4]] << 8) | rest[hdr[4] + 1];
+
+    // The client's version, in the framing every node starts with.
+    unsigned int nHdr = CMessageHeader::SizeOnWire(PROTO_NO_CHECKSUM_VERSION);
+    std::vector<char> vHdr(nHdr);
+    unsigned int nSize = 0;
+    if (!SelfTestReadN(s, &vHdr[0], nHdr))
+    {
+        seen.err = "no version from the client";
+        closesocket(s);
+        return;
+    }
+    memcpy(&nSize, &vHdr[16], 4);
+    std::vector<char> vPayload(nSize);
+    if (std::string(&vHdr[4]) != "version" || (nSize && !SelfTestReadN(s, &vPayload[0], nSize)))
+    {
+        seen.err = "first message is not a version";
+        closesocket(s);
+        return;
+    }
+
+    CNode peer(INVALID_SOCKET, CAddress(), true);
+    peer.vSend.SetVersion(VERSION);
+    peer.PushMessage("btfpeers", std::vector<std::string>());
+    if (fStemOk)
+        peer.PushMessage("stemok");
+    CDataStream out = peer.vSend;
+    if (!SelfTestWriteN(s, &out[0], (int)out.size()))
+    {
+        seen.err = "could not answer";
+        closesocket(s);
+        return;
+    }
+
+    nHdr = CMessageHeader::SizeOnWire(VERSION);
+    vHdr.resize(nHdr);
+    while (seen.vHashes.size() < nExpectTx && SelfTestReadN(s, &vHdr[0], nHdr))
+    {
+        memcpy(&nSize, &vHdr[16], 4);
+        vPayload.assign(nSize, 0);
+        if (nSize && !SelfTestReadN(s, &vPayload[0], nSize))
+            break;
+        seen.command = std::string(&vHdr[4]);
+        CDataStream ss(vPayload, SER_NETWORK, VERSION);
+        CTransaction tx;
+        ss >> tx;
+        seen.vHashes.push_back(tx.GetHash());
+    }
+    closesocket(s);
+}
+
+// Our own transactions over a connection and Tor circuit of their own
+// (dandelion.cpp): fresh SOCKS5 credentials each time, nothing but a version
+// message before the transactions, parents ahead of the child, "stemtx" to a
+// Dandelion peer and "tx" to one that predates it.
+static int RunDandelionOneShotSelfTest()
+{
+    printf("dandelion-oneshot self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock winsock;
+    nFail += Check(winsock.fStarted, "Winsock started") ? 0 : 1;
+#endif
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    bool fUp = listener != INVALID_SOCKET
+        && ::bind(listener, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && listen(listener, 4) == 0
+        && getsockname(listener, (struct sockaddr*)&addr, &addrLen) == 0;
+    nFail += Check(fUp, "loopback mock Tor up") ? 0 : 1;
+    if (!fUp)
+        return 1;
+    SelfTestSetSocketTimeout(listener, 30);
+    unsigned short nProxyPort = ntohs(addr.sin_port);
+
+    // A parent and the child that spends it. Nothing checks them here; the
+    // test is what goes on the wire.
+    CTransaction parent, child, lone;
+    parent.vin.resize(1);
+    parent.vin[0].prevout.hash = Hash(BEGIN(nProxyPort), END(nProxyPort));
+    parent.vin[0].prevout.n = 0;
+    parent.vout.resize(1);
+    parent.vout[0].nValue = 5 * COIN;
+    child.vin.resize(1);
+    child.vin[0].prevout.hash = parent.GetHash();
+    child.vin[0].prevout.n = 0;
+    child.vout.resize(1);
+    child.vout[0].nValue = 4 * COIN;
+    lone = child;
+    lone.vout[0].nValue = 3 * COIN;
+    std::vector<CTransaction> vPair, vLone;
+    vPair.push_back(parent);
+    vPair.push_back(child);
+    vLone.push_back(lone);
+
+    std::string err;
+    BtfClearSocks5Proxy();
+    nFail += Check(BtfEnableTorProxy(strprintf("127.0.0.1:%u", (unsigned)nProxyPort), err),
+                   "mock Tor set as the proxy") ? 0 : 1;
+
+    OneShotSeen seen[3];
+    std::thread server([&]() {
+        OneShotMockPeer(listener, true, 2, seen[0]);
+        OneShotMockPeer(listener, true, 1, seen[1]);
+        OneShotMockPeer(listener, false, 1, seen[2]);
+    });
+
+    std::string how[3];
+    unsigned char rnd[16];
+    std::string iso[3];
+    for (int i = 0; i < 3; i++)
+    {
+        RAND_bytes(rnd, sizeof(rnd));
+        iso[i] = HexStr(rnd, rnd + sizeof(rnd), false);
+    }
+    bool f0 = DandelionSendOneShot(vPair, "peerone.onion", 18433, CAddress(), iso[0], how[0]);
+    bool f1 = DandelionSendOneShot(vLone, "peertwo.onion", 18433, CAddress(), iso[1], how[1]);
+    bool f2 = DandelionSendOneShot(vLone, "peerold.onion", 18433, CAddress(), iso[2], how[2]);
+    server.join();
+    closesocket(listener);
+
+    for (int i = 0; i < 3; i++)
+        if (!seen[i].err.empty())
+            printf("  mock peer %d: %s\n", i, seen[i].err.c_str());
+    nFail += Check(f0 && how[0] == "stem", strprintf("parent and child sent as a stem (%s)", how[0].c_str()).c_str()) ? 0 : 1;
+    nFail += Check(seen[0].command == "stemtx" && seen[0].vHashes.size() == 2 &&
+                   seen[0].vHashes[0] == parent.GetHash() && seen[0].vHashes[1] == child.GetHash(),
+                   "the peer got stemtx, parent first, then the child") ? 0 : 1;
+    nFail += Check(seen[0].host == "peerone.onion" && seen[0].port == 18433,
+                   "CONNECT named the peer's onion, resolved by Tor") ? 0 : 1;
+    nFail += Check(f1 && seen[1].vHashes.size() == 1 && seen[1].vHashes[0] == lone.GetHash(),
+                   "a second transaction, second connection") ? 0 : 1;
+    nFail += Check(seen[0].user == iso[0] && seen[1].user == iso[1] && seen[0].user != seen[1].user &&
+                   seen[0].user.size() == 32,
+                   "each connection with its own SOCKS5 credentials: its own Tor circuit") ? 0 : 1;
+    nFail += Check(f2 && how[2] == "tx (peer predates Dandelion)" && seen[2].command == "tx" &&
+                   seen[2].vHashes.size() == 1 && seen[2].vHashes[0] == lone.GetHash(),
+                   strprintf("a peer that never says stemok gets a plain tx (%s)", how[2].c_str()).c_str()) ? 0 : 1;
+
+    // Credentials mean something to Tor only; a plain SOCKS5 proxy gets
+    // nothing from this path, and the stem we keep takes over.
+    BtfClearSocks5Proxy();
+    nFail += Check(BtfSetSocks5Proxy(strprintf("127.0.0.1:%u", (unsigned)nProxyPort), err) &&
+                   BtfConnectSocketIsolated("peer.onion", 18433, SOCK_ONION_PEER, 5, "x") == INVALID_SOCKET,
+                   "no isolated connection through a proxy that is not Tor") ? 0 : 1;
+    BtfClearSocks5Proxy();
+    nFail += Check(BtfConnectSocketIsolated("peer.onion", 18433, SOCK_ONION_PEER, 5, "x") == INVALID_SOCKET,
+                   "no isolated connection without a proxy") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // Checksum framing, misbehavior and bans, DoS scores on blocks, the initial
 // block download gate, and confirmation depth in coin selection: the network
 // hardening Bitcoin picked up between 0.2 and 0.3.x, done here in one release.
@@ -7947,6 +8178,8 @@ int RunSelfTest(const std::string& name)
         return RunMultisigSelfTest();
     if (name == "socks5-proxy")
         return RunSocks5ProxySelfTest();
+    if (name == "dandelion-oneshot")
+        return RunDandelionOneShotSelfTest();
     if (name == "managed-tor")
         return RunManagedTorSelfTest();
     if (name == "treasury")

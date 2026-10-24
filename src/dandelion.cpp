@@ -6,6 +6,8 @@
 #else
 #include "headers.h"
 #include "dandelion.h"
+#include "proxy.h"
+#include "sockcount.h"
 #endif
 
 #include <algorithm>
@@ -133,7 +135,7 @@ static void Stem(const CTransaction& tx, uint64_t from)
              from ? "" : " (ours)");
 }
 
-void DandelionRelayOwn(const CTransaction& tx)
+static void StemOwn(const CTransaction& tx)
 {
     CRITICAL_BLOCK(cs_dandelion)
     {
@@ -141,6 +143,279 @@ void DandelionRelayOwn(const CTransaction& tx)
         // Our own always goes into the stem first: fluffing it here would
         // make this node the first to announce it.
         Stem(tx, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One connection per transaction.
+//
+// A stem hides which node wrote a transaction, but every stem hop of ours
+// leaves over a long-lived connection, and our relay sees all of them: two
+// payments from this wallet reach it over the same connection, from the same
+// .btf identity, and can be tied together. So, with Tor, our own transaction
+// does not leave over any connection we keep. A few seconds after the wallet
+// makes it, a connection is opened for it alone, on a Tor circuit of its own
+// (fresh SOCKS credentials, so Tor shares the circuit with nothing), to a peer
+// picked at random. It carries a version message, which every connection
+// starts with, and the transaction -- no descriptor, no peer list, nothing
+// that names this node -- and closes. The peer sees a stranger hand it a stem
+// transaction, which is what every stem hop looks like.
+
+static CCriticalSection cs_oneshot;
+static set<uint256> setOneShotPending;
+
+static void SetRecvTimeoutMs(SOCKET s, int nMs)
+{
+#ifdef _WIN32
+    DWORD tv = (DWORD)nMs;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = nMs / 1000;
+    tv.tv_usec = (nMs % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static bool SendAll(SOCKET s, CNode& node)
+{
+    CDataStream vOut(SER_NETWORK);
+    CRITICAL_BLOCK(node.cs_vSend)
+    {
+        vOut = node.vSend;
+        node.vSend.clear();
+    }
+    const char* p = vOut.empty() ? NULL : &vOut[0];
+    size_t nLeft = vOut.size();
+    while (nLeft > 0)
+    {
+        int r = send(s, p, (int)nLeft, BTF_SEND_FLAGS);
+        if (r <= 0)
+            return false;
+        p += r;
+        nLeft -= r;
+    }
+    return true;
+}
+
+bool DandelionSendOneShot(const vector<CTransaction>& vtx, const string& strHost, unsigned short nPort,
+                          const CAddress& addrYou, const string& strIsolation, string& strHow)
+{
+    strHow = "connect failed";
+    SOCKET s = BtfConnectSocketIsolated(strHost, nPort, SOCK_ONION_PEER, ONESHOT_CONNECT_SECONDS,
+                                        strIsolation);
+    if (s == INVALID_SOCKET)
+        return false;
+
+    // Not in vNodes: nothing the node sends to its peers -- inventory, peer
+    // lists, chat, shares -- can reach this connection. The CNode only frames
+    // messages; the socket stays ours.
+    CNode node(INVALID_SOCKET, addrYou, false);
+    bool fOk = SendAll(s, node);
+    SetRecvTimeoutMs(s, 1000);
+
+    vector<char> vBuf;
+    int nRecvVersion = PROTO_NO_CHECKSUM_VERSION;
+    int64 nStart = GetTime(), nVersionAt = 0;
+    bool fStemOk = false, fSent = false;
+    size_t nRead = 0;
+    while (fOk && !fShutdown && !fSent && GetTime() - nStart < ONESHOT_HANDSHAKE_SECONDS)
+    {
+        char buf[4096];
+        int r = recv(s, buf, sizeof(buf), 0);
+        if (r == 0)
+        {
+            strHow = "peer closed";
+            fOk = false;
+            break;
+        }
+        if (r < 0)
+        {
+            // The one-second receive timeout is how this loop ticks; any
+            // other error is the end of the connection.
+            int nErr = WSAGetLastError();
+#ifdef _WIN32
+            bool fTick = nErr == WSAETIMEDOUT || nErr == WSAEWOULDBLOCK;
+#else
+            bool fTick = nErr == EAGAIN || nErr == EWOULDBLOCK || nErr == EINTR;
+#endif
+            if (!fTick)
+            {
+                strHow = strprintf("receive error %d", nErr);
+                fOk = false;
+                break;
+            }
+        }
+        if (r > 0)
+        {
+            vBuf.insert(vBuf.end(), buf, buf + r);
+            nRead += r;
+            if (nRead > ONESHOT_MAX_READ)
+            {
+                strHow = "peer sent too much";
+                fOk = false;
+                break;
+            }
+        }
+        // Whole messages off the front of the buffer. Only two matter: the
+        // peer's version (it fixes the framing from here on) and "stemok".
+        for (;;)
+        {
+            unsigned int nHeader = CMessageHeader::SizeOnWire(nRecvVersion);
+            if (vBuf.size() < nHeader)
+                break;
+            CMessageHeader hdr;
+            CDataStream ssHdr(&vBuf[0], &vBuf[0] + nHeader, SER_NETWORK, nRecvVersion);
+            ssHdr >> hdr;
+            if (!hdr.IsValid())
+            {
+                strHow = "bad message from peer";
+                fOk = false;
+                break;
+            }
+            if (vBuf.size() < nHeader + hdr.nMessageSize)
+                break;
+            string strCommand = hdr.GetCommand();
+            if (strCommand == "version" && nVersionAt == 0 && hdr.nMessageSize >= 4)
+            {
+                int nPeerVersion = 0;
+                memcpy(&nPeerVersion, &vBuf[nHeader], 4);
+                if (nPeerVersion <= 0)
+                {
+                    strHow = "bad version from peer";
+                    fOk = false;
+                    break;
+                }
+                nRecvVersion = min(nPeerVersion, VERSION);
+                CRITICAL_BLOCK(node.cs_vSend)
+                    node.vSend.SetVersion(nRecvVersion);
+                nVersionAt = GetTime();
+            }
+            else if (strCommand == "stemok")
+                fStemOk = true;
+            vBuf.erase(vBuf.begin(), vBuf.begin() + nHeader + hdr.nMessageSize);
+        }
+        // A node from before Dandelion never says stemok: after a short wait
+        // it gets the transaction the old way, and announces it itself.
+        if (fOk && nVersionAt && (fStemOk || GetTime() - nVersionAt >= ONESHOT_STEMOK_WAIT_SECONDS))
+        {
+            // In order: a parent the peer has not seen must come before the
+            // child that spends it, or the child is an orphan there.
+            foreach(const CTransaction& tx, vtx)
+                node.PushMessage(fStemOk ? "stemtx" : "tx", tx);
+            fOk = SendAll(s, node);
+            fSent = fOk;
+            strHow = fStemOk ? "stem" : "tx (peer predates Dandelion)";
+        }
+    }
+    if (fOk && !fSent)
+        strHow = nVersionAt ? "timed out" : "no version from peer";
+    if (fSent)
+    {
+        // Give Tor a moment to carry the last bytes before the stream ends.
+        for (int i = 0; i < 4 && !fShutdown; i++)
+        {
+            char buf[4096];
+            if (recv(s, buf, sizeof(buf), 0) == 0)
+                break;
+        }
+    }
+    BtfCloseSocket(s);
+    return fSent;
+}
+
+static void ThreadOneShot(void* parg)
+{
+    vector<CTransaction> vtx = *(vector<CTransaction>*)parg;
+    delete (vector<CTransaction>*)parg;
+    uint256 hash = vtx.back().GetHash();
+
+    // Not the instant the wallet made it: a transaction that appears the
+    // moment someone clicks Send says when they clicked.
+    int64 nWake = GetTime() + ONESHOT_DELAY_MIN_SECONDS + (int64)GetRand(ONESHOT_DELAY_SPREAD_SECONDS + 1);
+    while (!fShutdown && GetTime() < nWake)
+        Sleep(250);
+
+    bool fSent = false;
+    set<string> setTried;
+    for (int i = 0; i < ONESHOT_TRIES && !fShutdown && !fSent; i++)
+    {
+        string strBtfAddr, strOnion, strHost, strHow;
+        CAddress addrYou;
+        if (!BtfPickBroadcastPeer(setTried, strBtfAddr, strOnion, addrYou))
+            break;
+        setTried.insert(strBtfAddr);
+        size_t colon = strOnion.rfind(':');
+        if (colon == string::npos)
+            continue;
+        strHost = strOnion.substr(0, colon);
+        unsigned short nPort = (unsigned short)atoi(strOnion.substr(colon + 1).c_str());
+        unsigned char rnd[16];
+        RAND_bytes(rnd, sizeof(rnd));
+        string strIsolation = HexStr(rnd, rnd + sizeof(rnd), false);
+        fSent = DandelionSendOneShot(vtx, strHost, nPort, addrYou, strIsolation, strHow);
+        LogPrint("dandelion", "dandelion: %s%s over its own circuit to %.12s...: %s\n",
+                 hash.ToString().substr(0, 10).c_str(),
+                 vtx.size() > 1 ? strprintf(" (+%u parent)", (unsigned)vtx.size() - 1).c_str() : "",
+                 strBtfAddr.c_str(), strHow.c_str());
+    }
+
+    foreach(const CTransaction& tx, vtx)
+    {
+        if (fSent)
+        {
+            // The stem it went into may die like any other; then it is ours
+            // to fluff once the embargo runs out.
+            CRITICAL_BLOCK(cs_dandelion)
+            {
+                uint256 h = tx.GetHash();
+                if (!mapStem.count(h) && mapStem.size() < MAX_STEM)
+                {
+                    StemTx st;
+                    st.tx = tx;
+                    st.nEmbargo = GetTime() + EMBARGO_MIN_SECONDS + (int64)GetRand(EMBARGO_SPREAD_SECONDS + 1);
+                    mapStem[h] = st;
+                }
+            }
+        }
+        else if (!fShutdown)
+            StemOwn(tx);   // no circuit of its own today: the stem we keep
+    }
+
+    CRITICAL_BLOCK(cs_oneshot)
+        setOneShotPending.erase(hash);
+}
+
+void DandelionRelayOwn(const CTransaction& tx, const vector<CTransaction>& vParents)
+{
+    vector<CTransaction> vtx = vParents;
+    vtx.push_back(tx);
+    if (!BtfTorProxyEnabled())
+    {
+        foreach(const CTransaction& t, vtx)
+            StemOwn(t);
+        return;
+    }
+    uint256 hash = tx.GetHash();
+    CRITICAL_BLOCK(cs_oneshot)
+    {
+        // The wallet offers its unconfirmed transactions again every ten
+        // minutes; one connection at a time for each.
+        if (setOneShotPending.count(hash))
+            return;
+        CRITICAL_BLOCK(cs_dandelion)
+            if (mapStem.count(hash))
+                return;
+        setOneShotPending.insert(hash);
+    }
+    vector<CTransaction>* pvtx = new vector<CTransaction>(vtx);
+    if (_beginthread(ThreadOneShot, 0, pvtx) == (uintptr_t)-1)
+    {
+        delete pvtx;
+        CRITICAL_BLOCK(cs_oneshot)
+            setOneShotPending.erase(hash);
+        foreach(const CTransaction& t, vtx)
+            StemOwn(t);
     }
 }
 

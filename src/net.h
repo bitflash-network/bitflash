@@ -42,6 +42,11 @@ void ThreadBtfConnect(void* parg);
 // Cached direct-onion endpoint (host.onion:port) for a .btf address, from peers
 // we have reached before. True on a hit -- lets callers skip a Nostr resolve.
 bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut);
+// A peer to hand one of our own transactions to over a connection of its own
+// (dandelion.cpp): reached before, on this network, not banned, not in setSkip,
+// preferably not connected to us now. False when there is none.
+bool BtfPickBroadcastPeer(const set<string>& setSkip, string& strBtfAddrOut, string& strOnionOut,
+                          CAddress& addrOut);
 // The pinned onion seeds of the active network. The chat app starts from these
 // the same way a node does: no server to ask first.
 void BtfSeedOnions(vector<string>& vOut);
