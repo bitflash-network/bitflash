@@ -1637,12 +1637,15 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         return error("AcceptTransaction() : ConnectInputs failed %s", hash.ToString().substr(0,6).c_str());
     }
     // Relay policy: no one transaction may take more than a fifth of a
-    // block's signature operations (Bitcoin's MAX_STANDARD_TX_SIGOPS). One
-    // that could never fit in a block would otherwise sit in the pool for
-    // good, and a builder that did not count would put it in a block the
-    // network rejects.
-    if (nSigOps > MAX_BLOCK_SIGOPS / 5)
-        return error("AcceptTransaction() : %s has %u signature operations", hash.ToString().substr(0,6).c_str(), nSigOps);
+    // block's signature operations (Bitcoin's MAX_STANDARD_TX_SIGOPS),
+    // redeem scripts included once rules v3 run them. Without it a
+    // transaction that can never fit in a block -- six P2SH inputs, each a
+    // redeem script of 199 untaken OP_CHECKMULTISIGs, is about 1.5 kB and
+    // over the block's 20,000 -- sat in every pool for good, and every block
+    // built from that pool was one the network rejects.
+    if (nSigOps > MAX_STANDARD_TX_SIGOPS)
+        return error("AcceptTransaction() : %s has %u signature operations, over %u",
+                     hash.ToString().substr(0,6).c_str(), nSigOps, MAX_STANDARD_TX_SIGOPS);
 
     // Store transaction in memory
     CRITICAL_BLOCK(cs_mapTransactions)
@@ -4799,12 +4802,14 @@ bool BitcoinMiner(int nThreadId)
             vector<char> vfAlreadyAdded(vOrder.size());
             bool fFoundSomething = true;
             unsigned int nBlockSize = 0;
-            // The same count ConnectBlock caps at MAX_BLOCK_SIGOPS, so this
-            // miner never builds a block the network has to reject: scripts,
-            // plus the redeem scripts rules v3 run.
-            // The block's time first: the rules its transactions are checked
-            // under follow from it, and it was still 0 here.
+            // The block's time before its contents: the rules its
+            // transactions are checked under follow from it, and it was still
+            // 0 here, so they were the clock's.
             pblock->nTime = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+            // Under MAX_BLOCK_SIGOPS, counted as ConnectBlock counts: the
+            // scripts, plus the redeem scripts rules v3 run. This miner did not
+            // count at all, and one transaction over the cap in the pool made
+            // every block it built one the network rejects.
             bool fSigOpsV4 = RulesV4Active(pblock->nTime);
             unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)

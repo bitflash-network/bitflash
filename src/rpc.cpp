@@ -193,13 +193,13 @@ static bool RebuildJob()
                 vector<char> vfAlreadyAdded(vOrder.size());
                 bool fFoundSomething = true;
                 unsigned int sz = 0;
-                // The block's time before its contents: which rules the
-                // transactions are checked under follows from it. It was 0
-                // here, so the rules were the clock's, not the block's.
+                // The block's time before its contents, as in BitcoinMiner:
+                // it was 0 here, so the rules were the clock's.
                 block.nTime = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
                                   (unsigned int)GetAdjustedTime());
                 // Under MAX_BLOCK_SIGOPS, P2SH included, as ConnectBlock
-                // counts: this builder did not count at all.
+                // counts. This builder did not count at all, and its blocks
+                // are mined and submitted for real.
                 bool fSigOpsV4 = RulesV4Active(block.nTime);
                 unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount(fSigOpsV4);
                 while (fFoundSomething && sz < MAX_SIZE / 2)

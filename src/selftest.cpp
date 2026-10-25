@@ -7046,6 +7046,32 @@ static int RunFeePolicySelfTest()
         nFail += Check(fE && !e2.AcceptTransaction(txdb, true),
                        "a transaction others build on in the pool is not replaced") ? 0 : 1;
 
+        // A fifth of a block's signature operations per transaction, at
+        // most: 200 bare 1-of-1 multisig outputs are 4,000 and enter, 201
+        // are 4,020 and do not -- such a transaction could never be mined.
+        {
+            struct Sigops
+            {
+                static CTransaction Make(const CTransaction& parent, unsigned int n, int nOutputs, CKey& key)
+                {
+                    CTransaction tx;
+                    tx.vin.push_back(CTxIn(parent.GetHash(), n, CScript(), SEQUENCE_REPLACEABLE));
+                    CScript ms;
+                    ms << OP_1 << key.GetPubKey() << OP_1 << OP_CHECKMULTISIG;
+                    for (int i = 0; i < nOutputs; i++)
+                        tx.vout.push_back(CTxOut(CENT, ms));
+                    return tx;
+                }
+            };
+            CTransaction over = Sigops::Make(parent, 5, 201, key);
+            CTransaction at = Sigops::Make(parent, 5, 200, key);
+            nFail += Check(over.GetSigOpCount() == 4020 && at.GetSigOpCount() == 4000 &&
+                           MAX_STANDARD_TX_SIGOPS == 4000,
+                           "the count: 20 per OP_CHECKMULTISIG, the cap a fifth of 20,000") ? 0 : 1;
+            nFail += Check(!over.AcceptTransaction(txdb, true) && at.AcceptTransaction(txdb, true),
+                           "a transaction over the signature-operation cap is refused, one at it is taken") ? 0 : 1;
+        }
+
         CRITICAL_BLOCK(cs_mapTransactions)
         {
             mapTransactions.clear();
