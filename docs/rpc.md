@@ -94,7 +94,7 @@ null.
 | `btcrefund` | `contract`, ref | takes it back after the lock |
 | `btcfindsecret` | `contract`, ref, [`fromheight`] | whether a Bitcoin contract was spent, and the secret |
 | `templatehash` | `{address: amount}`, [`version`=2], [`sequence`], [`locktime`=0] | the hash `OP_CHECKTEMPLATEVERIFY` compares with, for a one-input transaction with these outputs (rules v4, `docs/rules-v4.md`) |
-| `spendscript` | `redeemhex`, `txid`, `[items]`, `{address: amount}`, [`version`=2], [`sequence`], [`locktime`=0] | spends the P2SH output of `txid` paying that redeem script; `items` go on the stack below it, bottom first: hex data, `true`, `false`, or `"sig:<pubkey>"` for a signature by a key this wallet holds; what the outputs leave over is the fee |
+| `spendscript` | `redeemhex`, `txid`, `[items]`, `{address: amount}`, [`version`=2], [`sequence`], [`locktime`=0], [`maxfee`=1] | spends the P2SH output of `txid` paying that redeem script; `items` go on the stack below it, bottom first: hex data, `true`, `false`, or `"sig:<pubkey>"` for a signature by a key this wallet holds; what the outputs leave over is the fee, refused over `maxfee`; outputs go in address order, the same order `templatehash` uses |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the

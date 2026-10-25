@@ -474,8 +474,10 @@ static void ParseStartupArguments(int argc, char* argv[])
     fBtfIsolated = fIsolate;
     if (!strBenchV4.empty())
     {
-        long n = atol(strBenchV4.c_str());
-        if (n <= 0)
+        char* end = NULL;
+        errno = 0;
+        long long n = strtoll(strBenchV4.c_str(), &end, 10);
+        if (errno || end == strBenchV4.c_str() || *end != '\0' || n <= 0 || n > 0xffffffffLL)
             StartupRefuse(strprintf("-benchrulesv4=%s is not a unix time", strBenchV4.c_str()), "");
         nBenchRulesV4Time = (unsigned int)n;
         fprintf(stderr, "bench: rules v4 from block time %u on this isolated testnet\n", nBenchRulesV4Time);

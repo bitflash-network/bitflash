@@ -1900,6 +1900,15 @@ void ThreadSocketHandler2(void* parg)
                              addr.ToString().c_str(), nFromThisIP);
                     BtfCloseSocket(hSocket);
                 }
+                else if (fBtfIsolated)
+                {
+                    // An isolated bench dials its one peer, and that peer
+                    // dials it: nothing needs to come in, and whoever does
+                    // could be a testnet node that kept this onion from
+                    // before (docs/rules-v4.md).
+                    LogPrint("net", "isolated bench: refusing an inbound connection\n");
+                    BtfCloseSocket(hSocket);
+                }
                 else
                 {
                     LogPrint("net", "accepted connection from %s\n", addr.ToString().c_str());

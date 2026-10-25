@@ -1694,7 +1694,9 @@ static json rpc_spendscript(const json& p)
 {
     if (p.size() < 4 || !p[0].is_string() || !p[1].is_string() || !p[2].is_array())
         throw runtime_error("spendscript <redeem hex> <txid> [\"sig:<pubkey>\" | true | false | <hex>, ...] "
-                            "{\"address\": amount} [version=2] [sequence=0xffffffff] [locktime=0]");
+                            "{\"address\": amount} [version=2] [sequence=0xffffffff] [locktime=0] [maxfee=1]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
     if (!IsHex(p[0].get<string>()))
         throw runtime_error("the redeem script is not hex");
     vector<unsigned char> vchRedeem = ParseHex(p[0].get<string>());
@@ -1717,6 +1719,12 @@ static json rpc_spendscript(const json& p)
     int64 nIn = txFrom.vout[nOut].nValue, nOutTotal = tx.GetValueOut();
     if (nOutTotal >= nIn)
         throw runtime_error("the outputs leave nothing for the fee");
+    // There is no change here: whatever the outputs leave over goes to the
+    // miner. A typo in an amount must not give a contract away.
+    int64 nMaxFee = (p.size() > 7 && !p[7].is_null()) ? AmountFromValue(p[7]) : COIN;
+    if (nIn - nOutTotal > nMaxFee)
+        throw runtime_error(strprintf("the outputs leave %s for the fee, over maxfee %s; pay the rest somewhere, or raise maxfee",
+                                      FormatMoney(nIn - nOutTotal).c_str(), FormatMoney(nMaxFee).c_str()));
 
     // Signatures commit to everything but the scriptSigs, so build those last.
     CScript scriptSig;

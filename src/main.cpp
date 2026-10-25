@@ -2274,11 +2274,20 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.vSpent.size())
                 return error("ConnectInputs() : %s prevout.n out of range %d %d %d", GetHash().ToString().substr(0,6).c_str(), prevout.n, (int)txPrev.vout.size(), (int)txindex.vSpent.size());
 
-            // If prev is coinbase, check that it's matured
+            // If prev is coinbase, check that it's matured -- on the chain
+            // this transaction is being connected to. It walked back from
+            // pindexBest, which during a reorganization is still the old tip:
+            // a block on the new branch spending a coinbase of that branch too
+            // early was found on neither, and passed on a node that reached
+            // it by reorganizing while every other node refused it. Outside a
+            // reorganization pindexPrev is pindexBest, as before.
             if (txPrev.IsCoinBase())
-                for (CBlockIndex* pindex = pindexBest; pindex && nBestHeight - pindex->nHeight < COINBASE_MATURITY-1; pindex = pindex->pprev)
+            {
+                int nPrevHeight = pindexPrev ? pindexPrev->nHeight : nBestHeight;
+                for (const CBlockIndex* pindex = pindexPrev; pindex && nPrevHeight - pindex->nHeight < COINBASE_MATURITY-1; pindex = pindex->pprev)
                     if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
-                        return error("ConnectInputs() : tried to spend coinbase at depth %d", nBestHeight - pindex->nHeight);
+                        return error("ConnectInputs() : tried to spend coinbase at depth %d", nPrevHeight - pindex->nHeight);
+            }
 
             // Rules v4 (BIP68): in a version 2 transaction, an input's
             // nSequence can say "not until this long after the coin was mined".
@@ -4789,6 +4798,7 @@ bool BitcoinMiner(int nThreadId)
 
         // Collect the latest transactions into the block
         int64 nFees = 0;
+        bool fSelectedV4 = false;   // the rules the transactions were chosen under
         CRITICAL_BLOCK(cs_main)
         CRITICAL_BLOCK(cs_mapTransactions)
         {
@@ -4811,6 +4821,7 @@ bool BitcoinMiner(int nThreadId)
             // count at all, and one transaction over the cap in the pool made
             // every block it built one the network rejects.
             bool fSigOpsV4 = RulesV4Active(pblock->nTime);
+            fSelectedV4 = fSigOpsV4;
             unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)
             {
@@ -4870,7 +4881,14 @@ bool BitcoinMiner(int nThreadId)
         //
         pblock->hashPrevBlock  = (pindexPrev ? pindexPrev->GetBlockHash() : 0);
         pblock->hashMerkleRoot = pblock->BuildMerkleTree();
-        pblock->nTime          = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+        // A later time, unless it would put the block under other rules than
+        // its transactions were chosen under: it keeps the time it was built
+        // at then, which is still after the median time past.
+        {
+            unsigned int nNow = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+            if (RulesV4Active(nNow) == fSelectedV4)
+                pblock->nTime = nNow;
+        }
         pblock->nBits          = nBits;
         pblock->nNonce         = 1;
 
@@ -4881,7 +4899,7 @@ bool BitcoinMiner(int nThreadId)
         // Keyed for the version this block's nTime selects. The first block
         // after the switch pays for the other dataset once.
         int nPoWVersion = PoWVersionAt(pblock->nTime);
-        bool fRulesV4Built = RulesV4Active(pblock->nTime);
+        bool fRulesV4Built = fSelectedV4;
         if (!RandomXFastReady(nPoWVersion))
         {
             unsigned int nThreads = std::thread::hardware_concurrency();
