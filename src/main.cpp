@@ -1629,12 +1629,23 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     // Check against previous transactions
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
-    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false))
+    unsigned int nSigOps = GetSigOpCount();
+    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false, 0, 0, &nSigOps))
     {
         if (pfMissingInputs)
             *pfMissingInputs = true;
         return error("AcceptTransaction() : ConnectInputs failed %s", hash.ToString().substr(0,6).c_str());
     }
+    // Relay policy: no one transaction may take more than a fifth of a
+    // block's signature operations (Bitcoin's MAX_STANDARD_TX_SIGOPS),
+    // redeem scripts included once rules v3 run them. Without it a
+    // transaction that can never fit in a block -- six P2SH inputs, each a
+    // redeem script of 199 untaken OP_CHECKMULTISIGs, is about 1.5 kB and
+    // over the block's 20,000 -- sat in every pool for good, and every block
+    // built from that pool was one the network rejects.
+    if (nSigOps > MAX_STANDARD_TX_SIGOPS)
+        return error("AcceptTransaction() : %s has %u signature operations, over %u",
+                     hash.ToString().substr(0,6).c_str(), nSigOps, MAX_STANDARD_TX_SIGOPS);
 
     // Store transaction in memory
     CRITICAL_BLOCK(cs_mapTransactions)
@@ -4717,6 +4728,15 @@ bool BitcoinMiner(int nThreadId)
             vector<char> vfAlreadyAdded(vOrder.size());
             bool fFoundSomething = true;
             unsigned int nBlockSize = 0;
+            // The block's time before its contents: the rules its
+            // transactions are checked under follow from it, and it was still
+            // 0 here, so they were the clock's.
+            pblock->nTime = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+            // Under MAX_BLOCK_SIGOPS, counted as ConnectBlock counts: the
+            // scripts, plus the redeem scripts rules v3 run. This miner did not
+            // count at all, and one transaction over the cap in the pool made
+            // every block it built one the network rejects.
+            unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount();
             while (fFoundSomething && nBlockSize < MAX_SIZE/2)
             {
                 fFoundSomething = false;
@@ -4734,8 +4754,15 @@ bool BitcoinMiner(int nThreadId)
                     int64 nMinFee = tx.GetMinFee(pblock->vtx.size() < 100);
 
                     map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
-                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), 0, nFees, false, true, nMinFee, pblock->nTime))
+                    int64 nFeesTmp = nFees;
+                    unsigned int nTxSigOps = tx.GetSigOpCount();
+                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), 0, nFeesTmp, false, true, nMinFee, pblock->nTime,
+                                          &nTxSigOps))
                         continue;
+                    if (nBlockSigOps + nTxSigOps > MAX_BLOCK_SIGOPS)
+                        continue;
+                    nBlockSigOps += nTxSigOps;
+                    nFees = nFeesTmp;
                     swap(mapTestPool, mapTestPoolTmp);
 
                     pblock->vtx.push_back(tx);

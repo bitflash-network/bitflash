@@ -30,6 +30,8 @@ static const unsigned int MAX_ORPHAN_BLOCKS = 200;
 // so a block within the size limit could still hold millions of them and take
 // the network minutes of CPU to reject. Same value Bitcoin settled on.
 static const unsigned int MAX_BLOCK_SIGOPS = 20000;
+// The most one relayed transaction may carry: a fifth of a block, as Bitcoin.
+static const unsigned int MAX_STANDARD_TX_SIGOPS = MAX_BLOCK_SIGOPS / 5;
 // Consensus block-size ceiling. MAX_SIZE is the serializer's generic safety
 // limit (32 MB), not a block rule. Bitcoin 0.1.0 predated the later 1 MB block
 // cap, so this tree inherited no real block-size consensus limit.
