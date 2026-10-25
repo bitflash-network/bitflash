@@ -66,6 +66,10 @@ static const unsigned int RULES_V4_TIME_TESTNET = 1798200000;
 
 unsigned int RulesV4Time();
 bool RulesV4Active(unsigned int nBlockTime);
+// -benchrulesv4=TIME: rules v4 from TIME on an isolated testnet bench
+// (-isolate), so they can be proven with coins before the real date. Refused
+// on mainnet; 0 when not given.
+extern unsigned int nBenchRulesV4Time;
 
 // The day atomic swaps open in the wallet and in btfchat on mainnet:
 // 2026-12-25 12:00 UTC. Not a consensus rule. Rules v3 still switch on at

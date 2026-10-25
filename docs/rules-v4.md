@@ -167,3 +167,32 @@ switch; other nodes should.
    and spend; `decodescript` names the new opcodes.
 6. Testnet with coins: every path spent, every failure tried on a live chain,
    before any date is set on mainnet.
+
+## Proven on an isolated testnet bench (2026-10-24)
+
+Two nodes forked off the testnet at height 9642 with `-isolate` (no cached
+peers, seeds, Nostr or peer exchange; each dials the other with
+`-connectbtf=ADDRESS@HOST.onion:PORT`) and `-benchrulesv4=<time>`, which moves
+the switch on that bench only and is refused on mainnet and without
+`-isolate`. One mined, the other validated every block it was sent. Contracts
+were built with `templatehash` and spent with `spendscript` (`docs/rpc.md`).
+
+| case | result |
+|---|---|
+| CTV, outputs other than the template | refused |
+| CTV, the template's outputs in a version 1 transaction | refused |
+| CTV, exactly the template | in block 9643 |
+| CSFS, BIP340 vector 0 with one bit of the signature flipped | refused |
+| CSFS, BIP340 vector 0 | in block 9643 |
+| CSV 2 blocks, input nSequence 1 | refused (script) |
+| CSV 2 blocks, version 1 transaction | refused (script) |
+| CSV 2 blocks, coin not mined yet | refused (relative lock) |
+| CSV 2 blocks, coin in 9643, next block 9644 | refused (relative lock) |
+| CSV 2 blocks, coin in 9643, next block 9645 | in block 9645 |
+
+To run it again: copy two testnet data directories, delete `nostr.key`,
+`btf_enc.key`, `btfpeers.json` and `managed-tor/` in each so they get new
+identities, start each once with `-testnet -isolate` and a placeholder
+`-connectbtf` to learn its address (it logs `isolated bench: this node is
+...`) and onion, then start both pointed at each other with the same
+`-benchrulesv4`.

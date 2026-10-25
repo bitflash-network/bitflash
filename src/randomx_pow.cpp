@@ -58,8 +58,12 @@ bool RulesV3Active(unsigned int nBlockTime)
     return t != 0 && nBlockTime >= t;
 }
 
+unsigned int nBenchRulesV4Time = 0;
+
 unsigned int RulesV4Time()
 {
+    if (IsTestNet() && nBenchRulesV4Time)
+        return nBenchRulesV4Time;
     return IsTestNet() ? RULES_V4_TIME_TESTNET : RULES_V4_TIME_MAINNET;
 }
 
