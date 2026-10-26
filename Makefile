@@ -27,7 +27,7 @@ APPIMAGE_RUNTIME        := /tmp/appimage-runtime-20251108
 APPIMAGE_RUNTIME_URL    := https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
 APPIMAGE_RUNTIME_SHA256 := 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 SUDO    := $(shell [ "$$(id -u)" = "0" ] && echo "" || echo "sudo")
-VERSION := 1.2.23
+VERSION := 1.2.31
 
 SECP256K1_REPO   := https://github.com/bitcoin-core/secp256k1
 SECP256K1_COMMIT := 7fecac74aed8e1fd9078380d67dd04663705c989
