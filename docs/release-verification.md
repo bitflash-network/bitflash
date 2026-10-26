@@ -98,5 +98,31 @@ to make the replacement verify. Serving from bitflash.network makes this the
 guarantee that matters: without a pinned key, "trust the site" is the only
 thing standing behind a download.
 
-This is not reproducible builds yet. It is the smaller, immediate step that
-makes every release asset auditable before anyone runs it.
+A signature says who made a package, not what is in it. Reproducible builds
+answer the second question.
+
+## Build it yourself and compare
+
+From 1.2.31, every package comes out byte for byte the same from the same
+commit:
+
+- archives have sorted entries, every time set to the commit time
+  (`SOURCE_DATE_EPOCH`), owners zeroed, and a fixed gzip header;
+- Windows executables carry no link time;
+- the AppImage tools are pinned by SHA-256.
+
+Two separate runs of the release workflow on one commit produced identical
+SHA-256s for all eight packages.
+
+To check a release against a build of your own, run the same workflow
+(`.github/workflows/release.yml`) on the release's tag commit, from a fork
+or on your own runner. Then compare its `SHA256SUMS` with the signed one.
+Push a branch at that commit and dispatch the workflow there; a tag would
+also run the publishing step. The packages match when the tools match:
+- Linux packages are built on `ubuntu-24.04`;
+- macOS packages are built on `macos-14`;
+- Windows packages are built with MSYS2 UCRT64 at the package versions the
+  runner installs.
+
+A build against other compiler or library versions will differ, and that
+says nothing about the release.
