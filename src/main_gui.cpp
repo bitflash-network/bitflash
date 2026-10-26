@@ -458,6 +458,31 @@ static void ParseStartupArguments(int argc, char* argv[])
     if (!btfConnect.empty())
         strBtfConnect = btfConnect;
 
+    // A testnet bench, cut off from the testnet: -isolate talks to the
+    // -connectbtf peer only, and -benchrulesv4=TIME switches rules v4 on at
+    // TIME there, so they can be spent and broken with coins before the date.
+    // Neither exists on mainnet.
+    bool fIsolate = arg(argc, argv, "/isolate") || arg(argc, argv, "-isolate");
+    string strBenchV4 = argval2(argc, argv, "/benchrulesv4", "-benchrulesv4");
+    if ((fIsolate || !strBenchV4.empty()) && !fUseTestNet)
+        StartupRefuse("-isolate and -benchrulesv4 are for a testnet bench only", "add -testnet, or leave them out");
+    if (!strBenchV4.empty() && !fIsolate)
+        StartupRefuse("-benchrulesv4 without -isolate would fork this node off the public testnet",
+                      "add -isolate and -connectbtf=ADDRESS@HOST.onion:PORT of the other bench node");
+    if (fIsolate && strBtfConnect.empty())
+        StartupRefuse("-isolate needs the bench's other node", "add -connectbtf=ADDRESS@HOST.onion:PORT");
+    fBtfIsolated = fIsolate;
+    if (!strBenchV4.empty())
+    {
+        char* end = NULL;
+        errno = 0;
+        long long n = strtoll(strBenchV4.c_str(), &end, 10);
+        if (errno || end == strBenchV4.c_str() || *end != '\0' || n <= 0 || n > 0xffffffffLL)
+            StartupRefuse(strprintf("-benchrulesv4=%s is not a unix time", strBenchV4.c_str()), "");
+        nBenchRulesV4Time = (unsigned int)n;
+        fprintf(stderr, "bench: rules v4 from block time %u on this isolated testnet\n", nBenchRulesV4Time);
+    }
+
     // net.cpp has described nListenPort as "tunable via /port" since it was
     // written, but nothing ever read the option, so the port was fixed at 8433
     // and a second node could not start on a machine already running one. Parse

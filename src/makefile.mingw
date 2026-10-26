@@ -263,6 +263,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=script-eval
 	./bitflash.exe -selftest=rules-v2
 	./bitflash.exe -selftest=rules-v3
+	./bitflash.exe -selftest=rules-v4
 	./bitflash.exe -selftest=sigcheck
 	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=btc-light

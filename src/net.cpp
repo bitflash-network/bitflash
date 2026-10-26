@@ -75,6 +75,9 @@ deque<pair<int64, CInv> > vRelayExpiration;
 CCriticalSection cs_mapRelay;
 map<CInv, int64> mapAlreadyAskedFor;
 string strBtfConnect; // .btf peer to keep connected to (from /connectbtf)
+// -isolate (testnet only): a bench that talks to its -connectbtf peer and
+// nobody else -- no cached peers, no seeds, no Nostr, no peer exchange.
+bool fBtfIsolated = false;
 static const int BTF_ONION_CONNECT_TIMEOUT_SECS = 120;
 
 int   nPeersWatched        = 0;
@@ -1252,6 +1255,10 @@ void BtfPexCollect(vector<string>& vDescOut)
 
 int BtfPexAccept(const vector<string>& vDesc)
 {
+    // An isolated bench learns of nobody: its one peer may still know the
+    // public testnet, and dialling any of it would end the isolation.
+    if (fBtfIsolated)
+        return 0;
     void* ctx = BtfSecpContext();
     if (!ctx)
         return 0;
@@ -1518,13 +1525,24 @@ void ThreadBtfConnect(void* parg)
     printf("ThreadBtfConnect started\n");
     string strAddr = *(string*)parg;
     delete (string*)parg;
+    // ADDRESS@HOST.onion:PORT dials that onion straight away, with no
+    // descriptor to resolve: how two isolated bench nodes find each other.
+    string strOnion;
+    size_t at = strAddr.find('@');
+    if (at != string::npos)
+    {
+        strOnion = strAddr.substr(at + 1);
+        strAddr = strAddr.substr(0, at);
+    }
     loop
     {
         if (fShutdown)
             return;
         try
         {
-            CNode* pnode = ConnectNodeBtf(strAddr);
+            unsigned char noEnc[32] = {0};
+            CNode* pnode = strOnion.empty() ? ConnectNodeBtf(strAddr)
+                                            : ConnectNodeBtfResolved(strAddr, "", strOnion, noEnc);
             if (pnode)
             {
                 if (!pnode->fNetworkNode)
@@ -1880,6 +1898,15 @@ void ThreadSocketHandler2(void* parg)
                 {
                     LogPrint("net", "refusing connection from %s, already %u from that address\n",
                              addr.ToString().c_str(), nFromThisIP);
+                    BtfCloseSocket(hSocket);
+                }
+                else if (fBtfIsolated)
+                {
+                    // An isolated bench dials its one peer, and that peer
+                    // dials it: nothing needs to come in, and whoever does
+                    // could be a testnet node that kept this onion from
+                    // before (docs/rules-v4.md).
+                    LogPrint("net", "isolated bench: refusing an inbound connection\n");
                     BtfCloseSocket(hSocket);
                 }
                 else
@@ -2375,11 +2402,17 @@ bool StartNode(string& strError)
     // Peers that answered last time, dialled straight away. The relays are the
     // only way to find anyone otherwise, and reaching them plus walking their
     // descriptor list is what makes a restart take minutes.
-    if (_beginthread(ThreadReconnectCachedBtfPeers, 0, NULL) == -1)
+    // An isolated bench (-isolate) does neither: it must not find, or be
+    // found by, the testnet it forked from. Nostr is what would have said
+    // who this node is, so it says it here, for the other bench node's
+    // -connectbtf.
+    if (fBtfIsolated)
+        printf("isolated bench: this node is %s\n", BtfLocalAddress().c_str());
+    if (!fBtfIsolated && _beginthread(ThreadReconnectCachedBtfPeers, 0, NULL) == -1)
         printf("Error: _beginthread(ThreadReconnectCachedBtfPeers) failed\n");
 
     // Peer discovery over Nostr relays (replaces the old IRC seed)
-    if (_beginthread(ThreadNostrSeed, 0, NULL) == -1)
+    if (!fBtfIsolated && _beginthread(ThreadNostrSeed, 0, NULL) == -1)
         printf("Error: _beginthread(ThreadNostrSeed) failed\n");
 
     // The public community directory, read off the chain for the chat apps

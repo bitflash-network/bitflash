@@ -34,6 +34,8 @@
 // the node identity from nostr.h: asking for that would generate and persist a
 // node key, and a self-test has no business creating one.
 #include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include "tor.h"
 #include "treasury.h"
 #include "walletcmd.h"
@@ -5276,6 +5278,387 @@ static int RunRulesV3SelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// Little-endian bytes, appended: the template hash is spelled out again here
+// by hand, so the test does not share a serializer with the code it checks.
+static void V4PutLE(std::vector<unsigned char>& v, uint64 n, int nBytes)
+{
+    for (int i = 0; i < nBytes; i++)
+        v.push_back((unsigned char)(n >> (8 * i)));
+}
+
+static uint256 V4Sha256(const std::vector<unsigned char>& v)
+{
+    uint256 h;
+    SHA256(v.empty() ? (const unsigned char*)"" : &v[0], v.size(), (unsigned char*)&h);
+    return h;
+}
+
+static uint256 V4TemplateHashByHand(const CTransaction& tx, unsigned int nIn)
+{
+    std::vector<unsigned char> seq, outs, all;
+    for (size_t i = 0; i < tx.vin.size(); i++)
+        V4PutLE(seq, tx.vin[i].nSequence, 4);
+    for (size_t i = 0; i < tx.vout.size(); i++)
+    {
+        V4PutLE(outs, (uint64)tx.vout[i].nValue, 8);
+        const CScript& s = tx.vout[i].scriptPubKey;
+        if (s.size() < 253)
+            outs.push_back((unsigned char)s.size());
+        else
+        {
+            outs.push_back(253);
+            V4PutLE(outs, s.size(), 2);
+        }
+        outs.insert(outs.end(), s.begin(), s.end());
+    }
+    V4PutLE(all, (uint32_t)tx.nVersion, 4);
+    V4PutLE(all, tx.nLockTime, 4);
+    V4PutLE(all, tx.vin.size(), 4);
+    uint256 hs = V4Sha256(seq);
+    all.insert(all.end(), hs.begin(), hs.end());
+    V4PutLE(all, tx.vout.size(), 4);
+    uint256 ho = V4Sha256(outs);
+    all.insert(all.end(), ho.begin(), ho.end());
+    V4PutLE(all, nIn, 4);
+    return V4Sha256(all);
+}
+
+static std::vector<unsigned char> V4Hex(const char* psz)
+{
+    return ParseHex(psz);
+}
+
+// Rules v4 (docs/rules-v4.md): OP_CHECKSEQUENCEVERIFY and BIP68,
+// OP_CHECKTEMPLATEVERIFY with the template hash without scriptSigs, and
+// OP_CHECKSIGFROMSTACK with BIP340 signatures.
+static int RunRulesV4SelfTest()
+{
+    printf("rules-v4 self-test\n");
+    int nFail = 0;
+
+    // ---- the switch
+    bool fWasTestNet = IsTestNet();
+    SelectNetworkParams(false);
+    nFail += Check(RulesV4Time() == 0 && !RulesV4Active(0xffffffffU),
+                   "mainnet: rules v4 are never on until a date is set") ? 0 : 1;
+    SelectNetworkParams(true);
+    nFail += Check(RulesV4Time() == 1798200000 && !RulesV4Active(1798200000 - 1) &&
+                   RulesV4Active(1798200000),
+                   "testnet: rules v4 from 2026-12-25 12:00 UTC, not a second before") ? 0 : 1;
+    nFail += Check(RulesV4Time() >= RulesV3Time(), "and never ahead of rules v3") ? 0 : 1;
+    nBenchRulesV4Time = 1792500000;
+    nFail += Check(RulesV4Time() == 1792500000 && RulesV4Active(1792500000),
+                   "an isolated testnet bench can move the switch (-benchrulesv4)") ? 0 : 1;
+    SelectNetworkParams(false);
+    nFail += Check(RulesV4Time() == 0 && !RulesV4Active(0xffffffffU),
+                   "and that never reaches mainnet") ? 0 : 1;
+    nBenchRulesV4Time = 0;
+    SelectNetworkParams(fWasTestNet);
+
+    nFail += Check(OP_CHECKSEQUENCEVERIFY == 0xb2 && OP_CHECKTEMPLATEVERIFY == 0xb3 &&
+                   OP_CHECKSIGFROMSTACK == 0xcc &&
+                   std::string(GetOpName(OP_CHECKSEQUENCEVERIFY)) == "OP_CHECKSEQUENCEVERIFY" &&
+                   std::string(GetOpName(OP_CHECKTEMPLATEVERIFY)) == "OP_CHECKTEMPLATEVERIFY" &&
+                   std::string(GetOpName(OP_CHECKSIGFROMSTACK)) == "OP_CHECKSIGFROMSTACK",
+                   "the opcodes are Bitcoin's bytes and names") ? 0 : 1;
+
+    // ---- OP_CHECKSEQUENCEVERIFY (BIP112)
+    CTransaction t;
+    t.nVersion = 2;
+    t.vin.resize(1);
+    t.vin[0].prevout = COutPoint(Hash(BEGIN(nFail), END(nFail)), 0);
+    t.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    struct Csv
+    {
+        static bool Run(const CTransaction& tx, int64 nArg, bool fV4)
+        {
+            CScript s;
+            s << nArg << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+            return EvalScript(s, tx, 0, 0, NULL, true, true, fV4);
+        }
+    };
+    const int64 TYPE = SEQUENCE_LOCKTIME_TYPE_FLAG;
+    t.vin[0].nSequence = 10;
+    nFail += Check(Csv::Run(t, 10, true), "CSV 10 blocks against nSequence 10 passes") ? 0 : 1;
+    nFail += Check(Csv::Run(t, 0, true), "CSV 0 passes") ? 0 : 1;
+    nFail += Check(!Csv::Run(t, 10, false), "the same script fails before rules v4: the byte is unknown") ? 0 : 1;
+    nFail += Check(!Csv::Run(t, 11, true), "CSV 11 against nSequence 10 fails") ? 0 : 1;
+    nFail += Check(!Csv::Run(t, TYPE | 10, true), "a time lock is not met by a height nSequence") ? 0 : 1;
+    nFail += Check(!Csv::Run(t, -1, true), "a negative argument fails") ? 0 : 1;
+    {
+        // Negative zero is zero (Bitcoin's CScriptNum), not 128 or the
+        // disable flag read off the raw bytes.
+        CScript s1, s2;
+        s1 << std::vector<unsigned char>(1, 0x80) << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        unsigned char nz[4] = {0, 0, 0, 0x80};
+        s2 << std::vector<unsigned char>(nz, nz + 4) << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        CTransaction v1 = t;
+        v1.nVersion = 1;
+        nFail += Check(EvalScript(s1, t, 0, 0, NULL, true, true, true) &&
+                       !EvalScript(s2, v1, 0, 0, NULL, true, true, true),
+                       "a negative zero argument is 0: met by nSequence 10, and not a reserved pass in a version 1 tx") ? 0 : 1;
+        CTransaction neg = t;
+        neg.nVersion = -1;
+        nFail += Check(Csv::Run(neg, 10, true), "a negative version counts as a large one, as in Bitcoin") ? 0 : 1;
+    }
+    t.vin[0].nSequence = (unsigned int)(TYPE | 5);
+    nFail += Check(Csv::Run(t, TYPE | 5, true) && !Csv::Run(t, 5, true),
+                   "time against time passes, height against time fails") ? 0 : 1;
+    t.vin[0].nSequence = 10 | 0x00010000;   // bits outside the mask mean nothing
+    nFail += Check(Csv::Run(t, 10, true) && Csv::Run(t, 10 | 0x00bf0000, true),
+                   "bits outside the type flag and the mask are ignored on both sides") ? 0 : 1;
+    t.vin[0].nSequence = SEQUENCE_LOCKTIME_DISABLE_FLAG | 10;
+    nFail += Check(!Csv::Run(t, 10, true), "an input with relative locks disabled fails CSV") ? 0 : 1;
+    nFail += Check(Csv::Run(t, (int64)SEQUENCE_LOCKTIME_DISABLE_FLAG, true),
+                   "an argument with the disable flag is reserved and passes") ? 0 : 1;
+    t.vin[0].nSequence = 10;
+    t.nVersion = 1;
+    nFail += Check(!Csv::Run(t, 10, true), "a version 1 transaction fails CSV") ? 0 : 1;
+    t.nVersion = 2;
+    {
+        CScript s;
+        s << OP_CHECKSEQUENCEVERIFY;
+        nFail += Check(!EvalScript(s, t, 0, 0, NULL, true, true, true), "CSV on an empty stack fails") ? 0 : 1;
+        CScript big;
+        big << std::vector<unsigned char>(6, 1) << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        nFail += Check(!EvalScript(big, t, 0, 0, NULL, true, true, true), "a 6-byte argument fails") ? 0 : 1;
+    }
+
+    // ---- BIP68: the relative lock in a block
+    {
+        // A chain of 40 blocks ten minutes apart, at disk positions of their
+        // own, and a coin mined in block 20.
+        std::vector<CBlockIndex*> chain;
+        std::vector<uint256> vHashes;
+        for (int h = 0; h < 40; h++)
+        {
+            CBlockIndex* p = new CBlockIndex();
+            p->nHeight = h;
+            p->nTime = 1800000000 + 600 * h;
+            p->nFile = 77;
+            p->nBlockPos = 1000 + h;
+            p->pprev = h ? chain.back() : NULL;
+            chain.push_back(p);
+            uint256 hash = Hash(BEGIN(h), END(h));
+            vHashes.push_back(hash);
+            mapBlockIndex[hash] = p;
+        }
+        CTxIndex coin(CDiskTxPos(77, 1000 + 20, 0), 1);
+        CTxIn in;
+        in.nSequence = 5;
+        nFail += Check(!SequenceLockPasses(in, coin, false, chain[23]) &&
+                       SequenceLockPasses(in, coin, false, chain[24]),
+                       "a 5-block lock on a coin of block 20: not in block 24, in block 25") ? 0 : 1;
+        in.nSequence = 0;
+        nFail += Check(SequenceLockPasses(in, coin, false, chain[19]),
+                       "a zero lock is no lock, even a block early") ? 0 : 1;
+        {
+            // A block that fails to connect leaves the index again; the
+            // lookup must still find a block added after it, at the same
+            // count of entries as before (the review case: a cache judged
+            // by size never looked).
+            CBlockIndex* pBad = new CBlockIndex();
+            pBad->nHeight = 40; pBad->nFile = 77; pBad->nBlockPos = 5000; pBad->pprev = chain.back();
+            uint256 hBad = Hash(BEGIN(pBad->nBlockPos), END(pBad->nBlockPos));
+            mapBlockIndex[hBad] = pBad;
+            CTxIndex atBad(CDiskTxPos(77, 5000, 0), 1);
+            bool fFoundBad = SequenceLockPasses(in, atBad, false, pBad);
+            mapBlockIndex.erase(hBad);
+            delete pBad;
+            CBlockIndex* pGood = new CBlockIndex();
+            pGood->nHeight = 40; pGood->nFile = 77; pGood->nBlockPos = 6000; pGood->pprev = chain.back();
+            uint256 hGood = Hash(BEGIN(pGood->nBlockPos), END(pGood->nBlockPos));
+            mapBlockIndex[hGood] = pGood;
+            CTxIndex atGood(CDiskTxPos(77, 6000, 0), 1);
+            CTxIndex atGone(CDiskTxPos(77, 5000, 0), 1);
+            nFail += Check(fFoundBad && SequenceLockPasses(in, atGood, false, pGood) &&
+                           !SequenceLockPasses(in, atGone, false, pGood),
+                           "a block deleted from the index and one added after it: the new one is found, the old one is not") ? 0 : 1;
+            mapBlockIndex.erase(hGood);
+            delete pGood;
+        }
+        // Time: from the median time past of block 19; 3 units = 1536 s.
+        in.nSequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 3;
+        int64 nBase = chain[19]->GetMedianTimePast();
+        int k = 20;
+        while (chain[k]->GetMedianTimePast() < nBase + 1536)
+            k++;
+        nFail += Check(!SequenceLockPasses(in, coin, false, chain[k - 1]) &&
+                       SequenceLockPasses(in, coin, false, chain[k]),
+                       "a 3 x 512 s lock is measured in median time past from the block before the coin's") ? 0 : 1;
+        in.nSequence = SEQUENCE_LOCKTIME_DISABLE_FLAG | 30;
+        nFail += Check(SequenceLockPasses(in, coin, false, chain[20]),
+                       "with the disable flag there is no relative lock") ? 0 : 1;
+        in.nSequence = 1;
+        nFail += Check(!SequenceLockPasses(in, coin, true, chain[39]) &&
+                       SequenceLockPasses(CTxIn(), coin, true, chain[39]),
+                       "a coin still in the pool counts as mined in the next block") ? 0 : 1;
+        CTxIndex nowhere(CDiskTxPos(78, 5, 0), 1);
+        in.nSequence = 0;
+        nFail += Check(!SequenceLockPasses(in, nowhere, false, chain[39]),
+                       "a coin at a position no block has is refused") ? 0 : 1;
+        for (size_t i = 0; i < vHashes.size(); i++)
+            mapBlockIndex.erase(vHashes[i]);
+        for (size_t i = 0; i < chain.size(); i++)
+            delete chain[i];
+    }
+
+    // ---- OP_CHECKTEMPLATEVERIFY
+    {
+        CTransaction c;
+        c.nVersion = 2;
+        c.nLockTime = 123;
+        c.vin.resize(2);
+        c.vin[0].prevout = COutPoint(Hash(BEGIN(c.nLockTime), END(c.nLockTime)), 0);
+        c.vin[0].nSequence = 7;
+        c.vin[1].prevout = COutPoint(Hash(BEGIN(c.nVersion), END(c.nVersion)), 1);
+        c.vin[1].nSequence = 0xfffffffe;
+        c.vout.push_back(CTxOut(3 * COIN, CScript() << OP_TRUE));
+        c.vout.push_back(CTxOut(CENT, CScript() << std::vector<unsigned char>(300, 7) << OP_DROP << OP_TRUE));
+        uint256 h0 = CheckTemplateHash(c, 0);
+        nFail += Check(h0 == V4TemplateHashByHand(c, 0) && CheckTemplateHash(c, 1) == V4TemplateHashByHand(c, 1),
+                       "the template hash is BIP119's fields in BIP119's order, minus the scriptSigs") ? 0 : 1;
+        nFail += Check(h0 != CheckTemplateHash(c, 1), "it commits to the input index") ? 0 : 1;
+        CTransaction m = c;
+        m.vin[0].scriptSig << OP_TRUE << std::vector<unsigned char>(40, 1);
+        m.vin[1].prevout.n = 9;
+        nFail += Check(CheckTemplateHash(m, 0) == h0,
+                       "and not to scriptSigs or the coins spent, so P2SH can carry it") ? 0 : 1;
+        struct Ctv
+        {
+            static bool Run(const CTransaction& tx, unsigned int nIn, const std::vector<unsigned char>& arg, bool fV4)
+            {
+                CScript s;
+                s << arg << OP_CHECKTEMPLATEVERIFY << OP_DROP << OP_TRUE;
+                return EvalScript(s, tx, nIn, 0, NULL, true, true, fV4);
+            }
+        };
+        std::vector<unsigned char> arg(h0.begin(), h0.end());
+        nFail += Check(Ctv::Run(c, 0, arg, true), "CTV with the right template passes") ? 0 : 1;
+        nFail += Check(!Ctv::Run(c, 0, arg, false), "and fails before rules v4") ? 0 : 1;
+        nFail += Check(!Ctv::Run(c, 1, arg, true), "the template of input 0 does not pass input 1") ? 0 : 1;
+        CTransaction d = c;
+        d.vout[0].nValue -= 1;
+        nFail += Check(!Ctv::Run(d, 0, arg, true), "one satoshi off in an output fails") ? 0 : 1;
+        d = c; d.nLockTime++;
+        nFail += Check(!Ctv::Run(d, 0, arg, true), "another nLockTime fails") ? 0 : 1;
+        d = c; d.vin[1].nSequence--;
+        nFail += Check(!Ctv::Run(d, 0, arg, true), "another nSequence, any input's, fails") ? 0 : 1;
+        d = c; d.vout.push_back(CTxOut(1, CScript() << OP_TRUE));
+        nFail += Check(!Ctv::Run(d, 0, arg, true), "an extra output fails") ? 0 : 1;
+        d = c; d.nVersion = 3;
+        nFail += Check(!Ctv::Run(d, 0, arg, true), "another version fails") ? 0 : 1;
+        nFail += Check(Ctv::Run(c, 0, std::vector<unsigned char>(31, 0), true) &&
+                       Ctv::Run(c, 0, std::vector<unsigned char>(33, 0), true),
+                       "an argument that is not 32 bytes is reserved and passes") ? 0 : 1;
+        CScript bare;
+        bare << OP_CHECKTEMPLATEVERIFY;
+        nFail += Check(!EvalScript(bare, c, 0, 0, NULL, true, true, true), "CTV on an empty stack fails") ? 0 : 1;
+
+        // In P2SH, with VerifySignature, as the wallet will use it.
+        CScript redeem;
+        redeem << arg << OP_CHECKTEMPLATEVERIFY << OP_DROP << OP_TRUE;
+        CScript p2sh;
+        p2sh.SetPayToScriptHash(redeem);
+        CTransaction from;
+        from.vout.push_back(CTxOut(4 * COIN, p2sh));
+        CTransaction s = c;
+        s.vin[0].prevout = COutPoint(from.GetHash(), 0);
+        s.vin[0].scriptSig = CScript() << static_cast<std::vector<unsigned char> >(redeem);
+        uint256 hs = CheckTemplateHash(s, 0);
+        nFail += Check(hs == h0, "spending a P2SH CTV output leaves the template hash as it was") ? 0 : 1;
+        nFail += Check(VerifySignature(from, s, 0, 0, true, true, true) &&
+                       !VerifySignature(from, s, 0, 0, true, true, false),
+                       "a P2SH CTV spend verifies under rules v4 and not before") ? 0 : 1;
+        s.vout[0].scriptPubKey = CScript() << OP_FALSE << OP_DROP << OP_TRUE;
+        nFail += Check(!VerifySignature(from, s, 0, 0, true, true, true),
+                       "and with its output redirected it does not") ? 0 : 1;
+    }
+
+    // ---- OP_CHECKSIGFROMSTACK
+    {
+        // BIP340's test vector 0: secret key 3, message 32 zero bytes.
+        std::vector<unsigned char> pub0 = V4Hex("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9");
+        std::vector<unsigned char> msg0(32, 0);
+        std::vector<unsigned char> sig0 = V4Hex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215"
+                                                "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0");
+        nFail += Check(SigCheckSchnorr(sig0, msg0, pub0), "BIP340 test vector 0 verifies") ? 0 : 1;
+        std::vector<unsigned char> sigBad = sig0;
+        sigBad[10] ^= 1;
+        nFail += Check(!SigCheckSchnorr(sigBad, msg0, pub0), "and with one bit flipped it does not") ? 0 : 1;
+
+        // A key of our own and a message of any length.
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        unsigned char seckey[32];
+        do { RAND_bytes(seckey, 32); } while (!secp256k1_ec_seckey_verify(ctx, seckey));
+        secp256k1_keypair kp;
+        secp256k1_xonly_pubkey xpub;
+        unsigned char pub32[32], sig64[64];
+        std::string strMsg = "the price at 2027-05-01 12:00 UTC was 42";
+        bool fKey = secp256k1_keypair_create(ctx, &kp, seckey) &&
+                    secp256k1_keypair_xonly_pub(ctx, &xpub, NULL, &kp) &&
+                    secp256k1_xonly_pubkey_serialize(ctx, pub32, &xpub) &&
+                    secp256k1_schnorrsig_sign_custom(ctx, sig64, (const unsigned char*)strMsg.data(),
+                                                     strMsg.size(), &kp, NULL);
+        secp256k1_context_destroy(ctx);
+        nFail += Check(fKey, "a BIP340 key and a signature over a 41-byte message") ? 0 : 1;
+        std::vector<unsigned char> pub(pub32, pub32 + 32), sig(sig64, sig64 + 64);
+        std::vector<unsigned char> msg(strMsg.begin(), strMsg.end());
+
+        CTransaction any;
+        any.vin.resize(1);
+        any.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+        struct Csfs
+        {
+            // <sig> <msg> <pub> CSFS, then optionally NOT
+            static bool Run(const CTransaction& tx, const std::vector<unsigned char>& s,
+                            const std::vector<unsigned char>& m, const std::vector<unsigned char>& p,
+                            bool fNot, bool fV4)
+            {
+                CScript sc;
+                sc << s << m << p << OP_CHECKSIGFROMSTACK;
+                if (fNot)
+                    sc << OP_NOT;
+                return EvalScript(sc, tx, 0, 0, NULL, true, true, fV4);
+            }
+        };
+        nFail += Check(Csfs::Run(any, sig, msg, pub, false, true), "CSFS: the key signed the message") ? 0 : 1;
+        nFail += Check(!Csfs::Run(any, sig, msg, pub, false, false), "and the byte is unknown before rules v4") ? 0 : 1;
+        std::vector<unsigned char> msg2 = msg;
+        msg2.back() = '3';
+        nFail += Check(!Csfs::Run(any, sig, msg2, pub, false, true) && !Csfs::Run(any, sig, msg2, pub, true, true),
+                       "a signature over another message fails the script, NOT or no NOT") ? 0 : 1;
+        nFail += Check(!Csfs::Run(any, std::vector<unsigned char>(), msg, pub, false, true) &&
+                       Csfs::Run(any, std::vector<unsigned char>(), msg, pub, true, true),
+                       "an empty signature is false, and only that can be") ? 0 : 1;
+        nFail += Check(!Csfs::Run(any, std::vector<unsigned char>(sig.begin(), sig.begin() + 63), msg, pub, true, true),
+                       "a 63-byte signature fails the script") ? 0 : 1;
+        nFail += Check(!Csfs::Run(any, sig, msg, std::vector<unsigned char>(), true, true),
+                       "an empty key fails the script") ? 0 : 1;
+        nFail += Check(Csfs::Run(any, sig, msg, std::vector<unsigned char>(33, 2), false, true),
+                       "a key of another size is a later rule's, and passes") ? 0 : 1;
+        nFail += Check(Csfs::Run(any, sig0, msg0, pub0, false, true),
+                       "BIP340 vector 0 through the opcode") ? 0 : 1;
+        CScript two;
+        two << sig << msg << OP_CHECKSIGFROMSTACK;
+        nFail += Check(!EvalScript(two, any, 0, 0, NULL, true, true, true), "fewer than three items fail") ? 0 : 1;
+
+        CScript counted;
+        counted << pub << OP_CHECKSIGFROMSTACK << OP_VERIFY << pub << OP_CHECKSIG;
+        nFail += Check(counted.GetSigOpCount(false) == 1 && counted.GetSigOpCount(true) == 2,
+                       "CSFS counts as a signature operation from rules v4 on") ? 0 : 1;
+        CScript scriptSig;
+        scriptSig << static_cast<std::vector<unsigned char> >(counted);
+        nFail += Check(GetP2SHSigOpCount(scriptSig, true) == 2 && GetP2SHSigOpCount(scriptSig, false) == 1,
+                       "inside a P2SH redeem script too") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // The treasury: the script the keys in treasury.cpp make, what pays it, and
 // the coinbase split. Runs against both networks' tables; mainnet may be
 // unconfigured, and then everything that would pay it must say so.
@@ -7457,6 +7840,8 @@ int RunSelfTest(const std::string& name)
         return RunChatWalletSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
+    if (name == "rules-v4")
+        return RunRulesV4SelfTest();
     if (name == "sigcheck")
         return RunSigCheckSelfTest();
     if (name == "btc-light")

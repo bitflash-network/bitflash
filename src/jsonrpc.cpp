@@ -1169,7 +1169,11 @@ static json rpc_signrawtransaction(const json& p)
             }
         }
         txin.scriptSig = scriptSigNew;
-        if (!VerifyScriptP2SH(txin.scriptSig, scriptPubKey, tx, i))
+        // Under the rules a block made now would be checked by, so a lock
+        // script (CLTV, CSV, CTV) counts as complete once it is.
+        unsigned int nNow = (unsigned int)GetAdjustedTime();
+        if (!VerifyScriptP2SH(txin.scriptSig, scriptPubKey, tx, i, RulesV2Active(nNow), RulesV3Active(nNow),
+                              RulesV4Active(nNow)))
         {
             fComplete = false;
             json e; e["vout"] = (int)i; e["error"] = "input does not verify yet (more signatures needed, or keys not held)";
@@ -1633,6 +1637,154 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
     j["amount"] = ValueFromAmount(nIn - nFee);
     j["fee"] = ValueFromAmount(nFee);
     j["to"] = PubKeyToAddress(vchTo);
+    return j;
+}
+
+// ---- scripts of rules v4, by hand (docs/rules-v4.md) -----------------------
+//
+// Two tools for contracts the wallet has no button for yet: the template hash
+// OP_CHECKTEMPLATEVERIFY will compare with, and the spend of a P2SH output by
+// any redeem script, with the version, sequence and lock time the script
+// needs. What the wallet signs is only ever what is asked: "sig:<pubkey>".
+
+// The outputs of an {address: amount} object, in address order (the order
+// the JSON object keeps), the same for templatehash and spendscript.
+static vector<CTxOut> OutputsFromParam(const json& o)
+{
+    if (!o.is_object() || o.empty())
+        throw runtime_error("outputs: {\"address\": amount, ...}");
+    vector<CTxOut> v;
+    for (json::const_iterator it = o.begin(); it != o.end(); ++it)
+        v.push_back(CTxOut(AmountFromValue(it.value()), ScriptForAddress(it.key())));
+    return v;
+}
+
+static unsigned int UIntParam(const json& p, size_t i, unsigned int nDefault)
+{
+    if (p.size() <= i || p[i].is_null())
+        return nDefault;
+    if (!p[i].is_number_integer() || p[i].get<int64>() < 0 || p[i].get<int64>() > 0xffffffffLL)
+        throw runtime_error(strprintf("parameter %u is not a 32-bit unsigned number", (unsigned)i + 1));
+    return (unsigned int)p[i].get<int64>();
+}
+
+// templatehash {outputs} [version=2] [sequence=0xffffffff] [locktime=0]
+// The hash of a one-input transaction with these fields, for input 0.
+static json rpc_templatehash(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("templatehash {\"address\": amount, ...} [version=2] [sequence] [locktime]");
+    CTransaction tx;
+    tx.nVersion = (int)UIntParam(p, 1, 2);
+    tx.vin.resize(1);
+    tx.vin[0].nSequence = UIntParam(p, 2, 0xffffffff);
+    tx.nLockTime = UIntParam(p, 3, 0);
+    tx.vout = OutputsFromParam(p[0]);
+    uint256 h = CheckTemplateHash(tx, 0);
+    json j;
+    j["hash"] = HexStr(h.begin(), h.end(), false);
+    return j;
+}
+
+// spendscript <redeem hex> <txid> [stack items] {outputs} [version] [sequence] [locktime]
+// Stack items, bottom first: hex data, true, false, or sig:<pubkey hex> for a
+// SIGHASH_ALL signature by a key this wallet holds. The redeem script goes on
+// top. What the outputs leave over is the fee.
+static json rpc_spendscript(const json& p)
+{
+    if (p.size() < 4 || !p[0].is_string() || !p[1].is_string() || !p[2].is_array())
+        throw runtime_error("spendscript <redeem hex> <txid> [\"sig:<pubkey>\" | true | false | <hex>, ...] "
+                            "{\"address\": amount} [version=2] [sequence=0xffffffff] [locktime=0] [maxfee=1]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    if (!IsHex(p[0].get<string>()))
+        throw runtime_error("the redeem script is not hex");
+    vector<unsigned char> vchRedeem = ParseHex(p[0].get<string>());
+    CScript redeem(vchRedeem.begin(), vchRedeem.end());
+    uint256 txid;
+    txid.SetHex(p[1].get<string>());
+    CTransaction txFrom;
+    unsigned int nOut = 0;
+    FindContractOutput(redeem, txid, txFrom, nOut);
+    if (OutputSpent(COutPoint(txFrom.GetHash(), nOut)))
+        throw runtime_error("that output is already spent");
+
+    CTransaction tx;
+    tx.nVersion = (int)UIntParam(p, 4, 2);
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(txFrom.GetHash(), nOut);
+    tx.vin[0].nSequence = UIntParam(p, 5, 0xffffffff);
+    tx.nLockTime = UIntParam(p, 6, 0);
+    tx.vout = OutputsFromParam(p[3]);
+    int64 nIn = txFrom.vout[nOut].nValue, nOutTotal = tx.GetValueOut();
+    if (nOutTotal >= nIn)
+        throw runtime_error("the outputs leave nothing for the fee");
+    // There is no change here: whatever the outputs leave over goes to the
+    // miner. A typo in an amount must not give a contract away.
+    int64 nMaxFee = (p.size() > 7 && !p[7].is_null()) ? AmountFromValue(p[7]) : COIN;
+    if (nIn - nOutTotal > nMaxFee)
+        throw runtime_error(strprintf("the outputs leave %s for the fee, over maxfee %s; pay the rest somewhere, or raise maxfee",
+                                      FormatMoney(nIn - nOutTotal).c_str(), FormatMoney(nMaxFee).c_str()));
+
+    // Signatures commit to everything but the scriptSigs, so build those last.
+    CScript scriptSig;
+    uint256 hashSig = SignatureHash(redeem, tx, 0, SIGHASH_ALL);
+    foreach(const json& item, p[2])
+    {
+        if (item.is_boolean())
+        {
+            scriptSig << (item.get<bool>() ? OP_TRUE : OP_FALSE);
+            continue;
+        }
+        if (!item.is_string())
+            throw runtime_error("a stack item is hex, true, false or sig:<pubkey>");
+        string s = item.get<string>();
+        if (s.compare(0, 4, "sig:") == 0)
+        {
+            vector<unsigned char> vchPubKey = ParseHex(s.substr(4));
+            CKey key;
+            CRITICAL_BLOCK(cs_mapKeys)
+            {
+                if (!mapKeys.count(vchPubKey))
+                    throw runtime_error("this wallet does not hold the key " + s.substr(4));
+                key.SetPrivKey(mapKeys[vchPubKey]);
+            }
+            vector<unsigned char> sig;
+            if (!key.Sign(hashSig, sig))
+                throw runtime_error("signing failed");
+            sig.push_back((unsigned char)SIGHASH_ALL);
+            scriptSig << sig;
+        }
+        else if (IsHex(s))
+            scriptSig << ParseHex(s);
+        else
+            throw runtime_error("a stack item is hex, true, false or sig:<pubkey>");
+    }
+    scriptSig << vchRedeem;
+    tx.vin[0].scriptSig = scriptSig;
+
+    unsigned int nNow = (unsigned int)GetAdjustedTime();
+    if (!VerifySignature(txFrom, tx, 0, 0, true, RulesV3Active(nNow), RulesV4Active(nNow)))
+        throw runtime_error("the spend does not verify under the rules now in force");
+
+    uint256 hash = tx.GetHash();
+    CDataStream ssTx(SER_NETWORK);
+    ssTx << tx;
+    CRITICAL_BLOCK(cs_main)
+    {
+        bool fMissingInputs = false;
+        // AcceptTransaction says "missing inputs" for every input it could not
+        // connect, a relative lock not over yet included.
+        if (!tx.AcceptTransaction(true, &fMissingInputs))
+            throw runtime_error(fMissingInputs ? "the node could not connect the input: not known to it, or under a relative lock not over yet"
+                                               : "the node refused it (see debug.log)");
+        AddToWalletIfMine(tx, NULL);
+        RelayMessage(CInv(MSG_TX, hash), ssTx);
+    }
+    json j;
+    j["txid"] = hash.GetHex();
+    j["fee"] = ValueFromAmount(nIn - nOutTotal);
+    j["hex"] = HexStr(ssTx.begin(), ssTx.end(), false);
     return j;
 }
 
@@ -2309,6 +2461,8 @@ static const RpcEntry kMethods[] = {
     { "swapinitiate",     rpc_swapinitiate },
     { "swapparticipate",  rpc_swapparticipate },
     { "swapauditcontract", rpc_swapauditcontract },
+    { "templatehash",     rpc_templatehash },
+    { "spendscript",      rpc_spendscript },
     { "swapredeem",       rpc_swapredeem },
     { "swaprefund",       rpc_swaprefund },
     { "swapextractsecret", rpc_swapextractsecret },

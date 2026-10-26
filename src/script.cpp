@@ -42,8 +42,42 @@ void MakeSameSize(valtype& vch1, valtype& vch2)
 #define stacktop(i)  (stack.at(stack.size()+(i)))
 #define altstacktop(i)  (altstack.at(altstack.size()+(i)))
 
+static uint256 Sha256Of(const CDataStream& ss)
+{
+    uint256 hash;
+    SHA256((const unsigned char*)(ss.empty() ? "" : &ss[0]), ss.size(), (unsigned char*)&hash);
+    return hash;
+}
+
+uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache* pCache)
+{
+    // BIP119's DefaultCheckTemplateVerifyHash without the scriptSigs field
+    // (docs/rules-v4.md). Single SHA-256 throughout, fixed-width little-endian
+    // integers, outputs as they are serialized.
+    CtvHashCache local;
+    CtvHashCache& c = pCache ? *pCache : local;
+    if (!c.fReady)
+    {
+        CDataStream ssSeq(SER_NETWORK), ssOut(SER_NETWORK);
+        foreach(const CTxIn& txin, tx.vin)
+            ssSeq << txin.nSequence;
+        foreach(const CTxOut& txout, tx.vout)
+            ssOut << txout;
+        c.hashSequences = Sha256Of(ssSeq);
+        c.hashOutputs = Sha256Of(ssOut);
+        c.fReady = true;
+    }
+    CDataStream ss(SER_NETWORK);
+    ss << tx.nVersion << tx.nLockTime;
+    ss << (unsigned int)tx.vin.size() << c.hashSequences;
+    ss << (unsigned int)tx.vout.size() << c.hashOutputs;
+    ss << nIn;
+    return Sha256Of(ss);
+}
+
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType,
-                vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs, bool fRulesV3)
+                vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs, bool fRulesV3,
+                bool fRulesV4)
 {
     CAutoBN_CTX pctx;
     CScript::const_iterator pc = script.begin();
@@ -52,6 +86,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
     vector<bool> vfExec;
     vector<valtype> stack;
     vector<valtype> altstack;
+    CtvHashCache ctvCache;   // OP_CHECKTEMPLATEVERIFY hashes txTo once per run
     unsigned int nOpCount = 0;
     if (pvStackRet)
         pvStackRet->clear();
@@ -179,6 +214,71 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                     return false;
                 // Left on the stack, as Bitcoin does: the script follows it with
                 // OP_DROP, and the same bytes then work on both chains.
+            }
+            break;
+
+            case OP_CHECKSEQUENCEVERIFY:
+            {
+                // BIP112: "not until this long after the coin I spend was
+                // mined". Like CLTV, the script does not measure anything: it
+                // checks this input's nSequence, and BIP68 (ConnectInputs) is
+                // what keeps the transaction out of a block until the relative
+                // lock that nSequence states has passed.
+                if (!fRulesV4)
+                    return false;
+                if (stack.size() < 1)
+                    return false;
+                const valtype& vch = stacktop(-1);
+                if (vch.size() > 5)
+                    return false;
+                CBigNum bnSeq(vch);
+                if (bnSeq < 0)
+                    return false;
+                // The low 32 bits of the number, from its canonical encoding:
+                // the bytes as pushed could be a negative zero (0x80), which
+                // is 0 to Bitcoin and must be 0 here, not 128. Nothing above
+                // bit 31 means anything to this rule.
+                valtype vchSeq = bnSeq.getvch();
+                unsigned int nScript = 0;
+                for (size_t k = 0; k < vchSeq.size() && k < 4; k++)
+                    nScript |= (unsigned int)vchSeq[k] << (8 * k);
+                // Disable flag in the script's number: reserved for later
+                // rules, so it passes, as in Bitcoin.
+                if (nScript & SEQUENCE_LOCKTIME_DISABLE_FLAG)
+                    break;
+                // Unsigned, as Bitcoin compares it: a negative version is a
+                // large one there, and must be here.
+                if ((unsigned int)txTo.nVersion < 2)
+                    return false;
+                unsigned int nTxSeq = txTo.vin[nIn].nSequence;
+                if (nTxSeq & SEQUENCE_LOCKTIME_DISABLE_FLAG)
+                    return false;
+                const unsigned int nMask = SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK;
+                unsigned int nTxMasked = nTxSeq & nMask, nScriptMasked = nScript & nMask;
+                // Blocks against blocks, time against time.
+                if ((nTxMasked < SEQUENCE_LOCKTIME_TYPE_FLAG) != (nScriptMasked < SEQUENCE_LOCKTIME_TYPE_FLAG))
+                    return false;
+                if (nScriptMasked > nTxMasked)
+                    return false;
+            }
+            break;
+
+            case OP_CHECKTEMPLATEVERIFY:
+            {
+                // BIP119, with the template hash of docs/rules-v4.md (no
+                // scriptSigs field). A 32-byte value must be the hash of the
+                // spending transaction; any other size is reserved and passes.
+                if (!fRulesV4)
+                    return false;
+                if (stack.size() < 1)
+                    return false;
+                const valtype& vch = stacktop(-1);
+                if (vch.size() == 32)
+                {
+                    uint256 hash = CheckTemplateHash(txTo, nIn, &ctvCache);
+                    if (memcmp(&vch[0], hash.begin(), 32) != 0)
+                        return false;
+                }
             }
             break;
 
@@ -816,6 +916,39 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
             }
             break;
 
+            case OP_CHECKSIGFROMSTACK:
+            {
+                // BIP348: (sig msg pubkey -- bool). The key signed the message,
+                // whatever the message is -- not this transaction.
+                if (!fRulesV4)
+                    return false;
+                if (stack.size() < 3)
+                    return false;
+                const valtype& vchSig = stacktop(-3);
+                const valtype& vchMsg = stacktop(-2);
+                const valtype& vchPubKey = stacktop(-1);
+                if (vchPubKey.empty())
+                    return false;
+                bool fSuccess;
+                if (vchSig.empty())
+                    fSuccess = false;   // the only way to say false
+                else if (vchPubKey.size() == 32)
+                {
+                    // A signature that is there and wrong fails the script:
+                    // nobody can make a passing script fail by swapping it.
+                    if (!SigCheckSchnorr(vchSig, vchMsg, vchPubKey))
+                        return false;
+                    fSuccess = true;
+                }
+                else
+                    fSuccess = true;    // a key type of a later rule
+                stack.pop_back();
+                stack.pop_back();
+                stack.pop_back();
+                stack.push_back(fSuccess ? vchTrue : vchFalse);
+            }
+            break;
+
             case OP_CHECKMULTISIG:
             case OP_CHECKMULTISIGVERIFY:
             {
@@ -1450,7 +1583,7 @@ bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int 
 }
 
 
-unsigned int GetP2SHSigOpCount(const CScript& scriptSig)
+unsigned int GetP2SHSigOpCount(const CScript& scriptSig, bool fRulesV4)
 {
     // The last push is the redeem script. A scriptSig that does not parse has
     // no redeem script to count; it fails verification anyway.
@@ -1463,15 +1596,15 @@ unsigned int GetP2SHSigOpCount(const CScript& scriptSig)
             return 0;
         last = vch;
     }
-    return CScript(last.begin(), last.end()).GetSigOpCount();
+    return CScript(last.begin(), last.end()).GetSigOpCount(fRulesV4);
 }
 
 bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                      bool fStrictSigs, bool fRulesV3)
+                      bool fStrictSigs, bool fRulesV3, bool fRulesV4)
 {
     if (!scriptSig.IsPushOnly())
         return false;
-    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3))
+    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4))
         return false;
     if (!scriptPubKey.IsPayToScriptHash())
         return true;
@@ -1506,7 +1639,7 @@ bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, con
     if (Hash160(subscript) != uint160(valtype(scriptPubKey.begin() + 2, scriptPubKey.begin() + 22)))
         return false;
     CScript inner(scriptSig.begin(), pcLastStart);
-    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3);
+    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4);
 }
 
 CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn,
@@ -1553,7 +1686,7 @@ CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, uns
 }
 
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType,
-                     bool fStrictSigs, bool fRulesV3)
+                     bool fStrictSigs, bool fRulesV3, bool fRulesV4)
 {
     assert(nIn < txTo.vin.size());
     const CTxIn& txin = txTo.vin[nIn];
@@ -1577,8 +1710,8 @@ bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsig
     // spent by anybody who presented a script with the right hash, signatures
     // or not -- which is why the wallet refused to pay to one.
     if (fRulesV3 && txout.scriptPubKey.IsPayToScriptHash())
-        return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true);
+        return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true, fRulesV4);
 
     return EvalScript(txin.scriptSig + CScript(OP_CODESEPARATOR) + txout.scriptPubKey, txTo, nIn, nHashType, NULL,
-                      fStrictSigs, fRulesV3);
+                      fStrictSigs, fRulesV3, fRulesV4);
 }

@@ -48,6 +48,7 @@ void BtfSeedOnions(vector<string>& vOut);
 // False for an onion whose port says it belongs to the other network.
 bool BtfOnionFitsThisNetwork(const string& strOnion);
 extern string strBtfConnect;
+extern bool fBtfIsolated;
 // Bootstrap seeds added at runtime with /btfseed=ADDRESS:ENCHEX (repeatable).
 // The compiled-in list lives in net.cpp; these are appended to it.
 extern std::vector<std::pair<std::string, std::string> > vBtfExtraSeeds;

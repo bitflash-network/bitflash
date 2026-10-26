@@ -58,6 +58,22 @@ bool RulesV3Active(unsigned int nBlockTime)
     return t != 0 && nBlockTime >= t;
 }
 
+unsigned int nBenchRulesV4Time = 0;
+
+unsigned int RulesV4Time()
+{
+    if (IsTestNet() && nBenchRulesV4Time)
+        return nBenchRulesV4Time;
+    return IsTestNet() ? RULES_V4_TIME_TESTNET : RULES_V4_TIME_MAINNET;
+}
+
+bool RulesV4Active(unsigned int nBlockTime)
+{
+    // Never ahead of rules v3, whatever the constants say.
+    unsigned int t = RulesV4Time();
+    return t != 0 && nBlockTime >= t && RulesV3Active(nBlockTime);
+}
+
 unsigned int SwapsOpenTimeFor(bool fTestNetwork)
 {
     unsigned int t = fTestNetwork ? RULES_V3_TIME_TESTNET : RULES_V3_TIME_MAINNET;

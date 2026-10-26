@@ -181,6 +181,7 @@ static bool RebuildJob()
         // Diagnosis and fix both come from Vic-Nas, who found it in his fork
         // of this code and described it exactly. The fork has since been
         // deleted, so this carries it back rather than losing it.
+        bool fSelectedV4 = false;   // the rules the transactions were chosen under
         int64 nFees = 0;
         {
             CTxDB txdb("r");
@@ -200,7 +201,9 @@ static bool RebuildJob()
                 // Under MAX_BLOCK_SIGOPS, P2SH included, as ConnectBlock
                 // counts. This builder did not count at all, and its blocks
                 // are mined and submitted for real.
-                unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount();
+                bool fSigOpsV4 = RulesV4Active(block.nTime);
+                fSelectedV4 = fSigOpsV4;
+                unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount(fSigOpsV4);
                 while (fFoundSomething && sz < MAX_SIZE / 2)
                 {
                     fFoundSomething = false;
@@ -212,7 +215,7 @@ static bool RebuildJob()
                         if (tx.IsCoinBase() || !IsFinalForNextBlock(tx)) continue;
                         map<uint256, CTxIndex> tmp(pool);
                         int64 nFeesTmp = nFees;
-                        unsigned int nTxSigOps = tx.GetSigOpCount();
+                        unsigned int nTxSigOps = tx.GetSigOpCount(fSigOpsV4);
                         if (!tx.ConnectInputs(txdb, tmp, CDiskTxPos(1,1,1), 0, nFeesTmp,
                                               false, true, tx.GetMinFee(block.vtx.size() < 100), block.nTime,
                                               &nTxSigOps))
@@ -239,8 +242,14 @@ static bool RebuildJob()
         block.vtx[0].vout[0].nValue = block.GetBlockValue(pindexPrev->nHeight + 1, nFees);
         block.hashPrevBlock  = pindexPrev->GetBlockHash();
         block.hashMerkleRoot = block.BuildMerkleTree();
-        block.nTime = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
-                          (unsigned int)GetAdjustedTime());
+        // Later, unless that would put the block under other rules than its
+        // transactions were chosen under (BitcoinMiner does the same).
+        {
+            unsigned int nNow = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
+                                    (unsigned int)GetAdjustedTime());
+            if (RulesV4Active(nNow) == fSelectedV4)
+                block.nTime = nNow;
+        }
         block.nBits  = nBits;
         block.nNonce = 1;
         // No AddKey here: the pool wrote this key to wallet.dat before it was

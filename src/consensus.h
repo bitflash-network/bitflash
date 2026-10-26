@@ -54,6 +54,23 @@ static const unsigned int RULES_V3_TIME_TESTNET = 1792458000;
 unsigned int RulesV3Time();
 bool RulesV3Active(unsigned int nBlockTime);
 
+// Rules v4 (docs/rules-v4.md): relative lock time (BIP68) and
+// OP_CHECKSEQUENCEVERIFY (BIP112), OP_CHECKTEMPLATEVERIFY (BIP119, without
+// the scriptSigs field), OP_CHECKSIGFROMSTACK (BIP348). Only after rules v3:
+// they need P2SH and median-time-past finality.
+//
+// Mainnet: 0, never, until the founder fixes the date (planned May 2027).
+static const unsigned int RULES_V4_TIME_MAINNET = 0;
+// Testnet: 2026-12-25 12:00 UTC at the latest.
+static const unsigned int RULES_V4_TIME_TESTNET = 1798200000;
+
+unsigned int RulesV4Time();
+bool RulesV4Active(unsigned int nBlockTime);
+// -benchrulesv4=TIME: rules v4 from TIME on an isolated testnet bench
+// (-isolate), so they can be proven with coins before the real date. Refused
+// on mainnet; 0 when not given.
+extern unsigned int nBenchRulesV4Time;
+
 // The day atomic swaps open in the wallet and in btfchat on mainnet:
 // 2026-12-25 12:00 UTC. Not a consensus rule. Rules v3 still switch on at
 // 2026-11-21, as 1.2.29 shipped them; moving that date in a later release
