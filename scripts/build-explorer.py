@@ -306,7 +306,7 @@ INDEX_HTML = r"""<!doctype html>
   <a class="brand" href="https://bitflash.network/"><img src="logo.png" width="22" height="22" alt="">Bitflash</a>
   <nav aria-label="Bitflash sites">
     <a href="https://bitflash.network/">home</a>
-    <a href="https://git.bitflash.network/bitflash/bitflash">code</a>
+    <a href="https://github.com/bitflash-network/bitflash">code</a>
     <a href="https://docs.bitflash.network/">docs</a>
     <a href="https://releases.bitflash.network/">downloads</a>
     <a href="https://explorer.bitflash.network/" aria-current="page">explorer</a>
