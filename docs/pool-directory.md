@@ -53,7 +53,6 @@ Use:
 ```text
 pool.bitflash.network        human-readable pool directory
 api.bitflash.network/pools.json
-status.bitflash.network      relay/node health, not pool ranking
 docs.bitflash.network        operator setup guide
 ```
 

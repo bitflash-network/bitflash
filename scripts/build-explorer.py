@@ -246,14 +246,35 @@ def build_explorer(raw_blocks, out_dir):
         )
 
     summaries.sort(key=lambda x: -x["height"])
+    estimate = network_estimate(blocks)
     (out / "blocks.json").write_text(
         json.dumps({
             "network": "bitflash",
             "tipHeight": len(blocks) - 1,
             "count": len(blocks),
-            "estimate": network_estimate(blocks),
+            "estimate": estimate,
             "blocks": summaries,
         }, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    # The front page of bitflash.network shows the height and the hashrate.
+    # blocks.json has both but is megabytes; this is the few bytes it needs.
+    (out / "tip.json").write_text(
+        json.dumps({
+            "network": "bitflash",
+            "height": len(blocks) - 1,
+            "time": blocks[-1]["time"] if blocks else None,
+            "hashrate": (estimate or {}).get("hashrate"),
+        }, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    # Cloudflare Pages reads this. Only the small files other sites read are
+    # opened to other origins; the treasury ledgers are copied in by the
+    # deploy, from the node that builds them, when they exist.
+    (out / "_headers").write_text(
+        "/tip.json\n  Access-Control-Allow-Origin: *\n"
+        "/treasury.json\n  Access-Control-Allow-Origin: *\n"
+        "/treasury-testnet.json\n  Access-Control-Allow-Origin: *\n",
         encoding="ascii",
     )
     # The asset URLs carry a hash of what they contain.
@@ -310,7 +331,6 @@ INDEX_HTML = r"""<!doctype html>
     <a href="https://docs.bitflash.network/">docs</a>
     <a href="https://releases.bitflash.network/">downloads</a>
     <a href="https://explorer.bitflash.network/" aria-current="page">explorer</a>
-    <a href="https://status.bitflash.network/">status</a>
     <a href="https://faucet.bitflash.network/">faucet</a>
   </nav>
   <span class="meta" id="tip"></span>
