@@ -14,7 +14,6 @@ Every public page should use the same top navigation:
 | docs | `https://docs.bitflash.network/` |
 | downloads | `https://releases.bitflash.network/` |
 | explorer | `https://explorer.bitflash.network/` |
-| status | `https://status.bitflash.network/` |
 
 The `code` link intentionally points at the repository, not an organization
 or instance root. A visitor choosing "code" wants the source tree. The Forgejo
@@ -71,6 +70,8 @@ explorer.js
 logo.png
 blocks.json
 block/<height>.json
+tip.json      height, tip time and hashrate, read by bitflash.network
+_headers      lets other origins read tip.json and the treasury ledgers
 ```
 
 Serve it with a strict content policy:

@@ -125,13 +125,14 @@ gettreasuryinfo
 grep -A3 MAINNET_KEYS src/treasury.cpp
 
 # the ledger the page shows, against your own block files
-curl -O https://status.bitflash.network/treasury.json
+curl -O https://explorer.bitflash.network/treasury.json
 python3 scripts/build-treasury.py --datadir ~/.bitflash --script <script hex> --verify treasury.json
 # ok: treasury.json agrees with this node's chain up to height N: balance X BTF, M movements
 ```
 
 `build-treasury.py` without `--verify` writes that file from your own chain,
-which is exactly what the status daemon does every block for the page. The
+which is exactly what the node behind the explorer does every block for the
+page. The
 notes next to movements (the reason for a spend, a name a donor asked for)
 are the one thing not on the chain; they are kept by hand in a file the
 script merges in, and they never change a number.
@@ -146,8 +147,8 @@ script merges in, and they never change a number.
   two *Options* controls. `-selftest=treasury` (20 checks).
 - **Ledger** (`scripts/build-treasury.py`): scans `blk*.dat`, writes or
   verifies `treasury.json`. On the 202, `treasury-refresh.service` runs it
-  when the block file changes and the status daemon serves the result at
-  `/treasury.json` (`--publish`), cross-origin, no cache.
+  when the block file changes, and the explorer deploy copies the result to
+  `explorer.bitflash.network/treasury.json`, cross-origin.
 - **Page** (site repository, `crates/site/src/treasury.rs` and
   `treasury.js`): the charter and the slots the script fills every 30 s.
 - **Explorer**: labels the treasury's outputs `treasury` (`--treasury <hex>`)

@@ -269,6 +269,13 @@ def run_golden_fixture(update):
         run([SCRIPTS / "build-explorer.py", blk1, blk2, explorer_dir])
         compare_golden("explorer-blocks.json",
                        (explorer_dir / "blocks.json").read_bytes(), update)
+        tip = json.loads((explorer_dir / "tip.json").read_text(encoding="ascii"))
+        full = json.loads((explorer_dir / "blocks.json").read_text(encoding="ascii"))
+        assert_true(tip["height"] == full["tipHeight"],
+                    "tip.json disagrees with blocks.json on the height")
+        assert_true("Access-Control-Allow-Origin" in
+                    (explorer_dir / "_headers").read_text(encoding="ascii"),
+                    "explorer _headers does not open tip.json to the site")
         # Block detail is chunked 1000 heights per file, so height 1 lives in
         # block/0.json under its own key. The test read block/1.json until
         # the chunking landed, and had been failing ever since.

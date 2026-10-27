@@ -77,7 +77,7 @@ mirror for when the sites themselves are blocked.
 
 ## What to test
 
-Use the public status page only as a rough health check. To prove the local node
+To prove the local node
 is really using Tor, test on the node itself:
 
 ```bash
