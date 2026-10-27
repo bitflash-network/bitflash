@@ -10,14 +10,15 @@ Every public page should use the same top navigation:
 | label | target |
 |---|---|
 | home | `https://bitflash.network/` |
-| code | `https://git.bitflash.network/bitflash/bitflash` |
+| code | `https://github.com/bitflash-network/bitflash` |
 | docs | `https://docs.bitflash.network/` |
 | downloads | `https://releases.bitflash.network/` |
 | explorer | `https://explorer.bitflash.network/` |
 | status | `https://status.bitflash.network/` |
 
-The `code` link intentionally points at the repository, not the Forgejo
-instance root. A visitor choosing "code" wants the source tree.
+The `code` link intentionally points at the repository, not an organization
+or instance root. A visitor choosing "code" wants the source tree. The Forgejo
+copy at git.bitflash.network is a private backup and is not linked.
 
 ## Documentation Pages To Publish
 
