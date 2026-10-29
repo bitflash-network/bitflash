@@ -146,7 +146,8 @@ static void RelayShare(const Share& s, CNode* pfrom)
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
             // Not before its version: the framing is not settled until then.
-            if (pnode != pfrom && pnode->nVersion != 0)
+            // Not to a node that drops shares unread.
+            if (pnode != pfrom && pnode->nVersion != 0 && (pnode->nServices & NODE_P2POOL))
                 pnode->PushMessage("p2pshare", s);
 }
 
@@ -397,8 +398,23 @@ bool P2PoolSubmitShare(const Share& share, string& errOut, bool* pfBlock)
     return fOk;
 }
 
+// The P2Pool peers this node reached and names to another: at most this many.
+static const size_t MAX_P2P_PEER_HINTS = 32;
+
 void P2PoolOnVersion(CNode* pfrom)
 {
+    // A node from before P2Pool would leave the question unanswered, and the
+    // wait for its answer would hold back this node's templates.
+    if (!(pfrom->nServices & NODE_P2POOL))
+        return;
+
+    // Who else holds the share chain, as far as this node has seen: a miner
+    // whose ordinary peers predate P2Pool learns where to look.
+    vector<string> vKnown;
+    BtfKnownP2PoolPeers(vKnown, MAX_P2P_PEER_HINTS);
+    if (!vKnown.empty())
+        pfrom->PushMessage("p2ppeers", vKnown);
+
     // Every peer while this node has no tip, and the first few in any case:
     // the line with the most work wins, so one peer's history -- honest or
     // not -- cannot keep out a better one, and a line saved hours ago is
@@ -423,6 +439,23 @@ bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& v
         vRecv >> s;
         if (!ShareSane(s) || !AcceptShare(s, pfrom, false))
             pfrom->Misbehaving(20);
+        return true;
+    }
+
+    if (strCommand == "p2ppeers")
+    {
+        // Hints only: a name already in our peer cache that we know nothing
+        // about moves up the list a P2Pool miner dials. A lie costs one dial;
+        // whether a peer holds the share chain is still its own version's
+        // word, and nothing here is passed on.
+        vector<string> vAddr;
+        vRecv >> vAddr;
+        if (vAddr.size() > MAX_P2P_PEER_HINTS)
+        {
+            pfrom->Misbehaving(20);
+            return true;
+        }
+        BtfNoteP2PoolHints(vAddr);
         return true;
     }
 

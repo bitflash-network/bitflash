@@ -11,8 +11,10 @@
 //   p2pgetsh   vector<uint256>: send me these shares
 //   p2psync    (empty): send me your line, I am starting
 //   p2pshares  int tip height, vector<Share>: part of a line, oldest first
-// Nodes from before P2Pool ignore all four, as they ignore every command they
-// do not know.
+//   p2ppeers   vector<string>: .btf addresses of peers we reached that hold
+//              the share chain (hints for a miner looking for such peers)
+// All of them go only to peers that say NODE_P2POOL; nodes from before P2Pool
+// would ignore them, as they ignore every command they do not know.
 #ifndef BITFLASH_P2POOL_NET_H
 #define BITFLASH_P2POOL_NET_H
 

@@ -5440,6 +5440,78 @@ static int RunP2PoolSyncSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-peers: which cached peers hold the share chain ---------------
+// What a dialled peer's version said sticks; another node's word only marks
+// peers we know nothing about; and only peers we reached and that said so
+// are named to other P2Pool nodes.
+static int RunP2PoolPeersSelfTest()
+{
+    printf("p2pool-peers self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+
+    // Four cached peers: three reached, one only heard about.
+    {
+        std::string body = "[";
+        const char* names[4] = { "peera.btf", "peerb.btf", "peerc.btf", "peerd.btf" };
+        for (int i = 0; i < 4; i++)
+        {
+            if (i) body += ",";
+            body += strprintf("{\"btf\":\"%s\",\"meeting\":\"\",\"enc\":\"%064d\",\"seen\":%lld%s}",
+                              names[i], 0, (long long)GetTime(), i < 3 ? ",\"ok\":true" : "");
+        }
+        body += "]";
+        FILE* f = fopen((GetAppDir() + "/btfpeers.json").c_str(), "w");
+        if (f)
+        {
+            fwrite(body.data(), 1, body.size(), f);
+            fclose(f);
+        }
+    }
+
+    BtfNoteP2PoolPeer("peera.btf", true);
+    BtfNoteP2PoolPeer("peerb.btf", false);
+    vector<string> vKnown;
+    BtfKnownP2PoolPeers(vKnown, 32);
+    nFail += Check(vKnown.size() == 1 && vKnown[0] == "peera.btf",
+                   "a peer whose version said NODE_P2POOL is named to others; one that said nothing of it is not") ? 0 : 1;
+
+    // Hints: peerb said no itself, and a hint does not overrule it; peerc and
+    // peerd are unknown and become hints; a name not in the cache is ignored.
+    vector<string> vHints;
+    vHints.push_back("peerb.btf");
+    vHints.push_back("peerc.btf");
+    vHints.push_back("peerd.btf");
+    vHints.push_back("nobody.btf");
+    BtfNoteP2PoolHints(vHints);
+    BtfKnownP2PoolPeers(vKnown, 32);
+    nFail += Check(vKnown.size() == 1 && vKnown[0] == "peera.btf",
+                   "another node's hints are never passed on as known") ? 0 : 1;
+
+    // And a hinted peer that answers takes its own version's word.
+    BtfNoteP2PoolPeer("peerc.btf", true);
+    BtfKnownP2PoolPeers(vKnown, 32);
+    nFail += Check(vKnown.size() == 2, "a hinted peer that says NODE_P2POOL when dialled is known from then on") ? 0 : 1;
+    BtfNoteP2PoolPeer("peerd.btf", true);
+    BtfKnownP2PoolPeers(vKnown, 32);
+    nFail += Check(vKnown.size() == 2, "but one never reached is still not named to anybody") ? 0 : 1;
+
+    nFail += Check((nLocalServices & NODE_P2POOL) != 0, "this node says it holds the share chain") ? 0 : 1;
+
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -8514,6 +8586,8 @@ int RunSelfTest(const std::string& name)
         return RunChatWalletSelfTest();
     if (name == "p2pool-sync")
         return RunP2PoolSyncSelfTest();
+    if (name == "p2pool-peers")
+        return RunP2PoolPeersSelfTest();
     if (name == "p2pool-chain")
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")

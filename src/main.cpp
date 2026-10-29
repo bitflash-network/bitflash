@@ -3541,6 +3541,10 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushMessage("btfpeers", vPexOut);
 
         ChatRelayOnVersion(pfrom);
+        // A peer we dialled says whether it holds the share chain; a P2Pool
+        // miner looks for the ones that do (net.cpp, DialP2PoolPeers).
+        if (!pfrom->strBtfAddr.empty())
+            BtfNoteP2PoolPeer(pfrom->strBtfAddr, (pfrom->nServices & NODE_P2POOL) != 0);
         P2PoolOnVersion(pfrom);
 
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);

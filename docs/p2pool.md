@@ -116,9 +116,21 @@ window is ~34 KB of outputs.
 ## Network
 
 - Share messages travel on the existing Bitflash peer-to-peer connections,
-  which are Tor-only. Two new messages: `p2pshare` (a share) and `p2pgetsh`
-  (ask for shares by id, to fill gaps). Nodes that do not run P2Pool ignore
-  them; older nodes ignore unknown commands, as since 0.1.0.
+  which are Tor-only: `p2pshare` (a share), `p2pgetsh` (ask for shares by id,
+  to fill gaps), `p2psync`/`p2pshares` (a line, for a starting node) and
+  `p2ppeers` (see below). Every node of a release with P2Pool holds and
+  relays the share chain, mining or not, and says so with the service bit
+  `NODE_P2POOL`; these messages go only to peers that say it. Older nodes
+  would drop them unread.
+- **Finding each other.** Until most of the network runs such a release, a
+  miner's ordinary peers may all be older nodes, and it would hear no share.
+  So a node mining with `-p2pool` keeps at least 3 peers that say
+  `NODE_P2POOL`, dialling up to 3 past its usual 8 for them: first peers whose
+  own version said so when it dialled them (remembered in its peer cache),
+  then peers another P2Pool node named (`p2ppeers`, which carries only
+  addresses the sender reached and saw say `NODE_P2POOL`, at most 32), then
+  peers it knows nothing about. A name in `p2ppeers` is a hint, never passed
+  on: a lie costs one dial.
 - A node relays a share only after verifying it, and scores a peer that sends
   an invalid one (net-hardening). A share refused on this node's own view (its
   clock, its main chain) or waiting on shares not here yet scores nobody.

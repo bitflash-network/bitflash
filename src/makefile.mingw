@@ -271,6 +271,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=p2pool-share
 	./bitflash.exe -selftest=p2pool-chain
 	./bitflash.exe -selftest=p2pool-sync
+	./bitflash.exe -selftest=p2pool-peers
 	./bitflash.exe -selftest=sigcheck
 	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=btc-light
