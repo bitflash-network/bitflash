@@ -153,6 +153,46 @@ block may hold. A bare script with one of the new bytes fails on an old node
 and is not relayed by anyone (non-standard). Miners must upgrade before the
 switch; other nodes should.
 
+## In the wallet: a vault and a batch
+
+**Vault** (`vaultcreate`, `vaultunvault`, `vaultwithdraw`, `vaultrecover`,
+`docs/rpc.md`). Two scripts, both P2SH:
+
+```
+vault:    <template hash> OP_CHECKTEMPLATEVERIFY
+unvault:  OP_IF
+              <delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+              OP_DUP OP_HASH160 <hot key hash> OP_EQUALVERIFY OP_CHECKSIG
+          OP_ELSE
+              OP_DUP OP_HASH160 <recovery key hash> OP_EQUALVERIFY OP_CHECKSIG
+          OP_ENDIF
+```
+
+The template hash fixes the only transaction that can spend the vault: one
+output, to the unvault script, of the amount less a fee paid in advance. So
+the coins cannot go anywhere else, whoever holds which key; they can only be
+unvaulted, in the open. From the unvault output the hot key can take them
+`delay` blocks after it confirms, and the recovery key at once. A thief with
+the hot key has to unvault first, and the owner, seeing it, has `delay` blocks
+to recover everything with a key the thief does not have. The recovery key
+belongs somewhere else than the wallet that makes the vault: on paper, a
+hardware device, another machine.
+
+**Batch** (`ctvbatch`, `ctvexpand`). `<template hash> OP_CHECKTEMPLATEVERIFY`
+over a transaction paying many people: one output on the chain now, the
+payments later, by a transaction anybody can broadcast and nobody can change.
+What it is for: paying many people when fees are high, with the payments
+already settled.
+
+Both are refused while rules v4 are not in force: before them,
+`OP_CHECKSEQUENCEVERIFY` and `OP_CHECKTEMPLATEVERIFY` do nothing, and coins
+behind them could be taken by anybody. The scripts and keys are kept in
+`v4contracts.json` beside the wallet, and every result carries the redeem
+scripts, with which `spendscript` alone can spend them.
+
+What CTV costs here: the fee of the transaction it fixes is fixed with it. It
+cannot be raised later; pick it generously.
+
 ## Order of work
 
 1. `consensus.h`: `RULES_V4_TIME_*`, `RulesV4Active`; the flag threaded
@@ -195,4 +235,29 @@ To run it again: copy two testnet data directories, delete `nostr.key`,
 identities, start each once with `-testnet -isolate` and a placeholder
 `-connectbtf` to learn its address (it logs `isolated bench: this node is
 ...`) and onion, then start both pointed at each other with the same
-`-benchrulesv4`.
+`-benchrulesv4`. Give `-rpcport` a port other than `-port` and `-port`+1: those
+two are published on the node's onion, and the node refuses to start an RPC
+server on either.
+
+### The wallet's vault and batch, on the same bench (2026-10-29)
+
+Node C made and spent everything with the RPCs above; node D only validated
+the blocks and received.
+
+| case | result |
+|---|---|
+| vault, withdraw before the unvault | refused (not unvaulted) |
+| vault, spend the vault output to another address with `spendscript` | refused (CTV) |
+| vault (delay 3), withdraw at once after the unvault | refused (relative lock) |
+| vault (delay 3), withdraw one block after the unvault confirmed | refused (relative lock) |
+| vault (delay 3), withdraw three blocks after | accepted; D holds the 99.98 |
+| vault (delay 10), recovery key right after the unvault | accepted |
+| batch, spend it to other amounts with `spendscript` | refused (CTV) |
+| batch, `ctvexpand` | accepted; D holds its 1 and 2 |
+
+D followed C to block 10325 and refused none of its blocks. The run turned up
+two defects, both fixed: an isolated bench refused every inbound connection,
+so its two nodes never met; and an unvault (or expansion) pays no address of
+the wallet that made it, so the wallet did not keep it and a restart before
+it was mined lost it. The wallet now keeps the transaction and sends it again
+when `vaultunvault` or `ctvexpand` is run a second time.

@@ -595,6 +595,19 @@ static void ParseStartupArguments(int argc, char* argv[])
             StartupRefuse("could not read -rpcpassword file: " + strErr, "");
         strRpcPassword = strFromFile;
     }
+    // The onion publishes the P2P port and the one above it (the pool's,
+    // tor.cpp), each forwarded to the same port on 127.0.0.1. An RPC server
+    // bound to either is reachable by anybody over Tor; a bench ran so with
+    // -port=18491 -rpcport=18492 before anyone noticed.
+    {
+        string strRpcPort = argval2(argc, argv, "/rpcport", "-rpcport");
+        int nP2P = (int)ntohs(nListenPort);
+        int nRpc = atoi(strRpcPort.c_str());
+        if (!strRpcPort.empty() && (nRpc == nP2P || nRpc == nP2P + 1))
+            StartupRefuse(strprintf("-rpcport=%d is a port this node publishes on its onion", nRpc),
+                          strprintf("Ports %d and %d are reachable by anybody over Tor; pick another for the RPC server.",
+                                    nP2P, nP2P + 1));
+    }
     fJsonRpc = JsonRpcConfigure(argval2(argc, argv, "/rpcuser", "-rpcuser"),
                                 strRpcPassword,
                                 argval2(argc, argv, "/rpcport", "-rpcport"));

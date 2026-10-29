@@ -2045,13 +2045,16 @@ void ThreadSocketHandler2(void* parg)
                              addr.ToString().c_str(), nFromThisIP);
                     BtfCloseSocket(hSocket);
                 }
-                else if (fBtfIsolated)
+                else if (fBtfIsolated && nNodes > 0)
                 {
-                    // An isolated bench dials its one peer, and that peer
-                    // dials it: nothing needs to come in, and whoever does
+                    // An isolated bench holds one peer. Its peer's dial
+                    // arrives here, as an inbound connection like any over
+                    // a hidden service: refusing every one, as this once did,
+                    // left two bench nodes refusing each other for good. So
+                    // one comes in while there is none; whoever else comes
                     // could be a testnet node that kept this onion from
                     // before (docs/rules-v4.md).
-                    LogPrint("net", "isolated bench: refusing an inbound connection\n");
+                    LogPrint("net", "isolated bench: already holds its peer, refusing an inbound connection\n");
                     BtfCloseSocket(hSocket);
                 }
                 else
