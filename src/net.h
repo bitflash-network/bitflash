@@ -23,6 +23,11 @@ enum
     // only ever offered to a peer that says this, so a node from before the
     // chat never sees a type it would choke on.
     NODE_CHAT    = (1 << 1),
+    // Holds and relays the P2Pool share chain (p2pool_net.h). Shares, and
+    // asks for them, only go to a peer that says this: a node from before
+    // P2Pool drops them unread, so a miner whose peers are all such nodes
+    // hears no share at all. A P2Pool miner looks for peers with this bit.
+    NODE_P2POOL  = (1 << 2),
 };
 
 
@@ -42,6 +47,13 @@ void ThreadBtfConnect(void* parg);
 // Cached direct-onion endpoint (host.onion:port) for a .btf address, from peers
 // we have reached before. True on a hit -- lets callers skip a Nostr resolve.
 bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut);
+// P2Pool peers in the peer cache (net.cpp): what a dialled peer's version
+// said about NODE_P2POOL; addresses another P2Pool node named, kept as hints
+// for peers we know nothing about yet; and the ones we reached that hold the
+// share chain, to name to other P2Pool nodes.
+void BtfNoteP2PoolPeer(const string& strBtfAddr, bool fP2Pool);
+void BtfNoteP2PoolHints(const vector<string>& vBtfAddr);
+void BtfKnownP2PoolPeers(vector<string>& vOut, size_t nMax);
 // The pinned onion seeds of the active network. The chat app starts from these
 // the same way a node does: no server to ask first.
 void BtfSeedOnions(vector<string>& vOut);
@@ -670,6 +682,16 @@ public:
     bool fInbound;
     bool fNetworkNode;
     bool fDisconnect;
+    // P2Pool history (p2pool_net.cpp): when we last sent this peer ours, when
+    // we asked it for its own (0: not asked, or the answer is over), and how
+    // many shares of that history it has sent.
+    int64 nP2PoolSyncServed;
+    int64 nP2PoolSyncAskedAt;
+    unsigned int nP2PoolHistoryRecv;
+    // When it last sent a share this node took (0: never), and whether it
+    // has named its P2Pool peers to us yet (once per connection).
+    int64 nP2PoolLastGood;
+    bool fP2PoolPeersRecv;
 protected:
     int nRefCount;
 public:
@@ -744,6 +766,11 @@ public:
         fInbound = fInboundIn;
         fNetworkNode = false;
         fDisconnect = false;
+        nP2PoolSyncServed = 0;
+        nP2PoolSyncAskedAt = 0;
+        nP2PoolHistoryRecv = 0;
+        nP2PoolLastGood = 0;
+        fP2PoolPeersRecv = false;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

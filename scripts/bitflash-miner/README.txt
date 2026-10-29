@@ -38,6 +38,29 @@ this network. There is no server in the middle and no host to switch off.
 The address it dials is in mine.cmd / mine.sh; a pool operator can put their
 own there.
 
+P2Pool: no pool at all
+----------------------
+  Windows:  mine.cmd p2pool
+  Linux:    ./mine.sh p2pool
+  macOS:    ./mine.sh p2pool
+
+Start your own Bitflash node with -p2pool first (the wallet or bitflash-node,
+mainnet or -testnet). The node joins the P2Pool share chain over Tor like any
+other Bitflash traffic and opens a local stratum on 127.0.0.1:3333 for XMRig.
+There is no operator and no fee: every block a P2Pool miner finds pays every
+miner in the last window of shares directly in its coinbase, and your node
+pays you at an address of its own wallet (or the one given with
+-p2poolpayto). No address goes on the command line here. Start the node with
+-p2poolport=N and set P2POOL_PORT=N for this script to use another port.
+
+XMRig only talks to 127.0.0.1 in this mode, so it does not use this package's
+Tor. Its 1% donation mining (the dev fee XMRig builds in) then connects to the
+XMRig donation server directly, not over Tor; the official build does not let
+it go below 1%. If that connection matters to you, use the Tor pool mode
+above, or build XMRig from source with the donation set to 0.
+
+See docs/p2pool.md in the Bitflash repository for how shares and payouts work.
+
 Expect antivirus noise
 ----------------------
 Windows Defender and most antivirus products flag XMRig because it is what

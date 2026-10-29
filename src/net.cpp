@@ -60,7 +60,7 @@ bool fClient = false;
 // no chat records, and must not tell anybody it does.
 uint64 nLocalServices = 0;
 #else
-uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT));
+uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT | NODE_P2POOL));
 #endif
 CAddress addrLocalHost(0, GetDefaultPort(), nLocalServices);
 unsigned short nListenPort = GetDefaultPort(); // local P2P port (tunable via /port)
@@ -715,7 +715,12 @@ struct CachedBtfPeer
     // were told, and passing hearsay along is how one node's mixed cache
     // becomes everybody's.
     bool fVerified;
+    // Whether it holds the P2Pool share chain (NODE_P2POOL): P2POOL_YES or
+    // P2POOL_NO as its own version message said when we dialled it,
+    // P2POOL_HINT when another P2Pool node named it, P2POOL_UNKNOWN otherwise.
+    int nP2Pool;
 };
+enum { P2POOL_UNKNOWN = -1, P2POOL_NO = 0, P2POOL_YES = 1, P2POOL_HINT = 2 };
 
 static string BtfPeerCachePath() { return GetAppDir() + "/btfpeers.json"; }
 
@@ -771,6 +776,7 @@ void LoadCachedBtfPeers(vector<CachedBtfPeer>& out)
             if (o.contains("desc") && o["desc"].is_string())
                 p.desc = o["desc"].get<string>();
             p.fVerified = o.value("ok", false);
+            p.nP2Pool = o.value("p2p", (int)P2POOL_UNKNOWN);
             if (nNow - p.lastSeen > CACHED_BTF_PEER_TTL) continue; // long gone
             out.push_back(p);
         }
@@ -783,6 +789,7 @@ void LoadCachedBtfPeers(vector<CachedBtfPeer>& out)
 }
 
 static CCriticalSection cs_btfPeerCache;
+static void SaveCachedBtfPeers(const vector<CachedBtfPeer>& peers);
 
 // Look up a peer's cached direct-onion endpoint (host.onion:port) by .btf
 // address, from the peers we have actually reached and remembered. Lets a
@@ -820,6 +827,7 @@ static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
 
         string strKeepDesc = strDesc;
         string strKeepOnion;
+        int nKeepP2Pool = P2POOL_UNKNOWN;
         btf::NormalizeOnionEndpoint(strOnion, strKeepOnion);
         for (size_t i = 0; i < peers.size(); i++)
             if (peers[i].btfAddr == strBtfAddr)
@@ -832,6 +840,7 @@ static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
                 // hearsay again because somebody mentioned it afterwards.
                 if (peers[i].fVerified)
                     fVerified = true;
+                nKeepP2Pool = peers[i].nP2Pool;
                 peers.erase(peers.begin() + i);
                 break;
             }
@@ -844,34 +853,99 @@ static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
         p.lastSeen = GetTime();
         p.desc     = strKeepDesc;
         p.fVerified = fVerified;
+        p.nP2Pool  = nKeepP2Pool;
         peers.insert(peers.begin(), p); // most recent first
 
         if (peers.size() > MAX_CACHED_BTF_PEERS)
             peers.resize(MAX_CACHED_BTF_PEERS);
+        SaveCachedBtfPeers(peers);
+    }
+}
 
-        nlohmann::json arr = nlohmann::json::array();
-        foreach(const CachedBtfPeer& q, peers)
-        {
-            nlohmann::json o;
-            o["btf"]     = q.btfAddr;
-            o["meeting"] = q.meeting;
-            if (!q.onion.empty())
-                o["onion"] = q.onion;
-            o["enc"]     = q.encHex;
-            o["seen"]    = q.lastSeen;
-            if (!q.desc.empty())
-                o["desc"] = q.desc;
-            if (q.fVerified)
-                o["ok"] = true;
-            arr.push_back(o);
-        }
-        FILE* f = fopen(BtfPeerCachePath().c_str(), "w");
-        if (f)
-        {
-            string s = arr.dump(2);
-            fwrite(s.c_str(), 1, s.size(), f);
-            fclose(f);
-        }
+// Under cs_btfPeerCache.
+static void SaveCachedBtfPeers(const vector<CachedBtfPeer>& peers)
+{
+    nlohmann::json arr = nlohmann::json::array();
+    foreach(const CachedBtfPeer& q, peers)
+    {
+        nlohmann::json o;
+        o["btf"]     = q.btfAddr;
+        o["meeting"] = q.meeting;
+        if (!q.onion.empty())
+            o["onion"] = q.onion;
+        o["enc"]     = q.encHex;
+        o["seen"]    = q.lastSeen;
+        if (!q.desc.empty())
+            o["desc"] = q.desc;
+        if (q.fVerified)
+            o["ok"] = true;
+        if (q.nP2Pool != P2POOL_UNKNOWN)
+            o["p2p"] = q.nP2Pool;
+        arr.push_back(o);
+    }
+    FILE* f = fopen(BtfPeerCachePath().c_str(), "w");
+    if (f)
+    {
+        string s = arr.dump(2);
+        fwrite(s.c_str(), 1, s.size(), f);
+        fclose(f);
+    }
+}
+
+void BtfNoteP2PoolPeer(const string& strBtfAddr, bool fP2Pool)
+{
+    if (strBtfAddr.empty())
+        return;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+    {
+        vector<CachedBtfPeer> peers;
+        LoadCachedBtfPeers(peers);
+        for (size_t i = 0; i < peers.size(); i++)
+            if (peers[i].btfAddr == strBtfAddr)
+            {
+                int n = fP2Pool ? P2POOL_YES : P2POOL_NO;
+                if (peers[i].nP2Pool != n)
+                {
+                    peers[i].nP2Pool = n;
+                    SaveCachedBtfPeers(peers);
+                }
+                break;
+            }
+    }
+}
+
+void BtfNoteP2PoolHints(const vector<string>& vBtfAddr)
+{
+    CRITICAL_BLOCK(cs_btfPeerCache)
+    {
+        vector<CachedBtfPeer> peers;
+        LoadCachedBtfPeers(peers);
+        bool fChanged = false;
+        foreach(const string& a, vBtfAddr)
+            for (size_t i = 0; i < peers.size(); i++)
+                if (peers[i].btfAddr == a && peers[i].nP2Pool == P2POOL_UNKNOWN)
+                {
+                    peers[i].nP2Pool = P2POOL_HINT;
+                    fChanged = true;
+                    break;
+                }
+        if (fChanged)
+            SaveCachedBtfPeers(peers);
+    }
+}
+
+void BtfKnownP2PoolPeers(vector<string>& vOut, size_t nMax)
+{
+    vOut.clear();
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        if (vOut.size() >= nMax)
+            break;
+        if (p.nP2Pool == P2POOL_YES && p.fVerified)
+            vOut.push_back(p.btfAddr);
     }
 }
 
@@ -1150,11 +1224,82 @@ static int DialRememberedBtfPeers(int nBudget)
     return nConnected;
 }
 
+// A P2Pool miner keeps this many peers that hold the share chain, dialling
+// past BTF_TARGET_PEERS for them if it must, up to P2POOL_EXTRA_PEERS more.
+// Until most of the network runs a release with P2Pool, a miner's ordinary
+// peers may all drop shares unread, and it would mine a share chain of its
+// own. Two dials a round.
+static const int P2POOL_TARGET_PEERS = 3;
+static const int P2POOL_EXTRA_PEERS  = 3;
+static const int P2POOL_DIALS_PER_ROUND = 2;
+
+// A peer counts once it has sent a share this node took, lately, or while it
+// is new. Saying NODE_P2POOL costs nothing: three that said it and passed on
+// nothing stopped a miner looking any further, and it heard no share.
+static const int64 P2POOL_PEER_GRACE = 10 * 60;
+
+static int CountP2PoolPeersConnected()
+{
+    int n = 0;
+    int64 nNow = GetTime();
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode->nVersion != 0 && !pnode->fDisconnect && (pnode->nServices & NODE_P2POOL) &&
+                (nNow - pnode->nTimeConnected < P2POOL_PEER_GRACE ||
+                 nNow - pnode->nP2PoolLastGood < P2POOL_PEER_GRACE))
+                n++;
+    return n;
+}
+
+// Peers known to hold the share chain first, then ones another P2Pool node
+// named, then ones we know nothing about, reached before ahead of the rest.
+// A peer whose version said it does not hold it is not dialled for this.
+static int DialP2PoolPeers(int nBudget)
+{
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+    vector<const CachedBtfPeer*> vOrder;
+    for (int pass = 0; pass < 4; pass++)
+        foreach(const CachedBtfPeer& p, peers)
+        {
+            bool fTake = pass == 0 ? p.nP2Pool == P2POOL_YES :
+                         pass == 1 ? p.nP2Pool == P2POOL_HINT :
+                         pass == 2 ? p.nP2Pool == P2POOL_UNKNOWN && p.fVerified :
+                                     p.nP2Pool == P2POOL_UNKNOWN && !p.fVerified;
+            if (fTake)
+                vOrder.push_back(&p);
+        }
+    int nConnected = 0, nTried = 0;
+    foreach(const CachedBtfPeer* p, vOrder)
+    {
+        if (fShutdown || nTried >= nBudget)
+            break;
+        if (p->btfAddr == BtfLocalAddress() || BtfAlreadyConnected(p->btfAddr) || !BtfDialDue(p->btfAddr))
+            continue;
+        unsigned char enc[32];
+        if (!HexToBytes(p->encHex, enc, 32))
+            continue;
+        nTried++;
+        bool fOk = ConnectNodeBtfResolved(p->btfAddr, p->meeting, p->onion, enc) != NULL;
+        BtfNoteDialResult(p->btfAddr, fOk);
+        if (fOk)
+            nConnected++;
+    }
+    if (nTried)
+        LogPrint("p2pool", "p2pool: dialled %d peer(s) looking for the share chain, %d answered\n", nTried, nConnected);
+    return nConnected;
+}
+
 void ThreadReconnectCachedBtfPeers(void* parg)
 {
     LogPrint("net", "btfpeers: connection scheduler started\n");
     while (!fShutdown)
     {
+        if (fP2PoolMode && !fBtfIsolated && CountP2PoolPeersConnected() < P2POOL_TARGET_PEERS &&
+            CountBtfPeersConnected() < BTF_TARGET_PEERS + P2POOL_EXTRA_PEERS)
+            DialP2PoolPeers(P2POOL_DIALS_PER_ROUND);
+
         int nHave = CountBtfPeersConnected();
         if (nHave < BTF_TARGET_PEERS)
         {
