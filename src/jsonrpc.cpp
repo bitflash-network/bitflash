@@ -1788,6 +1788,323 @@ static json rpc_spendscript(const json& p)
     return j;
 }
 
+// ---- rules v4 in the wallet: a vault and a CTV batch (docs/rules-v4.md) ----
+//
+// Both are made of what templatehash and spendscript already do; these name
+// the two uses the rules were written for and remember the scripts, so that
+// spending them later takes an address, not five hex strings.
+//
+// A vault: the coins can leave it one way only, by a transaction fixed when
+// it was made, which moves them to an "unvault" output everybody can see.
+// From there the hot key can take them only `delay` blocks later; the
+// recovery key can take them at once. A stolen hot key shows itself by the
+// unvault, and the owner has `delay` blocks to send everything to safety.
+//
+// A batch: one output now, which unfolds into many payments later, fixed in
+// advance, by a transaction anybody can broadcast.
+//
+// The scripts and keys are kept in v4contracts.json beside the wallet. The
+// redeem scripts are also in every result: with them and the keys, the coins
+// can be spent with spendscript alone.
+
+static string V4ContractsPath()
+{
+    return GetAppDir() + "/v4contracts.json";
+}
+
+static json LoadV4Contracts()
+{
+    FILE* f = fopen(V4ContractsPath().c_str(), "r");
+    if (!f)
+        return json::object();
+    string body;
+    char buf[4096];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0)
+        body.append(buf, r);
+    fclose(f);
+    try
+    {
+        json j = json::parse(body);
+        return j.is_object() ? j : json::object();
+    }
+    catch (...)
+    {
+        throw runtime_error(V4ContractsPath() + " is unreadable; it holds the scripts of your vaults and batches -- restore it from a backup");
+    }
+}
+
+static void SaveV4Contracts(const json& j)
+{
+    string tmp = V4ContractsPath() + ".new";
+    FILE* f = fopen(tmp.c_str(), "w");
+    if (!f)
+        throw runtime_error("could not write " + tmp);
+    string s = j.dump(2);
+    fwrite(s.data(), 1, s.size(), f);
+    fclose(f);
+    remove(V4ContractsPath().c_str());
+    rename(tmp.c_str(), V4ContractsPath().c_str());
+}
+
+// Before rules v4, OP_CHECKSEQUENCEVERIFY and OP_CHECKTEMPLATEVERIFY are
+// no-ops: coins locked behind them could be taken by anybody.
+static void RequireRulesV4()
+{
+    if (!RulesV4Active((unsigned int)GetAdjustedTime()))
+        throw runtime_error("rules v4 are not in force on this chain yet; coins locked in such a script now could be taken by anybody");
+}
+
+static json V4Contract(const string& strAddr, const char* pszType)
+{
+    json all = LoadV4Contracts();
+    if (!all.contains(strAddr) || all[strAddr].value("type", "") != pszType)
+        throw runtime_error(strprintf("no %s at %s in %s", pszType, strAddr.c_str(), V4ContractsPath().c_str()));
+    return all[strAddr];
+}
+
+static void SetV4Contract(const string& strAddr, const json& rec)
+{
+    json all = LoadV4Contracts();
+    all[strAddr] = rec;
+    SaveV4Contracts(all);
+}
+
+// The one-input transaction a CTV hash fixes: version 2, sequence final,
+// lock time 0 -- what spendscript builds by default.
+static uint256 TemplateHashFor(const vector<CTxOut>& vout)
+{
+    CTransaction tx;
+    tx.nVersion = 2;
+    tx.vin.resize(1);
+    tx.vin[0].nSequence = 0xffffffff;
+    tx.nLockTime = 0;
+    tx.vout = vout;
+    return CheckTemplateHash(tx, 0);
+}
+
+static CScript CtvScript(const uint256& hash)
+{
+    CScript s;
+    s << vector<unsigned char>(hash.begin(), hash.end()) << OP_CHECKTEMPLATEVERIFY;
+    return s;
+}
+
+static CWalletTx FundScript(const CScript& redeem, int64 nValue)
+{
+    CScript scriptPubKey;
+    scriptPubKey << OP_HASH160 << Hash160(redeem) << OP_EQUAL;
+    CWalletTx wtx;
+    if (!SendMoney(scriptPubKey, nValue, wtx))
+        throw runtime_error("send failed: insufficient balance once the fee is counted");
+    return wtx;
+}
+
+static vector<unsigned char> FreshWalletKey()
+{
+    vector<unsigned char> v = GetKeyFromPool();
+    if (v.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    return v;
+}
+
+// vaultcreate <amount> <delay blocks> [recovery address] [fee=0.01]
+static json rpc_vaultcreate(const json& p)
+{
+    if (p.size() < 2)
+        throw runtime_error("vaultcreate <amount> <delay in blocks, 1-65535> [recovery address] [fee=0.01]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    RequireRulesV4();
+    int64 nAmount = AmountFromValue(p[0]);
+    unsigned int nDelay = UIntParam(p, 1, 0);
+    if (nDelay < 1 || nDelay > 0xffff)
+        throw runtime_error("the delay is 1 to 65535 blocks");
+    int64 nFee = (p.size() > 3 && !p[3].is_null()) ? AmountFromValue(p[3]) : CENT;
+    if (nFee <= 0 || nAmount <= nFee)
+        throw runtime_error("the amount must be more than the fee the unvault prepays");
+
+    vector<unsigned char> vchHot = FreshWalletKey();
+    uint160 hashRecovery;
+    vector<unsigned char> vchRecovery;
+    bool fRecoveryHere = !(p.size() > 2 && p[2].is_string() && !p[2].get<string>().empty());
+    if (fRecoveryHere)
+    {
+        vchRecovery = FreshWalletKey();
+        hashRecovery = Hash160(vchRecovery);
+    }
+    else if (!AddressToHash160(p[2].get<string>(), hashRecovery))
+        throw runtime_error("the recovery address is not a Bitflash address");
+
+    // Stage 2: the hot key after the delay, or the recovery key at once.
+    CScript unvault;
+    unvault << OP_IF << (int64)nDelay << OP_CHECKSEQUENCEVERIFY << OP_DROP
+            << OP_DUP << OP_HASH160 << Hash160(vchHot) << OP_EQUALVERIFY << OP_CHECKSIG
+            << OP_ELSE
+            << OP_DUP << OP_HASH160 << hashRecovery << OP_EQUALVERIFY << OP_CHECKSIG
+            << OP_ENDIF;
+    string strUnvault = Hash160ToScriptAddress(Hash160(unvault));
+    // Stage 1: out only by the unvault transaction, its fee paid in advance.
+    vector<CTxOut> vUnvault(1, CTxOut(nAmount - nFee, ScriptForAddress(strUnvault)));
+    CScript vault = CtvScript(TemplateHashFor(vUnvault));
+    string strVault = Hash160ToScriptAddress(Hash160(vault));
+
+    CWalletTx wtx = FundScript(vault, nAmount);
+    json rec;
+    rec["type"] = "vault";
+    rec["vaultRedeem"] = HexStr(vault.begin(), vault.end(), false);
+    rec["unvaultAddress"] = strUnvault;
+    rec["unvaultRedeem"] = HexStr(unvault.begin(), unvault.end(), false);
+    rec["hotPubKey"] = HexStr(vchHot.begin(), vchHot.end(), false);
+    rec["recoveryAddress"] = Hash160ToAddress(hashRecovery);
+    if (fRecoveryHere)
+        rec["recoveryPubKey"] = HexStr(vchRecovery.begin(), vchRecovery.end(), false);
+    rec["delay"] = nDelay;
+    rec["amount"] = ValueFromAmount(nAmount);
+    rec["unvaultAmount"] = ValueFromAmount(nAmount - nFee);
+    rec["fundTxid"] = wtx.GetHash().GetHex();
+    SetV4Contract(strVault, rec);
+
+    json j = rec;
+    j["vaultAddress"] = strVault;
+    if (fRecoveryHere)
+        j["warning"] = "the recovery key is in this same wallet; for a vault worth the name, give the address of a key kept somewhere else";
+    return j;
+}
+
+// vaultunvault <vault address>: the one way out, fixed in advance; no key.
+static json rpc_vaultunvault(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("vaultunvault <vault address>");
+    json rec = V4Contract(p[0].get<string>(), "vault");
+    // Done before: broadcast again. It pays no address of this wallet, so the
+    // wallet does not keep it, and a restart before it was mined lost it.
+    if (rec.contains("unvaultHex"))
+    {
+        json again = json::object();
+        again["txid"] = rpc_sendrawtransaction(json::array({ rec["unvaultHex"] }));
+        again["rebroadcast"] = true;
+        return again;
+    }
+    json out;
+    out[rec["unvaultAddress"].get<string>()] = rec["unvaultAmount"];
+    json r = rpc_spendscript(json::array({ rec["vaultRedeem"], rec["fundTxid"], json::array(), out,
+                                           2, 0xffffffffLL, 0, rec["amount"] }));
+    rec["unvaultTxid"] = r["txid"];
+    rec["unvaultHex"] = r["hex"];
+    SetV4Contract(p[0].get<string>(), rec);
+    r["unvaultAddress"] = rec["unvaultAddress"];
+    r["withdrawFrom"] = strprintf("the hot key can take it %u blocks after this confirms; vaultrecover can take it now",
+                                  rec["delay"].get<unsigned int>());
+    return r;
+}
+
+// The unvault output to `to`, by the hot key (fHot: after the delay) or the
+// recovery key (at once).
+static json SpendUnvault(const string& strVault, const json& p, bool fHot)
+{
+    json rec = V4Contract(strVault, "vault");
+    if (!rec.contains("unvaultTxid"))
+        throw runtime_error("not unvaulted yet: vaultunvault first");
+    if (p.size() < 2 || !p[1].is_string())
+        throw runtime_error(fHot ? "vaultwithdraw <vault address> <to address> [fee=0.01]"
+                                 : "vaultrecover <vault address> <to address> [fee=0.01]");
+    int64 nFee = (p.size() > 2 && !p[2].is_null()) ? AmountFromValue(p[2]) : CENT;
+    int64 nIn = AmountFromValue(rec["unvaultAmount"]);
+    if (nIn <= nFee)
+        throw runtime_error("the unvault output holds less than the fee");
+    string strPub = fHot ? rec["hotPubKey"].get<string>() : rec.value("recoveryPubKey", "");
+    if (strPub.empty())
+        throw runtime_error("the recovery key is not in this wallet: sign with the wallet that holds " +
+                            rec["recoveryAddress"].get<string>() + " (spendscript, redeem " +
+                            rec["unvaultRedeem"].get<string>() + ", items [sig, pubkey, false])");
+    json out;
+    out[p[1].get<string>()] = ValueFromAmount(nIn - nFee);
+    json items = json::array({ "sig:" + strPub, strPub, fHot });
+    // The hot path carries the delay in nSequence, which OP_CHECKSEQUENCEVERIFY reads.
+    unsigned int nSequence = fHot ? rec["delay"].get<unsigned int>() : 0xffffffff;
+    json r = rpc_spendscript(json::array({ rec["unvaultRedeem"], rec["unvaultTxid"], items, out,
+                                           2, (int64)nSequence, 0, ValueFromAmount(nFee) }));
+    rec[fHot ? "withdrawTxid" : "recoverTxid"] = r["txid"];
+    SetV4Contract(strVault, rec);
+    return r;
+}
+
+// vaultwithdraw <vault address> <to address> [fee]
+static json rpc_vaultwithdraw(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("vaultwithdraw <vault address> <to address> [fee=0.01]");
+    return SpendUnvault(p[0].get<string>(), p, true);
+}
+
+// vaultrecover <vault address> <to address> [fee]
+static json rpc_vaultrecover(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("vaultrecover <vault address> <to address> [fee=0.01]");
+    return SpendUnvault(p[0].get<string>(), p, false);
+}
+
+// ctvbatch {"address": amount, ...} [fee=0.01]
+static json rpc_ctvbatch(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("ctvbatch {\"address\": amount, ...} [fee=0.01]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    RequireRulesV4();
+    vector<CTxOut> vout = OutputsFromParam(p[0]);
+    int64 nFee = (p.size() > 1 && !p[1].is_null()) ? AmountFromValue(p[1]) : CENT;
+    if (nFee <= 0)
+        throw runtime_error("the expansion needs a fee, paid now");
+    int64 nTotal = 0;
+    foreach(const CTxOut& o, vout)
+        nTotal += o.nValue;
+    CScript batch = CtvScript(TemplateHashFor(vout));
+    string strBatch = Hash160ToScriptAddress(Hash160(batch));
+    CWalletTx wtx = FundScript(batch, nTotal + nFee);
+    json rec;
+    rec["type"] = "batch";
+    rec["redeem"] = HexStr(batch.begin(), batch.end(), false);
+    rec["outputs"] = p[0];
+    rec["fee"] = ValueFromAmount(nFee);
+    rec["fundTxid"] = wtx.GetHash().GetHex();
+    SetV4Contract(strBatch, rec);
+    json j = rec;
+    j["batchAddress"] = strBatch;
+    return j;
+}
+
+// ctvexpand <batch address>: the payments, exactly as fixed; no key.
+static json rpc_ctvexpand(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("ctvexpand <batch address>");
+    json rec = V4Contract(p[0].get<string>(), "batch");
+    // Done before: broadcast again (see vaultunvault).
+    if (rec.contains("expandHex"))
+    {
+        json again = json::object();
+        again["txid"] = rpc_sendrawtransaction(json::array({ rec["expandHex"] }));
+        again["rebroadcast"] = true;
+        return again;
+    }
+    json r = rpc_spendscript(json::array({ rec["redeem"], rec["fundTxid"], json::array(), rec["outputs"],
+                                           2, 0xffffffffLL, 0, rec["fee"] }));
+    rec["expandTxid"] = r["txid"];
+    rec["expandHex"] = r["hex"];
+    SetV4Contract(p[0].get<string>(), rec);
+    return r;
+}
+
+// listv4contracts: the vaults and batches this wallet made.
+static json rpc_listv4contracts(const json& p)
+{
+    return LoadV4Contracts();
+}
+
 // swapredeem <contract> <contract txid> <secret>
 static json rpc_swapredeem(const json& p)
 {
@@ -2463,6 +2780,13 @@ static const RpcEntry kMethods[] = {
     { "swapauditcontract", rpc_swapauditcontract },
     { "templatehash",     rpc_templatehash },
     { "spendscript",      rpc_spendscript },
+    { "vaultcreate",      rpc_vaultcreate },
+    { "vaultunvault",     rpc_vaultunvault },
+    { "vaultwithdraw",    rpc_vaultwithdraw },
+    { "vaultrecover",     rpc_vaultrecover },
+    { "ctvbatch",         rpc_ctvbatch },
+    { "ctvexpand",        rpc_ctvexpand },
+    { "listv4contracts",  rpc_listv4contracts },
     { "swapredeem",       rpc_swapredeem },
     { "swaprefund",       rpc_swaprefund },
     { "swapextractsecret", rpc_swapextractsecret },
