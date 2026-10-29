@@ -1883,7 +1883,7 @@ static uint256 TemplateHashFor(const vector<CTxOut>& vout)
     return CheckTemplateHash(tx, 0);
 }
 
-static CScript CtvScript(const uint256& hash)
+static CScript CtvScript(uint256 hash)   // by value: uint256's begin() is not const
 {
     CScript s;
     s << vector<unsigned char>(hash.begin(), hash.end()) << OP_CHECKTEMPLATEVERIFY;
