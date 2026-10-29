@@ -106,9 +106,12 @@ static Header Decode(const Bytes& raw)
 static Bytes Genesis(const std::string& network)
 {
     Bytes b; Put(b, 1, 4); b.resize(36, 0);
-    // TODO: independently verify the main/testnet4 checkpoint and replace height
-    // zero with a recent retarget-boundary checkpoint plus its preceding MTP
-    // context and filter-header anchor before shipping a fast initial sync.
+    // Height zero, each header after it checked for work and retarget: slow
+    // the first time, and safe. These genesis fields are Bitcoin Core's (v31.1,
+    // src/kernel/chainparams.cpp), and SelfTest checks the hashes they make.
+    // A fast initial sync would start instead at a recent retarget boundary,
+    // with its preceding MTP context and filter-header anchor, each verified
+    // against Core; that is an optimisation still to do, not a gap.
     uint256 merkle(network == "testnet4" ? "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
                                            : "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
     HashBytes(b, merkle);
@@ -616,11 +619,14 @@ static void Round(State& s, Peer& primary, Peer* second)
     if (s.filters.size() < s.savedFilters) SaveFilters(s);
     // A fresh timestamp alone is cheap to forge near genesis. Do not expose
     // payments until the chain has independently accumulated modern work.
-    // TODO: independently verify these minimum-work anchors with checkpoints.
+    // These are Bitcoin Core's own nMinimumChainWork, from
+    // src/kernel/chainparams.cpp at the signed release tag v31.1 (main:
+    // assumevalid block 938343; testnet4: 123613). The values first written
+    // here matched no Core release and nobody could say where they came from.
     Integer minimum = s.headers.network == "main"
-        ? Number(uint256("000000000000000000000000000000000000000145ec036acc5ba740052af1a0"))
+        ? Number(uint256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"))
         : s.headers.network == "testnet4"
-        ? Number(uint256("000000000000000000000000000000000000000000000e346a558455ade8eca9")) : Integer(0);
+        ? Number(uint256("0000000000000000000000000000000000000000000009a0fe15d0177d086304")) : Integer(0);
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
         (s.headers.network == "regtest" || (int64)s.headers.Tip().time > GetTime()-7200);
     // Confirmed transactions remain saved so a reorg can resume rebroadcast.
