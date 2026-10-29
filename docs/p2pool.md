@@ -83,8 +83,14 @@ not a share.
 that meet in the shares a node holds. Two lines that do not meet (a node that
 mined alone before it heard the network, or was cut off for long) began their
 sums at different shares, so a long run alone would outweigh the network for
-good; those are weighed on the work of their last 2160 shares instead. The tip
-is always a share checked in full (see *Starting*).
+good; those are weighed on the work of their last 2160 shares instead. Work
+is summed share by share above the point where two lines meet. The tip is
+always a share checked in full (see *Starting*), and a line whose newest share
+is more than 30 minutes old by this node's clock does not replace a livelier
+tip: a share's time has no lower bound, so the network's own line of some days
+ago, when difficulty was higher, could otherwise be played back to a starting
+node. This decides which line a node mines on, never whether a share is
+valid.
 
 **Uncles:** a share found at the same time as another is not wasted. The next
 share may reference it as an uncle (up to 3 shares back); the uncle is paid
@@ -130,7 +136,9 @@ window is ~34 KB of outputs.
   then peers another P2Pool node named (`p2ppeers`, which carries only
   addresses the sender reached and saw say `NODE_P2POOL`, at most 32), then
   peers it knows nothing about. A name in `p2ppeers` is a hint, never passed
-  on: a lie costs one dial.
+  on: a lie costs one dial. A peer counts toward the 3 only while it is new
+  (10 minutes) or has passed on a share this node took in the last 10
+  minutes: saying `NODE_P2POOL` costs nothing.
 - A node relays a share only after verifying it, and scores a peer that sends
   an invalid one (net-hardening). A share refused on this node's own view (its
   clock, its main chain) or waiting on shares not here yet scores nobody.
@@ -149,9 +157,12 @@ with their uncles:
 - the newest 720 have a whole window and a whole retarget behind them, and are
   checked in full, exactly as a fresh share;
 - the deeper ones cannot be: their own windows reach shares nobody sends. They
-  are taken on their work, commitment and merkle branch alone, and an uncle
-  adds to a line's work only where the uncle rules can be seen to hold. Such a
-  share is never the tip;
+  are taken on their work, commitment, merkle branch and coinbase shape
+  (addresses only) alone, and an uncle adds to a line's work only where the
+  uncle rules can be seen to hold. Such a share is never the tip, never an
+  uncle, never handed to a peer that asks for it by id, and never hangs on a
+  share checked in full (one that did is dropped); a history arrives oldest
+  first or is refused, and such shares are held to 64 MB in all;
 - a peer's history wins only by having more work than the others; every peer
   is asked while the chain is short.
 

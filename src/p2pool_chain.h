@@ -28,6 +28,12 @@ static const unsigned int HISTORY_SHARES = WINDOW_SHARES + RETARGET_SHARES + 2 *
 // made a share's validity depend on what else a node held, and two nodes
 // with different side lines would have parted ways (ShareChain::Evict).
 static const size_t MAX_CHAIN_SHARES = 4 * HISTORY_SHARES;
+// Bytes of shares held on their work alone (AddTrusted), whose payouts are
+// never checked: an honest history is a few MB.
+static const size_t MAX_TRUSTED_BYTES = 64 * 1000 * 1000;
+// A line whose newest share is older than this, by this node's clock, does
+// not replace a livelier tip (ShareChain::Heavier).
+static const int64 TIP_MAX_AGE = 30 * 60;
 
 // A refusal that says nothing bad about the sender: the share waits on
 // others not here yet, or was judged on this node's own clock or main chain
@@ -60,7 +66,7 @@ public:
     // hashTip spelled out: uint256 does not zero itself, and a chain with no
     // shares must answer 0 for its tip, not whatever the memory held.
     explicit ShareChain(const CBigNum& bnFloorIn, bool fCheckPoWIn = true)
-        : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10) {}
+        : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0) {}
 
     // Verify a share in context and keep it. A share whose parent or uncles
     // are not here is refused with their ids in *pvMissing, so the caller
@@ -131,6 +137,7 @@ private:
     CBigNum bnFloor;
     bool fCheckPoW;
     int nLastPruneCut;     // the cut of the last Prune pass
+    size_t nTrustedBytes;  // bytes of the shares held with fTrusted
 
     const Entry* Get(const uint256& id) const;
     bool OnLine(const uint256& id, const uint256& from, int nDepth) const;
@@ -141,12 +148,15 @@ private:
                       vector<uint256>* pvMissing, bool* pfBlock);
     bool CheckUncles(const ShareData& d, const uint256& parent, int nHeight, string& errOut) const;
     // Whether the line ending at 'id' should replace the tip.
-    bool Heavier(const uint256& id) const;
-    bool LinesMeet(const uint256& a, const uint256& b) const;
+    bool Heavier(const uint256& id, int64 nNow) const;
+    bool LinesMeet(const uint256& a, const uint256& b, CBigNum& bnAOut, CBigNum& bnBOut) const;
     CBigNum LineWork(const Entry* e) const;
     uint256 RootOf(const uint256& id, map<uint256, uint256>& roots) const;
     void Prune();
-    void Evict();
+    // Drop side lines until there is room for nRoom more shares (see below).
+    void Evict(size_t nRoom = 0);
+    // Every share leaves through here, so nTrustedBytes stays true.
+    void Drop(const uint256& id);
 };
 
 } // namespace p2pool

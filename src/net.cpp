@@ -1233,12 +1233,20 @@ static const int P2POOL_TARGET_PEERS = 3;
 static const int P2POOL_EXTRA_PEERS  = 3;
 static const int P2POOL_DIALS_PER_ROUND = 2;
 
+// A peer counts once it has sent a share this node took, lately, or while it
+// is new. Saying NODE_P2POOL costs nothing: three that said it and passed on
+// nothing stopped a miner looking any further, and it heard no share.
+static const int64 P2POOL_PEER_GRACE = 10 * 60;
+
 static int CountP2PoolPeersConnected()
 {
     int n = 0;
+    int64 nNow = GetTime();
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
-            if (pnode->nVersion != 0 && !pnode->fDisconnect && (pnode->nServices & NODE_P2POOL))
+            if (pnode->nVersion != 0 && !pnode->fDisconnect && (pnode->nServices & NODE_P2POOL) &&
+                (nNow - pnode->nTimeConnected < P2POOL_PEER_GRACE ||
+                 nNow - pnode->nP2PoolLastGood < P2POOL_PEER_GRACE))
                 n++;
     return n;
 }

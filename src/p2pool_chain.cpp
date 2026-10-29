@@ -115,6 +115,10 @@ const char* ShareChain::UncleProblem(const uint256& u, const uint256& parent, in
     const Entry* e = Get(u);
     if (!e)
         return "an unknown uncle";
+    // Held only on its work: nothing says it is a share at all. Honest
+    // histories never put such a share near the tip, where uncles are.
+    if (e->fTrusted)
+        return "here: an uncle this node holds only on its work";
     if (e->nHeight >= nHeight || e->nHeight < nHeight - MAX_UNCLE_DEPTH)
         return "an uncle too old or not older";
     // A sibling of the line, not a share on it: its parent is on the line,
@@ -262,6 +266,11 @@ vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
         const Entry& e = it->second;
         if (e.nHeight >= nHeight || e.nHeight < nHeight - MAX_UNCLE_DEPTH)
             continue;
+        // Never one taken on its work alone: peers check an uncle in full,
+        // and one planted near the tip by a history refused this node's
+        // shares everywhere and got it banned.
+        if (e.fTrusted)
+            continue;
         if (OnLine(it->first, parent, MAX_UNCLE_DEPTH) ||
             !OnLine(e.share.data.hashPrevShare, parent, MAX_UNCLE_DEPTH) ||
             UncleTaken(it->first, parent, MAX_UNCLE_DEPTH))
@@ -273,8 +282,10 @@ vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
 
 bool ShareChain::GetShare(const uint256& id, Share& out) const
 {
+    // Not one taken on its work alone: the peer asking checks it in full and
+    // blames whoever sent it if it fails.
     const Entry* e = Get(id);
-    if (!e)
+    if (!e || e->fTrusted)
         return false;
     out = e->share;
     return true;
@@ -370,7 +381,17 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
     e.fTrusted = false;
     mapShares[id] = e;
 
-    if (Heavier(id))
+    // A share taken on its work alone, from an earlier history, cannot hang
+    // on a share checked in full: it would carry whatever it says onto this
+    // line unchecked.
+    vector<uint256> vTrustedChildren;
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+        if (it->second.fTrusted && it->second.share.data.hashPrevShare == id)
+            vTrustedChildren.push_back(it->first);
+    for (size_t i = 0; i < vTrustedChildren.size(); i++)
+        Drop(vTrustedChildren[i]);
+
+    if (Heavier(id, main.Now()))
         hashTip = id;
     if (pfBlock) *pfBlock = fBlock;
     Prune();
@@ -391,8 +412,13 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     // peers to answer fill the room with lines of no work and keep the
     // honest history out.
     if (mapShares.size() >= MAX_CHAIN_SHARES)
-        Evict();
+        Evict(1);
     if (mapShares.size() >= MAX_CHAIN_SHARES)
+        return Fail(errOut, "here: no room for more history");
+    // And in bytes: what such a share pays is never checked, so a history of
+    // shares as big as a message allows would otherwise be kept whole.
+    size_t nBytes = ::GetSerializeSize(s, SER_NETWORK);
+    if (nTrustedBytes + nBytes > MAX_TRUSTED_BYTES)
         return Fail(errOut, "here: no room for more history");
     bool fBlock;
     if (!CheckShareWork(s, bnFloor, fBlock, errOut, fCheckPoW))
@@ -419,11 +445,34 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     e.bnChainWork = (parent ? parent->bnChainWork : CBigNum(0)) + e.bnOwnWork;
     e.fTrusted = true;
     mapShares[id] = e;
+    nTrustedBytes += nBytes;
     return true;
+}
+
+void ShareChain::Drop(const uint256& id)
+{
+    map<uint256, Entry>::iterator it = mapShares.find(id);
+    if (it == mapShares.end())
+        return;
+    if (it->second.fTrusted)
+    {
+        size_t n = ::GetSerializeSize(it->second.share, SER_NETWORK);
+        nTrustedBytes = n > nTrustedBytes ? 0 : nTrustedBytes - n;
+    }
+    mapShares.erase(it);
 }
 
 bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut)
 {
+    // Oldest first, as History() sends it. A part out of order let a child
+    // come before its parent and be taken on trust, then sit on the parent
+    // once that was checked in full.
+    for (size_t i = 1; i < part.size(); i++)
+        if (part[i].data.nShareHeight < part[i - 1].data.nShareHeight)
+        {
+            errOut = "a history out of height order";
+            return false;
+        }
     for (size_t i = 0; i < part.size(); i++)
     {
         const Share& s = part[i];
@@ -447,44 +496,60 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
     return true;
 }
 
-// Do the lines ending at a and b share a share held here?
-bool ShareChain::LinesMeet(const uint256& a, const uint256& b) const
+// Do the lines ending at a and b share a share held here? If so, the work
+// each has above that share, summed share by share: bnChainWork is not used
+// for it, since a line whose deepest share later got ancestors from a
+// history kept the sums it had begun at zero.
+bool ShareChain::LinesMeet(const uint256& a, const uint256& b, CBigNum& bnAOut, CBigNum& bnBOut) const
 {
     const Entry* ea = Get(a);
     const Entry* eb = Get(b);
+    bnAOut = 0;
+    bnBOut = 0;
     while (ea && eb)
     {
         if (ea == eb)
             return true;
         if (ea->nHeight >= eb->nHeight)
+        {
+            bnAOut += ea->bnOwnWork;
             ea = Get(ea->share.data.hashPrevShare);
+        }
         else
+        {
+            bnBOut += eb->bnOwnWork;
             eb = Get(eb->share.data.hashPrevShare);
+        }
     }
     return false;
 }
 
 // The work of the last WINDOW_SHARES of the line ending at e, or of as many
-// of them as are held.
+// of them as are held, summed share by share.
 CBigNum ShareChain::LineWork(const Entry* e) const
 {
-    const Entry* last = e;
-    for (unsigned int n = 1; n < WINDOW_SHARES; n++)
+    CBigNum bn = 0;
+    for (unsigned int n = 0; n < WINDOW_SHARES && e; n++)
     {
-        const Entry* p = Get(last->share.data.hashPrevShare);
-        if (!p)
-            break;
-        last = p;
+        bn += e->bnOwnWork;
+        e = Get(e->share.data.hashPrevShare);
     }
-    return e->bnChainWork - last->bnChainWork + last->bnOwnWork;
+    return bn;
 }
 
-// Most work wins; on a tie the line seen first stays. Summed work compares
-// two lines that meet in the shares held here. Two that do not -- this node
-// mined alone before it heard the network, or was cut off for long -- began
-// their sums at different shares, and a long run alone would outweigh the
-// whole network for good; those are compared on their last WINDOW_SHARES.
-bool ShareChain::Heavier(const uint256& id) const
+// Most work wins; on a tie the line seen first stays. Work is compared above
+// the share where the two lines meet. Two that do not meet -- this node mined
+// alone before it heard the network, or was cut off for long -- are compared
+// on their last WINDOW_SHARES: summed from their own first shares, a long run
+// alone would outweigh the whole network for good.
+//
+// And a line must be live to win: its newest share no older than
+// TIP_MAX_AGE by this node's clock, unless the tip it would replace is no
+// livelier. A share's time has no lower bound, so the network's own line of
+// some days ago, when its difficulty was higher, could be played back to a
+// starting node and outweigh today's. This decides only which line a node
+// mines on, never whether a share is valid.
+bool ShareChain::Heavier(const uint256& id, int64 nNow) const
 {
     const Entry* c = Get(id);
     if (!c || c->fTrusted)
@@ -492,8 +557,15 @@ bool ShareChain::Heavier(const uint256& id) const
     const Entry* t = Get(hashTip);
     if (!t)
         return true;
-    if (LinesMeet(id, hashTip))
-        return c->bnChainWork > t->bnChainWork;
+    if (c->share.data.hashPrevShare == hashTip)
+        return true;   // it builds on the tip
+    bool fCandLive = (int64)c->share.nTime >= nNow - TIP_MAX_AGE;
+    bool fTipLive = (int64)t->share.nTime >= nNow - TIP_MAX_AGE;
+    if (fCandLive != fTipLive)
+        return fCandLive;
+    CBigNum bnC, bnT;
+    if (LinesMeet(id, hashTip, bnC, bnT))
+        return bnC > bnT;
     return LineWork(c) > LineWork(t);
 }
 
@@ -590,7 +662,7 @@ void ShareChain::Prune()
             vCut.push_back(it->first);
     }
     for (size_t i = 0; i < vCut.size(); i++)
-        mapShares.erase(vCut[i]);
+        Drop(vCut[i]);
 }
 
 // The memory backstop: past MAX_CHAIN_SHARES, drop side lines, the lightest
@@ -598,9 +670,9 @@ void ShareChain::Prune()
 // room is free again. Never the tip's line nor an uncle it names, which a
 // template's window needs. A dropped share that later turns out to matter
 // is asked for again like any missing one.
-void ShareChain::Evict()
+void ShareChain::Evict(size_t nRoom)
 {
-    if (mapShares.size() <= MAX_CHAIN_SHARES)
+    if (mapShares.size() + nRoom <= MAX_CHAIN_SHARES)
         return;
     set<uint256> keep;
     uint256 cur = hashTip;
@@ -627,7 +699,7 @@ void ShareChain::Evict()
         uint256 id = leaves.begin()->second;
         leaves.erase(leaves.begin());
         uint256 parent = Get(id)->share.data.hashPrevShare;
-        mapShares.erase(id);
+        Drop(id);
         map<uint256, int>::iterator ci = children.find(parent);
         if (ci != children.end() && --ci->second == 0 && !keep.count(parent))
             leaves.insert(make_pair(Get(parent)->bnChainWork, parent));

@@ -4914,6 +4914,14 @@ static int RunP2PoolShareSelfTest()
                        "a P2PKH or P2SH address is a payout script; anything more is not") ? 0 : 1;
     }
 
+    // A coinbase pays addresses and nothing else, on the share alone: it
+    // bounds what a share taken on its work alone can carry, whose payouts
+    // are never checked against a window.
+    t = s;
+    t.coinbase.vout[0].scriptPubKey = CScript() << OP_RETURN << vector<unsigned char>(40, 0x55);
+    nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "a coinbase paying something other than an address",
+                   "a coinbase output that is not an address is refused on the share alone") ? 0 : 1;
+
     t = s;
     t.data.nShareHeight = p2pool::MAX_SHARE_HEIGHT + 1;
     nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "share height out of range",
@@ -5341,6 +5349,25 @@ static int RunP2PoolSyncSelfTest()
         bool fDeep = d.AddHistory(deep, nTipHeight, main, err);
         nFail += Check(fDeep && d.Size() == 400 && d.Tip() == 0,
                        "four hundred shares taken on their work alone hold no tip") ? 0 : 1;
+        // Nor are they handed to a peer that asks by id (it checks in full,
+        // and blames the sender), nor named as uncles.
+        p2pool::Share got;
+        bool fServed = d.GetShare(deep[200].GetId(), got);
+        bool fUncle = !d.UncleCandidates(deep[201].GetId()).empty();
+        nFail += Check(!fServed && !fUncle,
+                       "and they are not served by id, nor offered as uncles") ? 0 : 1;
+    }
+
+    // A part out of height order is refused: a child first, taken on trust
+    // while its parent was missing, then sat on the parent once that was
+    // checked in full.
+    {
+        p2pool::ShareChain e(bnFloor, false);
+        vector<p2pool::Share> backwards;
+        backwards.push_back(hist[hist.size() - 1]);
+        backwards.push_back(hist[hist.size() - 2]);
+        nFail += Check(!e.AddHistory(backwards, nTipHeight, main, err) && err == "a history out of height order",
+                       "a history part out of height order is refused") ? 0 : 1;
     }
 
     // A node that mined alone, for longer than a history and on easier
@@ -5387,6 +5414,7 @@ static int RunP2PoolSyncSelfTest()
             sp = s.GetId();
         }
         if (!fSolo) printf("       %s\n", err.c_str());
+        p2pool::ShareChain soloBefore = solo;
         bool fTook = true;
         for (size_t i = 0; i < netHist.size() && fTook; i += 400)
         {
@@ -5396,6 +5424,31 @@ static int RunP2PoolSyncSelfTest()
         if (!fTook) printf("       %s\n", err.c_str());
         nFail += Check(fNet && fSolo && fTook && solo.Tip() == net.Tip(),
                        "a node that mined alone longer, on easier shares, moves to the network's line") ? 0 : 1;
+
+        // The same network line played back from two hours ago: just as
+        // heavy in its window, but not live. A share's time has no lower
+        // bound, so only the tip choice can tell; the lone node stays put.
+        p2pool::ShareChain old(bnHardFloor, false);
+        unsigned int to = (unsigned int)main.nNow - nSpan - 100 - 7200;
+        uint256 op = 0;
+        bool fOld = true;
+        for (unsigned int i = 0; i < nNet && fOld; i++)
+        {
+            to += (i < 1000 || i % 2) ? 10 : 9;
+            p2pool::Share s = ChainShare(old, main, op, script((unsigned char)(1 + i % 7)), to);
+            fOld = old.Add(s, main, err);
+            op = s.GetId();
+        }
+        vector<p2pool::Share> oldHist;
+        old.History(oldHist);
+        bool fOldTook = true;
+        for (size_t i = 0; i < oldHist.size() && fOldTook; i += 400)
+        {
+            vector<p2pool::Share> part(oldHist.begin() + i, oldHist.begin() + std::min(oldHist.size(), i + 400));
+            fOldTook = soloBefore.AddHistory(part, old.Height(old.Tip()), main, err);
+        }
+        nFail += Check(fOld && fOldTook && soloBefore.Tip() == sp && soloBefore.Has(old.Tip()),
+                       "a heavier line from two hours ago, played back, does not take a live tip") ? 0 : 1;
     }
 
     // The same for a fresh share: a main block this node lacks does not make

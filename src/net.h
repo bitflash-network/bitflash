@@ -688,6 +688,10 @@ public:
     int64 nP2PoolSyncServed;
     int64 nP2PoolSyncAskedAt;
     unsigned int nP2PoolHistoryRecv;
+    // When it last sent a share this node took (0: never), and whether it
+    // has named its P2Pool peers to us yet (once per connection).
+    int64 nP2PoolLastGood;
+    bool fP2PoolPeersRecv;
 protected:
     int nRefCount;
 public:
@@ -765,6 +769,8 @@ public:
         nP2PoolSyncServed = 0;
         nP2PoolSyncAskedAt = 0;
         nP2PoolHistoryRecv = 0;
+        nP2PoolLastGood = 0;
+        fP2PoolPeersRecv = false;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

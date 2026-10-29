@@ -88,6 +88,15 @@ bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut,
     // anywhere else would be kept at whatever size its sender chose.
     if (!share.coinbase.CheckTransaction())
         return Fail(errOut, "a coinbase no block could carry");
+    // What any window pays: one address per output, and no more outputs than
+    // a window of shares with two uncles each. Checked here, on the share
+    // alone, so it also bounds a share taken on its work alone, whose
+    // payouts are never checked against a window.
+    if (share.coinbase.vout.size() > 3 * WINDOW_SHARES)
+        return Fail(errOut, "a coinbase paying more addresses than a window holds");
+    foreach(const CTxOut& o, share.coinbase.vout)
+        if (!IsPayoutScript(vector<unsigned char>(o.scriptPubKey.begin(), o.scriptPubKey.end())))
+            return Fail(errOut, "a coinbase paying something other than an address");
 
     // The coinbase commits to this share's chain data, and only to it.
     uint256 hashCommit;
