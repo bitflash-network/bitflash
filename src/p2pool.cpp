@@ -18,9 +18,9 @@ bool ComputePayouts(const std::vector<WindowShare>& window, int64_t nValue,
         errOut = "empty payout window";
         return false;
     }
-    if (nValue < 0)
+    if (nValue < 0 || nValue >= ((int64_t)1 << 51))
     {
-        errOut = "negative block value";
+        errOut = "block value out of range";
         return false;
     }
 
@@ -39,8 +39,9 @@ bool ComputePayouts(const std::vector<WindowShare>& window, int64_t nValue,
         total += window[i].work;
     }
 
-    // nValue * work fits in 128 bits: nValue < 2^63 and the total work of a
-    // window of 2160 64-bit values is < 2^75.
+    // nValue * work fits in 128 bits: nValue < 2^51 (checked above; all the
+    // money there is, 21 million coins, is under 2^51 satoshis) and a window
+    // of 2160 shares with two uncles each is under 2^13 64-bit values, < 2^77.
     int64_t paid = 0;
     std::map<std::vector<unsigned char>, unsigned __int128>::const_iterator best = work.end();
     for (std::map<std::vector<unsigned char>, unsigned __int128>::const_iterator it = work.begin();

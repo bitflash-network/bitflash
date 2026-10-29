@@ -40,6 +40,13 @@ struct ShareData
 
 static const unsigned int MAX_UNCLES = 2;
 static const unsigned int MAX_PAYOUT_SCRIPT = 64;
+// Far past anything real, and far below where an int or a subsidy halving
+// count would overflow.
+static const unsigned int MAX_SHARE_HEIGHT = 1 << 30;
+static const int MAX_BLOCK_HEIGHT = 10000000;
+
+// A payout script a share may name: a P2PKH or a P2SH address, nothing else.
+bool IsPayoutScript(const vector<unsigned char>& script);
 
 // The coinbase push that carries the commitment: "p2p" and 32 bytes.
 vector<unsigned char> CommitmentPush(const uint256& hashShareData);
@@ -85,12 +92,14 @@ struct Share
 // Everything a share can be checked for on its own, given the payout window
 // it claims to pay (the window ending with this share, step 3 builds it):
 // the commitment, the merkle branch, the RandomX work against nShareBits, a
-// share target no easier than bnFloor and no harder than the block's own,
-// and a coinbase paying exactly ComputePayouts(window, its own total) with a
-// total of at least the subsidy. On success fBlockOut says whether the work
-// also meets nBits, which makes the share a Bitflash block.
-// The checks that need no window: share data bounds, the commitment, the
-// merkle branch, the targets and the RandomX work (unless !fCheckPoW).
+// share target no easier than bnFloor, and a coinbase paying exactly
+// ComputePayouts(window, its own total) with a total of at least the subsidy
+// at nBlockHeight. On success fBlockOut says whether the work also meets the
+// nBits the share states, which would make it a Bitflash block; nothing else
+// is checked against that nBits.
+// The checks that need no window: share data bounds, the payout script, the
+// coinbase's own rules, the commitment, the merkle branch, the target and the
+// RandomX work (unless !fCheckPoW).
 bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
                     bool fCheckPoW = true);
 

@@ -4894,6 +4894,31 @@ static int RunP2PoolShareSelfTest()
     nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "an uncle named twice",
                    "the same uncle named twice is refused on the share alone") ? 0 : 1;
 
+    // Every payout script of the window becomes an output of every
+    // template's coinbase: 64 OP_CHECKMULTISIG count 1280 signature
+    // operations there, and a few such shares put every P2Pool block over
+    // the block limit. Only an address is a payout script.
+    t = s;
+    t.data.payoutScript.assign(64, OP_CHECKMULTISIG);
+    nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "bad payout script",
+                   "a payout script of signature operations, not an address, is refused") ? 0 : 1;
+    {
+        CScript p2sh;
+        p2sh << OP_HASH160 << uint160(0) << OP_EQUAL;
+        vector<unsigned char> v2sh(p2sh.begin(), p2sh.end());
+        vector<unsigned char> v2pkh = pay(a);
+        vector<unsigned char> vLong = v2pkh;
+        vLong.push_back(OP_CHECKSIG);
+        nFail += Check(p2pool::IsPayoutScript(v2pkh) && p2pool::IsPayoutScript(v2sh) &&
+                       !p2pool::IsPayoutScript(vLong),
+                       "a P2PKH or P2SH address is a payout script; anything more is not") ? 0 : 1;
+    }
+
+    t = s;
+    t.data.nShareHeight = p2pool::MAX_SHARE_HEIGHT + 1;
+    nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "share height out of range",
+                   "a share height past anything real is refused") ? 0 : 1;
+
     t = s;
     t.coinbase.vin[0].scriptSig << vector<unsigned char>(80, 0x42);
     nFail += Check(!p2pool::CheckShareWork(t, bnFloor, fBlock, err) && err == "a coinbase no block could carry",
@@ -4961,7 +4986,7 @@ static p2pool::Share ChainShare(const p2pool::ShareChain& chain, const TestMainV
     s.data.nShareHeight = parent == 0 ? 0 : chain.Height(parent) + 1;
     s.data.vUncles = uncles;
     s.data.payoutScript = payout;
-    s.data.nShareBits = chain.NextShareBits(parent, main.nBits);
+    s.data.nShareBits = chain.NextShareBits(parent);
 
     vector<p2pool::WindowShare> window;
     vector<p2pool::Payout> pay;
@@ -5165,9 +5190,8 @@ static int RunP2PoolChainSelfTest()
 
     // ---- the share target follows the pace
     {
-        unsigned int nInit = p2pool::ShareBitsFromMain(main.nBits, bnFloor);
-        CBigNum bnInit;
-        bnInit.SetCompact(nInit);
+        // A chain starts at the floor; the retarget takes it from there.
+        CBigNum bnInit = bnFloor;
         for (int pace = 0; pace < 2; pace++)
         {
             p2pool::ShareChain chain(bnFloor, false);
@@ -5183,13 +5207,13 @@ static int RunP2PoolChainSelfTest()
             }
             if (!fOk) printf("       %s\n", err.c_str());
             CBigNum bnNext;
-            bnNext.SetCompact(chain.NextShareBits(prev, main.nBits));
+            bnNext.SetCompact(chain.NextShareBits(prev));
             if (pace == 0)
                 nFail += Check(fOk && bnNext * 2 <= bnInit + bnInit / 1000 && bnNext * 2 >= bnInit - bnInit / 1000,
                                "720 shares at 5 s instead of 10: the target halves") ? 0 : 1;
             else
-                nFail += Check(fOk && bnNext * 4 <= bnInit * 16 + bnInit / 100 && bnNext >= bnInit * 4 - bnInit / 100,
-                               "720 shares at 50 s: the target eases, by four at most") ? 0 : 1;
+                nFail += Check(fOk && bnNext == CBigNum().SetCompact(bnFloor.GetCompact()),
+                               "720 shares at 50 s: the target stays at the floor, never easier") ? 0 : 1;
         }
     }
 
@@ -5296,6 +5320,18 @@ static int RunP2PoolSyncSelfTest()
     if (!fSynced) printf("       %s\n", err.c_str());
     nFail += Check(fSynced && b.Tip() == a.Tip(), "it ends on the same tip, though it never saw their main block") ? 0 : 1;
 
+    // A share a history calls deep, but whose parent was checked in full, is
+    // checked in full too. Taken on trust on this node's tip, one carried a
+    // child onto the tip that every peer then refused, and blamed this node.
+    {
+        p2pool::ShareChain probe = b;
+        p2pool::Share j = ChainShare(b, main, b.Tip(), script(5), t);   // timed before its line's median
+        vector<p2pool::Share> one(1, j);
+        bool fRefused = !probe.AddHistory(one, nTipHeight + 100000, main, err) && !probe.Has(j.GetId());
+        nFail += Check(fRefused && err.find("median") != string::npos,
+                       "a 'deep' share hung on a share checked in full is checked in full, and refused") ? 0 : 1;
+    }
+
     // The deep end of a history is taken on its work alone, and holds no tip:
     // the line a node mines on ends in a share checked in full. A history of
     // such shares alone used to become the tip.
@@ -5313,32 +5349,52 @@ static int RunP2PoolSyncSelfTest()
     // window. Lines that never meet are weighed on their windows; on sums it
     // kept its own line for good.
     {
-        TestMainView mainS;
-        mainS.nBits = 0x1d013fff;            // shares 1.25 times easier
-        mainS.nTip = 61005;
-        mainS.nNow = main.nNow;
-        for (int h = 61001; h <= 61005; h++)
-            mainS.heights[Hash(BEGIN(h), END(h))] = h;
-        p2pool::ShareChain solo(bnFloor, false);
+        // The network: at the floor for its first thousand shares, then
+        // coming every 9.5 s instead of 10, so its target hardens a little
+        // through the window. A floor hard enough that 5% shows in the work:
+        // at the easiest target every share is worth 2.
+        CBigNum bnHardFloor;
+        bnHardFloor.SetCompact(0x1f00ffff);
+        p2pool::ShareChain net(bnHardFloor, false);
+        unsigned int nNet = p2pool::HISTORY_SHARES + 200;
+        unsigned int nSpan = 0;
+        for (unsigned int i = 0; i < nNet; i++)
+            nSpan += (i < 1000 || i % 2) ? 10 : 9;
+        unsigned int tn = (unsigned int)main.nNow - nSpan - 100;
+        uint256 np = 0;
+        bool fNet = true;
+        for (unsigned int i = 0; i < nNet && fNet; i++)
+        {
+            tn += (i < 1000 || i % 2) ? 10 : 9;
+            p2pool::Share s = ChainShare(net, main, np, script((unsigned char)(1 + i % 7)), tn);
+            fNet = net.Add(s, main, err);
+            np = s.GetId();
+        }
+        if (!fNet) printf("       %s\n", err.c_str());
+        vector<p2pool::Share> netHist;
+        net.History(netHist);
+
+        // The lone node: at the floor throughout, every 10 s, for longer.
+        p2pool::ShareChain solo(bnHardFloor, false);
         unsigned int nSolo = 4000;
         unsigned int ts = (unsigned int)main.nNow - 10 * nSolo - 100;
         uint256 sp = 0;
         bool fSolo = true;
         for (unsigned int i = 0; i < nSolo && fSolo; i++)
         {
-            p2pool::Share s = ChainShare(solo, mainS, sp, script(8), ts + 10 * i);
-            fSolo = solo.Add(s, mainS, err);
+            p2pool::Share s = ChainShare(solo, main, sp, script(8), ts + 10 * i);
+            fSolo = solo.Add(s, main, err);
             sp = s.GetId();
         }
         if (!fSolo) printf("       %s\n", err.c_str());
         bool fTook = true;
-        for (size_t i = 0; i < hist.size() && fTook; i += 400)
+        for (size_t i = 0; i < netHist.size() && fTook; i += 400)
         {
-            vector<p2pool::Share> part(hist.begin() + i, hist.begin() + std::min(hist.size(), i + 400));
-            fTook = solo.AddHistory(part, nTipHeight, mainS, err);
+            vector<p2pool::Share> part(netHist.begin() + i, netHist.begin() + std::min(netHist.size(), i + 400));
+            fTook = solo.AddHistory(part, net.Height(net.Tip()), main, err);
         }
         if (!fTook) printf("       %s\n", err.c_str());
-        nFail += Check(fSolo && fTook && solo.Tip() == a.Tip(),
+        nFail += Check(fNet && fSolo && fTook && solo.Tip() == net.Tip(),
                        "a node that mined alone longer, on easier shares, moves to the network's line") ? 0 : 1;
     }
 

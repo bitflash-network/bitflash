@@ -39,7 +39,7 @@ struct Payout
 // distinct script, sorted by script bytes. Each gets floor(nValue * work /
 // total); what rounding leaves goes to the script with the most work (the
 // first in sort order on a tie). The outputs add up to nValue exactly.
-// Refuses an empty window, a share with no work or no script, and nValue < 0.
+// Refuses an empty window, a share with no work or no script, and nValue outside 0 to 2^51.
 bool ComputePayouts(const std::vector<WindowShare>& window, int64_t nValue,
                     std::vector<Payout>& out, std::string& errOut);
 

@@ -34,16 +34,15 @@ static const size_t MAX_CHAIN_SHARES = 4 * HISTORY_SHARES;
 // (those start "here:").
 bool InnocentRefusal(const string& err);
 
-// What the share chain needs from the main chain. The node answers from its
-// block index; tests answer from a table.
+// What the share chain takes from outside itself: the clock, and nothing of
+// the main chain. A share's validity once rested on whether a node had the
+// main block it was mined on; two honest nodes, one with that block and one
+// without, then judged the same share differently and parted ways for good.
+// The node answers from its adjusted time; tests answer from a table.
 class MainView
 {
 public:
     virtual ~MainView() {}
-    // A main-chain block the node has: its height, and the nBits the block
-    // after it must carry.
-    virtual bool BlockInfo(const uint256& hash, int& nHeightOut, unsigned int& nNextBitsOut) const = 0;
-    virtual int TipHeight() const = 0;
     virtual int64 Now() const = 0;
 };
 
@@ -52,10 +51,6 @@ uint64_t WorkOf(unsigned int nBits);
 
 // The block height a coinbase states in its first push (rules v2, BIP34).
 bool CoinbaseHeight(const CTransaction& coinbase, int& nHeightOut);
-
-// The share target of a chain's first RETARGET_SHARES shares: the block
-// target made SHARES_PER_BLOCK times easier, never easier than the floor.
-unsigned int ShareBitsFromMain(unsigned int nMainBits, const CBigNum& bnFloor);
 
 class ShareChain
 {
@@ -102,8 +97,16 @@ public:
     int Height(const uint256& id) const;
     size_t Size() const { return mapShares.size(); }
 
-    // The share target the child of 'parent' must carry (0: the first share).
-    unsigned int NextShareBits(const uint256& parent, unsigned int nMainBits) const;
+    // The share target the child of 'parent' must carry (0: the first share):
+    // the floor for a chain's first RETARGET_SHARES, then the retarget.
+    unsigned int NextShareBits(const uint256& parent) const;
+
+    // The earliest time a child of 'parent' may carry: one second past the
+    // median of the last 11 shares (0 for the first share).
+    unsigned int NextShareMinTime(const uint256& parent) const;
+
+    // Whether this node is still to learn the share chain: it has no tip.
+    bool Empty() const { return hashTip == 0; }
 
     // The payout window of a share with this data and its own work: itself,
     // its uncles, and the line behind it, WINDOW_SHARES deep. An uncle counts
@@ -135,7 +138,7 @@ private:
     // Why 'u' may not be an uncle of a child of 'parent' at nHeight; NULL if it may.
     const char* UncleProblem(const uint256& u, const uint256& parent, int nHeight) const;
     bool AddInContext(const Share& s, const MainView& main, string& errOut,
-                      vector<uint256>* pvMissing, bool* pfBlock, bool& fLocalView);
+                      vector<uint256>* pvMissing, bool* pfBlock);
     bool CheckUncles(const ShareData& d, const uint256& parent, int nHeight, string& errOut) const;
     // Whether the line ending at 'id' should replace the tip.
     bool Heavier(const uint256& id) const;

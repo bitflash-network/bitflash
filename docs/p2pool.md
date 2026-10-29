@@ -51,9 +51,19 @@ data. The PoW therefore cannot be lifted from one share chain onto another.
 **Valid share:** the header hashes (RandomX, the main chain's own PoW v2) under
 the share target; the coinbase outputs equal the payout list computed from the
 parent; the parent and uncles are known (a missing one is fetched, never
-held against the sender); the timestamp is sane; the bits are right for the
-main block it was mined on, or, when the node lacks that block, the coinbase
-states its height.
+held against the sender); the timestamp is sane; the coinbase states its
+block height (rules v2), which sets the subsidy it must pay, and meets every
+rule a block's coinbase meets; the payout script is a P2PKH or P2SH address,
+nothing else (every payout script of the window becomes an output of every
+coinbase, so a script of signature operations would push every P2Pool block
+over the block's limit).
+
+A share is judged on the share chain and itself alone, never on the main
+blocks a node holds. Its `nBits` decides only whether its work is also a
+block, which is the main chain's business. Checking `nBits` against the main
+block it was mined on made two honest nodes, one holding that block and one
+not, judge the same share differently and part ways; taking `nBits` on the
+share's word let anybody name an easy one.
 
 How far behind the main tip a share was mined does **not** decide its
 validity: that would depend on when the share arrived, and two honest nodes
@@ -62,8 +72,12 @@ nodes, over an uncle fetched minutes after it was mined. Work on an old main
 block is still work the window pays; mining on the tip is the miner's own
 interest, and a node's templates are always on its tip.
 
-**Share target:** retargets every share over the last 720 shares to keep 10
-seconds per share, never below a floor (spam) nor above the main difficulty.
+**Share target:** a chain's first 720 shares are at the floor (the network's
+easiest target); from then on it retargets every share over the last 720 to
+keep 10 seconds per share, never easier than the floor. It is not held to the
+block target: when blocks are the easier of the two, the miner is given the
+block target, and work that meets it but not the share target is a block and
+not a share.
 
 **Chain choice:** most cumulative share work, uncles included, between lines
 that meet in the shares a node holds. Two lines that do not meet (a node that

@@ -37,14 +37,16 @@ p2pool::ShareChain& P2PoolChain();
 // saved in p2pool.dat (every two minutes while it runs).
 void P2PoolInit();
 
-// The main chain as the share chain sees it, from the block index. Callers
-// hold cs_main.
+// What the share chain takes from the node: its adjusted clock.
 class NodeMainView : public p2pool::MainView
 {
 public:
-    bool BlockInfo(const uint256& hash, int& nHeightOut, unsigned int& nNextBitsOut) const;
-    int TipHeight() const;
     int64 Now() const;
 };
+
+// Whether this node should hold back templates: it has no share chain yet
+// and has just asked a peer for one. Mining meanwhile would start a chain of
+// its own at height 0. Under cs_p2pool.
+bool P2PoolAwaitingHistory();
 
 #endif

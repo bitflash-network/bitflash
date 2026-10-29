@@ -43,16 +43,6 @@ uint64_t WorkOf(unsigned int nBits)
     return n;
 }
 
-unsigned int ShareBitsFromMain(unsigned int nMainBits, const CBigNum& bnFloor)
-{
-    CBigNum bn;
-    bn.SetCompact(nMainBits);
-    bn *= SHARES_PER_BLOCK;
-    if (bn > bnFloor)
-        bn = bnFloor;
-    return bn.GetCompact();
-}
-
 // The block height a coinbase states in its first push (rules v2, BIP34).
 bool CoinbaseHeight(const CTransaction& coinbase, int& nHeightOut)
 {
@@ -151,11 +141,30 @@ bool ShareChain::CheckUncles(const ShareData& d, const uint256& parent, int nHei
     return true;
 }
 
-unsigned int ShareChain::NextShareBits(const uint256& parent, unsigned int nMainBits) const
+unsigned int ShareChain::NextShareMinTime(const uint256& parent) const
 {
+    vector<unsigned int> times;
+    const Entry* e = Get(parent);
+    for (int i = 0; i < 11 && e; i++)
+    {
+        times.push_back(e->share.nTime);
+        e = Get(e->share.data.hashPrevShare);
+    }
+    if (times.empty())
+        return 0;
+    std::sort(times.begin(), times.end());
+    return times[times.size() / 2] + 1;
+}
+
+unsigned int ShareChain::NextShareBits(const uint256& parent) const
+{
+    // A chain's first shares are at the floor, and the retarget takes it from
+    // there. They were the block target made twelve times easier, from the
+    // nBits the share itself states -- which let a share name an easy nBits
+    // and be mined for next to nothing.
     const Entry* p = Get(parent);
     if (!p || p->nHeight + 1 < (int)RETARGET_SHARES)
-        return ShareBitsFromMain(nMainBits, bnFloor);
+        return bnFloor.GetCompact();
 
     // The mean target of the last RETARGET_SHARES shares, scaled by how much
     // faster or slower than SHARE_SPACING they came, by at most 4 either way.
@@ -179,11 +188,12 @@ unsigned int ShareChain::NextShareBits(const uint256& parent, unsigned int nMain
     bnNew *= nActual;
     bnNew /= nExpected;
 
-    // Never easier than the floor, never harder than a block.
-    CBigNum bnMain;
-    bnMain.SetCompact(nMainBits);
+    // Never easier than the floor. Not held to the block target either: that
+    // came from the nBits a share states for itself, and a share naming an
+    // easy one dragged its children's target down with it. A share target
+    // harder than the block's only means a block that is not also a share.
     if (bnNew > bnFloor) bnNew = bnFloor;
-    if (bnNew < bnMain) bnNew = bnMain;
+    if (bnNew < 1) bnNew = 1;
     return bnNew.GetCompact();
 }
 
@@ -272,18 +282,11 @@ bool ShareChain::GetShare(const uint256& id, Share& out) const
 
 bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock)
 {
-    bool fLocalView = false;
-    if (AddInContext(s, main, errOut, pvMissing, pfBlock, fLocalView))
-        return true;
-    // Judged without the main block it was mined on: what it was refused for
-    // may be right on a node that has that block.
-    if (fLocalView && errOut.compare(0, 5, "here:") != 0)
-        errOut = "here: " + errOut;
-    return false;
+    return AddInContext(s, main, errOut, pvMissing, pfBlock);
 }
 
 bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errOut,
-                              vector<uint256>* pvMissing, bool* pfBlock, bool& fLocalView)
+                              vector<uint256>* pvMissing, bool* pfBlock)
 {
     if (pvMissing) pvMissing->clear();
     if (pfBlock) *pfBlock = false;
@@ -292,11 +295,13 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
     if (Has(id))
         return Fail(errOut, "already have this share");
 
+    if (d.vUncles.size() > MAX_UNCLES)
+        return Fail(errOut, "too many uncles");
+
     // Everything it names must be here first: its parent and its uncles.
     // A peer that named an uncle we never received did nothing wrong; it was
     // scored for it once, and two honest nodes ended up banning each other
     // onto separate share chains.
-    if (d.vUncles.size() <= MAX_UNCLES)
     {
         vector<uint256> vMissing;
         if (d.hashPrevShare != 0 && !Has(d.hashPrevShare))
@@ -319,67 +324,39 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
     if ((int)d.nShareHeight != nHeight)
         return Fail(errOut, "wrong share height");
 
-    // Its place in the main chain. On a block this node has, the bits must be
-    // that block's; on one it does not have -- orphaned since, or never seen
-    // here -- the height its coinbase states (rules v2) is enough. How far
-    // behind the tip that block is does not decide anything: it would make a
-    // share's validity depend on when it arrived, and two honest nodes would
-    // disagree about the same share. That split two testnet nodes, when an
-    // uncle fetched minutes after it was mined was refused as stale and every
-    // share naming it waited forever. Work on an old block is still work the
-    // window pays; mining on the tip is the miner's own interest, and this
-    // node's templates are always on its tip.
-    int nPrevHeight;
-    unsigned int nNextBits;
-    if (main.BlockInfo(s.hashPrevBlock, nPrevHeight, nNextBits))
-    {
-        // A node with that block off its main chain never gets here, and
-        // takes the share; this one refuses. Neither is the sender's fault.
-        if (s.nBits != nNextBits)
-            return Fail(errOut, "here: wrong main-chain bits");
-    }
-    else
-    {
-        int nHeight;
-        if (!CoinbaseHeight(s.coinbase, nHeight) || nHeight < 1)
-            return Fail(errOut, "a share whose coinbase states no height");
-        nPrevHeight = nHeight - 1;
-        fLocalView = true;
-    }
+    // Its place in the main chain: the height its coinbase states (rules v2),
+    // which sets the subsidy it must pay. Only that: a share is judged on the
+    // share chain and itself, never on the main blocks a node happens to
+    // hold. How far behind the main tip it was mined decides nothing either
+    // -- work on an old block is still work the window pays, and mining on
+    // the tip is the miner's own interest.
+    int nBlockHeight;
+    if (!CoinbaseHeight(s.coinbase, nBlockHeight) || nBlockHeight < 1)
+        return Fail(errOut, "a share whose coinbase states no height");
 
-    // Time: after the median of the last 11 shares, not far in the future
-    // -- by this node's clock, which is nobody else's.
+    // Not far in the future, by this node's clock, which is nobody else's.
     if ((int64)s.nTime > main.Now() + MAX_SHARE_FUTURE)
         return Fail(errOut, "here: share time too far in the future");
-    if (parent)
-    {
-        vector<unsigned int> times;
-        const Entry* e = parent;
-        for (int i = 0; i < 11 && e; i++)
-        {
-            times.push_back(e->share.nTime);
-            e = Get(e->share.data.hashPrevShare);
-        }
-        std::sort(times.begin(), times.end());
-        if (s.nTime <= times[times.size() / 2])
-            return Fail(errOut, "share time not after the median of the last 11");
-    }
 
-    if (d.nShareBits != NextShareBits(d.hashPrevShare, s.nBits))
-        return Fail(errOut, "wrong share target");
-    if (!CheckUncles(d, d.hashPrevShare, nHeight, errOut))
-        return false;
-
+    // The whole window behind it first: the median and the retarget below
+    // read the same ancestors, and on a line held only in part they came out
+    // wrong and blamed the sender for what this node lacked.
     uint64_t nWork = WorkOf(d.nShareBits);
     vector<WindowShare> window;
     if (!WindowFor(d, nWork, window, errOut))
         return false;
+
+    // After the median of the last 11 shares.
+    if (s.nTime < NextShareMinTime(d.hashPrevShare))
+        return Fail(errOut, "share time not after the median of the last 11");
+
+    if (d.nShareBits != NextShareBits(d.hashPrevShare))
+        return Fail(errOut, "wrong share target");
+    if (!CheckUncles(d, d.hashPrevShare, nHeight, errOut))
+        return false;
+
     bool fBlock = false;
-    // From here on the share is judged on itself -- its work, its coinbase
-    // against a window every node with these shares computes the same -- and
-    // a refusal is the sender's to answer for, main block known or not.
-    fLocalView = false;
-    if (!CheckShare(s, window, nPrevHeight + 1, bnFloor, fBlock, errOut, fCheckPoW))
+    if (!CheckShare(s, window, nBlockHeight, bnFloor, fBlock, errOut, fCheckPoW))
         return false;
 
     Entry e;
@@ -408,8 +385,13 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     if (Has(id))
         return Fail(errOut, "already have this share");
     // Unlike a share checked in full, nothing here ties these to the tip's
-    // line, so they are capped as they come; a history that does not fit is
-    // this node's limit, not the sender's fault.
+    // line, so they are capped as they come: the lightest side lines go
+    // first, as for any share, and a history that still does not fit is this
+    // node's limit, not the sender's fault. Refusing at once let the first
+    // peers to answer fill the room with lines of no work and keep the
+    // honest history out.
+    if (mapShares.size() >= MAX_CHAIN_SHARES)
+        Evict();
     if (mapShares.size() >= MAX_CHAIN_SHARES)
         return Fail(errOut, "here: no room for more history");
     bool fBlock;
@@ -446,9 +428,14 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
     {
         const Share& s = part[i];
         string err;
-        bool fOk = (int)s.data.nShareHeight < nTipHeight - (int)RETARGET_SHARES
-                 ? AddTrusted(s, err)
-                 : Add(s, main, err);
+        // On its work alone only deep in the history, and only below every
+        // share checked in full: on a parent checked in full it is checked
+        // in full too. Hung on this node's tip, a share taken on trust once
+        // carried a child onto the tip that every peer then refused.
+        const Entry* parent = Get(s.data.hashPrevShare);
+        bool fTrust = (int64)s.data.nShareHeight < (int64)nTipHeight - (int64)RETARGET_SHARES &&
+                      (!parent || parent->fTrusted);
+        bool fOk = fTrust ? AddTrusted(s, err) : Add(s, main, err);
         if (fOk || err == "already have this share")
             continue;
         // Nothing wrong with the sender; what follows builds on this one.

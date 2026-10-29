@@ -87,11 +87,14 @@ struct StratumJob {
     CBlock      block;
     uint256     target;  // full block target; share targets are per-miner via vardiff
     int         height;
-    // P2Pool: what the coinbase commits to, the share chain's target (the
-    // only target a miner is given), and the coinbase's merkle branch -- the
-    // same for every miner, since index 0's branch holds no coinbase hash.
+    // P2Pool: what the coinbase commits to, the target a miner is given (the
+    // easier of the share chain's and the block's, so a block is never
+    // filtered out by the miner), the share chain's own target, and the
+    // coinbase's merkle branch -- the same for every miner, since index 0's
+    // branch holds no coinbase hash.
     p2pool::ShareData shareData;
     uint256     shareTarget;
+    uint256     shareChainTarget;
     std::vector<uint256> vBranch;
 };
 
@@ -132,21 +135,34 @@ static std::vector<unsigned char> P2PoolPayoutScript()
     return vchScript;
 }
 
+// Room a P2Pool template keeps for its coinbase, which is written after the
+// transactions are chosen: an output and a signature operation per address,
+// for a window of 2160 shares each naming up to two uncles.
+static const unsigned int P2POOL_COINBASE_SIGOPS = 3 * p2pool::WINDOW_SHARES;
+static const unsigned int P2POOL_COINBASE_BYTES = 3 * p2pool::WINDOW_SHARES * 34 + 1000;
+
 // The coinbase of a P2Pool template: height, bits, extranonce and the share
 // commitment in, the share window paid out. False when this node cannot know
-// what the window must pay (its share chain is still syncing).
+// what the window must pay (its share chain is still syncing). nMinTimeOut:
+// the earliest time the share may carry.
 static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint32_t extraNonce, int64 nFees,
-                           p2pool::ShareData& dataOut, uint256& shareTargetOut)
+                           p2pool::ShareData& dataOut, uint256& shareTargetOut, unsigned int& nMinTimeOut)
 {
     p2pool::ShareData d;
     vector<p2pool::Payout> pay;
     string err;
     CRITICAL_BLOCK(cs_p2pool)
     {
+        if (P2PoolAwaitingHistory())
+        {
+            LogPrint("pool", "[p2pool] no template yet: waiting for the share chain from peers\n");
+            return false;
+        }
         p2pool::ShareChain& c = P2PoolChain();
         d.hashPrevShare = c.Tip();
         d.nShareHeight = d.hashPrevShare == 0 ? 0 : c.Height(d.hashPrevShare) + 1;
-        d.nShareBits = c.NextShareBits(d.hashPrevShare, nBits);
+        d.nShareBits = c.NextShareBits(d.hashPrevShare);
+        nMinTimeOut = c.NextShareMinTime(d.hashPrevShare);
         d.vUncles = c.UncleCandidates(d.hashPrevShare);
         d.payoutScript = P2PoolPayoutScript();
         vector<p2pool::WindowShare> window;
@@ -232,8 +248,12 @@ static bool RebuildJob()
         unsigned int nBits = GetNextWorkRequired(pindexPrev);
 
         // From the pool, so the template's payout key is in wallet.dat before
-        // any miner is handed work against it.
-        vector<unsigned char> vchPubKey = GetKeyFromPool();
+        // any miner is handed work against it. Not under P2Pool, whose
+        // coinbase pays the window: a key a rebuild, one every share, filled
+        // wallet.dat with thousands a day that nothing ever paid.
+        vector<unsigned char> vchPubKey;
+        if (!fP2PoolMode)
+            vchPubKey = GetKeyFromPool();
         static std::atomic<uint32_t> sExtra{0};
         uint32_t extraNonce = ++sExtra;
 
@@ -247,7 +267,10 @@ static bool RebuildJob()
         // is mined and submitted like any other. #58.
         txNew.vin[0].scriptSig << (pindexPrev ? pindexPrev->nHeight + 1 : 0) << nBits << (CBigNum)extraNonce;
         txNew.vout.resize(1);
-        txNew.vout[0].scriptPubKey << vchPubKey << OP_CHECKSIG;
+        if (fP2PoolMode)
+            txNew.vout[0].scriptPubKey << OP_TRUE;   // replaced by P2PoolCoinbase
+        else
+            txNew.vout[0].scriptPubKey << vchPubKey << OP_CHECKSIG;
 
         CBlock block;
         block.vtx.push_back(txNew);
@@ -293,7 +316,16 @@ static bool RebuildJob()
                 bool fSigOpsV4 = RulesV4Active(block.nTime);
                 fSelectedV4 = fSigOpsV4;
                 unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount(fSigOpsV4);
-                while (fFoundSomething && sz < MAX_SIZE / 2)
+                unsigned int nSizeLimit = MAX_SIZE / 2;
+                if (fP2PoolMode)
+                {
+                    // Room for the coinbase P2PoolCoinbase writes later: an
+                    // output, and a signature operation, per address of the
+                    // window, its uncles included.
+                    nBlockSigOps = P2POOL_COINBASE_SIGOPS;
+                    nSizeLimit = MAX_BLOCK_SIZE - P2POOL_COINBASE_BYTES;
+                }
+                while (fFoundSomething && sz < nSizeLimit)
                 {
                     fFoundSomething = false;
                     for (unsigned int n = 0; n < vOrder.size(); n++)
@@ -310,6 +342,8 @@ static bool RebuildJob()
                                               &nTxSigOps))
                             continue;
                         if (nBlockSigOps + nTxSigOps > MAX_BLOCK_SIGOPS)
+                            continue;
+                        if (sz + ::GetSerializeSize(tx, SER_NETWORK) >= nSizeLimit)
                             continue;
                         nBlockSigOps += nTxSigOps;
                         nFees = nFeesTmp;
@@ -334,9 +368,26 @@ static bool RebuildJob()
         // and commits to the share chain.
         p2pool::ShareData shareData;
         uint256 shareTarget;
+        unsigned int nShareMinTime = 0;
         if (fP2PoolMode &&
-            !P2PoolCoinbase(block, pindexPrev->nHeight + 1, nBits, extraNonce, nFees, shareData, shareTarget))
+            !P2PoolCoinbase(block, pindexPrev->nHeight + 1, nBits, extraNonce, nFees, shareData, shareTarget,
+                            nShareMinTime))
             return false;
+        if (fP2PoolMode)
+        {
+            // The coinbase came after the transactions were chosen: check
+            // the block it makes as CheckBlock will, rather than trust the
+            // room set aside for it.
+            unsigned int nSigOps = 0;
+            foreach(const CTransaction& tx, block.vtx)
+                nSigOps += tx.GetSigOpCount(fSelectedV4);
+            if (nSigOps > MAX_BLOCK_SIGOPS || ::GetSerializeSize(block, SER_DISK) > MAX_BLOCK_SIZE)
+            {
+                LogPrint("pool", "[p2pool] no template: the block would carry %u signature operations, %u bytes\n",
+                         nSigOps, (unsigned)::GetSerializeSize(block, SER_DISK));
+                return false;
+            }
+        }
 
         block.hashPrevBlock  = pindexPrev->GetBlockHash();
         block.hashMerkleRoot = block.BuildMerkleTree();
@@ -347,6 +398,14 @@ static bool RebuildJob()
                                     (unsigned int)GetAdjustedTime());
             if (RulesV4Active(nNow) == fSelectedV4)
                 block.nTime = nNow;
+        }
+        // And after the share chain's median: a share timed before it is
+        // refused, after the miner had been told it was accepted.
+        if (fP2PoolMode && block.nTime < nShareMinTime)
+        {
+            if (RulesV4Active(nShareMinTime) != fSelectedV4)
+                return false;
+            block.nTime = nShareMinTime;
         }
         block.nBits  = nBits;
         block.nNonce = 1;
@@ -360,9 +419,13 @@ static bool RebuildJob()
         job.height      = nBestHeight + 1;
         if (fP2PoolMode)
         {
-            job.shareData   = shareData;
-            job.shareTarget = shareTarget;
-            job.vBranch     = block.GetMerkleBranch(0);
+            job.shareData        = shareData;
+            job.shareChainTarget = shareTarget;
+            // The share target is no longer held to the block's: when blocks
+            // are the easier, the miner is given theirs, or it would never
+            // hand back a block that is not also a share.
+            job.shareTarget      = shareTarget < job.target ? job.target : shareTarget;
+            job.vBranch          = block.GetMerkleBranch(0);
         }
 
         gCurrentJob = job;
@@ -1797,8 +1860,9 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         reply(true);
 
         // P2Pool: the work is a share of the share chain. Keep it and send it
-        // to every peer; the template then moves onto it.
-        if (fP2PoolMode) {
+        // to every peer; the template then moves onto it. Work that met only
+        // the block target is a block, checked below, and not a share.
+        if (fP2PoolMode && powHash <= sj.shareChainTarget) {
             p2pool::Share s;
             s.nVersion       = b.nVersion;
             s.hashPrevBlock  = b.hashPrevBlock;

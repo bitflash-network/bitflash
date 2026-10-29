@@ -72,8 +72,15 @@ bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut,
         for (size_t j = i + 1; j < d.vUncles.size(); j++)
             if (d.vUncles[i] == d.vUncles[j])
                 return Fail(errOut, "an uncle named twice");
-    if (d.payoutScript.empty() || d.payoutScript.size() > MAX_PAYOUT_SCRIPT)
+    // An address, nothing else. Every payout script of the window becomes an
+    // output of every template's coinbase, so a script of 64 OP_CHECKMULTISIG
+    // -- 1280 signature operations as a block counts them -- named by a few
+    // shares put every P2Pool block over MAX_BLOCK_SIGOPS for six hours.
+    if (!IsPayoutScript(d.payoutScript))
         return Fail(errOut, "bad payout script");
+    // Heights far past anything real only make for arithmetic that overflows.
+    if (d.nShareHeight > MAX_SHARE_HEIGHT)
+        return Fail(errOut, "share height out of range");
     if (!share.coinbase.IsCoinBase())
         return Fail(errOut, "not a coinbase");
     // The rules any block's coinbase meets, the 100-byte scriptSig among
@@ -91,23 +98,39 @@ bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut,
     if (CBlock::CheckMerkleBranch(share.coinbase.GetHash(), share.vMerkleBranch, 0) != share.hashMerkleRoot)
         return Fail(errOut, "the coinbase is not in the merkle root");
 
-    // Targets: the share's no easier than the floor, no harder than the block.
+    // The share's target no easier than the floor. Nothing is checked against
+    // nBits, which the share states for itself: a share whose validity rested
+    // on it either let anybody pick an easy one, or rested on whether a node
+    // had that main block -- and two honest nodes, one with it and one
+    // without, parted ways for good.
     CBigNum bnShare, bnBlock;
     bnShare.SetCompact(d.nShareBits);
     bnBlock.SetCompact(share.nBits);
     if (bnShare <= 0 || bnShare > bnFloor)
         return Fail(errOut, "share target easier than the floor");
-    if (bnShare < bnBlock)
-        return Fail(errOut, "share target harder than the block's");
 
     if (fCheckPoW)
     {
         uint256 hashPoW = share.Header().GetPoWHash();
         if (CBigNum(hashPoW) > bnShare)
             return Fail(errOut, "RandomX work does not meet the share target");
-        fBlockOut = CBigNum(hashPoW) <= bnBlock;
+        // A block only if it is one by its own nBits; whether the main chain
+        // takes it is for the main chain to say.
+        fBlockOut = bnBlock > 0 && CBigNum(hashPoW) <= bnBlock;
     }
     return true;
+}
+
+bool IsPayoutScript(const vector<unsigned char>& s)
+{
+    // OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    if (s.size() == 25 && s[0] == OP_DUP && s[1] == OP_HASH160 && s[2] == 20 &&
+        s[23] == OP_EQUALVERIFY && s[24] == OP_CHECKSIG)
+        return true;
+    // OP_HASH160 <20> OP_EQUAL (a treasury or other P2SH address)
+    if (s.size() == 23 && s[0] == OP_HASH160 && s[1] == 20 && s[22] == OP_EQUAL)
+        return true;
+    return false;
 }
 
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
@@ -115,6 +138,8 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
 {
     if (!CheckShareWork(share, bnFloor, fBlockOut, errOut, fCheckPoW))
         return false;
+    if (nBlockHeight < 1 || nBlockHeight > MAX_BLOCK_HEIGHT)
+        return Fail(errOut, "block height out of range");
 
     // It pays the window exactly, and pays at least the subsidy.
     int64 nTotal = 0;
