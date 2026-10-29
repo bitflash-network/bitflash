@@ -17,8 +17,10 @@ static bool Fail(string& errOut, const char* why)
 
 vector<unsigned char> CommitmentPush(const uint256& hashShareData)
 {
+    // uint256's begin() is not const; clang will not call it on a const one.
+    uint256 h = hashShareData;
     vector<unsigned char> v(TAG, TAG + 3);
-    v.insert(v.end(), hashShareData.begin(), hashShareData.end());
+    v.insert(v.end(), h.begin(), h.end());
     return v;
 }
 
