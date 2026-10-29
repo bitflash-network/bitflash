@@ -7770,6 +7770,8 @@ static int RunSwapWaitPaymentSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+#include "test_light_pow.h"
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -7812,6 +7814,10 @@ int RunSelfTest(const std::string& name)
         return RunParseMoneySelfTest();
     if (name == "debug-log-buffer")
         return RunDebugLogBufferSelfTest();
+    if (name == "dgb-pow")
+        return RunDgbPoWSelfTest();
+    if (name == "rvn-kawpow")
+        return RunRvnKawPoWSelfTest();
     if (name == "pow-v2")
         return RunPoWV2SelfTest();
     if (name == "sigpipe")
@@ -7860,6 +7866,6 @@ int RunSelfTest(const std::string& name)
         return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

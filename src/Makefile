@@ -87,6 +87,52 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
 
+# Standalone foreign-chain PoW modules are always compiled without -fpermissive.
+# sphlib's portable byte loads avoid unaligned accesses under UBSan.
+LIGHT_POW_SOURCES = dgb_pow.cpp \
+    rvn_kawpow.cpp \
+    pow_vendor/dgb/KeccakP-800-reference.cpp \
+    pow_vendor/dgb/cubehash.cpp \
+    pow_vendor/dgb/echo.cpp \
+    pow_vendor/dgb/luffa.cpp \
+    pow_vendor/dgb/odocrypt.cpp \
+    pow_vendor/dgb/shavite.cpp \
+    pow_vendor/dgb/simd.cpp \
+    pow_vendor/dgb/skein.cpp \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/ethash.cpp \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/progpow.cpp
+LIGHT_POW_C_SOURCES = pow_vendor/rvn/crypto/ethash/lib/ethash/primes.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccak.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf1600.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf800.c
+LIGHT_POW_HEADERS = dgb_pow.h rvn_kawpow.h light_pow_common.h light_pow_internal.h \
+    pow_vendor/dgb/aes_helper.cpp \
+    pow_vendor/dgb/KeccakP-800-SnP.h \
+    pow_vendor/dgb/brg_endian.h \
+    pow_vendor/dgb/odocrypt.h \
+    pow_vendor/dgb/sph_cubehash.h \
+    pow_vendor/dgb/sph_echo.h \
+    pow_vendor/dgb/sph_luffa.h \
+    pow_vendor/dgb/sph_shavite.h \
+    pow_vendor/dgb/sph_simd.h \
+    pow_vendor/dgb/sph_skein.h \
+    pow_vendor/dgb/sph_types.h \
+    pow_vendor/rvn/crypto/ethash/include/ethash/ethash.h \
+    pow_vendor/rvn/crypto/ethash/include/ethash/ethash.hpp \
+    pow_vendor/rvn/crypto/ethash/include/ethash/hash_types.h \
+    pow_vendor/rvn/crypto/ethash/include/ethash/hash_types.hpp \
+    pow_vendor/rvn/crypto/ethash/include/ethash/keccak.h \
+    pow_vendor/rvn/crypto/ethash/include/ethash/keccak.hpp \
+    pow_vendor/rvn/crypto/ethash/include/ethash/progpow.hpp \
+    pow_vendor/rvn/crypto/ethash/include/ethash/version.h \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/bit_manipulation.h \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/builtins.h \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/endianness.hpp \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/ethash-internal.hpp \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/kiss99.hpp \
+    pow_vendor/rvn/crypto/ethash/lib/ethash/primes.h \
+    pow_vendor/rvn/crypto/ethash/lib/support/attributes.h
+LIGHT_POW_OBJS = $(foreach dir,obj obj-chat obj-node obj-chatterm obj-fuzz, \
+    $(patsubst %.cpp,$(dir)/%.o,$(LIGHT_POW_SOURCES)) \
+    $(patsubst %.c,$(dir)/%.o,$(LIGHT_POW_C_SOURCES)))
+
 NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/market.o obj/sha.o obj/nostr.o obj/randomx_pow.o \
             obj/btfaddr.o obj/btfchan.o obj/rpc.o \
@@ -96,46 +142,71 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/btfchat.o obj/btfchatmsg.o obj/btfchatbox.o obj/btfchatlog.o \
             obj/btfchatlink.o obj/btfchatsock.o obj/btfchatnode.o \
             obj/chatstore.o obj/chatrelay.o obj/btfchatnet.o obj/swap.o obj/btfchatwallet.o obj/rpcclient.o obj/btcswap.o obj/btclight.o obj/chatswap.o obj/btfchatswap.o obj/bip21.o obj/qrcodegen.o obj/invoice.o \
-            obj/community.o obj/chatdir.o obj/sigcheck.o
+            obj/community.o obj/chatdir.o obj/sigcheck.o \
+            $(patsubst %.cpp,obj/%.o,$(LIGHT_POW_SOURCES)) $(patsubst %.c,obj/%.o,$(LIGHT_POW_C_SOURCES))
 
 GUI_OBJS = obj/gui.o obj/main_gui.o
 
 all: bitflash
 
+$(LIGHT_POW_OBJS): CXXFLAGS := $(filter-out -fpermissive,$(CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
+$(LIGHT_POW_OBJS): FUZZ_CXXFLAGS := $(filter-out -fpermissive,$(FUZZ_CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
+$(LIGHT_POW_OBJS): $(LIGHT_POW_HEADERS)
+obj/selftest.o obj-chat/selftest.o obj-node/selftest.o obj-chatterm/selftest.o obj-fuzz/selftest.o: dgb_pow.h rvn_kawpow.h light_pow_common.h test_light_pow.h test_light_pow_vectors.h
+
+
+# Keep upstream Keccak translation units in C, as their declarations require.
+LIGHT_POW_CFLAGS = -std=c99 -O2 -Ipow_vendor/rvn -fno-strict-aliasing
+obj/%.o: %.c $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
+obj-chat/%.o: %.c $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
+obj-node/%.o: %.c $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
+obj-chatterm/%.o: %.c $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
+obj-fuzz/%.o: %.c $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -x c $(filter-out -std=gnu++14 -fpermissive,$(FUZZ_CXXFLAGS)) -std=c99 -Ipow_vendor/rvn -o $@ $<
+
 obj/%.o: %.cpp $(HEADERS)
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/sha.o: sha.cpp sha.h
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
 
 obj/mlkem.o: mlkem/mlkem_native.c
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 obj/imgui.o:              $(IMGUI_DIR)/imgui.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/imgui_draw.o:         $(IMGUI_DIR)/imgui_draw.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/imgui_tables.o:       $(IMGUI_DIR)/imgui_tables.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/imgui_widgets.o:      $(IMGUI_DIR)/imgui_widgets.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/imgui_impl_glfw.o:    $(IMGUI_DIR)/imgui_impl_glfw.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/imgui_impl_opengl3.o: $(IMGUI_DIR)/imgui_impl_opengl3.cpp
-	@mkdir -p obj
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 bitflash: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
@@ -156,15 +227,15 @@ CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
             $(IMGUI_OBJS)
 
 obj-chat/%.o: %.cpp $(HEADERS)
-	@mkdir -p obj-chat
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CHATFLAGS) -o $@ $<
 
 obj-chat/sha.o: sha.cpp sha.h
-	@mkdir -p obj-chat
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CHATFLAGS) -O3 -o $@ $<
 
 obj-chat/mlkem.o: mlkem/mlkem_native.c
-	@mkdir -p obj-chat
+	@mkdir -p $(dir $@)
 	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 btfchat: $(CHAT_OBJS)
@@ -178,15 +249,15 @@ CHATTERM_OBJS = $(patsubst obj/%,obj-chatterm/%,$(NODE_OBJS)) \
                 obj-chatterm/chat_terminal.o obj-chatterm/main_gui.o obj-chatterm/headless.o
 
 obj-chatterm/%.o: %.cpp $(HEADERS)
-	@mkdir -p obj-chatterm
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -o $@ $<
 
 obj-chatterm/sha.o: sha.cpp sha.h
-	@mkdir -p obj-chatterm
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CHATFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
 
 obj-chatterm/mlkem.o: mlkem/mlkem_native.c
-	@mkdir -p obj-chatterm
+	@mkdir -p $(dir $@)
 	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 btfchat-terminal: $(CHATTERM_OBJS)
@@ -216,22 +287,22 @@ FUZZ_NET_MESSAGE_OBJS = $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_net_message.o
 FUZZ_SCRIPT_OBJS = $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_script.o
 
 obj-node/%.o: %.cpp $(HEADERS)
-	@mkdir -p obj-node
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -DBITFLASH_NO_GUI -o $@ $<
 
 obj-node/sha.o: sha.cpp sha.h
-	@mkdir -p obj-node
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
 
 # ML-KEM is C, not C++, so the obj-node/%.o rule above cannot build it. It
 # needs its own line in every object directory -- obj-node and obj-fuzz were
 # missing it, so the headless node had never been built with the chat in it.
 obj-node/mlkem.o: mlkem/mlkem_native.c
-	@mkdir -p obj-node
+	@mkdir -p $(dir $@)
 	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 obj-fuzz/mlkem.o: mlkem/mlkem_native.c
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(CC) -c $(MLKEMFLAGS) -o $@ $<
 
 bitflash-node: $(NODE_ONLY_OBJS)
@@ -239,19 +310,19 @@ bitflash-node: $(NODE_ONLY_OBJS)
 	@echo "Built: bitflash-node (headless, no libGL needed)"
 
 obj-fuzz/%.o: %.cpp $(HEADERS)
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
 obj-fuzz/sha.o: sha.cpp sha.h
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -O1 -o $@ $<
 
 obj-fuzz/fuzz_net_message.o: fuzz_net_message.cpp $(HEADERS)
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
 obj-fuzz/fuzz_script.o: fuzz_script.cpp $(HEADERS)
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
 fuzz-net-message: $(FUZZ_NET_MESSAGE_OBJS)
@@ -265,7 +336,7 @@ fuzz-script: $(FUZZ_SCRIPT_OBJS)
 	@echo "Built: fuzz-script"
 
 obj-fuzz/fuzz_sigcheck.o: fuzz_sigcheck.cpp $(HEADERS)
-	@mkdir -p obj-fuzz
+	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
 fuzz-sigcheck: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_sigcheck.o
@@ -371,6 +442,8 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=parse-money
 	./bitflash-node -selftest=debug-log-buffer
 	./bitflash-node -selftest=pow-v2
+	./bitflash-node -selftest=dgb-pow
+	./bitflash-node -selftest=rvn-kawpow
 	./bitflash-node -selftest=sigpipe
 	./bitflash-node -selftest=script-eval
 	./bitflash-node -selftest=rules-v2
