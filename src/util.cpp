@@ -21,9 +21,12 @@ bool fDebug = false;
 // calls they replace, so default output stays quiet unless requested.
 static bool LogCategoryDefaultOn(const char* category)
 {
+    // p2pool: a line per share (one every ~10 s across the network) is what
+    // lets a miner see the share chain work.
     return strcmp(category, "pool")   == 0 ||
            strcmp(category, "worker") == 0 ||
-           strcmp(category, "payout") == 0;
+           strcmp(category, "payout") == 0 ||
+           strcmp(category, "p2pool") == 0;
 }
 
 bool LogAcceptsCategory(const char* category)

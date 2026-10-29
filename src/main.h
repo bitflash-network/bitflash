@@ -119,7 +119,12 @@ extern bool fSoloMineTest; // /solomine: mine without requiring a peer (local te
 extern int nMinerThreads;
 // Resolves the automatic case into a real count.
 int MinerThreadCount();
-extern bool gPoolServerRunning;    // GUI/startup state
+// P2Pool (docs/p2pool.md): the pool server runs for this node's own miners
+// only, on 127.0.0.1, and every block pays the share window directly.
+extern bool fP2PoolMode;
+extern unsigned short nP2PoolPort;           // default 3333
+extern std::string strP2PoolPayTo;           // -p2poolpayto; empty: a fresh wallet address a day
+extern bool gPoolServerRunning;   // GUI/startup state
 extern volatile bool gPoolRunning; // runtime pool server loop flag (rpc.cpp)
 
 struct PendingPayoutView

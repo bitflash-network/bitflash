@@ -670,6 +670,12 @@ public:
     bool fInbound;
     bool fNetworkNode;
     bool fDisconnect;
+    // P2Pool history (p2pool_net.cpp): when we last sent this peer ours, when
+    // we asked it for its own (0: not asked, or the answer is over), and how
+    // many shares of that history it has sent.
+    int64 nP2PoolSyncServed;
+    int64 nP2PoolSyncAskedAt;
+    unsigned int nP2PoolHistoryRecv;
 protected:
     int nRefCount;
 public:
@@ -744,6 +750,9 @@ public:
         fInbound = fInboundIn;
         fNetworkNode = false;
         fDisconnect = false;
+        nP2PoolSyncServed = 0;
+        nP2PoolSyncAskedAt = 0;
+        nP2PoolHistoryRecv = 0;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;
