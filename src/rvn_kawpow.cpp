@@ -5,6 +5,7 @@
 #include "light_pow_internal.h"
 #include <crypto/ethash/include/ethash/progpow.hpp>
 #include <limits>
+#include <mutex>
 
 namespace rvnpow
 {
@@ -74,11 +75,16 @@ struct EpochMemo
 };
 
 // Intentionally not managed.cpp's global cache: this memo has a hard two-entry
-// bound, no full DAG and no internal locks. Its owning worker serializes calls.
+// bound and no full DAG. It is locked across the lookup AND the verification
+// that uses the returned context: a second thread's eviction would otherwise
+// free a context still being read. The lock costs nothing next to ~14 ms a
+// proof.
 static EpochMemo memo;
+static std::mutex memoMutex;
 
 size_t CachedEpochs()
 {
+    std::lock_guard<std::mutex> lock(memoMutex);
     size_t count = 0;
     for (const auto& entry : memo.entries)
         if (entry.context)
@@ -88,6 +94,7 @@ size_t CachedEpochs()
 
 size_t CachedBytes()
 {
+    std::lock_guard<std::mutex> lock(memoMutex);
     size_t bytes = 0;
     for (const auto& entry : memo.entries)
         bytes += entry.bytes;
@@ -96,6 +103,7 @@ size_t CachedBytes()
 
 void ClearCache()
 {
+    std::lock_guard<std::mutex> lock(memoMutex);
     for (auto& entry : memo.entries)
     {
         entry.context.reset();
@@ -119,9 +127,9 @@ static const ethash::epoch_context* Context(int height, std::string& err)
     // upstream to size/allocate a cache for an untrusted embedded height.
     const uint64_t estimate = (uint64_t(1) << 24) + uint64_t(epoch) * (uint64_t(1) << 17) +
                               progpow::l1_cache_size + 64;
-    if (estimate > 128U * 1024 * 1024)
+    if (estimate > MAX_CACHE_BYTES)
     {
-        err = "Ravencoin epoch exceeds the 128 MiB per-cache resource budget";
+        err = "Ravencoin epoch exceeds this node's per-cache resource budget";
         return nullptr;
     }
     CacheEntry* victim = &memo.entries[0];
@@ -159,6 +167,7 @@ bool CheckProofOfWork(const Header& header, std::string& err)
     if (lightpow::detail::Number(BlockHash(header)) > target)
         return Fail(err, "Ravencoin final hash exceeds the target");
     const int height = static_cast<int>(header.Height());
+    std::lock_guard<std::mutex> lock(memoMutex);
     const auto* context = Context(height, err);
     if (!context)
         return false;
@@ -170,6 +179,28 @@ bool CheckProofOfWork(const Header& header, std::string& err)
     if (!progpow::verify(*context, height, Input(header), Mix(header), header.Nonce(), boundary))
         return Fail(err, "Ravencoin KAWPOW mix does not match the light computation");
     return true;
+}
+
+bool ValidateHeader(const std::vector<lightpow::PastBlock>& parents, const Header& header,
+                    lightpow::Hash& work, std::string& err)
+{
+    err.clear();
+    work.fill(0);
+    // Stricter than Ravencoin Core, on purpose: v4.6.1 never ties the embedded
+    // nHeight to the real height (validation.cpp CheckBlockHeader). Here it
+    // must be the parent's plus one, because it picks the KAWPOW epoch, and an
+    // unchecked one let a header choose which multi-MiB cache to build.
+    if (parents.empty() || parents.back().height == (std::numeric_limits<int>::max)() ||
+        header.Height() != static_cast<uint32_t>(parents.back().height + 1))
+        return Fail(err, "Ravencoin embedded height is not its parent's plus one");
+    const uint32_t expected = NextWorkRequired(parents, err);
+    if (expected == 0)
+        return false;
+    if (header.Bits() != expected)
+        return Fail(err, "Ravencoin header difficulty does not match DGW");
+    if (!CheckProofOfWork(header, err))
+        return false;
+    return BlockProof(header.Bits(), work, err);
 }
 
 uint32_t NextWorkRequired(const std::vector<lightpow::PastBlock>& history, std::string& err)

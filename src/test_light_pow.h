@@ -62,6 +62,11 @@ static int RunDgbPoWSelfTest()
                 ok &= Check(dgbpow::NextWorkRequired(parents, algo, err) == header.Bits(), "DGB consecutive MultiShield difficulty");
                 ok &= Check(dgbpow::BlockProof(parents, header, vector.height, hash, err) &&
                             lightpow::DisplayHash(hash) == vector.work, "DGB Core geometric chain work");
+                lightpow::Hash validated{};
+                ok &= Check(dgbpow::ValidateHeader(parents, header, vector.height, validated, err) &&
+                            validated == hash, "DGB ValidateHeader takes the real header, same work");
+                ok &= Check(!dgbpow::ValidateHeader(parents, mutated, vector.height, validated, err),
+                            "DGB ValidateHeader refuses a broken proof that BlockProof alone would price");
                 if (vector.height == dgbpow::CHECKPOINT_HEIGHT) first = header;
             }
         }
@@ -99,6 +104,9 @@ static int RunDgbPoWSelfTest()
     wrong.raw[72] ^= 1;
     ok &= Check(!dgbpow::BlockProof(missing, wrong, dgbpow::CHECKPOINT_HEIGHT, work, err), "DGB work rejects unexpected difficulty");
     ok &= Check(!dgbpow::BlockProof(missing, first, dgbpow::CHECKPOINT_HEIGHT + 1, work, err), "DGB work rejects wrong candidate height");
+    ok &= Check(!dgbpow::ValidateHeader(missing, wrong, dgbpow::CHECKPOINT_HEIGHT, work, err) &&
+                !dgbpow::ValidateHeader(missing, first, dgbpow::CHECKPOINT_HEIGHT + 1, work, err),
+                "DGB ValidateHeader refuses a wrong difficulty or height before any proof");
     for (int algo : {0, 1, 3, 4, 7})
         printf("dgb-pow: algo=%d %.3f us/header (%u real headers)\n", algo, micros[algo] / counts[algo], counts[algo]);
     printf("dgb-pow self-test: %s (101 proofs, 100 consecutive retargets/work)\n", ok ? "PASS" : "FAIL");
@@ -114,7 +122,8 @@ static int RunRvnKawPoWSelfTest()
     rvnpow::ClearCache();
     double cold = 0, warm = 0;
     unsigned int coldCount = 0, warmCount = 0;
-    rvnpow::Header first;
+    rvnpow::Header first, last;
+    std::vector<lightpow::PastBlock> lastParents;
     for (const auto& vector : lightpowtest::rvn)
     {
         auto raw = ParseHex(vector.raw);
@@ -146,7 +155,12 @@ static int RunRvnKawPoWSelfTest()
             mutated = header;
             mutated.raw[88] ^= 1;
             ok &= Check(!rvnpow::CheckProofOfWork(mutated, err), "RVN mix mutation rejected");
+            lightpow::Hash validated{};
+            ok &= Check(rvnpow::ValidateHeader(parents, header, validated, err) && validated == work,
+                        "RVN ValidateHeader takes the real header, same work");
             if (vector.height == rvnpow::CHECKPOINT_HEIGHT) first = header;
+            last = header;
+            lastParents = parents;
         }
         parents.push_back({vector.height, header.Time(), header.Bits()});
     }
@@ -194,6 +208,37 @@ static int RunRvnKawPoWSelfTest()
     ok &= Check(rvnpow::CheckProofOfWork(first, err), "RVN LRU retained epoch remains valid");
     rvnpow::ClearCache();
     ok &= Check(rvnpow::CachedEpochs() == 0 && rvnpow::CachedBytes() == 0, "RVN cache release");
+    // A forged header names its own nBits and embedded height, so its epoch:
+    // ValidateHeader must refuse it on those, before building any cache.
+    {
+        lightpow::Hash work{};
+        auto easy = last;
+        for (int i = 0; i < 4; ++i) easy.raw[72 + i] = static_cast<unsigned char>(0x1e0fffffU >> (8 * i));
+        ok &= Check(!rvnpow::ValidateHeader(lastParents, easy, work, err) && rvnpow::CachedEpochs() == 0,
+                    "RVN ValidateHeader refuses a self-chosen easy nBits before any cache");
+        const auto raw = ParseHex(lightpowtest::forgedRvn[1]);
+        rvnpow::Header forged;
+        rvnpow::ParseHeader(raw.data(), raw.size(), forged, err);
+        ok &= Check(!rvnpow::ValidateHeader(lastParents, forged, work, err) && rvnpow::CachedEpochs() == 0,
+                    "RVN ValidateHeader refuses an embedded height off the branch before any cache");
+        // The first epoch past MAX_CACHE_BYTES, at the easiest target, with a
+        // nonce found so the cheap final-hash check passes: only the budget
+        // can stop it, and it must, before allocating.
+        auto distant = last;
+        const uint32_t beyond = 7500U * 1920U;
+        for (int i = 0; i < 4; ++i) distant.raw[76 + i] = static_cast<unsigned char>(beyond >> (8 * i));
+        for (int i = 0; i < 4; ++i) distant.raw[72 + i] = static_cast<unsigned char>(0x1e0fffffU >> (8 * i));
+        bool found = false;
+        for (uint64_t nonce = 0; nonce < (uint64_t(1) << 26) && !found; ++nonce)
+        {
+            for (int i = 0; i < 8; ++i) distant.raw[80 + i] = static_cast<unsigned char>(nonce >> (8 * i));
+            found = lightpow::DisplayHash(rvnpow::BlockHash(distant)) <=
+                    "00000fffff000000000000000000000000000000000000000000000000000000";
+        }
+        ok &= Check(found && !rvnpow::CheckProofOfWork(distant, err) &&
+                    err.find("resource budget") != std::string::npos && rvnpow::CachedEpochs() == 0,
+                    "RVN an epoch past this node's cache budget is refused without allocating");
+    }
     printf("rvn-kawpow self-test: %s (32 proofs, 32 consecutive retargets)\n", ok ? "PASS" : "FAIL");
     fflush(stdout);
     return ok ? 0 : 1;

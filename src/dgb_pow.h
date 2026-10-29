@@ -41,5 +41,13 @@ bool CheckProofOfWork(const Header& header, int height, std::string& err);
 uint32_t NextWorkRequired(const std::vector<PastBlock>& parents, Algo algo, std::string& err);
 bool BlockProof(const std::vector<PastBlock>& parents, const Header& header,
                 int height, lightpow::Hash& work, std::string& err);
+
+// THE entry point for a header from the network: `height` is the parent's
+// plus one, nBits is what MultiShield V4 gives on `parents` for the header's
+// algorithm, and only then the proof of work (scrypt costs ~300 us). On
+// success `work` is the header's chain work. BlockProof alone returns work
+// without checking the proof; the pieces stay public for tests.
+bool ValidateHeader(const std::vector<PastBlock>& parents, const Header& header,
+                    int height, lightpow::Hash& work, std::string& err);
 }
 #endif

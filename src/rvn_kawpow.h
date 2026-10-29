@@ -29,9 +29,24 @@ bool CheckProofOfWork(const Header& header, std::string& err);
 uint32_t NextWorkRequired(const std::vector<lightpow::PastBlock>& parents, std::string& err);
 bool BlockProof(uint32_t bits, lightpow::Hash& work, std::string& err);
 
-// The sole mutable process-wide state is this two-entry epoch memo. Callers
-// must serialize proof verification and these cache helpers on one worker.
-// There are no internal locks. Each cache is limited to 128 MiB, including L1.
+// THE entry point for a header from the network. In this order, cheapest
+// first: the embedded height is the parent's plus one, nBits is what DGW
+// gives on `parents` (oldest first, one validated branch), and only then the
+// KAWPOW proof, whose epoch cache costs seconds and up to MAX_CACHE_BYTES. On
+// success `work` is the header's chain work. The pieces above stay public
+// for tests; a header taken with CheckProofOfWork alone could name any nBits
+// and any epoch, and make this node build caches for headers costing ~1 s.
+bool ValidateHeader(const std::vector<lightpow::PastBlock>& parents, const Header& header,
+                    lightpow::Hash& work, std::string& err);
+
+// Each cached epoch is held to this. A light cache grows by 128 KiB an epoch
+// (7500 blocks, about five days); this budget lasts to epoch 1919, height
+// about 14.4 million, around 2045. A header past it is refused as this node's
+// resource limit, not as invalid; raise it, after review, well before then.
+static constexpr uint64_t MAX_CACHE_BYTES = uint64_t(256) * 1024 * 1024;
+
+// The sole mutable process-wide state is this two-entry epoch memo. It is
+// locked: verification and these helpers may be called from any thread.
 size_t CachedEpochs();
 size_t CachedBytes();
 void ClearCache();

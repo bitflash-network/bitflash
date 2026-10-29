@@ -285,7 +285,7 @@ bool BlockProof(const std::vector<PastBlock>& history, const Header& header,
         return Fail(err, "DigiByte work requires the candidate's actual height");
     const uint32_t expected = Next(history, Algorithm(header), err);
     if (expected == 0)
-        return false;
+        return err.empty() ? Fail(err, "DigiByte retarget gave no target") : false;
     if (header.Bits() != expected)
         return Fail(err, "DigiByte header difficulty does not match its history");
     // v8.22.2 src/chain.cpp GetBlockProof: post-DigiSpeed work is the inverse
@@ -305,5 +305,25 @@ bool BlockProof(const std::vector<PastBlock>& history, const Header& header,
     }
     work = lightpow::detail::Bytes(lightpow::detail::Work(average) << 7);
     return true;
+}
+
+bool ValidateHeader(const std::vector<PastBlock>& parents, const Header& header,
+                    int height, lightpow::Hash& work, std::string& err)
+{
+    err.clear();
+    work.fill(0);
+    if (!History(parents, err))
+        return false;
+    if (height < CHECKPOINT_HEIGHT || parents.back().height == (std::numeric_limits<int>::max)() ||
+        height != parents.back().height + 1)
+        return Fail(err, "DigiByte header height is not its parent's plus one");
+    const uint32_t expected = Next(parents, Algorithm(header), err);
+    if (expected == 0)
+        return err.empty() ? Fail(err, "DigiByte retarget gave no target") : false;
+    if (header.Bits() != expected)
+        return Fail(err, "DigiByte header difficulty does not match its history");
+    if (!CheckProofOfWork(header, height, err))
+        return false;
+    return BlockProof(parents, header, height, work, err);
 }
 }

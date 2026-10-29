@@ -5,6 +5,39 @@ They perform no I/O, networking or synchronization and do not change Bitflash
 consensus, swaps or the existing Bitcoin light client. Hash/work byte arrays are
 little endian; `DisplayHash` returns the conventional reversed hexadecimal form.
 
+## The entry point
+
+A header from the network goes through `dgbpow::ValidateHeader(parents,
+header, height, work, err)` or `rvnpow::ValidateHeader(parents, header, work,
+err)` and nothing else. Each checks the cheap things first: the height is the
+parent's plus one, and nBits is what the difficulty rule gives on the parents.
+Only then does it check the proof, and only then return the chain work. The
+lower-level functions below stay public for the self-tests. A header checked
+with `CheckProofOfWork` alone could name its own nBits and, for Ravencoin, its
+own epoch, and make a node spend seconds and megabytes building caches for
+headers that cost about a second to forge.
+
+The Ravencoin epoch memo is locked, across the lookup and the verification
+that uses it, so any thread may call it. Each cached epoch is held to
+`rvnpow::MAX_CACHE_BYTES`, 256 MiB, which lasts to epoch 1919 (height about
+14.4 million, around 2045). A header past it is refused as this node's
+resource limit, and the self-test checks that boundary. Raise it, after
+review, well before then.
+
+**Stricter than Ravencoin Core, on purpose.** Ravencoin v4.6.1 never ties the
+embedded `nHeight` to the block's real height. Here it must be the parent's
+plus one, because it picks the KAWPOW epoch. A header that uses that
+upstream looseness would stall a light client: a denial of service, not a
+theft. Do not "fix" this towards upstream.
+
+**DigiByte reference version.** DigiByte mainnet runs Core v9.26.7. Its
+`pow.cpp`, `chain.cpp`, `primitives/block.{h,cpp}`, `arith_uint256.cpp` and
+header checks were compared with v8.22.2: proof of work, retarget and work are
+the same. v9 adds the Groestl deactivation height (23,808,000, below the
+checkpoint) and AlgoLock, which has the same effect as v8's `IsAlgoActive`
+after Odocrypt. Recheck against the running release before each Bitflash
+release.
+
 ## Supported checkpoints and caller contract
 
 | Chain | First supported height | Mainnet block ID |
@@ -47,13 +80,13 @@ before adding `BlockProof`. Both adapters must additionally validate chain links
 median/future-time rules, applicable header versions and cumulative-work branch
 selection. Metadata passed as history must already belong to that branch.
 
-Only Ravencoin's two-entry light-cache memo is mutable shared state. A single
-owning worker must serialize verification and cache helper calls. Caches are
-LRU-evicted **before** allocation; there is no full DAG, disk persistence or lock.
-Each cache has a 128 MiB resource ceiling, including the 16 KiB L1 and context.
-At epochs 600/601 they total 191,003,136 bytes (about 182.16 MiB). Epochs whose
-cache estimate exceeds the ceiling return a resource error; this is a local
-budget, not a consensus rejection, and will need review as the chain grows.
+Only Ravencoin's two-entry light-cache memo is mutable shared state, and it is
+locked (see *The entry point*). Caches are LRU-evicted **before** allocation;
+there is no full DAG or disk persistence. Each cache has a 256 MiB resource
+ceiling (`MAX_CACHE_BYTES`), including the 16 KiB L1 and context. At epochs
+600/601 they total 191,003,136 bytes (about 182.16 MiB). Epochs whose cache
+estimate exceeds the ceiling return a resource error; this is a local budget,
+not a consensus rejection, and needs review before epoch 1919.
 
 ## Offline vectors and measurements
 

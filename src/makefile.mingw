@@ -45,6 +45,8 @@ IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
 
 # Standalone foreign-chain PoW modules are always compiled without -fpermissive.
+# `override`: a CXXFLAGS given on the command line must not drop these flags
+# (the build broke, or the vendored code silently built with -fpermissive).
 # sphlib's portable byte loads avoid unaligned accesses under UBSan.
 LIGHT_POW_SOURCES = dgb_pow.cpp \
     rvn_kawpow.cpp \
@@ -120,8 +122,8 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
 
 all: bitflash.exe
 
-$(LIGHT_POW_OBJS): CXXFLAGS := $(filter-out -fpermissive,$(CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
-$(LIGHT_POW_OBJS): FUZZ_CXXFLAGS := $(filter-out -fpermissive,$(FUZZ_CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
+$(LIGHT_POW_OBJS): override CXXFLAGS := $(filter-out -fpermissive,$(CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
+$(LIGHT_POW_OBJS): override FUZZ_CXXFLAGS := $(filter-out -fpermissive,$(FUZZ_CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
 $(LIGHT_POW_OBJS): $(LIGHT_POW_HEADERS)
 obj/selftest.o obj-chat/selftest.o obj-node/selftest.o obj-chatterm/selftest.o obj-fuzz/selftest.o: dgb_pow.h rvn_kawpow.h light_pow_common.h test_light_pow.h test_light_pow_vectors.h
 
