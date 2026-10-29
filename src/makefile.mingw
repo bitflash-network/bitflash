@@ -146,7 +146,7 @@ obj-chatterm/%.o: %.c $(LIGHT_POW_HEADERS)
 	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
 obj-fuzz/%.o: %.c $(LIGHT_POW_HEADERS)
 	@mkdir -p $(dir $@)
-	$(FUZZ_CXX) -x c $(filter-out -std=gnu++14 -fpermissive,$(FUZZ_CXXFLAGS)) -std=c99 -Ipow_vendor/rvn -o $@ $<
+	$(FUZZ_CXX) -c -x c $(filter-out -std=gnu++14 -fpermissive,$(FUZZ_CXXFLAGS)) -std=c99 -Ipow_vendor/rvn -o $@ $<
 
 obj/%.o: %.cpp $(HEADERS)
 	mkdir -p $(dir $@)

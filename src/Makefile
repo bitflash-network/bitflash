@@ -171,7 +171,7 @@ obj-chatterm/%.o: %.c $(LIGHT_POW_HEADERS)
 	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
 obj-fuzz/%.o: %.c $(LIGHT_POW_HEADERS)
 	@mkdir -p $(dir $@)
-	$(FUZZ_CXX) -x c $(filter-out -std=gnu++14 -fpermissive,$(FUZZ_CXXFLAGS)) -std=c99 -Ipow_vendor/rvn -o $@ $<
+	$(FUZZ_CXX) -c -x c $(filter-out -std=gnu++14 -fpermissive,$(FUZZ_CXXFLAGS)) -std=c99 -Ipow_vendor/rvn -o $@ $<
 
 obj/%.o: %.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
@@ -365,7 +365,7 @@ fuzz-script-smoke: fuzz-script
 	./fuzz-script -runs=128 ../work/fuzz-corpus/script
 
 clean:
-	rm -rf obj obj-node obj-fuzz bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -414,6 +414,24 @@ test_chatswap: test_chatswap.cpp chatswap.cpp chatswap.h
 
 test_bip21: test_bip21.cpp bip21.cpp bip21.h qrcodegen.cpp qrcodegen.hpp
 	$(CXX) $(CXXFLAGS) -o $@ test_bip21.cpp bip21.cpp qrcodegen.cpp
+
+# Standalone proof verification avoids unrelated wallet dependencies on native
+# and sanitizer hosts. The fixtures/assertions are shared with RunSelfTest.
+LIGHT_POW_TEST_OBJS = $(patsubst %.cpp,obj/%.o,$(LIGHT_POW_SOURCES)) $(patsubst %.c,obj/%.o,$(LIGHT_POW_C_SOURCES))
+LIGHT_POW_SAN_OBJS = $(patsubst obj/%,obj-fuzz/%,$(LIGHT_POW_TEST_OBJS))
+obj/test_light_pow.o: test_light_pow.cpp test_light_pow.h test_light_pow_vectors.h $(LIGHT_POW_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CXX) -c $(filter-out -fpermissive,$(CXXFLAGS)) -o $@ $<
+test_light_pow: obj/test_light_pow.o $(LIGHT_POW_TEST_OBJS)
+	$(CXX) $(filter-out -fpermissive,$(CXXFLAGS)) -o $@ $^ $(PLATFORM_LIB) -lcrypto
+obj-fuzz/test_light_pow.o obj-fuzz/fuzz_light_pow.o: FUZZ_CXXFLAGS := $(filter-out -fpermissive,$(FUZZ_CXXFLAGS))
+obj-fuzz/test_light_pow.o: test_light_pow.cpp test_light_pow.h test_light_pow_vectors.h $(LIGHT_POW_HEADERS)
+obj-fuzz/fuzz_light_pow.o: fuzz_light_pow.cpp $(LIGHT_POW_HEADERS)
+test-light-pow-sanitize: obj-fuzz/test_light_pow.o $(LIGHT_POW_SAN_OBJS)
+	$(FUZZ_CXX) $(filter-out -fpermissive,$(FUZZ_CXXFLAGS)) -o $@ $^ $(PLATFORM_LIB) -lcrypto
+fuzz-light-pow: obj-fuzz/fuzz_light_pow.o $(LIGHT_POW_SAN_OBJS)
+	$(FUZZ_CXX) $(filter-out -fpermissive -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) $(FUZZ_LDFLAGS) -o $@ $^ $(PLATFORM_LIB) -lcrypto
+
 
 tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 bitflash-node
 	./test_bip32

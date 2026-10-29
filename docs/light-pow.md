@@ -79,8 +79,11 @@ DigiByte's anchor was also checked using chainz's height-to-hash API; the next O
 header and RVN height 4,507,500 were independently checked. Expected retarget/work
 values were generated with an independent integer reference transcribed from the
 pinned Core sources. RVN work at 4,507,490 additionally matches the explorer's
-chainwork delta from 4,507,489. DigiByte explorer does not expose chainwork, so
-its work values have no independent running-Core RPC comparison yet.
+chainwork delta from 4,507,489. A subsequent independent Core 9.26.7 comparison through DigiScope's public
+HTTP explorer proxy confirmed all 100 consecutive DGB chainwork deltas and proof
+digests, covering all five algorithms. The captured responses and exact scope are
+in [the validation report](light-pow-validation.md) and
+[Core comparison data](light-pow-dgb-core-check.json).
 
 On this Windows machine (Intel Core i7-8700 @ 3.20 GHz, 2 exposed logical CPUs),
 UCRT64 GCC 16.1.0, `-O2`, the final-source wallet self-tests measured **PoW only**:
@@ -114,13 +117,15 @@ Use `make -f makefile.mingw -j2 tests` on MSYS2 UCRT64, or `make -C src tests`
 on Linux. The self-test bodies are shared with a standalone diagnostic driver
 so strict/sanitized builds need no wallet/database dependencies.
 
-Verification on this host includes Windows wallet/self-tests, strict Clang
-compilation and Linux-target object compilation with
-`-fsanitize=fuzzer-no-link,address,undefined`. UBSan trap-mode execution is used
-for both offline test bodies on Windows. This does not establish a native Linux
-or macOS build/run, a full Linux fuzz link/run or ASan runtime coverage: the UCRT64
-Clang distribution lacks its ASan runtime and rejects the Windows fuzzer target.
-Those native builds/runs remain for the integrating developer.
+Verification includes the Windows wallet suite, native execution of both module
+self-tests in a real Linux VM with GCC 14.2 and Clang 19.1, ASan/UBSan with leak
+detection, and a five-minute libFuzzer/ASan/UBSan smoke run (144 executions under
+CPU emulation). The makefile provides `test_light_pow`, `test-light-pow-sanitize`
+and `fuzz-light-pow` targets. See [light-pow-validation.md](light-pow-validation.md)
+for exact commands, outcomes and the independent DGB Core comparison. This does
+not establish a native build/run of the complete Linux wallet or any macOS
+execution. The UCRT64 Clang distribution still lacks a usable Windows ASan/fuzzer
+runtime; the sanitizer runtime executions were performed on Linux.
 
 Earlier DigiByte algorithms/retarget regimes, X16R/X16RV2, other networks,
 transaction/block validity, filters, peer discovery, networking, reorg storage,
