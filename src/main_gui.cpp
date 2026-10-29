@@ -12,6 +12,7 @@
 #include "treasury.h"
 #include "walletcmd.h"
 #include "jsonrpc.h"
+#include "p2pool_net.h"
 #include <thread>          // hardware_concurrency, to sanity-check /genproclimit
 #ifndef _WIN32
 #include <csignal>
@@ -196,6 +197,10 @@ static void PrintUsage()
     printf("            or chat-live (needs Tor and the network; not run by `make tests`)\n");
     printf("\n");
     printf("Mining mode:\n");
+    printf("  /p2pool                    (pooled mining with no pool: XMRig points at this node,\n");
+    printf("                              blocks pay every miner of the share window; docs/p2pool.md)\n");
+    printf("  /p2poolport=N              (default 3333, on 127.0.0.1 only)\n");
+    printf("  /p2poolpayto=ADDRESS       (default: a fresh address of this wallet, changed daily)\n");
     printf("  /operator\n");
     printf("  /participant=POOL_BTF_ADDRESS\n");
     printf("  /stratumbridge=POOL_BTF_ADDRESS\n");
@@ -386,6 +391,30 @@ static void ParseStartupArguments(int argc, char* argv[])
         fMineModeFromCommandLine = true;
     }
 
+    // P2Pool (docs/p2pool.md): pooled mining with no pool. XMRig points at
+    // this node, 127.0.0.1:3333; every block pays the share window directly.
+    if (arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool"))
+    {
+        if (nMineMode == MINE_OPERATOR)
+            StartupRefuse("-p2pool and -operator do not go together",
+                          "P2Pool needs no operator: every miner runs their own node.");
+        fP2PoolMode = true;
+        string strPort = argval2(argc, argv, "/p2poolport", "-p2poolport");
+        if (!strPort.empty())
+        {
+            long n = atol(strPort.c_str());
+            if (n <= 1024 || n > 65535)
+                StartupRefuse(strprintf("-p2poolport=%s is not a usable port", strPort.c_str()),
+                              "Pick a port between 1025 and 65535, or leave it out for 3333.");
+            nP2PoolPort = (unsigned short)n;
+        }
+        strP2PoolPayTo = argval2(argc, argv, "/p2poolpayto", "-p2poolpayto");
+        uint160 h;
+        if (!strP2PoolPayTo.empty() && !AddressToHash160(strP2PoolPayTo, h))
+            StartupRefuse(strprintf("-p2poolpayto=%s is not a Bitflash address", strP2PoolPayTo.c_str()),
+                          "Leave it out to be paid at a fresh address of this wallet, changed every day.");
+    }
+
     if (arg(argc,argv,"/participant") || arg(argc,argv,"-participant"))
     {
         nMineMode = MINE_PARTICIPANT;
@@ -565,6 +594,19 @@ static void ParseStartupArguments(int argc, char* argv[])
         if (!ReadPassphraseArgument(strRpcPassword, strFromFile, strErr))
             StartupRefuse("could not read -rpcpassword file: " + strErr, "");
         strRpcPassword = strFromFile;
+    }
+    // The onion publishes the P2P port and the one above it (the pool's,
+    // tor.cpp), each forwarded to the same port on 127.0.0.1. An RPC server
+    // bound to either is reachable by anybody over Tor; a bench ran so with
+    // -port=18491 -rpcport=18492 before anyone noticed.
+    {
+        string strRpcPort = argval2(argc, argv, "/rpcport", "-rpcport");
+        int nP2P = (int)ntohs(nListenPort);
+        int nRpc = atoi(strRpcPort.c_str());
+        if (!strRpcPort.empty() && (nRpc == nP2P || nRpc == nP2P + 1))
+            StartupRefuse(strprintf("-rpcport=%d is a port this node publishes on its onion", nRpc),
+                          strprintf("Ports %d and %d are reachable by anybody over Tor; pick another for the RPC server.",
+                                    nP2P, nP2P + 1));
     }
     fJsonRpc = JsonRpcConfigure(argval2(argc, argv, "/rpcuser", "-rpcuser"),
                                 strRpcPassword,
@@ -1078,6 +1120,9 @@ int main(int argc, char* argv[])
                           "but never delete wallet.dat, which holds your keys.");
         return 1;
     }
+    // The share chain this node kept (p2pool.dat); every node relays shares,
+    // so every node keeps it, mining or not.
+    P2PoolInit();
 #endif
 
     printf("Loading wallet...\n");
@@ -1497,7 +1542,7 @@ int main(int argc, char* argv[])
     }
 #endif
 
-    if (nMineMode == MINE_OPERATOR) {
+    if (nMineMode == MINE_OPERATOR || fP2PoolMode) {
         gPoolServerRunning = true;
         gPoolRunning = true;
         if (_beginthread(ThreadRPCServer, 0, NULL) == (uintptr_t)-1)

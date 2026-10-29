@@ -12,6 +12,7 @@
 #include "headers.h"
 #include "treasury.h"
 #include "chatrelay.h"  // the chat's records: held, relayed and served here
+#include "p2pool_net.h"  // the P2Pool share chain: held, checked and relayed here
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -131,6 +132,9 @@ string strPoolStatusFile;
 string strPoolRoundsFile;
 double dPoolFeePercent   = 0.0;
 bool   fStratumBridge    = false;
+bool   fP2PoolMode       = false;
+unsigned short nP2PoolPort = 3333;
+string strP2PoolPayTo;
 int    nStratumBridgePort = 3333;
 string strStratumBridgeBind = "127.0.0.1";
 
@@ -3537,6 +3541,11 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushMessage("btfpeers", vPexOut);
 
         ChatRelayOnVersion(pfrom);
+        // A peer we dialled says whether it holds the share chain; a P2Pool
+        // miner looks for the ones that do (net.cpp, DialP2PoolPeers).
+        if (!pfrom->strBtfAddr.empty())
+            BtfNoteP2PoolPeer(pfrom->strBtfAddr, (pfrom->nServices & NODE_P2POOL) != 0);
+        P2PoolOnVersion(pfrom);
 
         if (LogAcceptsCategory("net")) printf("version addrMe = %s, peer height = %d\n", addrMe.ToString().c_str(), pfrom->nStartingHeight);
     }
@@ -3825,6 +3834,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (ChatRelayProcessMessage(pfrom, strCommand, vRecv))
     {
         // chatrec, chatput, chatget, getchatinv -- see chatrelay.h.
+    }
+
+
+    else if (P2PoolProcessMessage(pfrom, strCommand, vRecv))
+    {
+        // p2pshare, p2pgetsh, p2psync, p2pshares -- see p2pool_net.h.
     }
 
 
