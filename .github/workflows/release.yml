@@ -345,7 +345,13 @@ jobs:
           # ---- Windows
           D=Bitflash-Miner-$V-windows
           mkdir -p $D/xmrig $D/tor $D/licenses
-          cp xw/xmrig-6.26.0/xmrig.exe xw/xmrig-6.26.0/WinRing0x64.sys $D/xmrig/
+          # WinRing0x64.sys stays out. XMRig loads it only when run as
+          # administrator, to tune CPU registers for a few percent more
+          # hashrate; mine.cmd never asks for that. Windows' vulnerable-driver
+          # blocklist refuses to load it anyway, and Defender reports it as
+          # VulnerableDriver:WinNT/Winring0 on download -- the whole zip looked
+          # like malware for a file nobody used. See docs/windows-defender.md.
+          cp xw/xmrig-6.26.0/xmrig.exe $D/xmrig/
           cp tw/tor/tor.exe $D/tor/
           cp xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
           cp tw/docs/tor.txt $D/licenses/TOR-LICENSE.txt

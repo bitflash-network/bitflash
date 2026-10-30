@@ -128,9 +128,25 @@ $(LIGHT_POW_OBJS): $(LIGHT_POW_HEADERS)
 obj/selftest.o obj-chat/selftest.o obj-node/selftest.o obj-chatterm/selftest.o obj-fuzz/selftest.o: dgb_pow.h rvn_kawpow.h light_pow_common.h test_light_pow.h test_light_pow_vectors.h
 
 
-obj/bitflash_res.o: bitflash.rc rc/bitcoin.ico
+# VERSIONINFO numbers, read from headers_core.h so the version is still bumped
+# in one place. A version string that does not split into three numbers stops
+# the build here rather than producing an exe that says 0.0.0.
+BF_VERSION := $(shell sed -n 's/.*BITFLASH_VERSION_STRING "\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' headers_core.h)
+BF_VERSION_WORDS := $(subst ., ,$(BF_VERSION))
+ifneq ($(words $(BF_VERSION_WORDS)),3)
+$(error cannot read a x.y.z BITFLASH_VERSION_STRING from headers_core.h)
+endif
+RCFLAGS = -DBF_VER_MAJOR=$(word 1,$(BF_VERSION_WORDS)) \
+          -DBF_VER_MINOR=$(word 2,$(BF_VERSION_WORDS)) \
+          -DBF_VER_PATCH=$(word 3,$(BF_VERSION_WORDS))
+
+obj/bitflash_res.o: bitflash.rc rc/bitcoin.ico headers_core.h
 	mkdir -p $(dir $@)
-	windres -o $@ -i bitflash.rc
+	windres $(RCFLAGS) -o $@ -i bitflash.rc
+
+obj-chat/bitflash_res.o: bitflash.rc rc/bitcoin.ico headers_core.h
+	mkdir -p $(dir $@)
+	windres $(RCFLAGS) -DBITFLASH_CHAT_APP -o $@ -i bitflash.rc
 
 # Keep upstream Keccak translation units in C, as their declarations require.
 LIGHT_POW_CFLAGS = -std=c99 -O2 -Ipow_vendor/rvn -fno-strict-aliasing
@@ -211,7 +227,7 @@ bitflash.exe: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 CHATFLAGS = $(CXXFLAGS) -DBITFLASH_CHAT_APP
 
 CHAT_OBJS = $(patsubst obj/%,obj-chat/%,$(NODE_OBJS)) \
-            obj-chat/gui_chat.o obj-chat/chat_terminal.o obj-chat/main_gui.o obj/bitflash_res.o \
+            obj-chat/gui_chat.o obj-chat/chat_terminal.o obj-chat/main_gui.o obj-chat/bitflash_res.o \
             $(IMGUI_OBJS)
 
 obj-chat/%.o: %.cpp $(HEADERS)

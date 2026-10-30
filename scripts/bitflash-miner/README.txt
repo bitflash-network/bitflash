@@ -70,6 +70,12 @@ hash published on https://github.com/xmrig/xmrig/releases/tag/v6.26.0. If
 your antivirus removes xmrig/xmrig.exe, restore it and add an exclusion for
 this folder -- or build XMRig yourself from that repository and drop it in.
 
+WinRing0x64.sys, the driver XMRig's own zip includes, is left out on
+purpose: XMRig loads it only when run as administrator, to tweak CPU
+registers for a few percent more hashrate, and current Windows blocks it as
+a vulnerable driver anyway. XMRig says once that it could not set MSR and
+mines normally.
+
 What is inside
 --------------
   xmrig/   XMRig 6.26.0, official build (GPLv3, source at github.com/xmrig/xmrig)
