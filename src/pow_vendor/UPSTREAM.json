@@ -1,0 +1,218 @@
+{
+  "digibyte": {
+    "repo": "DigiByte-Core/digibyte",
+    "tag": "v8.22.2",
+    "commit": "cc529634484591e1ceb57b6168b93c3671e27335"
+  },
+  "ravencoin": {
+    "repo": "RavenProject/Ravencoin",
+    "tag": "v4.6.1",
+    "commit": "7864c39c2bbc85eadcc36cdf5b789d5f551ede7d"
+  },
+  "files": [
+    {
+      "upstream": "src/crypto/skein.cpp",
+      "path": "src/pow_vendor/dgb/skein.cpp",
+      "sha256": "ff0e17bea26cb6eb2fc815ae0401e310466167b0afb7504e2c36d1c4bba6bc4d"
+    },
+    {
+      "upstream": "src/crypto/sph_skein.h",
+      "path": "src/pow_vendor/dgb/sph_skein.h",
+      "sha256": "b4c57deae6fc543ba5436bc3df5ea04b91254164d15383fe8f40625e53a015c9"
+    },
+    {
+      "upstream": "src/crypto/luffa.cpp",
+      "path": "src/pow_vendor/dgb/luffa.cpp",
+      "sha256": "d575f204a9736cc6051239e9fd6ba0c941489690ab51422777baaa46e7a99b65"
+    },
+    {
+      "upstream": "src/crypto/sph_luffa.h",
+      "path": "src/pow_vendor/dgb/sph_luffa.h",
+      "sha256": "23f739f0b3fd84523fe5092486ecfe39e8e435e71b7466ac6f4807ee014d0168"
+    },
+    {
+      "upstream": "src/crypto/cubehash.cpp",
+      "path": "src/pow_vendor/dgb/cubehash.cpp",
+      "sha256": "2cec6697aef8338f05b1873ca028e167d35eb372d24e125e44d02bc8336a5f2f"
+    },
+    {
+      "upstream": "src/crypto/sph_cubehash.h",
+      "path": "src/pow_vendor/dgb/sph_cubehash.h",
+      "sha256": "10e4d2b9c395abaa470b21ed1560d53ce4f651637909b3ff3d935adfbbf250c2"
+    },
+    {
+      "upstream": "src/crypto/shavite.cpp",
+      "path": "src/pow_vendor/dgb/shavite.cpp",
+      "sha256": "3fd4245a412ed2ca8dcdc71aa903f4008f66bbeb050b1bd85c252da205e95090"
+    },
+    {
+      "upstream": "src/crypto/sph_shavite.h",
+      "path": "src/pow_vendor/dgb/sph_shavite.h",
+      "sha256": "674d201d2270b06c449563ba0419019173d5836fe7eda325780289a9d1493807"
+    },
+    {
+      "upstream": "src/crypto/simd.cpp",
+      "path": "src/pow_vendor/dgb/simd.cpp",
+      "sha256": "5ebff151dbe3908f1fd2fc58682fe2466a19e28241ccb9a08acdde53ae3ba7ef",
+      "upstream_sha256": "1e94f2a898cce4c124df4fa9f9ed5b37bfb14499544e26dbb3e3a28e9b617706",
+      "patch": "FFT16: replace 14 signed negative left shifts by bounded multiplications; see README.md."
+    },
+    {
+      "upstream": "src/crypto/sph_simd.h",
+      "path": "src/pow_vendor/dgb/sph_simd.h",
+      "sha256": "4b51e70b06a623269112751754fe98026f6868fb9de81f645117cceef35f64da"
+    },
+    {
+      "upstream": "src/crypto/echo.cpp",
+      "path": "src/pow_vendor/dgb/echo.cpp",
+      "sha256": "47cc9301db6a96dddb082f8c4e95e286f688736e5e73e7b4b16c49ae2521b94a"
+    },
+    {
+      "upstream": "src/crypto/sph_echo.h",
+      "path": "src/pow_vendor/dgb/sph_echo.h",
+      "sha256": "caac741dddf0ef86aa1d8c32e031a78a361550e41b57cc0fef0e0b90b6702a24"
+    },
+    {
+      "upstream": "src/crypto/sph_types.h",
+      "path": "src/pow_vendor/dgb/sph_types.h",
+      "sha256": "0a87bd456362fef5f39f1b3541e9e7ecfc0305be2ea89d804fd4e65585b19db9"
+    },
+    {
+      "upstream": "src/crypto/aes_helper.cpp",
+      "path": "src/pow_vendor/dgb/aes_helper.cpp",
+      "sha256": "8b7cc84cbed2249a0dca22cfabd847474fc147efb971bd893a2881e3ea4e8c46"
+    },
+    {
+      "upstream": "src/crypto/odocrypt.cpp",
+      "path": "src/pow_vendor/dgb/odocrypt.cpp",
+      "sha256": "c00b3a581a33df7f81210cc24b5cc771847455a836782688916260384de12f3d"
+    },
+    {
+      "upstream": "src/crypto/odocrypt.h",
+      "path": "src/pow_vendor/dgb/odocrypt.h",
+      "sha256": "f53da320123b0b114f177a7cf4166babb01a18a78ba37a6f48a30d23ebc4f266"
+    },
+    {
+      "upstream": "src/crypto/KeccakP-800-reference.cpp",
+      "path": "src/pow_vendor/dgb/KeccakP-800-reference.cpp",
+      "sha256": "96f31cd6c0fc049063d0fd340b9d4051b32e8c0a0f5fc9281946c0d404cc0f77"
+    },
+    {
+      "upstream": "src/crypto/KeccakP-800-SnP.h",
+      "path": "src/pow_vendor/dgb/KeccakP-800-SnP.h",
+      "sha256": "8cbbde35992924f73586b4d9706910f3d79438bf5edf24f774526375c988fda8"
+    },
+    {
+      "upstream": "src/crypto/brg_endian.h",
+      "path": "src/pow_vendor/dgb/brg_endian.h",
+      "sha256": "5fbc8e476a28827e0fb764db47b4e94947fd9138cd9f26fce114cbc1ee507aa9"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/bit_manipulation.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/bit_manipulation.h",
+      "sha256": "193ef1e49580fab089dda87b0f999e4b1476fb9a05c7dacd93bf402a8225d0f6"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/builtins.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/builtins.h",
+      "sha256": "1c5425d92426806e9423e4c312cb37aee98caa60c6c6513fabeb2ce87c78236a"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/endianness.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/endianness.hpp",
+      "sha256": "ea0efbebc7e431da84df99cec2ea7c1c10467df8ee8b9e099cab51b0de29ada3"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/ethash-internal.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/ethash-internal.hpp",
+      "sha256": "2c74f9d958b92bca78fba496d9893aaa13064613cfc8d3e2e384dd606dd3e03d"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/ethash.cpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/ethash.cpp",
+      "sha256": "e5dc87f08424f651dce637f571875106f4bfb5f4392cda218ec0807eee9c0fd1",
+      "upstream_sha256": "27c6d0b50ead0c4070ea80a97518cc9b60abefdf31cf595b314e564a0171443f",
+      "patch": "find_epoch_number: remove unused thread-local last-seed memo; retain stateless search. See README.md."
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/kiss99.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/kiss99.hpp",
+      "sha256": "5ac3c59da60ed0ba71521571c88f9853544b681057c4d3d2d6868ac7d1b1ac0e"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/primes.c",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/primes.c",
+      "sha256": "b54828b52b5e014874ef97e08bc9a7466b15b11d06e8d6ed2423d1995669b650"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/primes.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/primes.h",
+      "sha256": "5013c0752115460ab5fd8a9567994376b4480439006f93e91315639377702307"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/ethash/progpow.cpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/ethash/progpow.cpp",
+      "sha256": "2336809d3504fc6bae2f0217a4d364f445fe2edb0692d1ffa0f0cff9f6df5678"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/keccak/keccak.c",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/keccak/keccak.c",
+      "sha256": "093a4ec78cc8577fbab017aebb9fa36f639d0cf770e92aa9641a07106f75fae2"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/keccak/keccakf1600.c",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf1600.c",
+      "sha256": "db6bda3c4b24d299374ad9f48fe8a66640dfca1a954e47c1499ad8648446fab9"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/keccak/keccakf800.c",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf800.c",
+      "sha256": "ae79cbfecb94ee42f5f349e7c50c2ac4a5530e9c75305ef6b89e087d4ff4e474"
+    },
+    {
+      "upstream": "src/crypto/ethash/lib/support/attributes.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/lib/support/attributes.h",
+      "sha256": "d2db44839d5db814f3a7706c7aae5a47b31601765c7fb4858f73aecd09772c4d"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/ethash.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/ethash.h",
+      "sha256": "0436a27e66bc98970251529acf8c1d2cb32df63c852036f42c0535a0471915c6"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/ethash.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/ethash.hpp",
+      "sha256": "a2c62451768bd9acbc13f89aa063bf3c3a85d9871e2f113e16ef66f0b2fb0c64"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/hash_types.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/hash_types.h",
+      "sha256": "9248ec7839942500be9947eedd4fe083d97d53d5db20f4dd77380d956a05b64f"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/hash_types.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/hash_types.hpp",
+      "sha256": "0c7cba4fbfa7f27f18b8bcad2bff818963e39a33bf9ee4b9831198b6655ab20a"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/keccak.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/keccak.h",
+      "sha256": "9d352d9d7532cba7dcba19276b31cfde3994fd75f7101b6c4f2b50148e7c00ff"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/keccak.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/keccak.hpp",
+      "sha256": "3a04754a602efa56f3b8c68b03dd2a91fbea1ab5703370d36104a366f4a03d85"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/progpow.hpp",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/progpow.hpp",
+      "sha256": "795447f475748dbc0812c12eb9450fc40533f2461becffa77712a3ab157b6e63"
+    },
+    {
+      "upstream": "src/crypto/ethash/include/ethash/version.h",
+      "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/version.h",
+      "sha256": "e1da4319d0da24b4920b33f0e30e59c175832d9d0dba6a0c8263d3dd7dd6d862"
+    }
+  ]
+}
