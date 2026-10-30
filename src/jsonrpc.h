@@ -20,4 +20,9 @@ bool JsonRpcConfigure(const std::string& strUser, const std::string& strPassword
 bool JsonRpcConfigureCookie(const std::string& strPort);
 void ThreadJsonRpcServer(void* parg);
 
+// Renews the inheritances this wallet owns before they open to the heir
+// (docs/inheritance.md). Runs whether or not the RPC server does.
+void ThreadInheritance(void* parg);
+int InheritanceSelfTest();   // -selftest=inheritance
+
 #endif

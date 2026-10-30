@@ -343,6 +343,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=rules-v2
 	./bitflash.exe -selftest=rules-v3
 	./bitflash.exe -selftest=rules-v4
+	./bitflash.exe -selftest=inheritance
 	./bitflash.exe -selftest=p2pool-share
 	./bitflash.exe -selftest=p2pool-chain
 	./bitflash.exe -selftest=p2pool-sync
