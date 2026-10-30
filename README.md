@@ -356,7 +356,8 @@ mine.cmd YOUR_BTF_ADDRESS        Windows
 It starts a private Tor and runs XMRig through it to the pool's onion; Ctrl+C
 stops both. Double-clicked, it asks for the address. Antivirus products flag
 XMRig everywhere — the binary is unchanged, and its hash matches the one on
-XMRig's release page.
+XMRig's release page. See [Windows Defender](docs/windows-defender.md) for what
+is flagged, why, and how false positives are reported.
 
 Or bring your own XMRig, which has spoken Tor on its own since 5.7.0: run Tor
 (the Tor Browser, open, is enough — its SOCKS port is 9150; a `tor` daemon

@@ -6,3 +6,66 @@
 // window this program has ever opened wore the generic Windows icon in its
 // title bar and in the taskbar, while the correct icon sat unused in the exe.
 GLFW_ICON ICON "rc/bitcoin.ico"
+
+// Version information: what Explorer shows under Properties > Details, and
+// what antivirus engines read before anything else. An exe with no
+// VERSIONINFO, no publisher and no signature looks like a dropper to the
+// machine-learning classifiers (Defender called a wallet build
+// Trojan:Win32/Bearfoos.A!ml); see docs/windows-defender.md.
+//
+// The numbers come from makefile.mingw, which reads them out of
+// BITFLASH_VERSION_STRING in headers_core.h -- still the one place the
+// version lives. Only numbers cross the command line: quotes do not survive
+// the trip through windres to its preprocessor. The same file is compiled
+// twice, the second time with -DBITFLASH_CHAT_APP for btfchat.exe.
+#include <winver.h>
+
+#ifndef BF_VER_MAJOR
+#error "build with makefile.mingw: it passes -DBF_VER_MAJOR/MINOR/PATCH from headers_core.h"
+#endif
+
+#define BF_STR2(x) #x
+#define BF_STR(x) BF_STR2(x)
+#define BF_VER_STRING BF_STR(BF_VER_MAJOR) "." BF_STR(BF_VER_MINOR) "." BF_STR(BF_VER_PATCH)
+
+#ifdef BITFLASH_CHAT_APP
+#define BF_DESCRIPTION "BtfChat - encrypted chat over Tor"
+#define BF_PRODUCT     "BtfChat"
+#define BF_EXE         "BtfChat.exe"
+#define BF_INTERNAL    "btfchat"
+#else
+#define BF_DESCRIPTION "Bitflash wallet and node"
+#define BF_PRODUCT     "Bitflash"
+#define BF_EXE         "Bitflash.exe"
+#define BF_INTERNAL    "bitflash"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     BF_VER_MAJOR,BF_VER_MINOR,BF_VER_PATCH,0
+PRODUCTVERSION  BF_VER_MAJOR,BF_VER_MINOR,BF_VER_PATCH,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0" // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "The Bitflash developers"
+            VALUE "FileDescription",  BF_DESCRIPTION
+            VALUE "FileVersion",      BF_VER_STRING
+            VALUE "InternalName",     BF_INTERNAL
+            VALUE "LegalCopyright",   "Copyright (c) 2009 Satoshi Nakamoto, (c) 2026 The Bitflash developers. MIT License."
+            VALUE "OriginalFilename", BF_EXE
+            VALUE "ProductName",      BF_PRODUCT
+            VALUE "ProductVersion",   BF_VER_STRING
+            VALUE "Comments",         "Open source: https://github.com/bitflash-network/bitflash"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

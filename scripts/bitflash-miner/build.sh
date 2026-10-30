@@ -16,7 +16,8 @@ rm -rf stage && mkdir -p stage
 D=stage/Bitflash-Miner-$V-windows
 mkdir -p $D/xmrig $D/tor $D/licenses
 (cd stage && unzip -q ../dl/xmrig-6.26.0-windows-x64.zip)
-cp stage/xmrig-6.26.0/xmrig.exe stage/xmrig-6.26.0/WinRing0x64.sys $D/xmrig/
+# No WinRing0x64.sys: see the miner job in .github/workflows/release.yml.
+cp stage/xmrig-6.26.0/xmrig.exe $D/xmrig/
 cp dl/xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
 cp win-tor/tor.exe $D/tor/
 cp win-tor/docs/*.txt $D/licenses/ 2>/dev/null || true
