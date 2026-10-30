@@ -106,3 +106,37 @@ Contracts are kept in `v4contracts.json` beside the wallet, with the vaults and
 batches (`docs/rules-v4.md`); back it up with the wallet. The commands are in
 `docs/rpc.md`. `-selftest=inheritance` checks the period arithmetic, the
 script and its three ways to be spent.
+
+## Proven on an isolated testnet bench (2026-10-30)
+
+Two nodes on testnet, cut off from the public network (`-isolate`, each
+`-connectbtf` to the other), with rules v4 in force from a bench height
+(`-benchrulesv4`): C holds the owner's wallet, D holds the heir's. The period
+was 4 time units (2048 seconds, `days` 0.0237), the shortest testnet allows
+that still spans several blocks, so the whole life of an inheritance fits in
+an afternoon. Every step was done with coins, through the RPC commands above.
+
+| Case | Result |
+|---|---|
+| `inheritcreate 100 <heir> 0.0237` (#1) | `CYnANdUwxrwnUZbqAR6dHE9qQ9PLVYipVW`, sequence 4194308, funded by `608c2e0af699bd4907d723e429ce57210fb04521e17d1208ca006f3e242e9b86` |
+| `inheritcreate 50 <heir> 0.0237` (#2) | `CSVSfNXjXoNBdGAm9ioZebp32pLjaqnXke`, funded by `6fa87d3945aa4970270464c62f54ef120c2ca180fc925366cecefecf2e05ebb4` |
+| `inheritimport` on D, package as a JSON string and as an object | accepted, role heir |
+| `inheritimport` on C (the owner's wallet) | refused: does not hold the heir key |
+| package with one byte of the script changed | refused: not the inheritance template |
+| package naming a script address as heir | refused |
+| automatic renewal, half the period after each output was mined | #1 renewed by `76fc8f76296cedfbb09a498aed34c4d45753d998850b9ff0beb8d589f9566538`, #2 by `10488136a8027a56124ff196869ee26aa6cc4389c43ada5b61b724a1c7ec914b`, 0.01 fee each; D followed both (renewals 1, amounts 99.99 and 49.99) without a new package |
+| `inheritclaim` on D right after the renewal | refused: not yet, opens in about 33 minutes (renewals so far: 1) |
+| heir path by hand (`spendscript`) with the period's sequence, too early | refused by the node: the input is under a relative lock not over yet |
+| heir path by hand with a final sequence (no lock) | refused: does not verify under the rules in force |
+| owner path signed with the heir's key | refused: does not verify |
+| `inheritcancel` of a third inheritance (`CTdULfRXsA5Ljr5XTQ7hfhkReAYz5TpvRN`) | coins back to the owner by `6b3fef3445ee91060b7739deef225edd38566a654c3e50af456e67e803850a48`, state closed |
+| owner's node stopped; D mines alone until `heirCanClaim` | true one period after the renewal was mined |
+| `inheritclaim` #1 and #2 on D | `5b4107d08b9b4e42b59412c3be8a7c009487474ca505052e38b1cd70ed7d8349` (99.98) and `fdcec9bcd357eb41e0ddee20a15a355b6e28740a58004669754793d7c993f50a` (49.98), both mined in block `eb42379941ea3b38b1725abf4ab26a4bc2f40362ff1b2e4461c800f021ee478a`; D's balance went from 1493.3644302 to 1643.3244302, exactly 149.96 more |
+| `inheritclaim` #1 a second time | refused: closed, spent by `5b4107d0…` |
+| owner's node started again after the claims | its renewer logged `closed by 5b4107d0…` and `closed by fdcec9bc…` on its first pass; `inheritinfo` says state closed, with the closing transaction |
+| `inheritrenew` #1 on the owner's node, too late | refused: closed, spent by `5b4107d0…` |
+
+The renewal came a little early on the bench, because the bench chain's tip
+was a day old when the miners started and median time past caught up over
+the first blocks; that is BIP68 measuring time as it should, and the reason
+the clock is median time past and not the coin's own timestamp.

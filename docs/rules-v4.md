@@ -14,7 +14,8 @@ the other wherever the two chains allow it:
 | CSFS, `OP_CHECKSIGFROMSTACK` | "this key signed this message" (any message, not only this transaction) | BIP348, proposed |
 
 What they are for, here: vaults (coins that can only move to a recovery key or
-through a delay), payment channels and their penalty windows, swaps that do
+through a delay), inheritance (coins an heir can take once the owner has gone
+quiet, `docs/inheritance.md`), payment channels and their penalty windows, swaps that do
 not need an absolute deadline, congestion batching (one output that unfolds
 into many payments later), and oracle-signed contracts. None of them changes
 what a coin is or adds new money.
@@ -154,6 +155,9 @@ and is not relayed by anyone (non-standard). Miners must upgrade before the
 switch; other nodes should.
 
 ## In the wallet: a vault and a batch
+
+(Inheritance, the third use the wallet makes of these rules, has its own
+page: `docs/inheritance.md`.)
 
 **Vault** (`vaultcreate`, `vaultunvault`, `vaultwithdraw`, `vaultrecover`,
 `docs/rpc.md`). Two scripts, both P2SH:
