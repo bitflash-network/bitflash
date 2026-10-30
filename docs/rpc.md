@@ -101,7 +101,14 @@ null.
 | `vaultrecover` | `vaultaddress`, `toaddress`, [`fee`=0.01] | the recovery key takes the unvault output, at once; if that key is not in this wallet, says how to sign it elsewhere with `spendscript` |
 | `ctvbatch` | `{address: amount}`, [`fee`=0.01] | one output now, which unfolds later into exactly these payments (rules v4); the fee of the unfolding is paid now. Refused while rules v4 are not in force |
 | `ctvexpand` | `batchaddress` | broadcasts the payments a batch fixed; no key is needed |
-| `listv4contracts` | | the vaults and batches this wallet made, as kept in `v4contracts.json` beside the wallet |
+| `listv4contracts` | | the vaults, batches and inheritances this wallet made or imports, as kept in `v4contracts.json` beside the wallet |
+| `inheritcreate` | `amount`, `heiraddress`, `days`, [`renewalfee`=0.01] | locks `amount` so the owner (a fresh key of this wallet) can spend it at any time and the heir only once it has sat untouched for `days` (rules v4; `docs/inheritance.md`). The wallet renews it by itself. `days` is 30 to 388 on mainnet; on testnet any length down to one 512-second unit. `heiraddress` must be an ordinary address. Returns the address, the script and the `heirPackage` to hand over |
+| `inheritinfo` | `address` | where an inheritance stands: active or closed, renewals so far, the output holding it, when it opens to the heir (`heirOpensIn`, `heirCanClaim`), and for the owner when the next renewal is due |
+| `inheritrenew` | `address`, [`fee`] | renews now (what the wallet does by itself once half the period has gone); if the last renewal is not mined yet, broadcasts it again |
+| `inheritcancel` | `address`, `toaddress`, [`fee`=0.01] | the owner takes the coins out; the inheritance is closed |
+| `inheritpackage` | `address` | the package for the heir: script, first transaction, heir address, period, network. No key is in it |
+| `inheritimport` | `package` (JSON object or string) | in the heir's wallet; refused unless the script is an inheritance script byte for byte and this wallet holds the heir key. Everything is read from the script, not from what the package says about it |
+| `inheritclaim` | `address`, `toaddress`, [`fee`=0.01] | the heir takes the coins, once the period has passed since the last renewal; before that, says how long is left |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the

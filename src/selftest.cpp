@@ -8655,6 +8655,8 @@ int RunSelfTest(const std::string& name)
         return RunRulesV3SelfTest();
     if (name == "rules-v4")
         return RunRulesV4SelfTest();
+    if (name == "inheritance")
+        return InheritanceSelfTest();
     if (name == "sigcheck")
         return RunSigCheckSelfTest();
     if (name == "btc-light")

@@ -473,6 +473,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
 	./bitflash-node -selftest=rules-v4
+	./bitflash-node -selftest=inheritance
 	./bitflash-node -selftest=p2pool-share
 	./bitflash-node -selftest=p2pool-chain
 	./bitflash-node -selftest=p2pool-sync

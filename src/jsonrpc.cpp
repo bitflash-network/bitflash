@@ -1863,11 +1863,17 @@ static json V4Contract(const string& strAddr, const char* pszType)
     return all[strAddr];
 }
 
+// The RPC thread and the inheritance renewer both write the file.
+static CCriticalSection cs_v4contracts;
+
 static void SetV4Contract(const string& strAddr, const json& rec)
 {
-    json all = LoadV4Contracts();
-    all[strAddr] = rec;
-    SaveV4Contracts(all);
+    CRITICAL_BLOCK(cs_v4contracts)
+    {
+        json all = LoadV4Contracts();
+        all[strAddr] = rec;
+        SaveV4Contracts(all);
+    }
 }
 
 // The one-input transaction a CTV hash fixes: version 2, sequence final,
@@ -2103,6 +2109,704 @@ static json rpc_ctvexpand(const json& p)
 static json rpc_listv4contracts(const json& p)
 {
     return LoadV4Contracts();
+}
+
+// ---- inheritance: coins an heir can take once the owner has gone quiet ----
+//
+// docs/inheritance.md. One pay-to-script-hash output:
+//
+//   OP_IF
+//     OP_DUP OP_HASH160 <owner> OP_EQUALVERIFY OP_CHECKSIG
+//   OP_ELSE
+//     <period> OP_CHECKSEQUENCEVERIFY OP_DROP
+//     OP_DUP OP_HASH160 <heir> OP_EQUALVERIFY OP_CHECKSIG
+//   OP_ENDIF
+//
+// The owner can spend it at any time. The heir can spend it only once it has
+// sat unspent for <period>: a relative lock in time (BIP68 units of 512
+// seconds, at most about 388 days), not in blocks, which at two minutes a
+// block would stop at 91 days. The owner's wallet renews it -- spends it back
+// to the same address -- once half the period has gone by, and that starts
+// the clock again. The address never changes, so what the heir keeps (the
+// script and the first transaction) stays good for good: the heir's wallet
+// follows the renewals through the transaction index.
+
+static const int64 INHERIT_UNIT_SECS = (int64)1 << SEQUENCE_LOCKTIME_GRANULARITY;
+static const int INHERIT_MIN_DAYS_MAINNET = 30;
+
+// The RPC thread and the renewer must not both spend the same output.
+static CCriticalSection cs_inherit;
+
+static unsigned int InheritSequence(double dDays)
+{
+    if (!(dDays > 0))
+        throw runtime_error("the period is a number of days");
+    if (!IsTestNet() && dDays < INHERIT_MIN_DAYS_MAINNET)
+        throw runtime_error(strprintf("the period is at least %d days on mainnet: any shorter, and a holiday away from the wallet hands the coins over",
+                                      INHERIT_MIN_DAYS_MAINNET));
+    double dUnits = ceil(dDays * 86400.0 / INHERIT_UNIT_SECS);
+    if (dUnits > SEQUENCE_LOCKTIME_MASK)
+        throw runtime_error(strprintf("the period is at most %d days (65535 units of 512 seconds)",
+                                      (int)(SEQUENCE_LOCKTIME_MASK * INHERIT_UNIT_SECS / 86400)));
+    return SEQUENCE_LOCKTIME_TYPE_FLAG | (unsigned int)dUnits;
+}
+
+static int64 InheritPeriodSecs(unsigned int nSequence)
+{
+    return (int64)(nSequence & SEQUENCE_LOCKTIME_MASK) * INHERIT_UNIT_SECS;
+}
+
+static CScript InheritScript(const uint160& hashOwner, const uint160& hashHeir, unsigned int nSequence)
+{
+    CScript s;
+    s << OP_IF
+      << OP_DUP << OP_HASH160 << hashOwner << OP_EQUALVERIFY << OP_CHECKSIG
+      << OP_ELSE
+      << (int64)nSequence << OP_CHECKSEQUENCEVERIFY << OP_DROP
+      << OP_DUP << OP_HASH160 << hashHeir << OP_EQUALVERIFY << OP_CHECKSIG
+      << OP_ENDIF;
+    return s;
+}
+
+// The owner, heir and period of an inheritance script; false for anything
+// else, byte for byte.
+static bool ParseInheritScript(const CScript& s, uint160& hashOwner, uint160& hashHeir, unsigned int& nSequence)
+{
+    vector<vector<unsigned char> > vPush;
+    CScript::const_iterator pc = s.begin();
+    while (pc < s.end())
+    {
+        opcodetype op;
+        vector<unsigned char> vch;
+        if (!s.GetOp(pc, op, vch))
+            return false;
+        if (op <= OP_PUSHDATA4)
+            vPush.push_back(vch);
+    }
+    if (vPush.size() != 3 || vPush[0].size() != 20 || vPush[2].size() != 20 || vPush[1].size() > 5)
+        return false;
+    CBigNum bnSeq(vPush[1]);
+    if (bnSeq < 0)
+        return false;
+    vector<unsigned char> vchSeq = bnSeq.getvch();
+    nSequence = 0;
+    for (size_t k = 0; k < vchSeq.size() && k < 4; k++)
+        nSequence |= (unsigned int)vchSeq[k] << (8 * k);
+    hashOwner = uint160(vPush[0]);
+    hashHeir = uint160(vPush[2]);
+    if (!(nSequence & SEQUENCE_LOCKTIME_TYPE_FLAG) || (nSequence & ~(SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK)) ||
+        !(nSequence & SEQUENCE_LOCKTIME_MASK))
+        return false;
+    return InheritScript(hashOwner, hashHeir, nSequence) == s;
+}
+
+static json InheritRecord(const string& strAddr)
+{
+    json all = LoadV4Contracts();
+    if (!all.contains(strAddr) || all[strAddr].value("type", "") != "inheritance")
+        throw runtime_error(strprintf("no inheritance at %s in %s (an heir imports the package first: inheritimport)",
+                                      strAddr.c_str(), V4ContractsPath().c_str()));
+    return all[strAddr];
+}
+
+static CScript InheritRedeem(const json& rec)
+{
+    vector<unsigned char> v = ParseHex(rec["redeem"].get<string>());
+    return CScript(v.begin(), v.end());
+}
+
+// Where an inheritance stands: the output holding it now, found by following
+// the renewals from the first transaction. False when it was spent somewhere
+// else -- by the owner, or by the heir; txOut is then the transaction that
+// spent it.
+static bool InheritFollow(const CScript& redeem, const uint256& txidFirst, CTransaction& txOut,
+                          unsigned int& nOut, int& nRenewals)
+{
+    FindContractOutput(redeem, txidFirst, txOut, nOut);
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(redeem);
+    nRenewals = 0;
+    for (;;)
+    {
+        COutPoint outpoint(txOut.GetHash(), nOut);
+        CTransaction txNext;
+        bool fSpent = false;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(outpoint);
+            if (mi != mapNextTx.end())
+            {
+                txNext = *mi->second.ptx;
+                fSpent = true;
+            }
+        }
+        if (!fSpent)
+        {
+            CTxIndex txindex;
+            if (CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && outpoint.n < txindex.vSpent.size() &&
+                !txindex.vSpent[outpoint.n].IsNull())
+            {
+                if (!txNext.ReadFromDisk(txindex.vSpent[outpoint.n]))
+                    throw runtime_error("could not read the transaction that spent " + outpoint.hash.GetHex());
+                fSpent = true;
+            }
+        }
+        if (!fSpent)
+            return true;
+        txOut = txNext;
+        unsigned int n = 0;
+        while (n < txNext.vout.size() && txNext.vout[n].scriptPubKey != p2sh)
+            n++;
+        if (n == txNext.vout.size())
+            return false;
+        nOut = n;
+        nRenewals++;
+    }
+}
+
+// The median time past the relative lock of a coin counts from (that of the
+// block before the coin's, as BIP68 has it); -1 while the coin is not in the
+// main chain.
+static int64 InheritCoinTime(const uint256& txid)
+{
+    CTxIndex txindex;
+    if (!CTxDB("r").ReadTxIndex(txid, txindex))
+        return -1;
+    CBlock block;
+    if (!block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+        return -1;
+    int64 nTime = -1;
+    CRITICAL_BLOCK(cs_main)
+    {
+        map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(block.GetHash());
+        if (mi != mapBlockIndex.end() && mi->second->IsInMainChain())
+        {
+            const CBlockIndex* pindexBase = mi->second->pprev ? mi->second->pprev : mi->second;
+            nTime = pindexBase->GetMedianTimePast();
+        }
+    }
+    return nTime;
+}
+
+static int64 TipMedianTime()
+{
+    int64 nTime = 0;
+    CRITICAL_BLOCK(cs_main)
+        if (pindexBest)
+            nTime = pindexBest->GetMedianTimePast();
+    return nTime;
+}
+
+static string InheritDuration(int64 nSecs)
+{
+    if (nSecs >= 2 * 86400)
+        return strprintf("%.1f days", nSecs / 86400.0);
+    if (nSecs >= 2 * 3600)
+        return strprintf("%.1f hours", nSecs / 3600.0);
+    return strprintf("%d minutes", (int)((nSecs + 59) / 60));
+}
+
+// What an heir needs, and all of it: hand it over on paper or in a file, with
+// the heir's own wallet backup. No key is in it.
+static json InheritPackage(const string& strAddr, const json& rec)
+{
+    json pkg;
+    pkg["type"] = "bitflash-inheritance";
+    pkg["network"] = IsTestNet() ? "testnet" : "mainnet";
+    pkg["address"] = strAddr;
+    pkg["redeem"] = rec["redeem"];
+    pkg["firstTxid"] = rec["fundTxid"];
+    pkg["heirAddress"] = rec["heirAddress"];
+    pkg["days"] = rec["days"];
+    return pkg;
+}
+
+static json InheritStatus(const string& strAddr, const json& rec)
+{
+    json j = rec;
+    j["address"] = strAddr;
+    unsigned int nSequence = rec["sequence"].get<unsigned int>();
+    int64 nPeriod = InheritPeriodSecs(nSequence);
+    CTransaction tx;
+    unsigned int n = 0;
+    int nRenewals = 0;
+    bool fOpen = InheritFollow(InheritRedeem(rec), uint256(rec["fundTxid"].get<string>()), tx, n, nRenewals);
+    j["renewals"] = nRenewals;
+    if (!fOpen)
+    {
+        j["state"] = "closed";
+        j["closedBy"] = tx.GetHash().GetHex();
+        return j;
+    }
+    j["state"] = "active";
+    j["currentTxid"] = tx.GetHash().GetHex();
+    j["currentVout"] = (int)n;
+    j["currentAmount"] = ValueFromAmount(tx.vout[n].nValue);
+    int64 nCoinTime = InheritCoinTime(tx.GetHash());
+    j["confirmed"] = nCoinTime >= 0;
+    if (nCoinTime >= 0)
+    {
+        int64 nNow = TipMedianTime();
+        j["heirOpensAt"] = nCoinTime + nPeriod;
+        j["heirCanClaim"] = nNow >= nCoinTime + nPeriod;
+        j["heirOpensIn"] = nNow >= nCoinTime + nPeriod ? string("now") : InheritDuration(nCoinTime + nPeriod - nNow);
+        if (rec.value("role", "") == "owner")
+            j["renewDueAt"] = nCoinTime + nPeriod / 2;
+    }
+    j["heirPackage"] = InheritPackage(strAddr, rec);
+    return j;
+}
+
+// The owner spends the inheritance output: back to its own address (a
+// renewal), or anywhere else (closing it).
+static json InheritOwnerSpend(const string& strAddr, const string* pstrTo, int64 nFee)
+{
+    json rec = InheritRecord(strAddr);
+    if (rec.value("role", "") != "owner")
+        throw runtime_error("this wallet is the heir of that inheritance, not its owner");
+    CTransaction tx;
+    unsigned int n = 0;
+    int nRenewals = 0;
+    if (!InheritFollow(InheritRedeem(rec), uint256(rec["fundTxid"].get<string>()), tx, n, nRenewals))
+        throw runtime_error("that inheritance is closed: spent by " + tx.GetHash().GetHex());
+    if (pstrTo == NULL && InheritCoinTime(tx.GetHash()) < 0)
+    {
+        // The last renewal is not mined yet: say it again rather than chain
+        // another on top of it.
+        if (rec.value("lastRenewTxid", "") == tx.GetHash().GetHex() && rec.contains("lastRenewHex"))
+        {
+            json again = json::object();
+            again["txid"] = rpc_sendrawtransaction(json::array({ rec["lastRenewHex"] }));
+            again["rebroadcast"] = true;
+            return again;
+        }
+        throw runtime_error("the output is not mined yet; the clock starts when it is");
+    }
+    int64 nIn = tx.vout[n].nValue;
+    if (nIn <= nFee + CENT)
+        throw runtime_error("the inheritance holds too little to pay the fee");
+    string strPub = rec["ownerPubKey"].get<string>();
+    json out;
+    out[pstrTo ? *pstrTo : strAddr] = ValueFromAmount(nIn - nFee);
+    json r = rpc_spendscript(json::array({ rec["redeem"], tx.GetHash().GetHex(),
+                                           json::array({ "sig:" + strPub, strPub, true }), out,
+                                           2, 0xffffffffLL, 0, ValueFromAmount(nFee) }));
+    if (pstrTo)
+    {
+        rec["closedTxid"] = r["txid"];
+        rec.erase("lastRenewHex");
+    }
+    else
+    {
+        // It pays no address of this wallet, so the wallet will not keep it:
+        // keep it here, to broadcast again until it is mined.
+        rec["lastRenewTxid"] = r["txid"];
+        rec["lastRenewHex"] = r["hex"];
+        rec["lastRenewTime"] = GetTime();
+    }
+    SetV4Contract(strAddr, rec);
+    r["renewals"] = nRenewals + (pstrTo ? 0 : 1);
+    return r;
+}
+
+// inheritcreate <amount> <heir address> <days> [fee=0.01]
+static json rpc_inheritcreate(const json& p)
+{
+    if (p.size() < 3 || !p[1].is_string() || !p[2].is_number())
+        throw runtime_error("inheritcreate <amount> <heir address> <days the owner may stay silent before the heir can take it> [renewal fee=0.01]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    RequireRulesV4();
+    int64 nAmount = AmountFromValue(p[0]);
+    uint160 hashHeir;
+    string strHeir = p[1].get<string>();
+    if (!AddressToHash160(strHeir, hashHeir))
+        throw runtime_error("the heir address is not an ordinary Bitflash address (a key the heir holds, not a script)");
+    unsigned int nSequence = InheritSequence(p[2].get<double>());
+    int64 nFee = (p.size() > 3 && !p[3].is_null()) ? AmountFromValue(p[3]) : CENT;
+    if (nFee <= 0 || nAmount <= 10 * nFee)
+        throw runtime_error("the amount must be well over the renewal fee, which each renewal takes from it");
+
+    CRITICAL_BLOCK(cs_inherit)
+    {
+        vector<unsigned char> vchOwner = FreshWalletKey();
+        CScript redeem = InheritScript(Hash160(vchOwner), hashHeir, nSequence);
+        string strAddr = Hash160ToScriptAddress(Hash160(redeem));
+        CWalletTx wtx = FundScript(redeem, nAmount);
+        json rec;
+        rec["type"] = "inheritance";
+        rec["role"] = "owner";
+        rec["redeem"] = HexStr(redeem.begin(), redeem.end(), false);
+        rec["ownerPubKey"] = HexStr(vchOwner.begin(), vchOwner.end(), false);
+        rec["heirAddress"] = strHeir;
+        rec["sequence"] = nSequence;
+        rec["days"] = InheritPeriodSecs(nSequence) / 86400.0;
+        rec["amount"] = ValueFromAmount(nAmount);
+        rec["renewFee"] = ValueFromAmount(nFee);
+        rec["autoRenew"] = true;
+        rec["fundTxid"] = wtx.GetHash().GetHex();
+        SetV4Contract(strAddr, rec);
+
+        json j = rec;
+        j["address"] = strAddr;
+        j["heirPackage"] = InheritPackage(strAddr, rec);
+        if (IsMineAddress(strHeir))
+            j["warning"] = "the heir key is in this same wallet: fine for a test, useless as an inheritance";
+        return j;
+    }
+    return json();
+}
+
+// inheritinfo <address>
+static json rpc_inheritinfo(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("inheritinfo <inheritance address>");
+    return InheritStatus(p[0].get<string>(), InheritRecord(p[0].get<string>()));
+}
+
+// inheritrenew <address> [fee]: what the wallet does by itself, now.
+static json rpc_inheritrenew(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("inheritrenew <inheritance address> [fee]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    CRITICAL_BLOCK(cs_inherit)
+    {
+        json rec = InheritRecord(p[0].get<string>());
+        int64 nFee = (p.size() > 1 && !p[1].is_null()) ? AmountFromValue(p[1]) : AmountFromValue(rec["renewFee"]);
+        return InheritOwnerSpend(p[0].get<string>(), NULL, nFee);
+    }
+    return json();
+}
+
+// inheritcancel <address> <to address> [fee=0.01]: the owner takes it back.
+static json rpc_inheritcancel(const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string() || !p[1].is_string())
+        throw runtime_error("inheritcancel <inheritance address> <to address> [fee=0.01]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    string strTo = p[1].get<string>();
+    if (strTo == p[0].get<string>())
+        throw runtime_error("that is the inheritance address itself: inheritrenew does that");
+    int64 nFee = (p.size() > 2 && !p[2].is_null()) ? AmountFromValue(p[2]) : CENT;
+    CRITICAL_BLOCK(cs_inherit)
+        return InheritOwnerSpend(p[0].get<string>(), &strTo, nFee);
+    return json();
+}
+
+// inheritpackage <address>: what to hand the heir.
+static json rpc_inheritpackage(const json& p)
+{
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error("inheritpackage <inheritance address>");
+    return InheritPackage(p[0].get<string>(), InheritRecord(p[0].get<string>()));
+}
+
+// inheritimport <package>: in the heir's wallet.
+static json rpc_inheritimport(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("inheritimport <package, as given by inheritcreate or inheritpackage>");
+    json pkg = p[0];
+    if (pkg.is_string())
+    {
+        try { pkg = json::parse(pkg.get<string>()); }
+        catch (...) { throw runtime_error("the package is not JSON"); }
+    }
+    if (!pkg.is_object() || pkg.value("type", "") != "bitflash-inheritance")
+        throw runtime_error("that is not an inheritance package");
+    if (pkg.value("network", "") != (IsTestNet() ? "testnet" : "mainnet"))
+        throw runtime_error("that package is for the other network");
+    if (!pkg.contains("redeem") || !pkg["redeem"].is_string() || !IsHex(pkg["redeem"].get<string>()) ||
+        !pkg.contains("firstTxid") || !pkg["firstTxid"].is_string())
+        throw runtime_error("the package lacks its script or first transaction");
+    vector<unsigned char> v = ParseHex(pkg["redeem"].get<string>());
+    CScript redeem(v.begin(), v.end());
+    uint160 hashOwner, hashHeir;
+    unsigned int nSequence = 0;
+    if (!ParseInheritScript(redeem, hashOwner, hashHeir, nSequence))
+        throw runtime_error("the script in the package is not an inheritance script");
+    // Everything is taken from the script itself, not from what the package
+    // says about it.
+    string strAddr = Hash160ToScriptAddress(Hash160(redeem));
+    if (pkg.value("address", strAddr) != strAddr)
+        throw runtime_error("the package's address does not match its script");
+    string strHeir = Hash160ToAddress(hashHeir);
+    if (!IsMineAddress(strHeir))
+        throw runtime_error("this wallet does not hold the heir key " + strHeir + "; import the package into the wallet that does");
+    json rec;
+    rec["type"] = "inheritance";
+    rec["role"] = "heir";
+    rec["redeem"] = pkg["redeem"];
+    rec["heirAddress"] = strHeir;
+    rec["ownerAddress"] = Hash160ToAddress(hashOwner);
+    rec["sequence"] = nSequence;
+    rec["days"] = InheritPeriodSecs(nSequence) / 86400.0;
+    rec["fundTxid"] = pkg["firstTxid"];
+    CTransaction tx;
+    unsigned int n = 0;
+    FindContractOutput(redeem, uint256(pkg["firstTxid"].get<string>()), tx, n);
+    SetV4Contract(strAddr, rec);
+    return InheritStatus(strAddr, rec);
+}
+
+// inheritclaim <address> <to address> [fee=0.01]: the heir, after the period.
+static json rpc_inheritclaim(const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string() || !p[1].is_string())
+        throw runtime_error("inheritclaim <inheritance address> <to address> [fee=0.01]");
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    string strAddr = p[0].get<string>();
+    int64 nFee = (p.size() > 2 && !p[2].is_null()) ? AmountFromValue(p[2]) : CENT;
+    CRITICAL_BLOCK(cs_inherit)
+    {
+        json rec = InheritRecord(strAddr);
+        unsigned int nSequence = rec["sequence"].get<unsigned int>();
+        CTransaction tx;
+        unsigned int n = 0;
+        int nRenewals = 0;
+        if (!InheritFollow(InheritRedeem(rec), uint256(rec["fundTxid"].get<string>()), tx, n, nRenewals))
+            throw runtime_error("that inheritance is closed: spent by " + tx.GetHash().GetHex());
+        int64 nCoinTime = InheritCoinTime(tx.GetHash());
+        if (nCoinTime < 0)
+            throw runtime_error(nRenewals ? "the owner renewed it moments ago (the renewal is not even mined yet)"
+                                          : "it was made moments ago (its first transaction is not mined yet); the period counts from its block");
+        int64 nOpens = nCoinTime + InheritPeriodSecs(nSequence), nNow = TipMedianTime();
+        if (nNow < nOpens)
+            throw runtime_error(strprintf("not yet: it opens to the heir in about %s, if the owner does not renew it first (renewals so far: %d)",
+                                          InheritDuration(nOpens - nNow).c_str(), nRenewals));
+        int64 nIn = tx.vout[n].nValue;
+        if (nIn <= nFee)
+            throw runtime_error("the inheritance holds less than the fee");
+        uint160 hashHeir;
+        AddressToHash160(rec["heirAddress"].get<string>(), hashHeir);
+        string strPub;
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            map<uint160, vector<unsigned char> >::iterator mi = mapPubKeys.find(hashHeir);
+            if (mi != mapPubKeys.end())
+                strPub = HexStr(mi->second.begin(), mi->second.end(), false);
+        }
+        if (strPub.empty())
+            throw runtime_error("this wallet does not hold the heir key " + rec["heirAddress"].get<string>());
+        json out;
+        out[p[1].get<string>()] = ValueFromAmount(nIn - nFee);
+        // The heir's path carries the period in nSequence, which
+        // OP_CHECKSEQUENCEVERIFY compares and BIP68 enforces.
+        json r = rpc_spendscript(json::array({ rec["redeem"], tx.GetHash().GetHex(),
+                                               json::array({ "sig:" + strPub, strPub, false }), out,
+                                               2, (int64)nSequence, 0, ValueFromAmount(nFee) }));
+        rec["closedTxid"] = r["txid"];
+        SetV4Contract(strAddr, rec);
+        return r;
+    }
+    return json();
+}
+
+// The renewer: a few minutes after start and every five minutes after that,
+// every inheritance this wallet owns that is half way to opening is spent back
+// to its own address.
+static void InheritanceTick()
+{
+    if (IsInitialBlockDownload())
+        return;
+    json all;
+    CRITICAL_BLOCK(cs_v4contracts)
+        all = LoadV4Contracts();
+    for (json::iterator it = all.begin(); it != all.end(); ++it)
+    {
+        const string strAddr = it.key();
+        const json& rec = it.value();
+        if (rec.value("type", "") != "inheritance" || rec.value("role", "") != "owner" ||
+            rec.contains("closedTxid") || !rec.value("autoRenew", true))
+            continue;
+        try
+        {
+            CRITICAL_BLOCK(cs_inherit)
+            {
+                CTransaction tx;
+                unsigned int n = 0;
+                int nRenewals = 0;
+                if (!InheritFollow(InheritRedeem(rec), uint256(rec["fundTxid"].get<string>()), tx, n, nRenewals))
+                {
+                    json closed = rec;
+                    closed["closedTxid"] = tx.GetHash().GetHex();
+                    closed.erase("lastRenewHex");
+                    SetV4Contract(strAddr, closed);
+                    printf("inheritance %s: closed by %s\n", strAddr.c_str(), tx.GetHash().GetHex().c_str());
+                    continue;
+                }
+                int64 nCoinTime = InheritCoinTime(tx.GetHash());
+                if (nCoinTime < 0)
+                {
+                    if (rec.value("lastRenewTxid", "") == tx.GetHash().GetHex() && rec.contains("lastRenewHex"))
+                    {
+                        try { rpc_sendrawtransaction(json::array({ rec["lastRenewHex"] })); }
+                        catch (std::exception& e) { printf("inheritance %s: rebroadcast: %s\n", strAddr.c_str(), e.what()); }
+                    }
+                    continue;
+                }
+                int64 nPeriod = InheritPeriodSecs(rec["sequence"].get<unsigned int>());
+                int64 nNow = TipMedianTime();
+                if (nNow - nCoinTime < nPeriod / 2)
+                    continue;
+                if (IsWalletLocked())
+                {
+                    printf("inheritance %s: renewal due, but the wallet is locked; unlock it within %s or the heir can take the coins\n",
+                           strAddr.c_str(), InheritDuration(max((int64)0, nCoinTime + nPeriod - nNow)).c_str());
+                    continue;
+                }
+                json r = InheritOwnerSpend(strAddr, NULL, AmountFromValue(rec["renewFee"]));
+                printf("inheritance %s: renewed by %s (renewal %d)\n", strAddr.c_str(),
+                       r["txid"].get<string>().c_str(), r.value("renewals", 0));
+            }
+        }
+        catch (std::exception& e)
+        {
+            printf("inheritance %s: %s\n", strAddr.c_str(), e.what());
+        }
+    }
+}
+
+// -selftest=inheritance: the period, the script and its three ways to be spent.
+// To the terminal: printf here is the debug log (util.h).
+int InheritanceSelfTest()
+{
+    fprintf(stdout, "inheritance self-test\n");
+    int nFail = 0;
+    struct T
+    {
+        static int Check(bool f, const char* psz)
+        {
+            fprintf(stdout, "  %s %s\n", f ? "ok  " : "FAIL", psz);
+            return f ? 0 : 1;
+        }
+        static bool Throws(double dDays)
+        {
+            try { InheritSequence(dDays); }
+            catch (std::exception&) { return true; }
+            return false;
+        }
+    };
+
+    // ---- the period
+    bool fWasTestNet = IsTestNet();
+    SelectNetworkParams(false);
+    nFail += T::Check(InheritSequence(30) == (SEQUENCE_LOCKTIME_TYPE_FLAG | 5063),
+                      "mainnet: 30 days is 5063 units of 512 seconds, a time lock") ;
+    nFail += T::Check(T::Throws(29.9) && T::Throws(0) && T::Throws(-1),
+                      "mainnet: under 30 days, zero or negative is refused");
+    nFail += T::Check(!T::Throws(388) && T::Throws(388.4) && T::Throws(1000),
+                      "388 days fits the 16-bit field; more does not");
+    SelectNetworkParams(true);
+    nFail += T::Check(InheritSequence(0.01) == (SEQUENCE_LOCKTIME_TYPE_FLAG | 2),
+                      "testnet: a short period for a bench (0.01 day, rounded up to 2 units)");
+    nFail += T::Check(InheritPeriodSecs(InheritSequence(1)) >= 86400 &&
+                      InheritPeriodSecs(InheritSequence(1)) < 86400 + 512,
+                      "the period is never shorter than asked, and at most one unit longer");
+    SelectNetworkParams(fWasTestNet);
+
+    // ---- the script
+    CKey keyOwner, keyHeir, keyOther;
+    keyOwner.MakeNewKey();
+    keyHeir.MakeNewKey();
+    keyOther.MakeNewKey();
+    vector<unsigned char> vchOwner = keyOwner.GetPubKey(), vchHeir = keyHeir.GetPubKey(), vchOther = keyOther.GetPubKey();
+    const unsigned int nSeq = SEQUENCE_LOCKTIME_TYPE_FLAG | 5063;
+    CScript redeem = InheritScript(Hash160(vchOwner), Hash160(vchHeir), nSeq);
+    uint160 hOwner, hHeir;
+    unsigned int nSeqParsed = 0;
+    nFail += T::Check(ParseInheritScript(redeem, hOwner, hHeir, nSeqParsed) && hOwner == Hash160(vchOwner) &&
+                      hHeir == Hash160(vchHeir) && nSeqParsed == nSeq,
+                      "the script reads back: owner, heir, period");
+    {
+        CScript extra = redeem;
+        extra << OP_DROP;
+        CScript blocks = InheritScript(Hash160(vchOwner), Hash160(vchHeir), 5063);
+        CScript swapped = redeem;
+        swapped[1] = OP_NOP;   // OP_DUP of the owner's path
+        nFail += T::Check(!ParseInheritScript(extra, hOwner, hHeir, nSeqParsed) &&
+                          !ParseInheritScript(blocks, hOwner, hHeir, nSeqParsed) &&
+                          !ParseInheritScript(swapped, hOwner, hHeir, nSeqParsed) &&
+                          !ParseInheritScript(CScript() << OP_TRUE, hOwner, hHeir, nSeqParsed),
+                          "anything else is refused: a trailing opcode, a lock in blocks, one byte changed");
+    }
+
+    // ---- the three ways out, signed and verified as a block would
+    CTransaction txFrom;
+    txFrom.vin.resize(1);
+    txFrom.vin[0].prevout = COutPoint(Hash(BEGIN(nSeq), END(nSeq)), 0);
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(redeem);
+    txFrom.vout.push_back(CTxOut(10 * COIN, p2sh));
+    struct Spend
+    {
+        static bool Run(const CTransaction& txFrom, const CScript& redeem, CKey& key, bool fOwnerPath,
+                        unsigned int nSequence, int nVersion, bool fRulesV4)
+        {
+            CTransaction tx;
+            tx.nVersion = nVersion;
+            tx.vin.resize(1);
+            tx.vin[0].prevout = COutPoint(txFrom.GetHash(), 0);
+            tx.vin[0].nSequence = nSequence;
+            tx.vout.push_back(CTxOut(10 * COIN - CENT, CScript() << OP_TRUE));
+            uint256 hash = SignatureHash(redeem, tx, 0, SIGHASH_ALL);
+            vector<unsigned char> sig;
+            if (!key.Sign(hash, sig))
+                return false;
+            sig.push_back((unsigned char)SIGHASH_ALL);
+            CScript scriptSig;
+            scriptSig << sig << key.GetPubKey() << (fOwnerPath ? OP_TRUE : OP_FALSE)
+                      << vector<unsigned char>(redeem.begin(), redeem.end());
+            tx.vin[0].scriptSig = scriptSig;
+            return VerifySignature(txFrom, tx, 0, 0, true, true, fRulesV4);
+        }
+    };
+    nFail += T::Check(Spend::Run(txFrom, redeem, keyOwner, true, 0xffffffff, 2, true),
+                      "the owner spends at any time, no lock in nSequence");
+    nFail += T::Check(Spend::Run(txFrom, redeem, keyHeir, false, nSeq, 2, true),
+                      "the heir's spend carries the period in nSequence and passes the script (BIP68 holds it out of blocks until then)");
+    nFail += T::Check(!Spend::Run(txFrom, redeem, keyHeir, false, nSeq - 1, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyHeir, false, 5063, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyHeir, false, 0xffffffff, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyHeir, false, nSeq, 1, true),
+                      "the heir is refused with a shorter period, a lock in blocks, no lock, or a version 1 transaction");
+    nFail += T::Check(!Spend::Run(txFrom, redeem, keyHeir, true, 0xffffffff, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyOwner, false, nSeq, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyOther, true, 0xffffffff, 2, true) &&
+                      !Spend::Run(txFrom, redeem, keyOther, false, nSeq, 2, true),
+                      "nobody takes the other's path, and a stranger takes neither");
+    nFail += T::Check(!Spend::Run(txFrom, redeem, keyHeir, false, nSeq, 2, false),
+                      "before rules v4 the heir's path fails outright (the CSV byte is unknown)");
+
+    fprintf(stdout, "%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+void ThreadInheritance(void*)
+{
+    int64 nNext = GetTime() + 120;
+    while (!fShutdown)
+    {
+        Sleep(5000);
+        if (GetTime() < nNext)
+            continue;
+        nNext = GetTime() + 300;
+        try
+        {
+            InheritanceTick();
+        }
+        catch (std::exception& e)
+        {
+            printf("inheritance: %s\n", e.what());
+        }
+    }
 }
 
 // swapredeem <contract> <contract txid> <secret>
@@ -2787,6 +3491,13 @@ static const RpcEntry kMethods[] = {
     { "ctvbatch",         rpc_ctvbatch },
     { "ctvexpand",        rpc_ctvexpand },
     { "listv4contracts",  rpc_listv4contracts },
+    { "inheritcreate",    rpc_inheritcreate },
+    { "inheritinfo",      rpc_inheritinfo },
+    { "inheritrenew",     rpc_inheritrenew },
+    { "inheritcancel",    rpc_inheritcancel },
+    { "inheritpackage",   rpc_inheritpackage },
+    { "inheritimport",    rpc_inheritimport },
+    { "inheritclaim",     rpc_inheritclaim },
     { "swapredeem",       rpc_swapredeem },
     { "swaprefund",       rpc_swaprefund },
     { "swapextractsecret", rpc_swapextractsecret },

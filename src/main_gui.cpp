@@ -1561,6 +1561,10 @@ int main(int argc, char* argv[])
             printf("Error: _beginthread(ThreadInvoices) failed\n");
 #endif
     }
+    // An inheritance made over the RPC must still be renewed when the node is
+    // later run without it: an owner who stops passing -rpcuser is not dead.
+    if (_beginthread(ThreadInheritance, 0, NULL) == (uintptr_t)-1)
+        printf("Error: _beginthread(ThreadInheritance) failed\n");
 #ifdef BITFLASH_CHAT_APP
     // btfchat never mines. It carries the chain so it validates on its own
     // rather than trusting a server, and it carries a wallet so its address can
