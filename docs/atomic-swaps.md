@@ -60,7 +60,8 @@ The peer must advertise `NODE_COMPACT_FILTERS` (Core nodes need
 
 `-btcpeer=host:port` may be repeated; supplying peers disables DNS seeds.
 Otherwise service-filtered Bitcoin DNS seeds (`x49.`) and discovered addresses
-provide peers. Connections use the wallet's `BtfConnectSocket` transport and
+provide peers; an `-isolate` bench node uses only `-btcpeer` and makes no
+Bitcoin connection without one. Connections use the wallet's `BtfConnectSocket` transport and
 therefore its configured Tor proxy. Two available peers must agree on filter
 headers before scanning proceeds. A disagreement stops audits rather than
 choosing one peer's answer. With one peer, omission resistance depends on that
