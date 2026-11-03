@@ -252,6 +252,40 @@ against his Core; Alice uses the Bitflash wallet:
 `ref` is the contract transaction's raw hex, a txid Core can find, or
 `txid:vout`.
 
+### Litecoin
+
+Every `btc*` call has a twin that takes the chain first: `coinswapinfo ltc`,
+`coinnewaddress ltc`, `coininitiate ltc addr amount`, `coinparticipate ltc
+addr amount hash`, `coinauditcontract ltc contract ref`, `coinredeem ltc
+contract ref secret`, `coinrefund ltc contract ref`, `coinfindsecret ltc
+contract ref`, `coinvalidatedestination ltc addr` (`coin... btc` is the same
+as `btc...`). The contract, the locks and the Bitflash half are the same.
+Litecoin addresses in the contract are legacy key addresses (`L...` on main,
+`m`/`n` on the test network).
+
+Where the Litecoin side runs is chosen as for Bitcoin: a running Litecoin
+Core (its cookie in the default data directory, or `-ltcdatadir`,
+`-ltcrpcport`, `-ltcrpcuser`/`-ltcrpcpassword`, `-ltcwallet`), else the
+embedded light client. `-ltcchain` is `main` (default), `test` (default on
+Bitflash testnet) or `regtest`; `-ltcpeer=host:port` (repeatable) names its
+peers, and `-ltcfeerate` the fee rate when there is no estimate.
+
+The light client checks every header's scrypt proof of work and Litecoin's
+retarget (the whole period, Litecoin's correction to Bitcoin's), and starts
+from a run of twelve real headers at a recent retarget boundary instead of
+genesis (see the table in `src/btclight.cpp` for where they were read and
+how they were checked). Litecoin peers rarely serve BIP157 filters, so it
+downloads the blocks inside a swap's window, from a day before the contract
+to the tip, checks each against its header's merkle root, and keeps the ones
+that pay or spend the contract. Asked for a plain block, Litecoin Core sends
+it without MWEB data, so the transactions read as Bitcoin's do. It dials only
+after a Litecoin swap has been made once (its state file exists), and only
+over the wallet's Tor. State: `ltc-light-<network>.headers` and `.json`.
+
+`-selftest=ltc-light` checks the genesis hashes, the anchors and their scrypt
+work, two retargets the chain made, the test network's minimum-difficulty
+rule, scrypt (not the header hash) as the work, and Litecoin's addresses.
+
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
 lock) and `-selftest=btc-swap` (Bitcoin addresses, reading Bitcoin's witness

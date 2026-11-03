@@ -97,43 +97,196 @@ unsigned int Retarget(unsigned int bits, int64 elapsed, unsigned int limit)
     Integer n = Target(bits)*elapsed/1209600, cap = Target(limit);
     return Bits(n > cap ? cap : n);
 }
+// Litecoin's CalculateNextWorkRequired (v0.21.4, src/pow.cpp): 3.5 days, and
+// a target within a bit of the limit is halved before the multiply and
+// doubled after, dropping its lowest bit as the 256-bit original does.
+unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int limit)
+{
+    const int64 timespan = 302400;
+    elapsed = std::max<int64>(timespan/4, std::min<int64>(timespan*4, elapsed));
+    Integer n = Target(bits), cap = Target(limit);
+    bool shift = boost::multiprecision::msb(n)+1 > boost::multiprecision::msb(cap);
+    if (shift) n >>= 1;
+    n = n*elapsed/timespan;
+    if (shift) n <<= 1;
+    return Bits(n > cap ? cap : n);
+}
+// Litecoin's proof of work: scrypt with N=1024, r=1, p=1 of the 80-byte
+// header, salted with itself (v0.21.4, src/crypto/scrypt.cpp).
+static uint256 Scrypt(const Bytes& raw)
+{
+    uint256 out;
+    if (crypto_pwhash_scryptsalsa208sha256_ll(&raw[0], raw.size(), &raw[0], raw.size(), 1024, 1, 1, out.begin(), 32) != 0)
+        throw std::runtime_error("scrypt failed");
+    return out;
+}
+
+// ---- the chains, each from its own source at a named tag
+//
+// Bitcoin: Bitcoin Core v31.1, src/kernel/chainparams.cpp. Litecoin:
+// litecoin-project/litecoin v0.21.4, src/chainparams.cpp and src/pow.cpp.
+//
+// Litecoin starts from a run of real headers instead of its genesis: from
+// genesis that is over three million scrypt headers over Tor. Each run ends
+// at a retarget boundary and carries the twelve headers the next retarget and
+// the first median times need. The mainnet run (heights 3203413 to 3203424)
+// was read from litecoinspace.org and its hashes checked against Trezor's
+// Blockbook (litecoinblockexplorer.net), and every header in it carries its
+// scrypt proof of work (SelfTestLitecoin). Its first retarget was checked
+// against the header the chain made: 0x192ea885 over 290369 s -> 0x192ccd4e.
+// The test network run is from litecoinspace.org alone; test coins are worth
+// nothing, and a wrong run only fails to connect.
+static const char* LTC_MAIN_ANCHOR[] = {
+    "140000205cbbcb71c02ef990ba2baad3d0d6ab1ccd6018e2683719c5b4a77090ca5a2801d75cbe847adc747952e2d9ecd3fb37e0282c370d25cbeec20a0435dc2398c2b3e474e26a85a82e19940ca448", // 3203413
+    "00000020cd213b6062b0e5f5db45d34b5f59682605fdb8008c07d94326022e11ba30db1134279dd9928621ed5fa631e4433b632a473381caab70490397097bcf002b523ca775e26a85a82e19dd1216dd", // 3203414
+    "000000209ca69383cb88a7e021a79c5c068b74e7dcf5d6d7e1a3d37993dfcf1914ded9e3b1cdae5b9a250068c0fb83f176c639bcedcb39c213576ded09e380952eea9296bc75e26a85a82e196ab8c37b", // 3203415
+    "00000020f11a62885ae848a1518354213cbf129169ae2c939b8838c5a6f9704acec53ed9336a5322ea767606f0ed47ddddb0e68881678c75ed2877cb0b72b59c6a6261388276e26a85a82e196a3b8c55", // 3203416
+    "1400002009483541436ed493f404347626c3c5bcc1f1b60243ce29573ed63be6f55eb36302de703c60d3f0015f4a16e169272b257e7f62d8c9c2bd7f600184391f974ea98a76e26a85a82e199f2856b3", // 3203417
+    "000000206c1110d17c9901fb88ac5910fdde78c6563ec0e5a25b90ae62bf7584f525011120dcfee42700c8f3cfdbc3dde7de755ffbb3c5e7a90afcb8031c9ce8322214160d77e26a85a82e1957b22f1b", // 3203418
+    "14000020da20e5b0afd2fb966a54ffc7810c2b2a271a9a8bb4a12af8e927527a931cfb7d7e9945c54d4016df272cbced32b8b458c3ab59f50508ece041d3028dc49765592a77e26a85a82e192270c986", // 3203419
+    "000000202aeebeee8b4db0e0e24e18abcf8df5b76b90afc8f255347e53565a8acfe8a7c04dca6209f833731d78a3bceb9bfc17a77486d8b4f634800c6f4afa5523ff4186c777e26a85a82e198550039d", // 3203420
+    "00000020e5b748978d989dc943f4baab522bfc910707e77408d4070b921fbd46cfe4b6c0f645167bc2ba4aa4e8f101c71d35239db90db0e48fa2e8ca0cb795ebd6c770d25578e26a85a82e1979a856f6", // 3203421
+    "0000002039b2403845894f554a211f135782966c79c796cb88baec43221e91e1b558484fa5f82b692588661a215b8990896c74cb36ea9f89c4f8cbc87d0324874afe24cd0079e26a85a82e190b4301e2", // 3203422
+    "000000205a73135b77e9eba4359f4bd09b9923950d779ac6cc19948029f037b161520b9977f4d5aeea81539e15765a34ca6114dbcf9fea38356991e09989df4e1bf3db881f7be26a85a82e1943ae8e6a", // 3203423
+    "00000020946d142d132dc0fdfac21ebeeac58485cc83882781d8ea6cb28a18e28951c489e06270c1e7943582248ea01a6525c23b4f06eb711561f7d05c7a4fe7285a8bef7a7be26a4ecd2c19c78e625c", // 3203424
+};
+static const char* LTC_TEST_ANCHOR[] = {
+    "000000201b9a3a27fef1d85b37b94e269ac847ae2dbae749587ab5a660d20f0d897225c91823e8e48261dacd0e61649fc357974fddc39ea13cca77273cf8101c3ac824424408e96afcff031dc9c17c9c", // 5013781
+    "00000020f670837ae40ea01c56b73ebca9d8345480d4e2cc124edd909970f393e6a42fae6753df0cf83b4b3ccf10d401a79ca26a84a6f92f6a9732e9c141ccbd959617984408e96afcff031d0ca03644", // 5013782
+    "000000201480122103e2cf4d7b96a3a597aa0cf6f51248eea6ddc7fc239072866b067049cd0288137fa745c7368c5e9f6477546ddc1ef1b592d1d4c9e23fac2c5f04031b4508e96afcff031d957d7b2e", // 5013783
+    "000000205ee59b39fe7c465a451a8e8bc6bd94f0ad0ef8c73fc91b93418215a8128d6563046759cdc8936515571729e734d198a217b04f7369fb3c907bf68a53e66bca154808e96afcff031dbda885f8", // 5013784
+    "00000020a21269d4f98151bb8b95cc052f1037efaabdca9a93790d125558616e3b5585c453ff615dc526a9a67ee08789f370475f6479f7a9b8e23e5da20dd3c1a34081df4908e96afcff031d0deaea58", // 5013785
+    "00000020d364453aef841570cf22873fb8302f9f819ca2c4c3e4e80b30e6ec5997db5edbada84d078023ca906a3f81b16ccc2ec0f752f052f3c5ae547577611bf743acc54b08e96afcff031d5c3e87b4", // 5013786
+    "000000201cfecf934ee964571b0a9721d59a92c0aa89f49a680a0c4ad1c3610dd6bea7b7afecbdab52721f9e4e830c2ad3529338b501c5380a449464e345c97e52106d354c08e96afcff031d19a068ab", // 5013787
+    "0000002069c170bf7d051ce965411eea7124faf4a9aaf751beec724563fd804f88b4f0d869f4b4321399df57c86fbfddf65f151d426b20379ed4f03d04dd452d1be716444d08e96afcff031dd5b3dc07", // 5013788
+    "00000020f37915829492ffc716c076fb8440f1a92c362b73ad44f3c594a324d1d9bb82d6652f98a32e7fb774a48adb1674e30c691c6cb32a1ba425e0161d39c255c349a05208e96afcff031d081e820a", // 5013789
+    "00000020e3d02f012e806d18c026c685f7c76a547bd19bf74047f574fc3d4a285251cc0a26b8d2b545c17a42b7d0e1ae1991cc40a58a2c01847f89fd19f9d714c75c06905508e96afcff031dab86c609", // 5013790
+    "0000002040a8bc2019b62a0b2a6e04babf759fd246317c5520f735e67a2cf1a0aacd3e7bf6942267077deee68be5b7978ad6e9a5de5fa366a842b9f6d7255d8c60daac155608e96afcff031de3c89edd", // 5013791
+    "00000020c78a61f81591df6ba42729bf1c51fca73794cb5cbcdce06c764a58e50a1a1b2d5fee8d2811c8bc302335386cf549fc00c29b2440adfd34abb052d2183dd7a4ad5808e96affff001d3d4b238f", // 5013792
+};
+static Bytes GenesisHeader(unsigned int version, const char* merkle, unsigned int time, unsigned int bits, unsigned int nonce)
+{
+    Bytes b; Put(b, version, 4); b.resize(36, 0);
+    uint256 m(merkle); b.insert(b.end(), m.begin(), m.end());
+    Put(b, time, 4); Put(b, bits, 4); Put(b, nonce, 4);
+    return b;
+}
+static std::vector<Net> MakeNets()
+{
+    std::vector<Net> v;
+    const char* btcMerkle = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+    Net n;
+    n.coin = "btc"; n.label = "Bitcoin"; n.timespan = 1209600; n.spacing = 600; n.filters = true;
+    n.services = 64; n.blockInv = 0x40000002; n.agent = "/Bitflash:btc-light/";
+    n.name = "main"; n.magic = 0xd9b4bef9; n.port = 8333;
+    n.seeds = {"x49.seed.bitcoin.sprovoost.nl", "x49.dnsseed.emzy.de", "x49.seed.mainnet.achownodes.xyz"};
+    n.pkhVersion = 0; n.shVersion = 5; n.shVersion2 = 5; n.hrp = "bc"; n.limitBits = 0x1d00ffff;
+    // assumevalid block 938343
+    n.minimumWork = "0000000000000000000000000000000000000001128750f82f4c366153a3a030";
+    n.genesis = GenesisHeader(1, btcMerkle, 1231006505, 0x1d00ffff, 2083236893);
+    v.push_back(n);
+    n.name = "testnet4"; n.magic = 0x283f161c; n.port = 48333;
+    n.seeds = {"x49.seed.testnet4.bitcoin.sprovoost.nl", "x49.seed.testnet4.wiz.biz"};
+    n.pkhVersion = 111; n.shVersion = 196; n.shVersion2 = 196; n.hrp = "tb";
+    n.minDifficulty = true; n.bip94 = true;
+    // assumevalid block 123613
+    n.minimumWork = "0000000000000000000000000000000000000000000009a0fe15d0177d086304";
+    n.genesis = GenesisHeader(1, "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e", 1714777860, 0x1d00ffff, 393743547);
+    v.push_back(n);
+    n.name = "regtest"; n.magic = 0xdab5bffa; n.port = 18444; n.seeds.clear(); n.hrp = "bcrt";
+    n.minDifficulty = false; n.bip94 = false; n.regtest = true; n.limitBits = 0x207fffff; n.minimumWork = "";
+    n.genesis = GenesisHeader(1, btcMerkle, 1296688602, 0x207fffff, 2);
+    v.push_back(n);
+
+    const char* ltcMerkle = "97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9";
+    Net l;
+    l.coin = "ltc"; l.label = "Litecoin"; l.timespan = 302400; l.spacing = 150; l.scrypt = true; l.fullPeriod = true;
+    // Few Litecoin peers serve BIP157 filters; any full node serves blocks,
+    // and asked for MSG_BLOCK it sends them without MWEB data (net_processing.cpp).
+    l.filters = false; l.services = 1; l.blockInv = 2; l.agent = "/Bitflash:ltc-light/";
+    l.name = "main"; l.magic = 0xdbb6c0fb; l.port = 9333;
+    l.seeds = {"seed-a.litecoin.loshan.co.uk", "dnsseed.thrasher.io", "dnsseed.litecointools.com",
+               "dnsseed.litecoinpool.org", "dnsseed.koin-project.com"};
+    l.pkhVersion = 48; l.shVersion = 50; l.shVersion2 = 5; l.hrp = "ltc"; l.limitBits = 0x1e0fffff;
+    l.genesis = GenesisHeader(1, ltcMerkle, 1317972665, 0x1e0ffff0, 2084524493);
+    l.anchorHeight = 3203424; l.anchor.assign(LTC_MAIN_ANCHOR, LTC_MAIN_ANCHOR + sizeof(LTC_MAIN_ANCHOR)/sizeof(LTC_MAIN_ANCHOR[0]));
+    v.push_back(l);
+    l.name = "test"; l.magic = 0xf1c8d2fd; l.port = 19335;
+    l.seeds = {"testnet-seed.litecointools.com", "seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io"};
+    l.pkhVersion = 111; l.shVersion = 58; l.shVersion2 = 196; l.hrp = "tltc"; l.minDifficulty = true;
+    l.genesis = GenesisHeader(1, ltcMerkle, 1486949366, 0x1e0ffff0, 293345);
+    l.anchorHeight = 5013792; l.anchor.assign(LTC_TEST_ANCHOR, LTC_TEST_ANCHOR + sizeof(LTC_TEST_ANCHOR)/sizeof(LTC_TEST_ANCHOR[0]));
+    v.push_back(l);
+    l.name = "regtest"; l.magic = 0xdab5bffa; l.port = 19444; l.seeds.clear(); l.hrp = "rltc";
+    l.minDifficulty = false; l.regtest = true; l.limitBits = 0x207fffff;
+    l.genesis = GenesisHeader(1, ltcMerkle, 1296688602, 0x207fffff, 0);
+    l.anchorHeight = 0; l.anchor.clear();
+    v.push_back(l);
+    return v;
+}
+static const std::vector<Net>& Nets()
+{
+    static const std::vector<Net> nets = MakeNets();
+    return nets;
+}
+const Net* FindNet(const std::string& coin, const std::string& network)
+{
+    for (const Net& n : Nets())
+        if (n.coin == coin && n.name == network)
+            return &n;
+    return NULL;
+}
+std::string Label(const std::string& coin)
+{
+    return coin == "ltc" ? "Litecoin" : "Bitcoin";
+}
 static Header Decode(const Bytes& raw)
 {
     if (raw.size() != 80) throw std::runtime_error("Bitcoin header must be 80 bytes");
     Header h; h.raw = raw; h.hash = Digest(raw); h.prev = ReadHash(raw, 4); h.merkle = ReadHash(raw, 36);
     h.time = (unsigned int)LE(raw, 68, 4); h.bits = (unsigned int)LE(raw, 72, 4); return h;
 }
-static Bytes Genesis(const std::string& network)
+Headers::Headers(const std::string& net) : network(net), net(FindNet("btc", net))
 {
-    Bytes b; Put(b, 1, 4); b.resize(36, 0);
     // Height zero, each header after it checked for work and retarget: slow
     // the first time, and safe. These genesis fields are Bitcoin Core's (v31.1,
     // src/kernel/chainparams.cpp), and SelfTest checks the hashes they make.
-    // A fast initial sync would start instead at a recent retarget boundary,
-    // with its preceding MTP context and filter-header anchor, each verified
-    // against Core; that is an optimisation still to do, not a gap.
-    uint256 merkle(network == "testnet4" ? "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
-                                           : "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
-    HashBytes(b, merkle);
-    Put(b, network == "main" ? 1231006505 : network == "testnet4" ? 1714777860 : 1296688602, 4);
-    Put(b, network == "regtest" ? 0x207fffff : 0x1d00ffff, 4);
-    Put(b, network == "main" ? 2083236893 : network == "testnet4" ? 393743547 : 2, 4);
-    return b;
+    if (!this->net) throw std::runtime_error("Bitcoin light supports main, testnet4 and regtest");
+    Start(*this->net);
 }
-Headers::Headers(const std::string& net) : network(net)
+Headers::Headers(const Net& n) : network(n.name), net(&n) { Start(n); }
+void Headers::Start(const Net& n)
 {
-    if (net != "main" && net != "testnet4" && net != "regtest") throw std::runtime_error("Bitcoin light supports main, testnet4 and regtest");
-    Header h = Decode(Genesis(net));
-    h.work = (Integer(1)<<256)/(Target(h.bits)+1);
-    nodes[h.hash] = h; active.push_back(h.hash);
+    if (n.anchor.empty())
+    {
+        Header h = Decode(n.genesis);
+        h.work = (Integer(1)<<256)/(Target(h.bits)+1);
+        nodes[h.hash] = h; active.push_back(h.hash); base = 0;
+        return;
+    }
+    // A run of real headers, trusted as a checkpoint is: linked to each
+    // other, and counting work only from here.
+    base = n.anchorHeight-(int)n.anchor.size()+1;
+    for (size_t i = 0; i < n.anchor.size(); ++i)
+    {
+        Header h = Decode(ParseHex(n.anchor[i]));
+        if (i && h.prev != active.back()) throw std::runtime_error(n.label+" anchor headers do not link");
+        h.height = base+(int)i;
+        h.work = i ? nodes.at(active.back()).work+(Integer(1)<<256)/(Target(h.bits)+1) : Integer(0);
+        nodes[h.hash] = h; active.push_back(h.hash);
+    }
 }
 const Header& Headers::Tip() const { return nodes.at(active.back()); }
-const Header& Headers::At(int height) const { return nodes.at(active.at(height)); }
+const Header& Headers::At(int height) const
+{
+    if (height < base) throw std::runtime_error("header before the light client's starting point");
+    return nodes.at(active.at(height-base));
+}
 bool Headers::Contains(const uint256& hash) const { return nodes.count(hash) != 0; }
 int Headers::ActiveHeight(const uint256& hash) const
 {
     auto it = nodes.find(hash);
-    if (it == nodes.end() || it->second.height > Tip().height || At(it->second.height).hash != hash) return -1;
+    if (it == nodes.end() || it->second.height < base || it->second.height > Tip().height || At(it->second.height).hash != hash) return -1;
     return it->second.height;
 }
 int64 Headers::Median(const Header& header) const
@@ -143,27 +296,33 @@ int64 Headers::Median(const Header& header) const
     for (int i = 0; i < 11; ++i)
     {
         times.push_back(h->time);
-        if (!h->height) break;
+        if (h->height <= base) break;
         h = &nodes.at(h->prev);
     }
     std::sort(times.begin(), times.end()); return times[times.size()/2];
 }
 unsigned int Headers::NextBits(const Header& parent, unsigned int time) const
 {
-    if (network == "regtest") return parent.bits;
-    int next = parent.height+1;
-    if (next % 2016)
+    if (net->regtest) return parent.bits;
+    int next = parent.height+1, interval = net->Interval();
+    if (next % interval)
     {
-        if (network == "main") return parent.bits;
-        if ((int64)time > (int64)parent.time+1200) return 0x1d00ffff;
+        if (!net->minDifficulty) return parent.bits;
+        // Testnet: a block more than two spacings after its parent may be
+        // at the limit; otherwise the last bits not at the limit.
+        if ((int64)time > (int64)parent.time+2*net->spacing) return net->limitBits;
         const Header* h = &parent;
-        while (h->height % 2016 && h->bits == 0x1d00ffff) h = &nodes.at(h->prev);
+        while (h->height % interval && h->height > base && h->bits == net->limitBits) h = &nodes.at(h->prev);
         return h->bits;
     }
+    // Bitcoin measures the period from its first block (interval-1 back);
+    // Litecoin from the block before it, except on the first retarget.
+    int back = net->fullPeriod && next != interval ? interval : interval-1;
     const Header* first = &parent;
-    for (int i = 0; i < 2015; ++i) first = &nodes.at(first->prev);
+    for (int i = 0; i < back; ++i) first = &nodes.at(first->prev);
+    if (net->fullPeriod) return LitecoinRetarget(parent.bits, (int64)parent.time-first->time, net->limitBits);
     // BIP94 preserves the first block's difficulty across testnet4 periods.
-    return Retarget(network == "testnet4" ? first->bits : parent.bits, (int64)parent.time-first->time, 0x1d00ffff);
+    return Retarget(net->bip94 ? first->bits : parent.bits, (int64)parent.time-first->time, net->limitBits);
 }
 bool Headers::Add(const Bytes& raw, std::string& err)
 {
@@ -172,24 +331,25 @@ bool Headers::Add(const Bytes& raw, std::string& err)
         Header h = Decode(raw);
         if (nodes.count(h.hash)) return true;
         std::map<uint256, Header>::const_iterator it = nodes.find(h.prev);
-        if (it == nodes.end()) throw std::runtime_error("unknown Bitcoin header parent");
+        if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
         const Header& p = it->second;
-        Integer target = Target(h.bits), limit = Target(network == "regtest" ? 0x207fffff : 0x1d00ffff);
-        if (target <= 0 || target > limit || Number(h.hash) > target) throw std::runtime_error("invalid Bitcoin proof of work");
-        if (h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid Bitcoin difficulty");
-        if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid Bitcoin header time");
-        if (network == "testnet4" && (p.height+1)%2016 == 0 && (int64)h.time < (int64)p.time-600)
+        Integer target = Target(h.bits), limit = Target(net->limitBits);
+        if (target <= 0 || target > limit || Number(net->scrypt ? Scrypt(raw) : h.hash) > target)
+            throw std::runtime_error("invalid "+net->label+" proof of work");
+        if (h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
+        if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
+        if (net->bip94 && (p.height+1)%net->Interval() == 0 && (int64)h.time < (int64)p.time-600)
             throw std::runtime_error("testnet4 timewarp");
         h.height = p.height+1; h.work = p.work+(Integer(1)<<256)/(target+1);
         nodes[h.hash] = h;
         if (h.work > Tip().work)
         {
-            active.resize(h.height+1,uint256(0));
+            active.resize(h.height+1-base,uint256(0));
             const Header* walk = &nodes.at(h.hash);
-            while (active[walk->height] != walk->hash)
+            while (active[walk->height-base] != walk->hash)
             {
-                active[walk->height] = walk->hash;
-                if (!walk->height) break;
+                active[walk->height-base] = walk->hash;
+                if (walk->height == base) break;
                 walk = &nodes.at(walk->prev);
             }
         }
@@ -201,7 +361,7 @@ std::vector<uint256> Headers::Locator() const
 {
     std::vector<uint256> out;
     int step = 1, h = Tip().height;
-    for (;;) { out.push_back(At(h).hash); if (!h) break; h = std::max(0, h-step); if (out.size() > 10) step *= 2; }
+    for (;;) { out.push_back(At(h).hash); if (h == base) break; h = std::max(base, h-step); if (out.size() > 10) step *= 2; }
     return out;
 }
 
@@ -287,17 +447,21 @@ bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& t
 
 bool Destination(const btcswap::Chain& chain, const std::string& addr, CScript& script, std::string& err)
 {
+    // Bitcoin's own-node mode also knows test and signet, which the light
+    // client does not: their prefixes are testnet4's.
+    const Net* net = FindNet(chain.coin, chain.name);
+    if (!net && chain.coin == "btc" && !chain.fMain) net = FindNet("btc", "testnet4");
     script.clear(); Bytes base;
     if (DecodeBase58Check(addr, base) && base.size() == 21)
     {
         Bytes hash(base.begin()+1, base.end());
         if (base[0] == chain.pkhVersion) { script << OP_DUP << OP_HASH160 << hash << OP_EQUALVERIFY << OP_CHECKSIG; return true; }
-        if (base[0] == chain.shVersion) { script << OP_HASH160 << hash << OP_EQUAL; return true; }
+        if (base[0] == chain.shVersion || (net && base[0] == net->shVersion2)) { script << OP_HASH160 << hash << OP_EQUAL; return true; }
     }
     std::string lower = addr; bool upper = false, small = false;
     for (size_t i = 0; i < lower.size(); ++i) { if (lower[i] >= 'A' && lower[i] <= 'Z') upper = true; if (lower[i] >= 'a' && lower[i] <= 'z') small = true; lower[i] = (char)tolower((unsigned char)lower[i]); }
     size_t sep = lower.rfind('1');
-    std::string hrp = chain.fMain ? "bc" : chain.name == "regtest" ? "bcrt" : "tb";
+    std::string hrp = net ? net->hrp : chain.fMain ? "bc" : "tb";
     if (addr.size() <= 90 && !(upper && small) && sep != std::string::npos && lower.substr(0, sep) == hrp && sep+7 < lower.size())
     {
         uint32_t check = 1;
@@ -327,7 +491,7 @@ bool Destination(const btcswap::Chain& chain, const std::string& addr, CScript& 
             script.insert(script.end(), program.begin(), program.end()); return true;
         }
     }
-    err = "invalid Bitcoin destination or wrong network"; return false;
+    err = "invalid "+Label(chain.coin)+" destination or wrong network"; return false;
 }
 
 struct Peer
@@ -335,7 +499,8 @@ struct Peer
     SOCKET socket = INVALID_SOCKET;
     std::string identity;
     unsigned int magic;
-    explicit Peer(unsigned int m) : magic(m) {}
+    const Net& net;
+    explicit Peer(const Net& n) : magic(n.magic), net(n) {}
     ~Peer() { if (socket != INVALID_SOCKET) closesocket(socket); }
     Peer(const Peer&) = delete;
     Peer& operator=(const Peer&) = delete;
@@ -344,10 +509,10 @@ struct Peer
         while (size && !fShutdown)
         {
             int n = writing ? send(socket, (const char*)data, (int)size, 0) : recv(socket, (char*)data, (int)size, 0);
-            if (n <= 0) throw std::runtime_error("Bitcoin peer disconnected or timed out");
+            if (n <= 0) throw std::runtime_error(net.label+" peer disconnected or timed out");
             data += n; size -= n;
         }
-        if (size) throw std::runtime_error("Bitcoin light shutting down");
+        if (size) throw std::runtime_error(net.label+" light shutting down");
     }
     void Send(const std::string& command, const Bytes& payload)
     {
@@ -364,26 +529,26 @@ struct Peer
         for (int messages = 0; messages < 256; ++messages)
         {
             Bytes header(24); Transfer(&header[0], 24, false);
-            if (LE(header, 0, 4) != magic) throw std::runtime_error("wrong Bitcoin message magic");
+            if (LE(header, 0, 4) != magic) throw std::runtime_error("wrong "+net.label+" message magic");
             size_t length = (size_t)LE(header, 16, 4);
-            if (length > 4000000 || length > budget) throw std::runtime_error("oversized Bitcoin message");
+            if (length > 4000000 || length > budget) throw std::runtime_error("oversized "+net.label+" message");
             budget -= length;
             std::string command;
             bool ended = false;
             for (int i = 4; i < 16; ++i)
             {
                 if (!header[i]) ended = true;
-                else if (ended || header[i] < 32 || header[i] > 126) throw std::runtime_error("invalid Bitcoin command");
+                else if (ended || header[i] < 32 || header[i] > 126) throw std::runtime_error("invalid "+net.label+" command");
                 else command += (char)header[i];
             }
             Bytes payload(length); if (length) Transfer(&payload[0], length, false);
             uint256 hash = Digest(payload);
-            if (!std::equal(hash.begin(), hash.begin()+4, header.begin()+20)) throw std::runtime_error("Bitcoin checksum mismatch");
+            if (!std::equal(hash.begin(), hash.begin()+4, header.begin()+20)) throw std::runtime_error(net.label+" checksum mismatch");
             if (command == wanted) return payload;
             if (command == "ping") { if (length != 8) throw std::runtime_error("invalid ping"); Send("pong", payload); }
-            if (command == "reject" || command == "notfound") throw std::runtime_error("Bitcoin peer rejected request");
+            if (command == "reject" || command == "notfound") throw std::runtime_error(net.label+" peer rejected request");
         }
-        throw std::runtime_error("Bitcoin peer did not answer request");
+        throw std::runtime_error(net.label+" peer did not answer request");
     }
     Bytes Request(const std::string& command, const Bytes& payload, const std::string& response)
     {
@@ -397,14 +562,14 @@ struct Peer
         {
             std::string text = spec.substr(colon+1);
             if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos || text.size() > 5 || atoi(text.c_str()) < 1 || atoi(text.c_str()) > 65535)
-                throw std::runtime_error("invalid -btcpeer port");
+                throw std::runtime_error("invalid -"+net.coin+"peer port");
             port = (unsigned short)atoi(text.c_str()); host = spec.substr(0, colon);
         }
         if (host.size() > 2 && host[0] == '[' && host.back() == ']') host = host.substr(1, host.size()-2);
         // Separate nodes on one host can listen on different P2P ports.
         identity = host + ":" + strprintf("%u", (unsigned int)port);
         socket = BtfConnectSocket(host, port, 0, 15);
-        if (socket == INVALID_SOCKET) throw std::runtime_error("cannot connect to Bitcoin peer " + spec);
+        if (socket == INVALID_SOCKET) throw std::runtime_error("cannot connect to "+net.label+" peer " + spec);
 #ifdef _WIN32
         DWORD timeout = 15000;
 #else
@@ -414,12 +579,12 @@ struct Peer
         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
         Bytes version; Put(version, 70016, 4); Put(version, 0, 8); Put(version, GetTime(), 8);
         version.resize(72, 0); uint64_t nonce; randombytes_buf(&nonce, sizeof(nonce)); Put(version, nonce, 8);
-        std::string agent = "/Bitflash:btc-light/"; Compact(version, agent.size()); version.insert(version.end(), agent.begin(), agent.end());
+        std::string agent = net.agent; Compact(version, agent.size()); version.insert(version.end(), agent.begin(), agent.end());
         Put(version, 0, 4); version.push_back(0);
         Send("version", version); Bytes theirs = Receive("version");
-        if (theirs.size() < 80 || LE(theirs, 0, 4) < 70015 || !(LE(theirs, 4, 8)&64))
-            throw std::runtime_error("Bitcoin peer lacks NODE_COMPACT_FILTERS");
-        if (LE(theirs, 72, 8) == nonce) throw std::runtime_error("Bitcoin self connection");
+        if (theirs.size() < 80 || LE(theirs, 0, 4) < 70015 || (LE(theirs, 4, 8)&net.services) != net.services)
+            throw std::runtime_error(net.filters ? "Bitcoin peer lacks NODE_COMPACT_FILTERS" : net.label+" peer is not a full node");
+        if (LE(theirs, 72, 8) == nonce) throw std::runtime_error(net.label+" self connection");
         Send("verack", Bytes()); Receive("verack");
     }
 };
@@ -439,11 +604,26 @@ struct State
     int peersCompared = 0;
     size_t savedFilters = 0;
     uint256 savedFilterTail = uint256(0);
+    // Where a chain without filters (Litecoin) scans blocks: scan is the next
+    // height, and scanHash the block before it, to step back after a reorg.
+    uint256 scanHash = uint256(0);
     bool synced = false;
-    explicit State(const std::string& net) : headers(net), path(std::string(GetAppDir())+"/btc-light-"+net) {}
+    const Net& net;
+    explicit State(const std::string& network) : State(*FindNet("btc", network)) {}
+    explicit State(const Net& n) : headers(n), path(std::string(GetAppDir())+"/"+n.coin+"-light-"+n.name), net(n)
+    {
+        if (!n.filters) scan = headers.Tip().height+1;
+    }
 };
-static State* state = NULL;
+static std::map<std::string, State*> states;
 static std::mutex startMutex;
+static State& StateOf(const btcswap::Chain& chain)
+{
+    std::lock_guard<std::mutex> start(startMutex);
+    auto it = states.find(chain.coin+"/"+chain.name);
+    if (it == states.end()) throw std::runtime_error(Label(chain.coin)+" light not initialized");
+    return *it->second;
+}
 static std::string Hex(const Bytes& b) { return HexStr(b.begin(), b.end(), false); }
 static void AtomicFile(const std::string& path, const std::string& data)
 {
@@ -469,6 +649,7 @@ static void AtomicFile(const std::string& path, const std::string& data)
 static void Save(State& s)
 {
     json j; j["version"] = 1; j["network"] = s.headers.network; j["scan"] = s.scan; j["birthday"] = s.birthday;
+    if (s.net.coin != "btc") { j["coin"] = s.net.coin; j["scanHash"] = s.scanHash.GetHex(); }
     j["watched"] = json::array(); j["blocks"] = json::array(); j["pending"] = json::array();
     for (std::set<Bytes>::const_iterator it = s.watched.begin(); it != s.watched.end(); ++it) j["watched"].push_back(Hex(*it));
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it) j["blocks"].push_back(Hex(it->second));
@@ -518,6 +699,18 @@ static void SaveFilters(State& s)
 
 static void Reconcile(State& s)
 {
+    if (!s.net.filters)
+    {
+        // Blocks scanned on a branch that left the active chain are scanned
+        // again on the one that replaced it.
+        int floor = s.headers.Base()+1;
+        s.scan = std::max(floor, std::min(s.scan, s.headers.Tip().height+1));
+        // A hundred blocks back covers any reorg these chains have seen.
+        if (s.scan > floor && s.scanHash != uint256(0) && s.headers.ActiveHeight(s.scanHash) != s.scan-1)
+            s.scan = std::max(floor, s.scan-100);
+        s.scanHash = s.scan > s.headers.Base() ? s.headers.At(s.scan-1).hash : uint256(0);
+        return;
+    }
     while (!s.filters.empty() && ((int)s.filters.size()-1 > s.headers.Tip().height || s.filters.back().block != s.headers.At((int)s.filters.size()-1).hash))
         s.filters.pop_back();
     s.scan = std::min(s.scan, (int)s.filters.size());
@@ -530,7 +723,7 @@ static void Load(State& s)
     if (f)
     {
         Bytes raw(80); std::string err;
-        while (f.read((char*)raw.data(), 80)) if (!s.headers.Add(raw, err)) throw std::runtime_error("Bitcoin header store: "+err);
+        while (f.read((char*)raw.data(), 80)) if (!s.headers.Add(raw, err)) throw std::runtime_error(s.net.label+" header store: "+err);
         if (f.gcount()) throw std::runtime_error("truncated Bitcoin header store; restore its backup");
     }
     std::ifstream filters((s.path+".filters").c_str(), std::ios::binary);
@@ -549,7 +742,9 @@ static void Load(State& s)
     if (stored)
     {
         json j; stored >> j;
-        if (j.value("version",0) != 1 || j.value("network",std::string()) != s.headers.network) throw std::runtime_error("wrong Bitcoin state network/version");
+        if (j.value("version",0) != 1 || j.value("network",std::string()) != s.headers.network || j.value("coin",std::string("btc")) != s.net.coin)
+            throw std::runtime_error("wrong "+s.net.label+" state network/version");
+        if (j.contains("scanHash")) s.scanHash = uint256(j.at("scanHash").get<std::string>());
         for (const auto& text : j.at("watched")) { Bytes b = ParseHex(text.get<std::string>()); if (b.size() != 23) throw std::runtime_error("invalid saved contract script"); s.watched.insert(b); }
         for (const auto& text : j.at("blocks"))
         {
@@ -582,7 +777,7 @@ static void Discover(State& s, Peer& p, std::unique_lock<std::recursive_mutex>& 
     if (b.size()-pos != n*30) throw std::runtime_error("invalid Bitcoin addr size");
     for (uint64_t i = 0; i < n && s.peers.size() < 256; ++i, pos += 30)
     {
-        if (!(LE(b,pos+4,8)&64)) continue;
+        if ((LE(b,pos+4,8)&s.net.services) != s.net.services) continue;
         bool ipv4 = true;
         for (int k = 0; k < 10; ++k) if (b[pos+12+k]) ipv4 = false;
         if (!ipv4 || b[pos+22] != 255 || b[pos+23] != 255) continue;
@@ -594,6 +789,59 @@ static void Discover(State& s, Peer& p, std::unique_lock<std::recursive_mutex>& 
     }
 }
 static std::vector<Bytes> ActiveScripts(State& s);
+struct Located { CTransaction tx; int height; };
+static std::map<uint256, Located> Transactions(State& s);
+// A chain whose peers serve no filters: every block from the watch window to
+// the tip, each checked against its header's merkle root, and those that pay
+// a watched contract or spend such a payment kept. The window opens a day
+// before the first watch, so it is a few hundred small blocks, not the chain.
+static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
+{
+    int tip = s.headers.Tip().height;
+    if (!s.synced) return;
+    // With nothing watched the cursor follows the tip, so a first contract
+    // looks back a day (Watch) and not to the starting point.
+    if (s.watched.empty()) { s.scan = tip+1; s.scanHash = s.headers.At(tip).hash; return; }
+    if (s.birthday)
+        while (s.scan <= tip && s.headers.Median(s.headers.At(s.scan)) < s.birthday-7200) ++s.scan;
+    if (s.scan > tip) return;
+    std::vector<Bytes> scripts = ActiveScripts(s);
+    if (scripts.empty()) { s.scan = tip+1; s.scanHash = s.headers.At(tip).hash; return; }
+    std::set<Bytes> wanted(scripts.begin(), scripts.end()), requested = s.watched;
+    std::set<COutPoint> paid;
+    for (const auto& entry : Transactions(s))
+        for (size_t n = 0; n < entry.second.tx.vout.size(); ++n)
+        {
+            const CScript& out = entry.second.tx.vout[n].scriptPubKey;
+            if (s.watched.count(Bytes(out.begin(),out.end()))) paid.insert(COutPoint(entry.first,(unsigned int)n));
+        }
+    // Twenty at a time: over Tor a peer that drops the connection costs at
+    // most twenty blocks, and the cursor is saved after each batch.
+    int from = s.scan, stop = std::min(from+19, tip);
+    Bytes inv; Compact(inv,stop-from+1);
+    for (int height = from; height <= stop; ++height) { Put(inv,s.net.blockInv,4); HashBytes(inv,s.headers.At(height).hash); }
+    lock.unlock();
+    try { primary.Send("getdata",inv); lock.lock(); } catch (...) { lock.lock(); throw; }
+    for (int height = from; height <= stop; ++height)
+    {
+        lock.unlock(); Bytes block;
+        try { block = primary.Receive("block"); lock.lock(); } catch (...) { lock.lock(); throw; }
+        std::vector<CTransaction> txs;
+        if (!VerifyBlock(block,s.headers.At(height),txs)) throw std::runtime_error(s.net.label+" block does not match its header");
+        bool keep = false;
+        for (const CTransaction& tx : txs)
+        {
+            for (const CTxIn& in : tx.vin) if (paid.count(in.prevout)) keep = true;
+            for (size_t n = 0; n < tx.vout.size(); ++n)
+            {
+                const CScript& out = tx.vout[n].scriptPubKey;
+                if (wanted.count(Bytes(out.begin(),out.end()))) { keep = true; paid.insert(COutPoint(tx.GetHash(),(unsigned int)n)); }
+            }
+        }
+        if (keep) s.blocks[s.headers.At(height).hash] = block;
+    }
+    if (s.scan == from && s.watched == requested) { s.scan = stop+1; s.scanHash = s.headers.At(stop).hash; }
+}
 static void Round(State& s, Peer& primary, Peer* second)
 {
     std::unique_lock<std::recursive_mutex> lock(s.mutex);
@@ -623,12 +871,11 @@ static void Round(State& s, Peer& primary, Peer* second)
     // src/kernel/chainparams.cpp at the signed release tag v31.1 (main:
     // assumevalid block 938343; testnet4: 123613). The values first written
     // here matched no Core release and nobody could say where they came from.
-    Integer minimum = s.headers.network == "main"
-        ? Number(uint256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"))
-        : s.headers.network == "testnet4"
-        ? Number(uint256("0000000000000000000000000000000000000000000009a0fe15d0177d086304")) : Integer(0);
+    // A chain started from an anchor counts work only from there; the anchor
+    // itself is the checkpoint, and every header after it pays its own work.
+    Integer minimum = *s.net.minimumWork && s.net.anchor.empty() ? Number(uint256(s.net.minimumWork)) : Integer(0);
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
-        (s.headers.network == "regtest" || (int64)s.headers.Tip().time > GetTime()-7200);
+        (s.net.regtest || (int64)s.headers.Tip().time > GetTime()-7200);
     // Confirmed transactions remain saved so a reorg can resume rebroadcast.
     std::set<uint256> confirmed;
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it)
@@ -643,6 +890,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     try { for (const auto& raw : broadcasts) { primary.Send("tx",raw); if (second) second->Send("tx",raw); } lock.lock(); }
     catch (...) { lock.lock(); throw; }
     s.peersCompared = 1;
+    if (!s.net.filters) { ScanBlocks(s,primary,lock); Save(s); return; }
     int start = (int)s.filters.size();
     if (start <= s.headers.Tip().height)
     {
@@ -726,8 +974,9 @@ static void Round(State& s, Peer& primary, Peer* second)
     }
     Save(s);
 }
-static std::vector<std::string> ConfiguredPeers()
+static std::vector<std::string> ConfiguredPeers(const std::string& coin)
 {
+    const std::string option = "-"+coin+"peer=";
     std::vector<std::string> args, peers;
 #ifdef _WIN32
     // Read repeated options without changing the legacy wallet's parser,
@@ -754,10 +1003,10 @@ static std::vector<std::string> ConfiguredPeers()
     while (std::getline(input,arg,'\0')) args.push_back(arg);
 #endif
     for (const auto& arg : args)
-        if (arg.compare(0,9,"-btcpeer=") == 0)
+        if (arg.compare(0,option.size(),option) == 0)
         {
-            std::string peer = arg.substr(9);
-            if (peer.empty() || peer.size() > 300) throw std::runtime_error("invalid -btcpeer");
+            std::string peer = arg.substr(option.size());
+            if (peer.empty() || peer.size() > 300) throw std::runtime_error("invalid "+option.substr(0,option.size()-1));
             if (std::find(peers.begin(),peers.end(),peer) == peers.end()) peers.push_back(peer);
         }
     return peers;
@@ -765,8 +1014,8 @@ static std::vector<std::string> ConfiguredPeers()
 
 static void Worker(State* s)
 {
-    unsigned short port = s->headers.network == "main" ? 8333 : s->headers.network == "testnet4" ? 48333 : 18444;
-    unsigned int magic = s->headers.network == "main" ? 0xd9b4bef9 : s->headers.network == "testnet4" ? 0x283f161c : 0xdab5bffa;
+    const Net& net = s->net;
+    unsigned short port = net.port;
     size_t rotation = 0;
     while (!fShutdown)
     {
@@ -774,34 +1023,27 @@ static void Worker(State* s)
         {
             // Configure can run before managed Tor finishes starting. Wait
             // here instead of ever leaking a seed or peer connection directly.
-            if (s->headers.network != "regtest" && !BtfTorProxyEnabled())
-                throw std::runtime_error("Bitcoin light is waiting for the wallet's Tor proxy");
+            if (!net.regtest && !BtfTorProxyEnabled())
+                throw std::runtime_error(net.label+" light is waiting for the wallet's Tor proxy");
             std::vector<std::string> choices;
             // Explicit peers suppress seeds, which makes regtest deterministic.
-            std::vector<std::string> configured = ConfiguredPeers();
+            std::vector<std::string> configured = ConfiguredPeers(net.coin);
             // An isolated bench dials only what it is told to: no seeds and
             // no saved peers, here as on the Bitflash side.
             if (configured.empty() && fBtfIsolated)
-                throw std::runtime_error("isolated node: Bitcoin light connects only to -btcpeer=host:port");
+                throw std::runtime_error("isolated node: "+net.label+" light connects only to -"+net.coin+"peer=host:port");
             if (!configured.empty()) choices = configured;
             else
             {
                 std::lock_guard<std::recursive_mutex> lock(s->mutex); choices = s->peers;
-                if (s->headers.network == "main")
-                {
-                    choices.push_back("x49.seed.bitcoin.sprovoost.nl"); choices.push_back("x49.dnsseed.emzy.de"); choices.push_back("x49.seed.mainnet.achownodes.xyz");
-                }
-                else if (s->headers.network == "testnet4")
-                {
-                    choices.push_back("x49.seed.testnet4.bitcoin.sprovoost.nl"); choices.push_back("x49.seed.testnet4.wiz.biz");
-                }
+                choices.insert(choices.end(), net.seeds.begin(), net.seeds.end());
             }
-            if (choices.empty()) throw std::runtime_error("regtest needs -btcpeer=host:port");
-            Peer primary(magic); primary.Connect(choices[rotation++%choices.size()],port);
+            if (choices.empty()) throw std::runtime_error("regtest needs -"+net.coin+"peer=host:port");
+            Peer primary(net); primary.Connect(choices[rotation++%choices.size()],port);
             std::unique_ptr<Peer> second;
             for (size_t i = 0; i < std::min<size_t>(choices.size(),4); ++i)
             {
-                std::unique_ptr<Peer> candidate(new Peer(magic));
+                std::unique_ptr<Peer> candidate(new Peer(net));
                 try { candidate->Connect(choices[(rotation+i)%choices.size()],port); }
                 catch (...) { continue; }
                 if (candidate->identity != primary.identity) { second = std::move(candidate); break; }
@@ -815,7 +1057,7 @@ static void Worker(State* s)
             {
                 Round(*s,primary,second.get());
                 bool synced;
-                { std::lock_guard<std::recursive_mutex> lock(s->mutex); s->error.clear(); synced = s->synced && (s->watched.empty() || s->scan >= (int)s->filters.size()); }
+                { std::lock_guard<std::recursive_mutex> lock(s->mutex); s->error.clear(); synced = s->synced && (s->watched.empty() || s->scan >= (s->net.filters ? (int)s->filters.size() : s->headers.Tip().height+1)); }
                 for (int i = 0; i < (synced ? 200 : 1) && !fShutdown; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
@@ -826,39 +1068,52 @@ static void Worker(State* s)
         for (int i = 0; i < 50 && !fShutdown; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
-bool CheckChain(const std::string& network, btcswap::Chain& out, std::string& err)
+bool CheckChain(const std::string& coin, const std::string& network, btcswap::Chain& out, std::string& err)
 {
     try
     {
-        if ((network == "main") == IsTestNet()) throw std::runtime_error("Bitcoin and Bitflash networks must match");
-        std::lock_guard<std::mutex> start(startMutex);
-        if (!state)
+        const Net* net = FindNet(coin, network);
+        if (!net) throw std::runtime_error(Label(coin)+" light does not support the network "+network);
+        if ((network == "main") == IsTestNet()) throw std::runtime_error(net->label+" and Bitflash networks must match");
+        State* state = NULL;
         {
-            std::unique_ptr<State> initial(new State(network)); Load(*initial);
-            state = initial.release(); std::thread(Worker,state).detach();
+            std::lock_guard<std::mutex> start(startMutex);
+            for (auto it = states.begin(); it != states.end(); ++it)
+                if (it->second->net.coin == coin && it->second->net.name != network)
+                    throw std::runtime_error("restart wallet to change "+net->label+" light network");
+            auto it = states.find(coin+"/"+network);
+            if (it == states.end())
+            {
+                std::unique_ptr<State> initial(new State(*net)); Load(*initial);
+                state = initial.release(); states[coin+"/"+network] = state; std::thread(Worker,state).detach();
+            }
+            else state = it->second;
         }
-        if (network != state->headers.network) throw std::runtime_error("restart wallet to change Bitcoin light network");
         std::lock_guard<std::recursive_mutex> lock(state->mutex);
-        out.name = network; out.fMain = network == "main"; out.pkhVersion = out.fMain ? 0 : 111; out.shVersion = out.fMain ? 5 : 196;
+        out.coin = coin; out.name = network; out.fMain = network == "main"; out.pkhVersion = net->pkhVersion; out.shVersion = net->shVersion;
         out.nBlocks = state->headers.Tip().height; out.nMedianTime = state->headers.Median(state->headers.Tip());
         return true;
     }
     catch (const std::exception& e) { err = e.what(); return false; }
 }
-void Watch(const CScript& contract)
+void Watch(const btcswap::Chain& chain, const CScript& contract)
 {
-    if (!state) throw std::runtime_error("Bitcoin light not initialized");
+    State& s = StateOf(chain);
     CScript script; script.SetPayToScriptHash(contract); Bytes b(script.begin(),script.end());
-    std::lock_guard<std::recursive_mutex> lock(state->mutex);
-    if (state->watched.insert(b).second)
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.watched.insert(b).second)
     {
-        if (!state->birthday) state->birthday = GetTime()-7*86400;
+        if (!s.birthday) s.birthday = GetTime()-7*86400;
         // New contracts can already have a funding transaction in a recent
-        // block. Existing watches retain their cursor across restarts.
-        state->scan = std::min(state->scan,std::max(0,state->headers.Tip().height-400)); Save(*state);
+        // block. Existing watches retain their cursor across restarts. A
+        // chain scanned block by block looks back a day; Bitcoin's filters
+        // look back 400 blocks.
+        int back = s.net.filters ? 400 : (int)(86400/s.net.spacing);
+        s.scan = std::min(s.scan,std::max(s.net.filters ? 0 : s.headers.Base()+1,s.headers.Tip().height-back));
+        if (!s.net.filters) s.scanHash = s.headers.At(s.scan-1).hash;
+        Save(s);
     }
 }
-struct Located { CTransaction tx; int height; };
 static std::map<uint256, Located> Transactions(State& s)
 {
     std::map<uint256, Located> out;
@@ -900,11 +1155,12 @@ static std::vector<Bytes> ActiveScripts(State& s)
     return active;
 }
 
-json Find(const CScript& contract, const std::string& ref, bool secret)
+json Find(const btcswap::Chain& chain, const CScript& contract, const std::string& ref, bool secret)
 {
-    Watch(contract); std::lock_guard<std::recursive_mutex> lock(state->mutex); State& s = *state;
+    Watch(chain, contract); State& s = StateOf(chain); std::lock_guard<std::recursive_mutex> lock(s.mutex);
     if (!s.error.empty()) throw std::runtime_error(s.error);
-    if (!s.synced || s.scan < s.headers.Tip().height+1) throw std::runtime_error("Bitcoin light is synchronizing headers and contract filters");
+    if (!s.synced || s.scan < s.headers.Tip().height+1)
+        throw std::runtime_error(s.net.label+(s.net.filters ? " light is synchronizing headers and contract filters" : " light is synchronizing headers and scanning blocks"));
     CScript script; script.SetPayToScriptHash(contract);
     auto txs = Transactions(s); uint256 txid(0); int output = -1;
     size_t colon = ref.find(':');
@@ -920,14 +1176,14 @@ json Find(const CScript& contract, const std::string& ref, bool secret)
     else if (ref.size() == 64 && IsHex(ref)) txid = uint256(ref);
     else
     {
-        CTransaction tx; if (!IsHex(ref) || !btcswap::ParseTx(ParseHex(ref),tx)) throw std::runtime_error("invalid Bitcoin contract reference"); txid = tx.GetHash();
+        CTransaction tx; if (!IsHex(ref) || !btcswap::ParseTx(ParseHex(ref),tx)) throw std::runtime_error("invalid "+s.net.label+" contract reference"); txid = tx.GetHash();
     }
     auto funding = txs.find(txid);
     if (funding != txs.end() && output < 0)
         for (size_t n = 0; n < funding->second.tx.vout.size(); ++n) if (funding->second.tx.vout[n].scriptPubKey == script) { output = (int)n; break; }
     json j = {{"contractTxid",txid.GetHex()},{"vout",output},{"unspent",false},{"confirmations",0},{"amount",nullptr},{"spent",false},{"found",false}};
     if (funding == txs.end() || output < 0) return j;
-    if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error("Bitcoin output does not pay this contract");
+    if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
     j["confirmations"] = s.headers.Tip().height-funding->second.height+1; j["unspent"] = true;
     j["amount"] = (double)funding->second.tx.vout[output].nValue/COIN;
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
@@ -946,33 +1202,33 @@ json Find(const CScript& contract, const std::string& ref, bool secret)
         }
     return j;
 }
-bool Call(const std::string& method, const json& params, json& result, std::string& err)
+bool Call(const btcswap::Chain& chain, const std::string& method, const json& params, json& result, std::string& err)
 {
     try
     {
-        if (!state) throw std::runtime_error("Bitcoin light not initialized");
-        State& s = *state; std::lock_guard<std::recursive_mutex> lock(s.mutex);
+        State& s = StateOf(chain); std::lock_guard<std::recursive_mutex> lock(s.mutex);
         if (method == "getblockchaininfo")
         {
             result = {{"chain",s.headers.network},{"blocks",s.headers.Tip().height},{"mediantime",s.headers.Median(s.headers.Tip())},
                       {"initialblockdownload",!s.synced},{"backend","light"},{"filters",s.filters.size()},{"scanned",s.scan},{"filterPeers",s.peersCompared},{"networkError",s.error}};
+            if (!s.net.filters) { result.erase("filters"); result.erase("filterPeers"); result["startHeight"] = s.headers.Base(); result["watched"] = s.watched.size(); }
             return true;
         }
         if (method == "sendrawtransaction")
         {
             Bytes raw = ParseHex(params.at(0).get<std::string>()); CTransaction tx;
-            if (!btcswap::ParseTx(raw,tx)) throw std::runtime_error("invalid Bitcoin transaction");
+            if (!btcswap::ParseTx(raw,tx)) throw std::runtime_error("invalid "+s.net.label+" transaction");
             s.pending[tx.GetHash()] = raw; Save(s); result = tx.GetHash().GetHex(); return true;
         }
         if (method == "getrawtransaction" || method == "gettransaction")
         {
             auto txs = Transactions(s); auto it = txs.find(uint256(params.at(0).get<std::string>()));
-            if (it == txs.end()) throw std::runtime_error("Bitcoin transaction not found by contract filters");
+            if (it == txs.end()) throw std::runtime_error(s.net.label+" transaction not found by contract filters");
             CDataStream stream(SER_NETWORK); stream << it->second.tx;
             result = HexStr(stream.begin(),stream.end(),false); if (method == "gettransaction") result = json{{"hex",result}};
             return true;
         }
-        throw std::runtime_error("Bitcoin light has no wallet RPC: "+method);
+        throw std::runtime_error(s.net.label+" light has no wallet RPC: "+method);
     }
     catch (const std::exception& e) { err = e.what(); return false; }
 }
@@ -1100,5 +1356,73 @@ int SelfTest()
         printf("  persistence fixture: %s\n",e.what()); check(false,"Bitcoin light persistence fixture");
     }
     printf("btc-light: %d failure(s)\n",failures); return failures ? 1 : 0;
+}
+
+int SelfTestLitecoin()
+{
+    setbuf(stdout, NULL);
+    printf("ltc-light self-test\n");
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) { printf("  %s %s\n",ok ? "PASS" : "FAIL",what); if (!ok) ++failures; };
+    std::string err;
+    const Net* mainNet = FindNet("ltc","main"); const Net* testNet = FindNet("ltc","test"); const Net* regNet = FindNet("ltc","regtest");
+    check(mainNet && testNet && regNet && !FindNet("ltc","testnet4"),"Litecoin networks: main, test, regtest");
+    if (!mainNet || !testNet || !regNet) { printf("ltc-light: %d failure(s)\n",failures+1); return 1; }
+    // Genesis fields of litecoin v0.21.4 (chainparams.cpp asserts these hashes).
+    check(Decode(mainNet->genesis).hash.GetHex() == "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2","main genesis hash");
+    check(Decode(testNet->genesis).hash.GetHex() == "4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0","test genesis hash");
+    check(Decode(regNet->genesis).hash.GetHex() == "530827f38f93b43ed12af0b3ad25a288dc02ed74d6d7857862df51fc56c416f9","regtest genesis hash");
+    check(Number(Scrypt(mainNet->genesis)) <= Target(0x1e0ffff0),"scrypt proof of work of the main genesis");
+    // The anchors: linked, at the heights named, each with real scrypt work.
+    Headers main(*mainNet), test(*testNet);
+    check(main.Tip().height == 3203424 && main.Tip().hash.GetHex() == "fe01c0e62d46266732835006c15bda7ba9a7b5ad97c3f7d6991913d18c00b1fd","main anchor ends at 3203424");
+    check(main.Base() == 3203413 && main.At(3203413).hash.GetHex() == "11db30ba112e022643d9078c00b8fd052668595f4bd345dbf5e5b062603b21cd","main anchor starts at 3203413");
+    check(test.Tip().height == 5013792 && test.Tip().hash.GetHex() == "670e8f9e180cc5b59f5498e19b1c9895dce4967dd20f4d45b4eb3d171b56772e" &&
+          test.At(5013781).hash.GetHex() == "ae2fa4e693f3709990dd4e12cce2d4805434d8a9bc3eb7561ca00ee47a8370f6","test anchor runs 5013781 to 5013792");
+    bool work = true;
+    for (const Net* n : {mainNet, testNet})
+        for (const char* text : n->anchor)
+        {
+            Bytes raw = ParseHex(text); Header h = Decode(raw);
+            if (Number(Scrypt(raw)) > Target(h.bits)) work = false;
+        }
+    check(work,"every anchor header carries its scrypt proof of work");
+    Bytes flipped = ParseHex(mainNet->anchor.back()); flipped[76] ^= 1;
+    check(Number(Scrypt(flipped)) > Target(Decode(flipped).bits),"one nonce bit flipped loses the proof of work");
+    // Retargets the chains made (heights 3203424 and 5013792).
+    check(LitecoinRetarget(0x192ea885,1793227551LL-1792937182LL,0x1e0fffff) == 0x192ccd4e,"main retarget at 3203424 (full period)");
+    check(LitecoinRetarget(0x1d03fffc,1793656918LL-1793653639LL,0x1e0fffff) == 0x1d00ffff,"test retarget at 5013792 (clamped)");
+    check(LitecoinRetarget(0x1e0fffff,302400*4,0x1e0fffff) == 0x1e0fffff,"retarget capped at the proof-of-work limit");
+    check(main.NextBits(main.Tip(),main.Tip().time+150) == main.Tip().bits,"main keeps its bits inside a period");
+    check(test.NextBits(test.Tip(),test.Tip().time+301) == 0x1e0fffff,"test: more than two spacings late allows the limit");
+    check(test.NextBits(test.Tip(),test.Tip().time+100) == test.Tip().bits,"test: on time keeps the last real bits");
+    // A header on the anchor with the right bits and no work is refused.
+    Bytes fake; Put(fake,0x20000000,4); HashBytes(fake,main.Tip().hash); HashBytes(fake,uint256(7));
+    Put(fake,main.Tip().time+150,4); Put(fake,main.Tip().bits,4); Put(fake,0,4);
+    check(!main.Add(fake,err) && err.find("proof of work") != std::string::npos,"header without scrypt work refused");
+    Headers reg(*regNet);
+    auto mine = [&](const Header& parent, unsigned int time, unsigned int tag) {
+        Bytes b; Put(b,0x20000000,4); HashBytes(b,parent.hash); HashBytes(b,uint256(tag)); Put(b,time,4); Put(b,0x207fffff,4); Put(b,0,4);
+        for (unsigned int nonce = 0;; ++nonce) { for (int i = 0; i < 4; ++i) b[76+i] = (unsigned char)(nonce>>(8*i)); if (Number(Scrypt(b)) <= Target(0x207fffff)) return b; }
+    };
+    Bytes a = mine(reg.Tip(),reg.Tip().time+1,1);
+    check(reg.Add(a,err) && reg.Tip().height == 1,"regtest header with scrypt work");
+    // A nonce whose header hash meets the target and whose scrypt does not.
+    Bytes b; Put(b,0x20000000,4); HashBytes(b,reg.Tip().hash); HashBytes(b,uint256(2)); Put(b,reg.Tip().time+1,4); Put(b,0x207fffff,4); Put(b,0,4);
+    for (unsigned int nonce = 0;; ++nonce)
+    {
+        for (int i = 0; i < 4; ++i) b[76+i] = (unsigned char)(nonce>>(8*i));
+        if (Number(Digest(b)) <= Target(0x207fffff) && Number(Scrypt(b)) > Target(0x207fffff)) break;
+    }
+    check(!reg.Add(b,err),"work judged by scrypt, not by the header hash");
+    btcswap::Chain chain; chain.coin = "ltc"; chain.name = "main"; chain.fMain = true; chain.pkhVersion = 48; chain.shVersion = 50; CScript dest;
+    check(Destination(chain,"LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ",dest,err) && dest.size() == 25,"Litecoin key address (L...)");
+    check(Destination(chain,"MJaRnao1s62a2zAKSkmG582KbLKianqb7v",dest,err) && dest.size() == 23,"Litecoin script address (M...)");
+    check(Destination(chain,"3CNHUhP3uyB9EUtRLsmvFUmvGdjGdkTxJw",dest,err) && dest.size() == 23,"Litecoin legacy script address (3...)");
+    check(Destination(chain,"ltc1qw508d6qejxtdg4y5r3zarvary0c5xw7kgmn4n9",dest,err) && Hex(Bytes(dest.begin(),dest.end())) == "0014751e76e8199196d454941c45d1b3a323f1433bd6","Litecoin witness v0 address (ltc1)");
+    check(!Destination(chain,"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",dest,err),"a Bitcoin address is not a Litecoin destination");
+    check(!Destination(chain,"mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r",dest,err),"a test network address is not a main one");
+    check(btcswap::PkhToAddress(chain,ParseHex("751e76e8199196d454941c45d1b3a323f1433bd6")) == "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ","contract key address for Litecoin");
+    printf("ltc-light: %d failure(s)\n",failures); return failures ? 1 : 0;
 }
 } // namespace btclight

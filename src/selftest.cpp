@@ -8661,6 +8661,8 @@ int RunSelfTest(const std::string& name)
         return RunSigCheckSelfTest();
     if (name == "btc-light")
         return btclight::SelfTest();
+    if (name == "ltc-light")
+        return btclight::SelfTestLitecoin();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

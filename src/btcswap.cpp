@@ -13,43 +13,81 @@ using json = nlohmann::json;
 namespace btcswap
 {
 
+// Each chain's own-node settings (-btcchain ..., -ltcchain ...). An empty
+// entry means the defaults: the chain's main network (its test network on
+// Bitflash testnet), its node's default RPC port and data directory, and the
+// embedded light client when no node cookie is there.
+struct Config
+{
+    std::string strChain, strDataDir, strWallet, strUser, strPassword, strFeeRate;
+    int nPort = 0;
+};
 static CCriticalSection cs_config;
-static std::string g_strChain, g_strDataDir, g_strWallet, g_strUser, g_strPassword, g_strFeeRate;
-static int g_nPort = 0;
-static std::string ConfiguredChain();
+static std::map<std::string, Config> g_config;
+static std::string ConfiguredChain(const std::string& coin);
+static bool DirExists(const std::string& path);
+
+bool KnownCoin(const std::string& coin)
+{
+    return coin == "btc" || coin == "ltc";
+}
+
+static Config GetConfig(const std::string& coin)
+{
+    Config c;
+    CRITICAL_BLOCK(cs_config)
+    {
+        std::map<std::string, Config>::const_iterator it = g_config.find(coin);
+        if (it != g_config.end())
+            c = it->second;
+    }
+    return c;
+}
+
+void Configure(const std::string& strCoin, const std::string& strChain, const std::string& strDataDir, int nPort,
+               const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
+               const std::string& strFeeRate)
+{
+    if (!KnownCoin(strCoin))
+        return;
+    CRITICAL_BLOCK(cs_config)
+    {
+        Config& c = g_config[strCoin];
+        c.strChain = strChain;
+        c.strDataDir = strDataDir;
+        c.nPort = nPort;
+        c.strWallet = strWallet;
+        c.strUser = strUser;
+        c.strPassword = strPassword;
+        c.strFeeRate = strFeeRate;
+    }
+    // Loading the queue here resumes broadcasts after a wallet restart, even
+    // before the person next opens the swap screen or calls RPC. Bitcoin's
+    // client always starts, as it did; another chain's only once it has been
+    // used (its state file exists), so a wallet that never swaps with it
+    // never dials that chain's peers.
+    std::string strState = std::string(GetAppDir()) + "/" + strCoin + "-light-" + ConfiguredChain(strCoin) + ".json";
+    if (UsingLight(strCoin) && (strCoin == "btc" || DirExists(strState)))
+    {
+        Chain chain;
+        std::string err;
+        if (!btclight::CheckChain(strCoin, ConfiguredChain(strCoin), chain, err))
+            printf("%s light: %s\n", btclight::Label(strCoin).c_str(), err.c_str());
+    }
+}
 
 void Configure(const std::string& strChain, const std::string& strDataDir, int nPort,
                const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
                const std::string& strFeeRate)
 {
-    CRITICAL_BLOCK(cs_config)
-    {
-        g_strChain = strChain;
-        g_strDataDir = strDataDir;
-        g_nPort = nPort;
-        g_strWallet = strWallet;
-        g_strUser = strUser;
-        g_strPassword = strPassword;
-        g_strFeeRate = strFeeRate;
-    }
-    if (UsingLight())
-    {
-        Chain chain;
-        std::string err;
-        // Loading the queue here resumes broadcasts after a wallet restart,
-        // even before the person next opens the swap screen or calls RPC.
-        if (!btclight::CheckChain(ConfiguredChain(), chain, err))
-            printf("Bitcoin light: %s\n", err.c_str());
-    }
+    Configure("btc", strChain, strDataDir, nPort, strWallet, strUser, strPassword, strFeeRate);
 }
 
-static std::string ConfiguredChain()
+static std::string ConfiguredChain(const std::string& coin)
 {
-    std::string s;
-    CRITICAL_BLOCK(cs_config)
-        s = g_strChain;
+    std::string s = GetConfig(coin).strChain;
     if (s.empty())
-        s = IsTestNet() ? "testnet4" : "main";
+        s = !IsTestNet() ? "main" : coin == "btc" ? "testnet4" : "test";
     if (s == "mainnet")
         s = "main";
     if (s == "testnet" || s == "testnet3")
@@ -57,8 +95,15 @@ static std::string ConfiguredChain()
     return s;
 }
 
-static int DefaultPort(const std::string& chain)
+static int DefaultPort(const std::string& coin, const std::string& chain)
 {
+    if (coin == "ltc")
+    {
+        // litecoin v0.21.4, src/chainparamsbase.cpp
+        if (chain == "test")    return 19332;
+        if (chain == "regtest") return 19443;
+        return 9332;
+    }
     if (chain == "test")     return 18332;
     if (chain == "testnet4") return 48332;
     if (chain == "signet")   return 38332;
@@ -66,8 +111,15 @@ static int DefaultPort(const std::string& chain)
     return 8332;
 }
 
-static std::string ChainSubdir(const std::string& chain)
+static std::string ChainSubdir(const std::string& coin, const std::string& chain)
 {
+    if (coin == "ltc")
+    {
+        // Litecoin keeps its test network in "testnet4" (chainparamsbase.cpp).
+        if (chain == "test")    return "testnet4";
+        if (chain == "regtest") return "regtest";
+        return "";
+    }
     if (chain == "test")     return "testnet3";
     if (chain == "testnet4") return "testnet4";
     if (chain == "signet")   return "signet";
@@ -81,120 +133,159 @@ static bool DirExists(const std::string& path)
     return stat(path.c_str(), &st) == 0;
 }
 
-// Bitcoin Core's default data directory. On Windows, 28.0 moved new installs
-// to %LOCALAPPDATA%; an older install keeps %APPDATA%.
-static std::string CoreDataDir()
+// The node's default data directory. On Windows, Bitcoin Core 28.0 moved new
+// installs to %LOCALAPPDATA%; an older install keeps %APPDATA%, where
+// Litecoin Core still is.
+static std::string CoreDataDir(const std::string& coin)
 {
-    std::string dir;
-    CRITICAL_BLOCK(cs_config)
-        dir = g_strDataDir;
+    std::string dir = GetConfig(coin).strDataDir;
     if (!dir.empty())
         return dir;
+    std::string name = coin == "ltc" ? "Litecoin" : "Bitcoin";
 #ifdef _WIN32
     const char* local = getenv("LOCALAPPDATA");
     const char* roam = getenv("APPDATA");
-    std::string a = std::string(local ? local : ".") + "\\Bitcoin";
-    std::string b = std::string(roam ? roam : ".") + "\\Bitcoin";
+    std::string a = std::string(local ? local : ".") + "\\" + name;
+    std::string b = std::string(roam ? roam : ".") + "\\" + name;
+    if (coin == "ltc")
+        return b;
     return DirExists(b) && !DirExists(a) ? b : a;
 #elif defined(__APPLE__)
     const char* home = getenv("HOME");
-    return std::string(home ? home : ".") + "/Library/Application Support/Bitcoin";
+    return std::string(home ? home : ".") + "/Library/Application Support/" + name;
 #else
     const char* home = getenv("HOME");
-    return std::string(home ? home : ".") + "/.bitcoin";
+    return std::string(home ? home : ".") + (coin == "ltc" ? "/.litecoin" : "/.bitcoin");
 #endif
+}
+
+bool UsingLight(const std::string& coin)
+{
+    Config c = GetConfig(coin);
+    if (!c.strDataDir.empty() || c.nPort || !c.strWallet.empty() || !c.strUser.empty() || !c.strPassword.empty())
+        return false;
+    // An existing cookie keeps the original automatic node setup working.
+    std::string sub = ChainSubdir(coin, ConfiguredChain(coin));
+    return !DirExists(CoreDataDir(coin) + (sub.empty() ? "" : "/" + sub) + "/.cookie");
 }
 
 bool UsingLight()
 {
-    CRITICAL_BLOCK(cs_config)
-    {
-        if (!g_strDataDir.empty() || g_nPort || !g_strWallet.empty() || !g_strUser.empty() || !g_strPassword.empty())
-            return false;
-    }
-    // An existing cookie keeps the original automatic Core setup working.
-    std::string sub = ChainSubdir(ConfiguredChain());
-    return !DirExists(CoreDataDir() + (sub.empty() ? "" : "/" + sub) + "/.cookie");
+    return UsingLight("btc");
 }
 
-bool Call(const std::string& method, const json& params, json& resultOut, std::string& errOut,
-          size_t nMaxBytes, int* pnCodeOut)
+std::string BackendName(const std::string& coin)
 {
-    std::string chain = ConfiguredChain();
-    if (UsingLight())
+    return btclight::Label(coin) + (UsingLight(coin) ? " light" : " Core");
+}
+
+bool Call(const std::string& coin, const std::string& method, const json& params, json& resultOut,
+          std::string& errOut, size_t nMaxBytes, int* pnCodeOut)
+{
+    if (!KnownCoin(coin))
+    {
+        errOut = "unknown chain " + coin;
+        return false;
+    }
+    std::string chain = ConfiguredChain(coin);
+    if (UsingLight(coin))
     {
         Chain info;
-        if (!btclight::CheckChain(chain, info, errOut)) return false;
-        return btclight::Call(method, params, resultOut, errOut);
+        if (!btclight::CheckChain(coin, chain, info, errOut)) return false;
+        return btclight::Call(info, method, params, resultOut, errOut);
     }
+    Config c = GetConfig(coin);
     LoopbackRpc to;
-    to.strWho = "Bitcoin Core";
+    to.strWho = btclight::Label(coin) + " Core";
     to.nMaxBytes = nMaxBytes;
     to.nTimeoutSecs = 120;
-    std::string user, pass, wallet;
-    CRITICAL_BLOCK(cs_config)
-    {
-        to.nPort = g_nPort;
-        user = g_strUser;
-        pass = g_strPassword;
-        wallet = g_strWallet;
-    }
-    if (!to.nPort)
-        to.nPort = DefaultPort(chain);
-    if (!wallet.empty())
-        to.strPath = "/wallet/" + wallet;
-    if (!user.empty())
-        to.strAuth = user + ":" + pass;
+    to.nPort = c.nPort ? c.nPort : DefaultPort(coin, chain);
+    if (!c.strWallet.empty())
+        to.strPath = "/wallet/" + c.strWallet;
+    if (!c.strUser.empty())
+        to.strAuth = c.strUser + ":" + c.strPassword;
     else
     {
-        std::string sub = ChainSubdir(chain);
-        std::string path = CoreDataDir() + (sub.empty() ? "" : "/" + sub) + "/.cookie";
+        std::string sub = ChainSubdir(coin, chain);
+        std::string path = CoreDataDir(coin) + (sub.empty() ? "" : "/" + sub) + "/.cookie";
         if (!ReadRpcCookie(path, to.strAuth, errOut))
         {
-            errOut = "Bitcoin Core not found: " + errOut +
-                     " (is it running? or give -btcdatadir, or -btcrpcuser/-btcrpcpassword)";
+            errOut = to.strWho + " not found: " + errOut + " (is it running? or give -" + coin +
+                     "datadir, or -" + coin + "rpcuser/-" + coin + "rpcpassword)";
             return false;
         }
     }
     return LoopbackRpcCall(to, method, params, resultOut, errOut, pnCodeOut);
 }
 
-bool CheckChain(Chain& out, std::string& errOut)
+bool Call(const std::string& method, const json& params, json& resultOut, std::string& errOut,
+          size_t nMaxBytes, int* pnCodeOut)
 {
-    if (UsingLight()) return btclight::CheckChain(ConfiguredChain(), out, errOut);
+    return Call("btc", method, params, resultOut, errOut, nMaxBytes, pnCodeOut);
+}
+
+bool CheckChain(const std::string& coin, Chain& out, std::string& errOut)
+{
+    if (!KnownCoin(coin))
+    {
+        errOut = "unknown chain " + coin;
+        return false;
+    }
+    std::string want = ConfiguredChain(coin);
+    if (UsingLight(coin)) return btclight::CheckChain(coin, want, out, errOut);
+    std::string who = btclight::Label(coin) + " Core";
     json r;
-    if (!Call("getblockchaininfo", json::array(), r, errOut))
+    if (!Call(coin, "getblockchaininfo", json::array(), r, errOut))
         return false;
     if (!r.is_object() || !r.contains("chain") || !r["chain"].is_string())
     {
-        errOut = "Bitcoin Core did not say which chain it is on";
+        errOut = who + " did not say which chain it is on";
         return false;
     }
+    out.coin = coin;
     out.name = r["chain"].get<std::string>();
     out.fMain = out.name == "main";
-    out.pkhVersion = out.fMain ? 0x00 : 0x6f;
-    out.shVersion = out.fMain ? 0x05 : 0xc4;
+    if (coin == "btc")
+    {
+        out.pkhVersion = out.fMain ? 0x00 : 0x6f;
+        out.shVersion = out.fMain ? 0x05 : 0xc4;
+    }
+    else
+    {
+        const btclight::Net* net = btclight::FindNet(coin, out.name);
+        if (!net)
+        {
+            errOut = who + " is on " + out.name + ", which this wallet does not know";
+            return false;
+        }
+        out.pkhVersion = net->pkhVersion;
+        out.shVersion = net->shVersion;
+    }
     out.nBlocks = r.contains("blocks") && r["blocks"].is_number_integer() ? r["blocks"].get<int>() : 0;
     out.nMedianTime = r.contains("mediantime") && r["mediantime"].is_number_integer() ? r["mediantime"].get<int64>() : 0;
-    std::string want = ConfiguredChain();
     if (out.name != want)
     {
-        errOut = "Bitcoin Core is on " + out.name + ", -btcchain says " + want;
+        errOut = who + " is on " + out.name + ", -" + coin + "chain says " + want;
         return false;
     }
     if (out.fMain == IsTestNet())
     {
-        errOut = IsTestNet() ? "testnet BTF trades only against a Bitcoin test chain, and this Core is on main"
-                             : "mainnet BTF trades only against Bitcoin's main chain, and this Core is on " + out.name;
+        errOut = IsTestNet() ? "testnet BTF trades only against a " + btclight::Label(coin) + " test chain, and this node is on main"
+                             : "mainnet BTF trades only against " + btclight::Label(coin) + "'s main chain, and this node is on " + out.name;
         return false;
     }
     if (r.contains("initialblockdownload") && r["initialblockdownload"].is_boolean() &&
         r["initialblockdownload"].get<bool>() && out.fMain)
     {
-        errOut = "Bitcoin Core is still downloading the chain; a swap needs it at the tip";
+        errOut = who + " is still downloading the chain; a swap needs it at the tip";
         return false;
     }
     return true;
+}
+
+bool CheckChain(Chain& out, std::string& errOut)
+{
+    return CheckChain("btc", out, errOut);
 }
 
 static std::string Encode(unsigned char nVersion, const std::vector<unsigned char>& h20)
@@ -215,14 +306,17 @@ bool AddressToPkh(const Chain& chain, const std::string& addr, std::vector<unsig
     std::vector<unsigned char> v;
     if (!DecodeBase58Check(addr, v) || v.size() != 21)
     {
-        errOut = "need a legacy Bitcoin address (1... on main, m... or n... on test chains); "
-                 "bc1/tb1 addresses cannot be in this contract";
+        errOut = chain.coin == "ltc"
+                     ? "need a legacy Litecoin key address (L... on main, m... or n... on test chains); "
+                       "ltc1/tltc1 addresses cannot be in this contract"
+                     : "need a legacy Bitcoin address (1... on main, m... or n... on test chains); "
+                       "bc1/tb1 addresses cannot be in this contract";
         return false;
     }
     if (v[0] != chain.pkhVersion)
     {
         errOut = v[0] == chain.shVersion ? "that is a script address; the contract needs a key address"
-                                         : "that address is for another Bitcoin network than " + chain.name;
+                                         : "that address is for another " + btclight::Label(chain.coin) + " network than " + chain.name;
         return false;
     }
     pkhOut.assign(v.begin() + 1, v.end());
@@ -365,23 +459,28 @@ bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransacti
     return pos == raw.size();
 }
 
-int64 FeeRatePerKvB()
+int64 FeeRatePerKvB(const std::string& coin)
 {
     int64 nRate = 0;
     json r;
     std::string err;
-    if (Call("estimatesmartfee", json::array({ 6 }), r, err) && r.is_object() &&
+    if (Call(coin, "estimatesmartfee", json::array({ 6 }), r, err) && r.is_object() &&
         r.contains("feerate") && r["feerate"].is_number())
         nRate = (int64)(r["feerate"].get<double>() * COIN + 0.5);
     if (nRate <= 0)
     {
-        std::string s;
-        CRITICAL_BLOCK(cs_config)
-            s = g_strFeeRate;
+        std::string s = GetConfig(coin).strFeeRate;
         if (s.empty() || !ParseMoney(s.c_str(), nRate))
             nRate = 10000;            // 10 sat/vbyte
     }
+    // 1000 per 1000 vbytes is the minimum relay fee of Bitcoin Core and of
+    // Litecoin Core (litecoin v0.21.4, src/validation.h).
     return std::max<int64>(nRate, 1000);
+}
+
+int64 FeeRatePerKvB()
+{
+    return FeeRatePerKvB("btc");
 }
 
 bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue, const CScript& scriptTo,
