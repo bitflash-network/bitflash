@@ -36,6 +36,11 @@ static const unsigned int MAX_STANDARD_TX_SIGOPS = MAX_BLOCK_SIGOPS / 5;
 // limit (32 MB), not a block rule. Bitcoin 0.1.0 predated the later 1 MB block
 // cap, so this tree inherited no real block-size consensus limit.
 static const unsigned int MAX_BLOCK_SIZE = 1000000;
+// What a block template keeps free for what its coinbase gains after the
+// transactions are chosen: the treasury's output and the extranonce the
+// coinbase script grows by. Not the P2Pool template, which keeps room for a
+// window of payouts (P2POOL_COINBASE_BYTES).
+static const unsigned int MINER_COINBASE_ROOM = 1000;
 // Relay policy (not consensus): the largest transaction this node passes on,
 // and how many it holds waiting for a block before it starts asking for the
 // base fee. Both had no ceiling in 0.1.0: a flood of free transactions grew

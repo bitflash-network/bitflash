@@ -1766,7 +1766,7 @@ bool ReplacementPaysEnough(int64 nNewFee, unsigned int nNewSize,
 int64 EstimateNextBlockFeePerKB()
 {
     // What the next block takes: the first 100 transactions under 10 KB free
-    // (GetMinFee's discount), and up to half the size limit in all, in the
+    // (GetMinFee's discount), and up to the block size limit in all, in the
     // order the miners now use. If everything waiting fits, the minimum does;
     // if not, a little over the rate where the block would cut off.
     CRITICAL_BLOCK(cs_main)
@@ -1779,7 +1779,7 @@ int64 EstimateNextBlockFeePerKB()
         for (size_t i = 0; i < v.size(); i++)
         {
             unsigned int n = ::GetSerializeSize(*v[i], SER_NETWORK);
-            if (nSize + n >= MAX_SIZE / 2 || i >= 100)
+            if (nSize + n >= MAX_BLOCK_SIZE - MINER_COINBASE_ROOM || i >= 100)
             {
                 int64 nFee = 0;
                 int64 nRate = GetMempoolTxFee(*v[i], txdb, nFee) && n ? nFee * 1000 / n : 0;
@@ -4826,7 +4826,15 @@ bool BitcoinMiner(int nThreadId)
             MempoolByFeeRate(txdb, vOrder);
             vector<char> vfAlreadyAdded(vOrder.size());
             bool fFoundSomething = true;
-            unsigned int nBlockSize = 0;
+            // Under MAX_BLOCK_SIZE, which CheckBlock holds every block to.
+            // This loop capped at MAX_SIZE/2 (16 MB, the message limit, as
+            // in 0.1.0 before there was a block limit), so whenever the
+            // memory pool held more than a megabyte the miner built a block
+            // its own CheckBlock refused ("size limits failed"), and went on
+            // building the same block: no block at all until the pool
+            // drained. Counted from the block as it stands (header,
+            // coinbase), with room for what the coinbase gains later.
+            unsigned int nBlockSize = ::GetSerializeSize(*pblock, SER_NETWORK) + MINER_COINBASE_ROOM;
             // The block's time before its contents: the rules its
             // transactions are checked under follow from it, and it was still
             // 0 here, so they were the clock's.
@@ -4838,7 +4846,7 @@ bool BitcoinMiner(int nThreadId)
             bool fSigOpsV4 = RulesV4Active(pblock->nTime);
             fSelectedV4 = fSigOpsV4;
             unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
-            while (fFoundSomething && nBlockSize < MAX_SIZE/2)
+            while (fFoundSomething && nBlockSize < MAX_BLOCK_SIZE)
             {
                 fFoundSomething = false;
                 for (unsigned int n = 0; n < vOrder.size(); n++)
@@ -4847,6 +4855,9 @@ bool BitcoinMiner(int nThreadId)
                         continue;
                     CTransaction& tx = *vOrder[n];
                     if (tx.IsCoinBase() || !IsFinalForNextBlock(tx))
+                        continue;
+                    unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
+                    if (nBlockSize + nTxSize > MAX_BLOCK_SIZE)
                         continue;
 
                     // Transaction fee requirements, mainly only needed for flood control
@@ -4867,7 +4878,7 @@ bool BitcoinMiner(int nThreadId)
                     swap(mapTestPool, mapTestPoolTmp);
 
                     pblock->vtx.push_back(tx);
-                    nBlockSize += ::GetSerializeSize(tx, SER_NETWORK);
+                    nBlockSize += nTxSize;
                     vfAlreadyAdded[n] = true;
                     fFoundSomething = true;
                 }
