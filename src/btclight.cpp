@@ -779,6 +779,10 @@ static void Worker(State* s)
             std::vector<std::string> choices;
             // Explicit peers suppress seeds, which makes regtest deterministic.
             std::vector<std::string> configured = ConfiguredPeers();
+            // An isolated bench dials only what it is told to: no seeds and
+            // no saved peers, here as on the Bitflash side.
+            if (configured.empty() && fBtfIsolated)
+                throw std::runtime_error("isolated node: Bitcoin light connects only to -btcpeer=host:port");
             if (!configured.empty()) choices = configured;
             else
             {

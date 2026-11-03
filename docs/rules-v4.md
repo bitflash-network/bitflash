@@ -215,7 +215,8 @@ cannot be raised later; pick it generously.
 ## Proven on an isolated testnet bench (2026-10-24)
 
 Two nodes forked off the testnet at height 9642 with `-isolate` (no cached
-peers, seeds, Nostr or peer exchange; each dials the other with
+peers, seeds, Nostr or peer exchange, and no Bitcoin light client connection
+without `-btcpeer`; each dials the other with
 `-connectbtf=ADDRESS@HOST.onion:PORT`) and `-benchrulesv4=<time>`, which moves
 the switch on that bench only and is refused on mainnet and without
 `-isolate`. One mined, the other validated every block it was sent. Contracts

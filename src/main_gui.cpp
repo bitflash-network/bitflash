@@ -488,7 +488,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         strBtfConnect = btfConnect;
 
     // A testnet bench, cut off from the testnet: -isolate talks to the
-    // -connectbtf peer only, and -benchrulesv4=TIME switches rules v4 on at
+    // -connectbtf peer only (and the Bitcoin light client to -btcpeer only), and -benchrulesv4=TIME switches rules v4 on at
     // TIME there, so they can be spent and broken with coins before the date.
     // Neither exists on mainnet.
     bool fIsolate = arg(argc, argv, "/isolate") || arg(argc, argv, "-isolate");
