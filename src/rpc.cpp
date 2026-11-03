@@ -316,7 +316,12 @@ static bool RebuildJob()
                 bool fSigOpsV4 = RulesV4Active(block.nTime);
                 fSelectedV4 = fSigOpsV4;
                 unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount(fSigOpsV4);
-                unsigned int nSizeLimit = MAX_SIZE / 2;
+                // Under MAX_BLOCK_SIZE, which CheckBlock holds every block
+                // to; this was MAX_SIZE / 2 (16 MB), and a memory pool past
+                // a megabyte made every operator block fail its own check.
+                // sz counts transactions only: the header and the coinbase,
+                // with what it gains later, have the room taken off.
+                unsigned int nSizeLimit = MAX_BLOCK_SIZE - MINER_COINBASE_ROOM;
                 if (fP2PoolMode)
                 {
                     // Room for the coinbase P2PoolCoinbase writes later: an
