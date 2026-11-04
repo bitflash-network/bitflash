@@ -630,6 +630,15 @@ static void ParseStartupArguments(int argc, char* argv[])
                        argval2(argc, argv, "/btcrpcuser", "-btcrpcuser"),
                        argval2(argc, argv, "/btcrpcpassword", "-btcrpcpassword"),
                        argval2(argc, argv, "/btcfeerate", "-btcfeerate"));
+    // The same for Litecoin (-ltcchain ...): litecoind, or the light client.
+    btcswap::Configure("ltc",
+                       argval2(argc, argv, "/ltcchain", "-ltcchain"),
+                       argval2(argc, argv, "/ltcdatadir", "-ltcdatadir"),
+                       atoi(argval2(argc, argv, "/ltcrpcport", "-ltcrpcport").c_str()),
+                       argval2(argc, argv, "/ltcwallet", "-ltcwallet"),
+                       argval2(argc, argv, "/ltcrpcuser", "-ltcrpcuser"),
+                       argval2(argc, argv, "/ltcrpcpassword", "-ltcrpcpassword"),
+                       argval2(argc, argv, "/ltcfeerate", "-ltcfeerate"));
     // Invoices: the shop's own payment gateway (invoice.h).
     {
         invoice::Config ic;

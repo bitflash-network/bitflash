@@ -51,9 +51,17 @@ static const int64 PARTICIPANT_LOCK_SECS = 24 * 3600;
 void Configure(const std::string& strChain, const std::string& strDataDir, int nPort,
                const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
                const std::string& strFeeRate);
+// The same for another chain ("ltc"): -<coin>chain, -<coin>datadir, ... and
+// its own node (litecoind) or its embedded light client.
+void Configure(const std::string& strCoin, const std::string& strChain, const std::string& strDataDir, int nPort,
+               const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
+               const std::string& strFeeRate);
+// The chains a swap can be made with, and whether a ticker is one of them.
+bool KnownCoin(const std::string& strCoin);
 
 struct Chain
 {
+    std::string coin = "btc";    // which chain: btc, ltc
     std::string name;            // as getblockchaininfo says: main, test, testnet4, signet, regtest
     bool fMain = false;
     unsigned char pkhVersion = 0;
@@ -63,14 +71,20 @@ struct Chain
 };
 
 bool UsingLight();
+bool UsingLight(const std::string& strCoin);
 
 // One call to Bitcoin Core. nMaxBytes: a raw block needs more than the default.
 bool Call(const std::string& method, const nlohmann::json& params, nlohmann::json& resultOut,
           std::string& errOut, size_t nMaxBytes = 4 * 1024 * 1024, int* pnCodeOut = NULL);
+bool Call(const std::string& strCoin, const std::string& method, const nlohmann::json& params, nlohmann::json& resultOut,
+          std::string& errOut, size_t nMaxBytes = 4 * 1024 * 1024, int* pnCodeOut = NULL);
+// "Bitcoin Core", "Litecoin Core", or the light client's name, for messages.
+std::string BackendName(const std::string& strCoin);
 
 // Ask Core which chain it is on, and refuse a chain that does not go with
 // this Bitflash network or with -btcchain.
 bool CheckChain(Chain& out, std::string& errOut);
+bool CheckChain(const std::string& strCoin, Chain& out, std::string& errOut);
 
 std::string PkhToAddress(const Chain& chain, const std::vector<unsigned char>& pkh);
 // Only P2PKH: the contract holds a Hash160 of a key, nothing else.
@@ -90,6 +104,7 @@ bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransacti
 // Fee rate to use, satoshis per 1000 vbytes: Core's estimate for 6 blocks,
 // else the configured one; never under 1 sat/vbyte.
 int64 FeeRatePerKvB();
+int64 FeeRatePerKvB(const std::string& strCoin);
 
 // Build and sign the spend of a contract output: redeem when pSecret is
 // given, else refund (nLockTime set to the contract's). One output, to
