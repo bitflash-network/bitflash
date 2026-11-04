@@ -381,6 +381,11 @@ static bool Socks5Connect(SOCKET s, const std::string& destHost,
     return true;
 }
 
+SOCKET BtfConnectLoopback(unsigned short destPort, int nTimeoutSecs)
+{
+    return ConnectDirect("127.0.0.1", destPort, 0, nTimeoutSecs);
+}
+
 SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
                         int nSockSite, int nTimeoutSecs)
 {

@@ -62,9 +62,16 @@ protocol, over Tor, to the chain's own peers, with no server of anyone's.
   blocks, but only those inside a swap's window, from when the contract can be
   funded to when the refund opens. These chains' blocks are small; a 48-hour
   window is a few hundred to a few thousand blocks.
-- **Minimum work.** It reports nothing until the header chain carries the
-  chain's own minimum chain work (from the chain's release), so a peer that
-  isolates it cannot feed it a cheap fork.
+- **Minimum work.** Started from genesis, it reports nothing until the header
+  chain carries the chain's own minimum chain work (from the chain's release),
+  so a peer that isolates it cannot feed it a cheap fork. Started from an
+  anchor (Litecoin), the anchor plays that part: what follows it must pay the
+  chain's real difficulty from there, reach the present, and hold against a
+  second peer's headers, the most work winning.
+- **Confirmations.** A peer that shows a private fork of real blocks is only
+  stopped by asking for more of them than it can afford, so a swap on a chain
+  with faster blocks asks for as much time as Bitcoin's confirmations cost,
+  not the same count.
 
 Embedded on 2026-12-25: Litecoin, Dogecoin, Bitcoin Cash and eCash, whose
 proof of work this client can check (scrypt, AuxPoW over scrypt, SHA-256d).

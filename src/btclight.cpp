@@ -334,7 +334,7 @@ bool Headers::Add(const Bytes& raw, std::string& err)
         if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
         const Header& p = it->second;
         Integer target = Target(h.bits), limit = Target(net->limitBits);
-        if (target <= 0 || target > limit || Number(net->scrypt ? Scrypt(raw) : h.hash) > target)
+        if (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(raw)) : h.hash) > target)
             throw std::runtime_error("invalid "+net->label+" proof of work");
         if (h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
         if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
@@ -356,6 +356,16 @@ bool Headers::Add(const Bytes& raw, std::string& err)
         return true;
     }
     catch (const std::exception& e) { err = e.what(); return false; }
+}
+int Headers::ForkHeight(const uint256& hash) const
+{
+    auto it = nodes.find(hash);
+    while (it != nodes.end() && ActiveHeight(it->first) < 0)
+    {
+        if (it->second.height <= base) return -1;
+        it = nodes.find(it->second.prev);
+    }
+    return it == nodes.end() ? -1 : it->second.height;
 }
 std::vector<uint256> Headers::Locator() const
 {
@@ -568,7 +578,9 @@ struct Peer
         if (host.size() > 2 && host[0] == '[' && host.back() == ']') host = host.substr(1, host.size()-2);
         // Separate nodes on one host can listen on different P2P ports.
         identity = host + ":" + strprintf("%u", (unsigned int)port);
-        socket = BtfConnectSocket(host, port, 0, 15);
+        // Regtest has no Tor to wait for, and with the wallet's Tor up a peer
+        // on this machine could not be reached through it. Nothing leaves.
+        socket = net.regtest && (host == "127.0.0.1" || host == "localhost") ? BtfConnectLoopback(port, 15) : BtfConnectSocket(host, port, 0, 15);
         if (socket == INVALID_SOCKET) throw std::runtime_error("cannot connect to "+net.label+" peer " + spec);
 #ifdef _WIN32
         DWORD timeout = 15000;
@@ -705,9 +717,12 @@ static void Reconcile(State& s)
         // again on the one that replaced it.
         int floor = s.headers.Base()+1;
         s.scan = std::max(floor, std::min(s.scan, s.headers.Tip().height+1));
-        // A hundred blocks back covers any reorg these chains have seen.
         if (s.scan > floor && s.scanHash != uint256(0) && s.headers.ActiveHeight(s.scanHash) != s.scan-1)
-            s.scan = std::max(floor, s.scan-100);
+        {
+            // Back to the fork point, or from the start if the block is unknown.
+            int fork = s.headers.ForkHeight(s.scanHash);
+            s.scan = std::max(floor, std::min(s.scan, fork < 0 ? floor : fork+1));
+        }
         s.scanHash = s.scan > s.headers.Base() ? s.headers.At(s.scan-1).hash : uint256(0);
         return;
     }
@@ -723,7 +738,15 @@ static void Load(State& s)
     if (f)
     {
         Bytes raw(80); std::string err;
-        while (f.read((char*)raw.data(), 80)) if (!s.headers.Add(raw, err)) throw std::runtime_error(s.net.label+" header store: "+err);
+        s.headers.storedHeaders = true;
+        while (f.read((char*)raw.data(), 80))
+        {
+            // A later release can start from a later anchor: what is stored
+            // from before it no longer connects, and is not needed.
+            if (!s.net.anchor.empty() && !s.headers.Contains(ReadHash(raw,4))) continue;
+            if (!s.headers.Add(raw, err)) throw std::runtime_error(s.net.label+" header store: "+err);
+        }
+        s.headers.storedHeaders = false;
         if (f.gcount()) throw std::runtime_error("truncated Bitcoin header store; restore its backup");
     }
     std::ifstream filters((s.path+".filters").c_str(), std::ios::binary);
@@ -791,16 +814,15 @@ static void Discover(State& s, Peer& p, std::unique_lock<std::recursive_mutex>& 
 static std::vector<Bytes> ActiveScripts(State& s);
 struct Located { CTransaction tx; int height; };
 static std::map<uint256, Located> Transactions(State& s);
-// A chain whose peers serve no filters: every block from the watch window to
-// the tip, each checked against its header's merkle root, and those that pay
-// a watched contract or spend such a payment kept. The window opens a day
-// before the first watch, so it is a few hundred small blocks, not the chain.
+// A chain whose peers serve no filters: every block from the contract's
+// window to the tip (Watch), each checked against its header's merkle root,
+// and those that pay a watched contract or spend such a payment kept.
 static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
 {
     int tip = s.headers.Tip().height;
     if (!s.synced) return;
     // With nothing watched the cursor follows the tip, so a first contract
-    // looks back a day (Watch) and not to the starting point.
+    // looks back as far as it needs (Watch) and not to the starting point.
     if (s.watched.empty()) { s.scan = tip+1; s.scanHash = s.headers.At(tip).hash; return; }
     if (s.birthday)
         while (s.scan <= tip && s.headers.Median(s.headers.At(s.scan)) < s.birthday-7200) ++s.scan;
@@ -842,12 +864,13 @@ static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_
     }
     if (s.scan == from && s.watched == requested) { s.scan = stop+1; s.scanHash = s.headers.At(stop).hash; }
 }
-static void Round(State& s, Peer& primary, Peer* second)
+// One getheaders with a peer; how many headers it sent. Each goes through the
+// same checks whoever sent it, and the most work wins.
+static uint64_t PullHeaders(State& s, Peer& peer, std::unique_lock<std::recursive_mutex>& lock)
 {
-    std::unique_lock<std::recursive_mutex> lock(s.mutex);
     Bytes request; Put(request,70016,4); std::vector<uint256> locator = s.headers.Locator(); Compact(request,locator.size());
     for (size_t i = 0; i < locator.size(); ++i) HashBytes(request,locator[i]); HashBytes(request,uint256(0));
-    Bytes response = Fetch(primary,"getheaders",request,"headers",lock);
+    Bytes response = Fetch(peer,"getheaders",request,"headers",lock);
     size_t pos = 0; uint64_t n = Count(response,pos,2000);
     uint256 last(0);
     for (uint64_t i = 0; i < n; ++i)
@@ -863,6 +886,20 @@ static void Round(State& s, Peer& primary, Peer* second)
         if (!known) AppendHeader(s,raw); last = h.hash;
     }
     if (pos != response.size()) throw std::runtime_error("extra Bitcoin header bytes");
+    return n;
+}
+static void Round(State& s, Peer& primary, Peer* second)
+{
+    std::unique_lock<std::recursive_mutex> lock(s.mutex);
+    uint64_t n = PullHeaders(s,primary,lock);
+    // Without filter headers to compare, a chain of real work that only the
+    // primary peer shows would go uncontradicted: the second peer's headers
+    // count too. A second peer that fails only takes itself out.
+    if (second && !s.net.filters)
+    {
+        try { n = std::max(n,PullHeaders(s,*second,lock)); }
+        catch (const std::exception& e) { printf("%s light: second peer: %s\n",s.net.label.c_str(),e.what()); }
+    }
     Reconcile(s);
     if (s.filters.size() < s.savedFilters) SaveFilters(s);
     // A fresh timestamp alone is cheap to forge near genesis. Do not expose
@@ -1103,14 +1140,27 @@ void Watch(const btcswap::Chain& chain, const CScript& contract)
     std::lock_guard<std::recursive_mutex> lock(s.mutex);
     if (s.watched.insert(b).second)
     {
-        if (!s.birthday) s.birthday = GetTime()-7*86400;
-        // New contracts can already have a funding transaction in a recent
-        // block. Existing watches retain their cursor across restarts. A
-        // chain scanned block by block looks back a day; Bitcoin's filters
-        // look back 400 blocks.
-        int back = s.net.filters ? 400 : (int)(86400/s.net.spacing);
-        s.scan = std::min(s.scan,std::max(s.net.filters ? 0 : s.headers.Base()+1,s.headers.Tip().height-back));
-        if (!s.net.filters) s.scanHash = s.headers.At(s.scan-1).hash;
+        if (s.net.filters)
+        {
+            if (!s.birthday) s.birthday = GetTime()-7*86400;
+            // New contracts can already have a funding transaction in a recent
+            // block. Existing watches retain their cursor across restarts.
+            s.scan = std::min(s.scan,std::max(0,s.headers.Tip().height-400));
+        }
+        else
+        {
+            // Scanned block by block, the contract says how far back to look:
+            // it cannot have been funded before its lock less the longest lock.
+            // That holds however late the audit or the refund comes, and costs
+            // only the blocks since the contract was made.
+            swap::Contract c;
+            int64 start = swap::ParseContract(contract,c) ? c.nLockTime-btcswap::INITIATOR_LOCK_SECS-7200 : GetTime()-3*86400;
+            int height = s.headers.Tip().height;
+            while (height > s.headers.Base()+1 && (int64)s.headers.At(height-1).time >= start) --height;
+            s.scan = std::min(s.scan,height);
+            s.scanHash = s.headers.At(s.scan-1).hash;
+            if (!s.birthday || start < s.birthday) s.birthday = start;
+        }
         Save(s);
     }
 }
@@ -1415,6 +1465,34 @@ int SelfTestLitecoin()
         if (Number(Digest(b)) <= Target(0x207fffff) && Number(Scrypt(b)) > Target(0x207fffff)) break;
     }
     check(!reg.Add(b,err),"work judged by scrypt, not by the header hash");
+    // A reorg: the scan cursor goes back to the fork point, however deep.
+    {
+        State s(*regNet);
+        Header top = s.headers.Tip(); std::vector<Bytes> line;
+        for (int i = 0; i < 4; ++i) { Bytes h = mine(top,top.time+1,10+i); s.headers.Add(h,err); top = s.headers.Tip(); line.push_back(h); }
+        s.scan = 5; s.scanHash = s.headers.At(4).hash; Reconcile(s);
+        check(s.scan == 5,"scan stays where it is on the same branch");
+        Header side = s.headers.At(1);
+        for (int i = 0; i < 5; ++i) { Bytes h = mine(side,side.time+1,40+i); s.headers.Add(h,err); side = Decode(h); side.height = 2+i; }
+        check(s.headers.Tip().height == 6 && s.headers.ForkHeight(Decode(line[3]).hash) == 1,"fork height of a block on a dead branch");
+        Reconcile(s);
+        check(s.scan == 2 && s.scanHash == s.headers.At(1).hash,"reorg sends the scan back to the fork point");
+    }
+    // The store: a later anchor drops what no longer connects, and the stored
+    // chain is read without scrypt, every other rule still applied.
+    {
+        const char* temporary = getenv("TEMP");
+        unsigned char nonce[8]; randombytes_buf(nonce,sizeof(nonce));
+        std::string prefix = std::string(temporary ? temporary : ".")+"/ltc-light-selftest-"+Hex(Bytes(nonce,nonce+8));
+        State s(*regNet); s.path = prefix;
+        Header top = s.headers.Tip();
+        for (int i = 0; i < 3; ++i) { Bytes h = mine(top,top.time+1,60+i); s.headers.Add(h,err); AppendHeader(s,h); top = s.headers.Tip(); }
+        State again(*regNet); again.path = prefix; Load(again);
+        check(again.headers.Tip().hash == top.hash,"stored headers read back");
+        Net later = *mainNet; later.anchor.assign(mainNet->anchor.end()-1,mainNet->anchor.end());
+        State moved(later); moved.path = prefix; Load(moved);
+        check(moved.headers.Tip().height == 3203424 && moved.headers.Base() == 3203424,"headers from before a later anchor are skipped, not fatal");
+    }
     btcswap::Chain chain; chain.coin = "ltc"; chain.name = "main"; chain.fMain = true; chain.pkhVersion = 48; chain.shVersion = 50; CScript dest;
     check(Destination(chain,"LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ",dest,err) && dest.size() == 25,"Litecoin key address (L...)");
     check(Destination(chain,"MJaRnao1s62a2zAKSkmG582KbLKianqb7v",dest,err) && dest.size() == 23,"Litecoin script address (M...)");

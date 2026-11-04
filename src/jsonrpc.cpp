@@ -3417,7 +3417,45 @@ static json CoinFindSecret(const string& coin, const json& p)
             btcswap::ParseTx(ParseHex(raw.get<string>()), tx))
             vCandidates.push_back(tx);
     }
-    int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - 400);
+    // More than a 48-hour lock: 400 of Bitcoin's blocks, 1728 of Litecoin's.
+    int nBack = coin == "ltc" ? 1728 : 400;
+    int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
+    if (coin != "btc")
+    {
+        // A raw Litecoin block carries MWEB data and a HogEx transaction that
+        // this wallet's reader does not take (and need not), so the node is
+        // asked for the block decoded, and the inputs are read from that.
+        for (int h = chain.nBlocks; h >= nFrom; h--)
+        {
+            json hash = CoinCall(coin, "getblockhash", json::array({ h }));
+            json block = CoinCall(coin, "getblock", json::array({ hash, 2 }), 256 * 1024 * 1024);
+            if (!block.is_object() || !block.contains("tx") || !block["tx"].is_array())
+                throw runtime_error(strprintf("%s block %d does not decode", btclight::Label(coin).c_str(), h));
+            for (const json& tx : block["tx"])
+            {
+                if (!tx.is_object() || !tx.contains("vin") || !tx["vin"].is_array())
+                    continue;
+                for (const json& in : tx["vin"])
+                {
+                    if (!in.is_object() || in.value("txid", string()) != strTxid || in.value("vout", -1) != (int)n)
+                        continue;
+                    j["found"] = true;
+                    j["height"] = h;
+                    j["txid"] = tx.value("txid", string());
+                    vector<unsigned char> secret, vchSig;
+                    if (in.contains("scriptSig") && in["scriptSig"].is_object() && in["scriptSig"].contains("hex"))
+                        vchSig = ParseHex(in["scriptSig"]["hex"].get<string>());
+                    if (swap::ExtractSecret(CScript(vchSig.begin(), vchSig.end()), c.secretHash, secret))
+                        j["secret"] = HexStr(secret.begin(), secret.end(), false);
+                    else
+                        j["refunded"] = true;
+                    return j;
+                }
+            }
+        }
+        j["found"] = false;
+        return j;
+    }
     for (int h = chain.nBlocks; vCandidates.empty() && h >= nFrom; h--)
     {
         json hash = CoinCall(coin, "getblockhash", json::array({ h }));

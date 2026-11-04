@@ -76,8 +76,14 @@ public:
     unsigned int NextBits(const Header& parent, unsigned int time) const;
     std::vector<uint256> Locator() const;
     int Base() const { return base; }
+    // The height of the last active ancestor of a known header, -1 if unknown.
+    int ForkHeight(const uint256& hash) const;
     std::string network;
     const Net* net;
+    // Reading this node's own store: every link, retarget and time is checked
+    // again, but not scrypt, which over a year of headers would hold the start
+    // of the wallet for minutes.
+    bool storedHeaders = false;
 private:
     void Start(const Net& n);
     std::map<uint256, Header> nodes;

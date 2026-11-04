@@ -30,5 +30,7 @@ std::string BtfSocks5ProxyName();
 
 SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
                         int nSockSite, int nTimeoutSecs);
+// A port on this machine, never through the proxy: Tor refuses loopback.
+SOCKET BtfConnectLoopback(unsigned short destPort, int nTimeoutSecs);
 
 #endif
