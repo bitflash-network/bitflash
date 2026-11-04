@@ -443,9 +443,9 @@ void ShowSwaps()
                       Short(s.peer).c_str(), btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str(),
                       btfchat::FormatSwapAmount(s.wantAmount).c_str(), s.want.c_str(), s.status.c_str()));
         if (s.stage == btfchat::SW_WAIT_PAYMENT && !s.paymentAddress.empty())
-            Say("      pay exactly " + btfchat::FormatSwapAmount(s.giveAmount) + " BTC to " + s.paymentAddress);
-        if ((s.give == "BTC" || s.want == "BTC") && s.btcDestination.empty() && s.myTxid.empty())
-            Say(strprintf("      your Bitcoin address: swap btc %u ADDRESS", (unsigned)(i + 1)));
+            Say("      pay exactly " + btfchat::FormatSwapAmount(s.giveAmount) + " " + s.give + " to " + s.paymentAddress);
+        if (s.btcDestination.empty() && s.myTxid.empty())
+            Say(strprintf("      your %s address: swap btc %u ADDRESS", s.give == "BTF" ? s.want.c_str() : s.give.c_str(), (unsigned)(i + 1)));
         if (s.fNeedsMe)
             Say(strprintf("      waiting for you: swap ok %u  (%s: lock %s %s)", (unsigned)(i + 1),
                           s.fMaker ? "accept" : "go on", btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str()));
@@ -688,21 +688,25 @@ void Command(const std::string& line)
     }
     if (cmd == "offer")
     {
-        // offer AMOUNT BTF|BTC for AMOUNT
+        // offer AMOUNT BTF|BTC|LTC for AMOUNT [BTC|LTC]
         std::istringstream a(rest);
-        std::string sGive, coin, sFor, sWant;
-        a >> sGive >> coin >> sFor >> sWant;
+        std::string sGive, coin, sFor, sWant, wantCoin;
+        a >> sGive >> coin >> sFor >> sWant >> wantCoin;
         std::transform(coin.begin(), coin.end(), coin.begin(), ::toupper);
+        std::transform(wantCoin.begin(), wantCoin.end(), wantCoin.begin(), ::toupper);
+        if (wantCoin.empty())
+            wantCoin = coin == "BTF" ? "BTC" : "BTF";
         int64 nGive = 0, nWant = 0;
-        if (g_room.empty() || (coin != "BTF" && coin != "BTC") || sFor != "for" ||
+        if (g_room.empty() || !btfchat::SwapCoinOk(coin) || !btfchat::SwapCoinOk(wantCoin) || coin == wantCoin ||
+            (coin != "BTF" && wantCoin != "BTF") || sFor != "for" ||
             !ParseMoney(sGive.c_str(), nGive) || nGive <= 0 || !ParseMoney(sWant.c_str(), nWant) || nWant <= 0)
         {
-            Say("in an open room: offer AMOUNT BTF for AMOUNT   (or AMOUNT BTC for AMOUNT)");
+            Say("in an open room: offer AMOUNT BTF for AMOUNT [BTC|LTC]   (or AMOUNT BTC for AMOUNT, AMOUNT LTC for AMOUNT)");
             return;
         }
         btfchat::SwapOffer o;
         o.give = coin;
-        o.want = coin == "BTF" ? "BTC" : "BTF";
+        o.want = wantCoin;
         o.giveAmount = nGive;
         o.wantAmount = nWant;
         if (btfchat::ChatSwapPostOffer(g_room, o, err))

@@ -8009,6 +8009,7 @@ static int RunInvoiceSelfTest()
 //   CHATSWAP_B=port:passfile   Bob's
 //   CHATSWAP_BTC=port          the regtest Core both wallets use (user/pass swap/swap,
 //                              wallet "w" mines)
+//   CHATSWAP_COIN=LTC          swap against Litecoin Core instead
 
 namespace
 {
@@ -8216,6 +8217,11 @@ static bool SwapTestRun(btfchat::SwapEngine& maker, btfchat::SwapEngine& taker, 
 static int RunChatSwapSelfTest()
 {
     printf("chat-swap self-test (testnet Bitflash wallets + Bitcoin Core regtest)\n");
+#ifdef _WIN32
+    // A self-test starts before the node would have started Winsock.
+    WSADATA wsadata;
+    WSAStartup(MAKEWORD(2, 2), &wsadata);
+#endif
     SwapTestHost a, b;
     const char* pszBtc = getenv("CHATSWAP_BTC");
     if (!IsTestNet() || !SwapTestWallet("CHATSWAP_A", a.wallet) || !SwapTestWallet("CHATSWAP_B", b.wallet) || !pszBtc)
@@ -8225,6 +8231,9 @@ static int RunChatSwapSelfTest()
     }
     int nBtc = atoi(pszBtc);
     int nFail = 0;
+    // CHATSWAP_COIN=LTC: the same swaps on Litecoin, with Litecoin Core on
+    // regtest in Bitcoin Core's place (CHATSWAP_BTC names its port).
+    const std::string coin = getenv("CHATSWAP_COIN") ? getenv("CHATSWAP_COIN") : "BTC";
     a.addr = "alice.btf";
     b.addr = "bob.btf";
     a.other = &b;
@@ -8238,7 +8247,7 @@ static int RunChatSwapSelfTest()
             btfchat::SwapEngine ea(&a), eb(&b);
             btfchat::SwapOffer o;
             o.give = "BTF"; o.giveAmount = COIN;
-            o.want = "BTC"; o.wantAmount = 5000000;
+            o.want = coin; o.wantAmount = 5000000;
             a.offers["11111111111111111111111111111111"] = o;
             std::string id, err;
             nFail += Check(eb.Take(a.addr, "11111111111111111111111111111111", o, id, err), "Bob takes the offer") ? 0 : 1;
@@ -8266,7 +8275,7 @@ static int RunChatSwapSelfTest()
             a.convo.clear();
             b.convo.clear();
             btfchat::SwapOffer o;
-            o.give = "BTC"; o.giveAmount = 4000000;
+            o.give = coin; o.giveAmount = 4000000;
             o.want = "BTF"; o.wantAmount = 80000000;
             b.offers["22222222222222222222222222222222"] = o;
             std::string id, err;
@@ -8292,7 +8301,7 @@ static int RunChatSwapSelfTest()
             b.convo.clear();
             btfchat::SwapOffer o;
             o.give = "BTF"; o.giveAmount = 50000000;
-            o.want = "BTC"; o.wantAmount = 3000000;
+            o.want = coin; o.wantAmount = 3000000;
             a.offers["33333333333333333333333333333333"] = o;
             std::string id, err;
             nFail += Check(eb.Take(a.addr, "33333333333333333333333333333333", o, id, err), "Bob takes it") ? 0 : 1;
@@ -8323,7 +8332,7 @@ struct WaitPayHost : public btfchat::SwapHost
     std::map<std::string, nlohmann::json> audits;   // any other contract, by its hex
     std::map<std::string, nlohmann::json> finds;    // btcfindsecret/swapfindsecret, by contract
     nlohmann::json refundParams, redeemParams;
-    int nRefunds = 0, nSteps = 0, nRedeems = 0;
+    int nRefunds = 0, nSteps = 0, nRedeems = 0, nCoinCalls = 0;
     std::string lastStep;
 
     std::string MyAddress() { return "me"; }
@@ -8333,8 +8342,18 @@ struct WaitPayHost : public btfchat::SwapHost
     void Contacts(std::vector<std::string>& out) { out.clear(); }
     void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out.clear(); }
     bool FindMyOffer(const std::string&, btfchat::SwapOffer&) { return false; }
-    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    bool Wallet(const std::string& methodIn, const nlohmann::json& paramsIn, nlohmann::json& r, std::string& err)
     {
+        // A chain other than Bitcoin goes through coin<step>, the chain first.
+        std::string method = methodIn;
+        nlohmann::json params = paramsIn;
+        if (method.compare(0, 4, "coin") == 0)
+        {
+            if (!params.is_array() || params.empty() || params[0] != "ltc") { err = "coin call without its chain"; return false; }
+            nCoinCalls++;
+            method = "btc" + method.substr(4);
+            params.erase(params.begin());
+        }
         std::string contract = params.is_array() && !params.empty() && params[0].is_string() ? params[0].get<std::string>() : "";
         if (method == "btcauditcontract" || method == "swapauditcontract")
         {
@@ -8375,10 +8394,10 @@ struct WaitPayHost : public btfchat::SwapHost
     }
 };
 
-static std::string WaitPaySwapJson(const std::string& id)
+static std::string WaitPaySwapJson(const std::string& id, const std::string& coin = "BTC")
 {
     nlohmann::json s = { { "id", id }, { "peer", "them" }, { "maker", true },
-                         { "give", "BTC" }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
+                         { "give", coin }, { "ga", 1000000 }, { "want", "BTF" }, { "wa", 100000000 },
                          { "btcDestination", "bcrt1qdestination" }, { "paymentAddress", "2NcontractAddress" },
                          { "myC", "00" }, { "myTx", "" }, { "myN", -1 }, { "stage", (int)btfchat::SW_WAIT_PAYMENT },
                          { "ok", true }, { "inv", true }, { "created", GetTime() }, { "updated", GetTime() } };
@@ -8399,6 +8418,25 @@ static int RunSwapWaitPaymentSelfTest()
     int nFail = 0;
     const std::string id(32, '1');
     int64_t nNow = GetTime();
+
+    {
+        // The same path on Litecoin: every chain call is coin<step> ltc.
+        WaitPayHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(WaitPaySwapJson(id, "LTC"));
+        h.Unpaid(0, nNow - 2 * 86400);
+        e.Round();
+        std::string err;
+        e.Cancel(id, err);
+        h.Paid(0.01, 0, nNow - 60);
+        e.Round();
+        btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nCoinCalls >= 1, "a Litecoin swap asks the wallet through coin* with its chain") ? 0 : 1;
+        nFail += Check(v.give == "LTC" && h.nRefunds == 1 && v.stage == btfchat::SW_REFUNDED,
+                       "and a payment on Litecoin comes back at its lock") ? 0 : 1;
+        nFail += Check(h.refundParams.size() == 3 && h.refundParams[1] == std::string(64, 'a') + ":1",
+                       "from the output that was paid, named as on Bitcoin") ? 0 : 1;
+    }
 
     {
         WaitPayHost h;

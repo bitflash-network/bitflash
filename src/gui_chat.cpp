@@ -449,8 +449,10 @@ std::string g_selectedCommunity;      // or which community (its id); one or the
 bool g_fShowDirectory = false;
 char g_communityNameBuf[40] = {0};
 char g_postBuf[1024] = {0};
-// A swap offer being written: what we give (0 BTF, 1 BTC) and the two amounts.
+// A swap offer being written: what we give (0 BTF, 1 BTC, 2 LTC), the chain
+// asked for when we give BTF (0 BTC, 1 LTC), and the two amounts.
 int  g_offerGive = 0;
+int  g_offerOther = 0;
 char g_offerGiveBuf[32] = {0};
 char g_offerWantBuf[32] = {0};
 // The swap whose lock is waiting for its second press.
@@ -905,7 +907,8 @@ void DrawCommunity()
 
     // A swap offer: what we give and what we want for it. Posting locks
     // nothing; whoever takes it locks second, after we do.
-    const char* coins[] = { "BTF", "BTC" };
+    const char* coins[] = { "BTF", "BTC", "LTC" };
+    const char* others[] = { "BTC", "LTC" };
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::TextUnformatted("swap: give");
     ImGui::PopStyleColor();
@@ -915,7 +918,7 @@ void DrawCommunity()
                              ImGuiInputTextFlags_CharsDecimal);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(64.0f);
-    ImGui::Combo("##offercoin", &g_offerGive, coins, 2);
+    ImGui::Combo("##offercoin", &g_offerGive, coins, 3);
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::Text("for");
@@ -925,11 +928,17 @@ void DrawCommunity()
     ImGui::InputTextWithHint("##offerwant", "amount", g_offerWantBuf, sizeof(g_offerWantBuf),
                              ImGuiInputTextFlags_CharsDecimal);
     ImGui::SameLine();
-    ImGui::Text("%s", coins[1 - g_offerGive]);
+    if (g_offerGive == 0)
+    {
+        ImGui::SetNextItemWidth(64.0f);
+        ImGui::Combo("##offerother", &g_offerOther, others, 2);
+    }
+    else
+        ImGui::TextUnformatted("BTF");
     ImGui::SameLine();
     btfchat::SwapOffer o;
     o.give = coins[g_offerGive];
-    o.want = coins[1 - g_offerGive];
+    o.want = g_offerGive == 0 ? others[g_offerOther] : "BTF";
     int64 nGive = 0, nWant = 0;
     bool fOfferOk = ParseMoney(g_offerGiveBuf, nGive) && nGive > 0 && ParseMoney(g_offerWantBuf, nWant) && nWant > 0 &&
                     !Busy();
@@ -972,8 +981,10 @@ void DrawSwaps(const std::string& peer)
         if (ImGui::IsItemHovered() && (!s.myTxid.empty() || !s.theirTxid.empty()))
             ImGui::SetTooltip("ours   %s\ntheirs %s\nredeem %s\nrefund %s", s.myTxid.c_str(), s.theirTxid.c_str(),
                               s.redeemTxid.c_str(), s.refundTxid.c_str());
-        if (!fFinal && (s.give == "BTC" || s.want == "BTC"))
+        if (!fFinal)
         {
+            const std::string coinOther = s.give == "BTF" ? s.want : s.give;
+            const bool fLtc = coinOther == "LTC";
             ImGui::PushID(s.id.c_str());
             static std::map<std::string, std::string> destinations;
             std::string& text = destinations[s.id];
@@ -981,14 +992,15 @@ void DrawSwaps(const std::string& peer)
             char address[96] = {0}; strncpy(address, text.c_str(), sizeof(address)-1);
             bool editable = s.myTxid.empty() && s.paymentAddress.empty();
             if (!editable) ImGui::BeginDisabled();
-            if (ImGui::InputTextWithHint("your Bitcoin receiving address", "1... / 3... / bc1... / tb1... / bcrt1...", address, sizeof(address)))
+            if (ImGui::InputTextWithHint(fLtc ? "your Litecoin receiving address" : "your Bitcoin receiving address",
+                                         fLtc ? "L... / M... / ltc1... / tltc1..." : "1... / 3... / bc1... / tb1... / bcrt1...", address, sizeof(address)))
                 text = address;
             ImGui::SameLine();
             if (ImGui::SmallButton("save address")) btfchat::ChatSwapBitcoinDestination(s.id, text);
             if (!editable) ImGui::EndDisabled();
             if (s.stage == btfchat::SW_WAIT_PAYMENT)
             {
-                ImGui::TextWrapped("Waiting for you to pay the contract. Pay exactly %s BTC.", btfchat::FormatSwapAmount(s.giveAmount).c_str());
+                ImGui::TextWrapped("Waiting for you to pay the contract. Pay exactly %s %s.", btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str());
                 ImGui::TextWrapped("%s", s.paymentAddress.c_str());
                 if (ImGui::SmallButton("copy payment address")) ImGui::SetClipboardText(s.paymentAddress.c_str());
             }

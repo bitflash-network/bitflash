@@ -117,7 +117,7 @@ struct SwapConfig
     int64_t nGiveUpWaiting = 12 * 3600;  // a contract that never confirms
     int64_t nAnswerWithin = 24 * 3600;   // a take nobody answers
     int64_t nRedeemBumpAfter = 3600;     // a light-client Bitcoin redeem still unconfirmed: send again, fee doubled
-    int     nMinConfirmations = 0;       // 0: 1 on testnet, 2 on mainnet
+    int     nMinConfirmations = 0;       // 0: 1 on testnet; on mainnet 2, 8 on Litecoin
     // Test chains only (the wallet refuses them on mainnet): shorter locks.
     int     nBtfInitiatorBlocks = 0, nBtfParticipantBlocks = 0;
     int64_t nBtcInitiatorSecs = 0, nBtcParticipantSecs = 0;
@@ -172,8 +172,10 @@ private:
     std::map<std::string, ChatSwap> swaps;
     std::set<std::string> stepsSeen;
 
-    int  MinConfirmations() const;
+    int  MinConfirmations(const std::string& coin) const;
     bool Wallet(const char* method, const nlohmann::json& params, nlohmann::json& r, std::string& err);
+    bool OnChain(const std::string& coin, const char* btf, const char* step, const nlohmann::json& params,
+                 nlohmann::json& r, std::string& err);
     bool NewAddress(const std::string& coin, std::string& out, std::string& err);
     bool TheirTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err);
     bool SendStep(const ChatSwap& s, SwapStep& st, std::string& err);

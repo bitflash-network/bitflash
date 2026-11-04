@@ -142,12 +142,18 @@ static int64_t Sats(const json& v)
 
 static std::string Ref(const std::string& coin, const std::string& txid, int vout)
 {
-    return coin == "BTC" ? txid + ":" + strprintf("%d", vout) : txid;
+    return coin != "BTF" ? txid + ":" + strprintf("%d", vout) : txid;
 }
 
-static const char* Method(const std::string& coin, const char* btf, const char* btc)
+static std::string CoinName(const std::string& coin)
 {
-    return coin == "BTC" ? btc : btf;
+    return coin == "LTC" ? "Litecoin" : coin == "BTC" ? "Bitcoin" : "Bitflash";
+}
+
+// The chain that is not Bitflash, in a swap that has one Bitflash side.
+static std::string Other(const ChatSwap& s)
+{
+    return s.give == "BTF" ? s.want : s.give;
 }
 
 static std::string NewId()
@@ -157,11 +163,15 @@ static std::string NewId()
     return HexStr(b, b + sizeof(b), false);
 }
 
-int SwapEngine::MinConfirmations() const
+int SwapEngine::MinConfirmations(const std::string& coin) const
 {
     if (config.nMinConfirmations > 0)
         return config.nMinConfirmations;
-    return IsTestNet() ? 1 : 2;
+    if (IsTestNet())
+        return 1;
+    // A private fork is stopped by the time it takes to mine, so Litecoin's
+    // blocks, four to Bitcoin's one, are asked for in the same time: 20 min.
+    return coin == "LTC" ? 8 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)
@@ -169,10 +179,27 @@ bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::st
     return host->Wallet(method, params, r, err);
 }
 
+// One step on a chain: Bitflash's own call, btc<step> on Bitcoin, and on any
+// other chain coin<step> with the chain first.
+bool SwapEngine::OnChain(const std::string& coin, const char* btf, const char* step, const json& params,
+                         json& r, std::string& err)
+{
+    if (coin == "BTF")
+        return Wallet(btf, params, r, err);
+    if (coin == "BTC")
+        return Wallet((std::string("btc") + step).c_str(), params, r, err);
+    std::string strLower = coin;
+    std::transform(strLower.begin(), strLower.end(), strLower.begin(), ::tolower);
+    json all = json::array({ strLower });
+    for (const json& p : params)
+        all.push_back(p);
+    return Wallet((std::string("coin") + step).c_str(), all, r, err);
+}
+
 bool SwapEngine::NewAddress(const std::string& coin, std::string& out, std::string& err)
 {
     json r;
-    if (!Wallet(Method(coin, "getnewaddress", "btcnewaddress"), json::array(), r, err))
+    if (!OnChain(coin, "getnewaddress", "newaddress", json::array(), r, err))
         return false;
     if (!r.is_string() || !SwapAddressShapeOk(coin, r.get<std::string>()))
     {
@@ -201,7 +228,7 @@ void SwapEngine::SendCancel(const ChatSwap& s, const std::string& why)
 // The lock-length parameter for a test chain's shorter locks, or nothing.
 json SwapEngine::LockParams(const ChatSwap& s, bool fInitiator) const
 {
-    if (s.give == "BTC")
+    if (s.give != "BTF")
     {
         int64_t n = fInitiator ? config.nBtcInitiatorSecs : config.nBtcParticipantSecs;
         return n > 0 ? json(n) : json(nullptr);
@@ -218,7 +245,7 @@ int SwapEngine::CheckTheirs(const ChatSwap& s, int64_t nMinLeft, const std::stri
 {
     json a;
     std::string err;
-    if (!Wallet(Method(s.want, "swapauditcontract", "btcauditcontract"),
+    if (!OnChain(s.want, "swapauditcontract", "auditcontract",
                 json::array({ s.theirContract, Ref(s.want, s.theirTxid, s.theirVout) }), a, err))
     {
         why = err;
@@ -258,12 +285,12 @@ int SwapEngine::CheckTheirs(const ChatSwap& s, int64_t nMinLeft, const std::stri
         why = "their contract holds " + a["amount"].dump() + " " + s.want + ", not " + FormatSwapAmount(s.wantAmount);
         return V_BAD;
     }
-    if (nConf < MinConfirmations())
+    if (nConf < MinConfirmations(s.want))
     {
-        why = strprintf("their contract has %d of %d confirmations", nConf, MinConfirmations());
+        why = strprintf("their contract has %d of %d confirmations", nConf, MinConfirmations(s.want));
         return V_WAIT;
     }
-    int64_t nLeft = s.want == "BTC" ? a.value("secondsUntilRefund", (int64_t)0)
+    int64_t nLeft = s.want != "BTF" ? a.value("secondsUntilRefund", (int64_t)0)
                                     : a.value("blocksUntilRefund", (int64_t)0) * BTF_BLOCK_SECS;
     if (nLeft < nMinLeft)
     {
@@ -278,10 +305,10 @@ int SwapEngine::CheckTheirs(const ChatSwap& s, int64_t nMinLeft, const std::stri
 bool SwapEngine::MyTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err)
 {
     json a;
-    if (!Wallet(Method(s.give, "swapauditcontract", "btcauditcontract"),
+    if (!OnChain(s.give, "swapauditcontract", "auditcontract",
                 json::array({ s.myContract, Ref(s.give, s.myTxid, s.myVout) }), a, err) || !a.is_object())
         return false;
-    nLeft = s.give == "BTC" ? a.value("secondsUntilRefund", (int64_t)0)
+    nLeft = s.give != "BTF" ? a.value("secondsUntilRefund", (int64_t)0)
                             : a.value("blocksUntilRefund", (int64_t)0) * BTF_BLOCK_SECS;
     return true;
 }
@@ -291,11 +318,11 @@ bool SwapEngine::MyTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err)
 bool SwapEngine::TheirTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err)
 {
     json a;
-    if (!Wallet(Method(s.want, "swapauditcontract", "btcauditcontract"),
+    if (!OnChain(s.want, "swapauditcontract", "auditcontract",
                 json::array({ s.theirContract, Ref(s.want, s.theirTxid, s.theirVout) }), a, err) || !a.is_object())
         return false;
     nLeft = !a.value("unspent", false) ? 0
-          : s.want == "BTC" ? a.value("secondsUntilRefund", (int64_t)0)
+          : s.want != "BTF" ? a.value("secondsUntilRefund", (int64_t)0)
                             : a.value("blocksUntilRefund", (int64_t)0) * BTF_BLOCK_SECS;
     return true;
 }
@@ -308,7 +335,7 @@ bool SwapEngine::FindSecret(const std::string& coin, const std::string& contract
     fSpent = false;
     fRefunded = false;
     secretOut.clear();
-    if (!Wallet(Method(coin, "swapfindsecret", "btcfindsecret"), json::array({ contract, ref }), r, err) || !r.is_object())
+    if (!OnChain(coin, "swapfindsecret", "findsecret", json::array({ contract, ref }), r, err) || !r.is_object())
         return false;
     fSpent = r.value("spent", false);
     secretOut = r.value("secret", std::string());
@@ -327,7 +354,7 @@ static bool TakeLockResult(ChatSwap& s, const json& r, std::string& err)
     s.paymentAddress = r.value("awaitingPayment", false) ? r.value("contractAddress", std::string()) : std::string();
     s.myContract = r["contract"].get<std::string>();
     s.myTxid = r["contractTxid"].get<std::string>();
-    s.myVout = s.give == "BTC" && r.contains("vout") ? r["vout"].get<int>() : -1;
+    s.myVout = s.give != "BTF" && r.contains("vout") ? r["vout"].get<int>() : -1;
     if (r.contains("secret"))
         s.secret = r["secret"].get<std::string>();
     if (r.contains("secretHash"))
@@ -361,13 +388,13 @@ void SwapEngine::TryRefund(ChatSwap& s)
                                  (long long)(nLeft / 60 + 1));
         return;
     }
-    if (s.give == "BTC" && s.myTxid.empty())
+    if (s.give != "BTF" && s.myTxid.empty())
     {
         // Our contract waited for a payment from another wallet. Paid after
         // all: refund that like any other lock. Never paid: once a day past
         // the lock has given a late payment time to confirm, it is over.
         json a;
-        if (!Wallet("btcauditcontract", json::array({ s.myContract, "" }), a, err) || !a.is_object())
+        if (!OnChain(s.give, "swapauditcontract", "auditcontract", json::array({ s.myContract, "" }), a, err) || !a.is_object())
         {
             s.lastError = err;
             return;
@@ -405,8 +432,8 @@ void SwapEngine::TryRefund(ChatSwap& s)
     }
     json r;
     json refundParams = json::array({s.myContract, Ref(s.give, s.myTxid, s.myVout)});
-    if (s.give == "BTC" && !s.btcDestination.empty()) refundParams.push_back(s.btcDestination);
-    if (Wallet(Method(s.give, "swaprefund", "btcrefund"),
+    if (s.give != "BTF" && !s.btcDestination.empty()) refundParams.push_back(s.btcDestination);
+    if (OnChain(s.give, "swaprefund", "refund",
                refundParams, r, err) && r.is_object())
     {
         s.refundTxid = r.value("txid", std::string());
@@ -442,12 +469,12 @@ void SwapEngine::Tick(ChatSwap& s)
     if ((s.stage == SW_TAKE_RECEIVED || s.stage == SW_READY_TO_LOCK) && s.fUserOk)
     {
         json info;
-        if (Wallet("btcswapinfo", json::array(), info, err) && info.value("backend", std::string()) == "light")
+        if (OnChain(Other(s), "", "swapinfo", json::array(), info, err) && info.value("backend", std::string()) == "light")
         {
             json checked;
-            if (s.btcDestination.empty() || !Wallet("btcvalidatedestination", json::array({s.btcDestination}), checked, err))
+            if (s.btcDestination.empty() || !OnChain(Other(s), "", "validatedestination", json::array({s.btcDestination}), checked, err))
             {
-                s.status = "enter your Bitcoin receiving address before locking";
+                s.status = "enter your " + CoinName(Other(s)) + " receiving address before locking";
                 s.lastError = err; s.fUserOk = false; return;
             }
         }
@@ -529,7 +556,7 @@ void SwapEngine::Tick(ChatSwap& s)
         if (!lock.is_null())
             params.push_back(lock);
         json r;
-        if (!Wallet(Method(s.give, "swapinitiate", "btcinitiate"), params, r, err) || !TakeLockResult(s, r, err))
+        if (!OnChain(s.give, "swapinitiate", "initiate", params, r, err) || !TakeLockResult(s, r, err))
         {
             s.lastError = err;
             s.fUserOk = false;      // the person decides again, knowing why
@@ -580,7 +607,7 @@ void SwapEngine::Tick(ChatSwap& s)
         if (!lock.is_null())
             params.push_back(lock);
         json r;
-        if (!Wallet(Method(s.give, "swapparticipate", "btcparticipate"), params, r, err) || !TakeLockResult(s, r, err))
+        if (!OnChain(s.give, "swapparticipate", "participate", params, r, err) || !TakeLockResult(s, r, err))
         {
             s.lastError = err;
             s.fUserOk = false;
@@ -594,9 +621,9 @@ void SwapEngine::Tick(ChatSwap& s)
 
     case SW_WAIT_PAYMENT:
     {
-        s.status = "waiting for you to pay the contract: pay exactly " + AmountText(s.giveAmount) + " BTC to " + s.paymentAddress;
+        s.status = "waiting for you to pay the contract: pay exactly " + AmountText(s.giveAmount) + " " + s.give + " to " + s.paymentAddress;
         json audit;
-        if (!Wallet("btcauditcontract", json::array({s.myContract, ""}), audit, err))
+        if (!OnChain(s.give, "swapauditcontract", "auditcontract", json::array({ s.myContract, "" }), audit, err))
         {
             s.lastError = err;
             return;
@@ -608,7 +635,7 @@ void SwapEngine::Tick(ChatSwap& s)
         {
             // Nothing paid before the lock: there is no swap left to make. The
             // refund stage still watches, in case a payment is on its way.
-            SendCancel(s, "the Bitcoin contract was never paid");
+            SendCancel(s, "the " + CoinName(s.give) + " contract was never paid");
             s.stage = SW_REFUNDING;
             s.status = "nothing was paid into our contract before its lock; do not pay it now";
             return;
@@ -620,7 +647,7 @@ void SwapEngine::Tick(ChatSwap& s)
             s.stage = SW_REFUNDING;
             return;
         }
-        if (!audit.value("unspent", false) || audit.value("confirmations", 0) < MinConfirmations()) return;
+        if (!audit.value("unspent", false) || audit.value("confirmations", 0) < MinConfirmations(s.give)) return;
         s.myTxid = audit.at("contractTxid").get<std::string>(); s.myVout = audit.at("vout").get<int>();
         if (Sats(audit["amount"]) != s.giveAmount || audit.value("secondsUntilRefund", (int64_t)0) <= 0)
         {
@@ -629,7 +656,7 @@ void SwapEngine::Tick(ChatSwap& s)
             return;
         }
         s.stage = SW_LOCKED; s.fSentLock = false;
-        s.status = "Bitcoin contract payment confirmed";
+        s.status = CoinName(s.give) + " contract payment confirmed";
         return;
     }
 
@@ -698,14 +725,14 @@ void SwapEngine::Tick(ChatSwap& s)
                 s.lastError = e2;
             if (nNow - s.redeemSince < config.nRedeemBumpAfter)
             {
-                s.status = "redeemed; waiting for Bitcoin to confirm it";
+                s.status = "redeemed; waiting for " + CoinName(s.want) + " to confirm it";
                 return;
             }
             int64_t nRate = std::min<int64_t>(std::max<int64_t>(s.redeemFeeRate, 1000) * 2, 1000000);
             json r;
             json bumpParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret,
                                            s.btcDestination, AmountText(nRate)});
-            if (Wallet("btcredeem", bumpParams, r, err) && r.is_object())
+            if (OnChain(s.want, "swapredeem", "redeem", bumpParams, r, err) && r.is_object())
             {
                 s.redeemTxid = r.value("txid", std::string());
                 s.redeemSince = nNow;
@@ -746,17 +773,17 @@ void SwapEngine::Tick(ChatSwap& s)
         }
         json r;
         json redeemParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret});
-        if (s.want == "BTC" && !s.btcDestination.empty()) redeemParams.push_back(s.btcDestination);
-        if (Wallet(Method(s.want, "swapredeem", "btcredeem"),
+        if (s.want != "BTF" && !s.btcDestination.empty()) redeemParams.push_back(s.btcDestination);
+        if (OnChain(s.want, "swapredeem", "redeem",
                    redeemParams, r, err) &&
             r.is_object())
         {
             s.redeemTxid = r.value("txid", std::string());
-            if (s.want == "BTC" && r.value("awaitingConfirmation", false))
+            if (s.want != "BTF" && r.value("awaitingConfirmation", false))
             {
                 s.redeemSince = nNow;
                 s.redeemFeeRate = r.contains("feeRatePerKvB") ? Sats(r["feeRatePerKvB"]) : 0;
-                s.status = "redeemed; waiting for Bitcoin to confirm it";
+                s.status = "redeemed; waiting for " + CoinName(s.want) + " to confirm it";
             }
             else
             {
@@ -1157,10 +1184,17 @@ static bool WalletCanSwap(const std::string& a, const std::string& b, std::strin
     json r;
     if (!WalletRpc("getinfo", json::array(), r, err))
         return false;
-    if ((a == "BTC" || b == "BTC") && !WalletRpc("btcswapinfo", json::array(), r, err))
+    for (const std::string& coin : { a, b })
     {
-        err = "the Bitcoin side is not ready: " + err;
-        return false;
+        if (coin == "BTF")
+            continue;
+        bool fReady = coin == "BTC" ? WalletRpc("btcswapinfo", json::array(), r, err)
+                                    : WalletRpc("coinswapinfo", json::array({ "ltc" }), r, err);
+        if (!fReady)
+        {
+            err = "the " + CoinName(coin) + " side is not ready: " + err;
+            return false;
+        }
     }
     return true;
 }
