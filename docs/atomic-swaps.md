@@ -263,6 +263,16 @@ as `btc...`). The contract, the locks and the Bitflash half are the same.
 Litecoin addresses in the contract are legacy key addresses (`L...` on main,
 `m`/`n` on the test network).
 
+In btfchat an offer names the chain: `swap: give 100 BTF for 2 LTC` in the
+window (the coin next to the second amount), or in the terminal `offer 100 BTF
+for 2 LTC` and `offer 2 LTC for 100`. One side is always BTF. On mainnet the
+chat waits for 8 Litecoin confirmations, about the 20 minutes of Bitcoin's 2,
+because what stops a private fork is the time it takes to mine, not the count.
+A wallet from before this does not show a Litecoin offer. Proven with coins
+by `-selftest=chat-swap` with `CHATSWAP_COIN=LTC` against Litecoin Core on
+regtest with MWEB active, on Litecoin Core and on the light client: a swap
+each way, and a maker who vanishes, with both sides' coins coming back alone.
+
 Where the Litecoin side runs is chosen as for Bitcoin: a running Litecoin
 Core (its cookie in the default data directory, or `-ltcdatadir`,
 `-ltcrpcport`, `-ltcrpcuser`/`-ltcrpcpassword`, `-ltcwallet`), else the

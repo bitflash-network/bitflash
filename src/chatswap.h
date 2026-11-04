@@ -41,7 +41,7 @@ static const int64_t MAX_SWAP_AMOUNT = (int64_t)21000000 * 100000000;
 
 struct SwapOffer
 {
-    std::string give;      // "BTF" or "BTC": what the person posting it gives
+    std::string give;      // "BTF", "BTC" or "LTC": what the person posting it gives
     int64_t     giveAmount;
     std::string want;      // the other one
     int64_t     wantAmount;
@@ -70,7 +70,7 @@ struct SwapStep
 
     // lock1, lock2: the contract and where it was funded. vout is -1 for a
     // Bitflash contract (found by its txid), the output index on Bitcoin.
-    std::string chain;     // "BTF" or "BTC"
+    std::string chain;     // "BTF", "BTC" or "LTC"
     std::string contract;  // hex
     std::string txid;
     int         vout;

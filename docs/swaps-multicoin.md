@@ -1,6 +1,6 @@
 # Swaps with more chains (design)
 
-Status: Litecoin implemented (RPC and both backends, docs/atomic-swaps.md);
+Status: Litecoin implemented (RPC, btfchat and both backends, docs/atomic-swaps.md);
 the others designed. Target: swaps with Litecoin, Dogecoin, Bitcoin Cash,
 eCash, DigiByte and Ravencoin open on mainnet with Bitcoin's, on 2026-12-25
 12:00 UTC; Zcash (transparent addresses) in January 2027.

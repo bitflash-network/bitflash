@@ -108,6 +108,26 @@ int main()
         CHECK(SwapAddressShapeOk("BTC", BTC_ADDR) && SwapAddressShapeOk("BTC", "1111111111111111111114oLvT2") &&
               !SwapAddressShapeOk("BTC", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
               "a legacy key address is Bitcoin's; bc1 cannot be in the contract");
+        CHECK(SwapAddressShapeOk("LTC", "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ") && SwapAddressShapeOk("LTC", BTC_ADDR) &&
+              !SwapAddressShapeOk("LTC", "1111111111111111111114oLvT2") &&
+              !SwapAddressShapeOk("BTC", "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ"),
+              "a legacy key address is Litecoin's on its own network");
+        SwapOffer o, back;
+        std::string err;
+        o.give = "LTC"; o.giveAmount = 200000000; o.want = "BTF"; o.wantAmount = 100000000;
+        CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "LTC" && back.want == "BTF",
+              "an offer of LTC for BTF");
+        CHECK(!ParseSwapOffer("{\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
+              "one side of an offer is always BTF");
+        CHECK(!ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
+              "a chain this wallet does not know is refused");
+        SwapStep l, step;
+        l.swap = std::string(32, 'c'); l.step = "lock1"; l.chain = "LTC"; l.contract = "00"; l.txid = std::string(64, 'a');
+        l.vout = 2; l.to = BTF_ADDR;
+        CHECK(ParseSwapStep(FormatSwapStep(l), step, err) && step.chain == "LTC" && step.vout == 2,
+              "a lock on Litecoin names its output, as on Bitcoin");
+        l.chain = "BTF"; l.to = "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ";
+        CHECK(ParseSwapStep(FormatSwapStep(l), step, err), "a Bitflash lock can ask to be paid on Litecoin");
         CHECK(FormatSwapAmount(150000) == "0.0015" && FormatSwapAmount(100000000) == "1" &&
               FormatSwapAmount(1) == "0.00000001", "amounts print without trailing zeros");
     }
