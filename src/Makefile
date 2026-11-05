@@ -81,7 +81,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
-          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
+          btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h coinunit.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
           proxy.h tor.h treasury.h gui_chat.h font_roboto.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -482,6 +482,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light
 	./bitflash-node -selftest=ltc-light
+	./bitflash-node -selftest=cash-light
 	./bitflash-node -selftest=swap-wait-payment
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice

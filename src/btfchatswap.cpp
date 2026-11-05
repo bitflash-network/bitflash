@@ -127,17 +127,18 @@ static bool IsFinal(int stage)
     return stage == SW_DONE || stage == SW_REFUNDED || stage == SW_CANCELLED || stage == SW_FAILED;
 }
 
-static std::string AmountText(int64_t n)
+// What the wallet's calls take and answer: the coin's own units.
+static std::string AmountText(const std::string& coin, int64_t n)
 {
-    return strprintf("%lld.%08lld", (long long)(n / COIN), (long long)(n % COIN));
+    return CoinAmountText(coin, n);
 }
 
-static int64_t Sats(const json& v)
+static int64_t Sats(const std::string& coin, const json& v)
 {
     if (!v.is_number())
         return -1;
     double d = v.get<double>();
-    return (int64_t)(d * COIN + (d >= 0 ? 0.5 : -0.5));
+    return (int64_t)(d * CoinUnit(coin) + (d >= 0 ? 0.5 : -0.5));
 }
 
 static std::string Ref(const std::string& coin, const std::string& txid, int vout)
@@ -147,7 +148,7 @@ static std::string Ref(const std::string& coin, const std::string& txid, int vou
 
 static std::string CoinName(const std::string& coin)
 {
-    return coin == "LTC" ? "Litecoin" : coin == "BTC" ? "Bitcoin" : "Bitflash";
+    return coin == "LTC" ? "Litecoin" : coin == "BCH" ? "Bitcoin Cash" : coin == "XEC" ? "eCash" : coin == "BTC" ? "Bitcoin" : "Bitflash";
 }
 
 // The chain that is not Bitflash, in a swap that has one Bitflash side.
@@ -171,7 +172,9 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
         return 1;
     // A private fork is stopped by the time it takes to mine, so Litecoin's
     // blocks, four to Bitcoin's one, are asked for in the same time: 20 min.
-    return coin == "LTC" ? 8 : 2;
+    // Bitcoin Cash and eCash run Bitcoin's SHA-256 with a sliver of its hash
+    // rate, so anyone can rent their next block: there, more time.
+    return coin == "LTC" ? 8 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)
@@ -280,9 +283,9 @@ int SwapEngine::CheckTheirs(const ChatSwap& s, int64_t nMinLeft, const std::stri
         why = "their contract is not on the chain yet";
         return V_WAIT;
     }
-    if (Sats(a["amount"]) != s.wantAmount)
+    if (Sats(s.want, a["amount"]) != s.wantAmount)
     {
-        why = "their contract holds " + a["amount"].dump() + " " + s.want + ", not " + FormatSwapAmount(s.wantAmount);
+        why = "their contract holds " + a["amount"].dump() + " " + s.want + ", not " + FormatSwapAmount(s.want, s.wantAmount);
         return V_BAD;
     }
     if (nConf < MinConfirmations(s.want))
@@ -381,7 +384,7 @@ void SwapEngine::TryRefund(ChatSwap& s)
         if (nLeft <= 0)
         {
             s.stage = SW_REFUNDED;
-            s.status = "refunded: our " + FormatSwapAmount(s.giveAmount) + " " + s.give + " came back";
+            s.status = "refunded: our " + FormatSwapAmount(s.give, s.giveAmount) + " " + s.give + " came back";
         }
         else
             s.status = strprintf("refunded ours; watching theirs for %lld more minutes in case ours is taken instead",
@@ -444,7 +447,7 @@ void SwapEngine::TryRefund(ChatSwap& s)
             return;
         }
         s.stage = SW_REFUNDED;
-        s.status = "refunded: our " + FormatSwapAmount(s.giveAmount) + " " + s.give + " came back";
+        s.status = "refunded: our " + FormatSwapAmount(s.give, s.giveAmount) + " " + s.give + " came back";
         return;
     }
     // Spent already? With the secret means they redeemed ours -- which they
@@ -551,7 +554,7 @@ void SwapEngine::Tick(ChatSwap& s)
             s.fUserOk = false;
             return;
         }
-        json params = json::array({ s.theirRecv, AmountText(s.giveAmount) });
+        json params = json::array({ s.theirRecv, AmountText(s.give, s.giveAmount) });
         json lock = LockParams(s, true);
         if (!lock.is_null())
             params.push_back(lock);
@@ -597,12 +600,12 @@ void SwapEngine::Tick(ChatSwap& s)
         if (s.stage == SW_CHECKING_THEIRS)
         {
             s.stage = SW_READY_TO_LOCK;
-            s.status = "their " + FormatSwapAmount(s.wantAmount) + " " + s.want + " is locked for us and checks out";
+            s.status = "their " + FormatSwapAmount(s.want, s.wantAmount) + " " + s.want + " is locked for us and checks out";
             return;
         }
         if (!s.fUserOk)
             return;
-        json params = json::array({ s.theirRecv, AmountText(s.giveAmount), s.secretHash });
+        json params = json::array({ s.theirRecv, AmountText(s.give, s.giveAmount), s.secretHash });
         json lock = LockParams(s, false);
         if (!lock.is_null())
             params.push_back(lock);
@@ -621,7 +624,7 @@ void SwapEngine::Tick(ChatSwap& s)
 
     case SW_WAIT_PAYMENT:
     {
-        s.status = "waiting for you to pay the contract: pay exactly " + AmountText(s.giveAmount) + " " + s.give + " to " + s.paymentAddress;
+        s.status = "waiting for you to pay the contract: pay exactly " + AmountText(s.give, s.giveAmount) + " " + s.give + " to " + s.paymentAddress;
         json audit;
         if (!OnChain(s.give, "swapauditcontract", "auditcontract", json::array({ s.myContract, "" }), audit, err))
         {
@@ -649,7 +652,7 @@ void SwapEngine::Tick(ChatSwap& s)
         }
         if (!audit.value("unspent", false) || audit.value("confirmations", 0) < MinConfirmations(s.give)) return;
         s.myTxid = audit.at("contractTxid").get<std::string>(); s.myVout = audit.at("vout").get<int>();
-        if (Sats(audit["amount"]) != s.giveAmount || audit.value("secondsUntilRefund", (int64_t)0) <= 0)
+        if (Sats(s.give, audit["amount"]) != s.giveAmount || audit.value("secondsUntilRefund", (int64_t)0) <= 0)
         {
             s.stage = SW_REFUNDING;
             s.status = "payment amount differs or contract expired; waiting to refund";
@@ -718,7 +721,7 @@ void SwapEngine::Tick(ChatSwap& s)
                 s.redeemSince = 0;
                 s.stage = fRefunded ? SW_FAILED : SW_DONE;
                 s.status = fRefunded ? "they refunded theirs before our redeem confirmed"
-                                     : "done: received " + FormatSwapAmount(s.wantAmount) + " " + s.want;
+                                     : "done: received " + FormatSwapAmount(s.want, s.wantAmount) + " " + s.want;
                 return;
             }
             if (!e2.empty())
@@ -731,7 +734,7 @@ void SwapEngine::Tick(ChatSwap& s)
             int64_t nRate = std::min<int64_t>(std::max<int64_t>(s.redeemFeeRate, 1000) * 2, 1000000);
             json r;
             json bumpParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret,
-                                           s.btcDestination, AmountText(nRate)});
+                                           s.btcDestination, AmountText(s.want, nRate)});
             if (OnChain(s.want, "swapredeem", "redeem", bumpParams, r, err) && r.is_object())
             {
                 s.redeemTxid = r.value("txid", std::string());
@@ -782,13 +785,13 @@ void SwapEngine::Tick(ChatSwap& s)
             if (s.want != "BTF" && r.value("awaitingConfirmation", false))
             {
                 s.redeemSince = nNow;
-                s.redeemFeeRate = r.contains("feeRatePerKvB") ? Sats(r["feeRatePerKvB"]) : 0;
+                s.redeemFeeRate = r.contains("feeRatePerKvB") ? Sats(s.want, r["feeRatePerKvB"]) : 0;
                 s.status = "redeemed; waiting for " + CoinName(s.want) + " to confirm it";
             }
             else
             {
                 s.stage = SW_DONE;
-                s.status = "done: received " + FormatSwapAmount(s.wantAmount) + " " + s.want;
+                s.status = "done: received " + FormatSwapAmount(s.want, s.wantAmount) + " " + s.want;
             }
             if (s.fMaker)
             {
@@ -1188,8 +1191,10 @@ static bool WalletCanSwap(const std::string& a, const std::string& b, std::strin
     {
         if (coin == "BTF")
             continue;
+        std::string strLower = coin;
+        std::transform(strLower.begin(), strLower.end(), strLower.begin(), ::tolower);
         bool fReady = coin == "BTC" ? WalletRpc("btcswapinfo", json::array(), r, err)
-                                    : WalletRpc("coinswapinfo", json::array({ "ltc" }), r, err);
+                                    : WalletRpc("coinswapinfo", json::array({ strLower }), r, err);
         if (!fReady)
         {
             err = "the " + CoinName(coin) + " side is not ready: " + err;

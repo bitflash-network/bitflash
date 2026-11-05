@@ -440,15 +440,15 @@ void ShowSwaps()
         const btfchat::SwapView& s = v[i];
         g_swapIds.push_back(s.id);
         Say(strprintf("%2u  [%s] with %s: you give %s %s, get %s %s -- %s", (unsigned)(i + 1), s.id.substr(0, 8).c_str(),
-                      Short(s.peer).c_str(), btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str(),
-                      btfchat::FormatSwapAmount(s.wantAmount).c_str(), s.want.c_str(), s.status.c_str()));
+                      Short(s.peer).c_str(), btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str(),
+                      btfchat::FormatSwapAmount(s.want, s.wantAmount).c_str(), s.want.c_str(), s.status.c_str()));
         if (s.stage == btfchat::SW_WAIT_PAYMENT && !s.paymentAddress.empty())
-            Say("      pay exactly " + btfchat::FormatSwapAmount(s.giveAmount) + " " + s.give + " to " + s.paymentAddress);
+            Say("      pay exactly " + btfchat::FormatSwapAmount(s.give, s.giveAmount) + " " + s.give + " to " + s.paymentAddress);
         if (s.btcDestination.empty() && s.myTxid.empty())
             Say(strprintf("      your %s address: swap btc %u ADDRESS", s.give == "BTF" ? s.want.c_str() : s.give.c_str(), (unsigned)(i + 1)));
         if (s.fNeedsMe)
             Say(strprintf("      waiting for you: swap ok %u  (%s: lock %s %s)", (unsigned)(i + 1),
-                          s.fMaker ? "accept" : "go on", btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str()));
+                          s.fMaker ? "accept" : "go on", btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str()));
         if (s.fCanCancel)
             Say(strprintf("      can still be called off: swap cancel %u", (unsigned)(i + 1)));
     }
@@ -688,7 +688,7 @@ void Command(const std::string& line)
     }
     if (cmd == "offer")
     {
-        // offer AMOUNT BTF|BTC|LTC for AMOUNT [BTC|LTC]
+        // offer AMOUNT BTF|BTC|LTC|BCH|XEC for AMOUNT [BTC|LTC|BCH|XEC]
         std::istringstream a(rest);
         std::string sGive, coin, sFor, sWant, wantCoin;
         a >> sGive >> coin >> sFor >> sWant >> wantCoin;
@@ -696,12 +696,12 @@ void Command(const std::string& line)
         std::transform(wantCoin.begin(), wantCoin.end(), wantCoin.begin(), ::toupper);
         if (wantCoin.empty())
             wantCoin = coin == "BTF" ? "BTC" : "BTF";
-        int64 nGive = 0, nWant = 0;
+        int64_t nGive = 0, nWant = 0;
         if (g_room.empty() || !btfchat::SwapCoinOk(coin) || !btfchat::SwapCoinOk(wantCoin) || coin == wantCoin ||
             (coin != "BTF" && wantCoin != "BTF") || sFor != "for" ||
-            !ParseMoney(sGive.c_str(), nGive) || nGive <= 0 || !ParseMoney(sWant.c_str(), nWant) || nWant <= 0)
+            !ParseCoinAmount(coin, sGive, nGive) || nGive <= 0 || !ParseCoinAmount(wantCoin, sWant, nWant) || nWant <= 0)
         {
-            Say("in an open room: offer AMOUNT BTF for AMOUNT [BTC|LTC]   (or AMOUNT BTC for AMOUNT, AMOUNT LTC for AMOUNT)");
+            Say("in an open room: offer AMOUNT BTF for AMOUNT [BTC|LTC|BCH|XEC]   (or AMOUNT BTC|LTC|BCH|XEC for AMOUNT)");
             return;
         }
         btfchat::SwapOffer o;
@@ -739,7 +739,7 @@ void Command(const std::string& line)
         {
             if (!s.fNeedsMe) { Say("that swap is not waiting for you"); return; }
             if (!Confirm(strprintf("%s: lock %s %s in the contract (it comes back by itself if the swap does not finish; keep the chat open)",
-                                   s.fMaker ? "accept" : "go on", btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str())))
+                                   s.fMaker ? "accept" : "go on", btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str())))
             { Say("nothing locked"); return; }
             Say(btfchat::ChatSwapApprove(s.id, err) ? "going on" : "could not: " + err);
             return;

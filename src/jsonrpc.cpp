@@ -119,6 +119,18 @@ static int64 AmountFromValue(const json& v)
     return n;
 }
 
+// The same in the units of a swap's chain.
+static double CoinValueFromAmount(const string& coin, int64 n) { return (double)n / (double)CoinUnit(coin); }
+
+static int64 CoinAmountFromValue(const string& coin, const json& v)
+{
+    string s = v.is_string() ? v.get<string>() : strprintf("%.*f", CoinDecimals(coin), v.get<double>());
+    int64_t n = 0;
+    if (!ParseCoinAmount(coin, s, n) || n <= 0)
+        throw runtime_error("invalid amount");
+    return n;
+}
+
 static bool ConstantTimeEqual(const string& a, const string& b)
 {
     // Length leaks, but a guess at the length of a password is not a guess at
@@ -2956,7 +2968,12 @@ static json CoinCall(const string& coin, const string& method, const json& param
 
 static string Ticker(const string& coin)
 {
-    return coin == "ltc" ? "LTC" : "BTC";
+    return coin == "ltc" ? "LTC" : coin == "bch" ? "BCH" : coin == "xec" ? "XEC" : "BTC";
+}
+
+static string ChainLogName(const string& coin)
+{
+    return coin == "ltc" ? "litecoin" : coin == "bch" ? "bitcoincash" : coin == "xec" ? "ecash" : "bitcoin";
 }
 
 static string UtcText(int64 t)
@@ -2982,15 +2999,10 @@ static int64 LockSecsParam(const json& p, size_t nIndex, int64 nDefault, const b
     return p[nIndex].get<int64>();
 }
 
-static string BtcAmountText(int64 n)
-{
-    return strprintf("%lld.%08lld", (long long)(n / COIN), (long long)(n % COIN));
-}
-
 static json BtcContractJson(const btcswap::Chain& chain, const swap::Contract& c, const CScript& contract)
 {
     json j;
-    j["chain"]           = (chain.coin == "ltc" ? "litecoin-" : "bitcoin-") + chain.name;
+    j["chain"]           = ChainLogName(chain.coin) + "-" + chain.name;
     j["contract"]        = HexStr(contract.begin(), contract.end(), false);
     j["contractAddress"] = btcswap::ScriptAddress(chain, contract);
     j["recipient"]       = btcswap::PkhToAddress(chain, c.recipientPkh);
@@ -3012,13 +3024,13 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
         btclight::Watch(chain, contract);
         json j = BtcContractJson(chain, c, contract);
         j["contractTxid"] = ""; j["vout"] = -1;
-        j["amount"] = ValueFromAmount(nValue);
+        j["amount"] = CoinValueFromAmount(chain.coin, nValue);
         j["awaitingPayment"] = true;
-        j["paymentInstructions"] = "pay exactly " + BtcAmountText(nValue) + " " + Ticker(chain.coin) + " to " + strAddr;
+        j["paymentInstructions"] = "pay exactly " + CoinAmountText(chain.coin, nValue) + " " + Ticker(chain.coin) + " to " + strAddr;
         return j;
     }
     string who = btcswap::BackendName(chain.coin);
-    json txid = CoinCall(chain.coin, "sendtoaddress", json::array({ strAddr, BtcAmountText(nValue) }));
+    json txid = CoinCall(chain.coin, "sendtoaddress", json::array({ strAddr, CoinAmountText(chain.coin, nValue) }));
     if (!txid.is_string())
         throw runtime_error(who + " did not return a transaction id");
     json wtx = CoinCall(chain.coin, "gettransaction", json::array({ txid }));
@@ -3039,7 +3051,7 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
     j["contractTxid"] = txid;
     j["contractTx"] = wtx["hex"];
     j["vout"] = nOut;
-    j["amount"] = ValueFromAmount(nValue);
+    j["amount"] = CoinValueFromAmount(chain.coin, nValue);
     return j;
 }
 
@@ -3074,13 +3086,13 @@ static json CoinSwapInfo(const string& coin, const json&)
         json status = CoinCall(coin, "getblockchaininfo", json::array());
         j["light"] = status;
         j["balance"] = nullptr;
-        j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB(coin));
+        j["feeRatePerKvB"] = CoinValueFromAmount(coin, btcswap::FeeRatePerKvB(coin));
         return j;
     }
     j["balance"] = btcswap::Call(coin, "getbalance", json::array(), bal, err) ? bal : json(nullptr);
     if (!err.empty())
         j["walletError"] = err;
-    j["feeRatePerKvB"] = ValueFromAmount(btcswap::FeeRatePerKvB(coin));
+    j["feeRatePerKvB"] = CoinValueFromAmount(coin, btcswap::FeeRatePerKvB(coin));
     return j;
 }
 
@@ -3122,7 +3134,7 @@ static json CoinInitiate(const string& coin, const json& p)
     c.secretHash.resize(32);
     SHA256(&secret[0], secret.size(), &c.secretHash[0]);
     c.nLockTime = GetTime() + LockSecsParam(p, 2, btcswap::INITIATOR_LOCK_SECS, chain);
-    json j = BtcFundContract(chain, c, AmountFromValue(p[1]));
+    json j = BtcFundContract(chain, c, CoinAmountFromValue(coin, p[1]));
     j["secret"] = HexStr(secret.begin(), secret.end(), false);
     j["role"] = "initiator";
     LogSwap(j);
@@ -3145,7 +3157,7 @@ static json CoinParticipate(const string& coin, const json& p)
     swap::Contract c = BtcNewContract(chain, p[0].get<string>());
     c.secretHash = ParseHex(strHash);
     c.nLockTime = GetTime() + LockSecsParam(p, 3, btcswap::PARTICIPANT_LOCK_SECS, chain);
-    json j = BtcFundContract(chain, c, AmountFromValue(p[1]));
+    json j = BtcFundContract(chain, c, CoinAmountFromValue(coin, p[1]));
     j["role"] = "participant";
     LogSwap(j);
     return j;
@@ -3211,7 +3223,7 @@ static BtcContractOut BtcResolveContract(const btcswap::Chain& chain, const json
         o.n = found["vout"].get<int>() < 0 ? 0 : found["vout"].get<unsigned int>();
         o.fUnspent = found["unspent"].get<bool>();
         o.nConfirmations = found["confirmations"].get<int>();
-        if (o.fUnspent) o.nValue = AmountFromValue(found["amount"]);
+        if (o.fUnspent) o.nValue = CoinAmountFromValue(coin, found["amount"]);
         return o;
     }
     string s = v.is_string() ? v.get<string>() : string();
@@ -3239,8 +3251,13 @@ static BtcContractOut BtcResolveContract(const btcswap::Chain& chain, const json
                            out["scriptPubKey"].contains("hex") ? out["scriptPubKey"]["hex"].get<string>() : string();
         if (strScript != HexStr(p2sh.begin(), p2sh.end(), false))
             throw runtime_error("that output does not pay this contract");
+        // A CashToken on the output goes into the signature hash, which this
+        // wallet does not sign for: coins it could never redeem. The node
+        // shows it beside the script, not in it.
+        if (out.contains("tokenData") || out["scriptPubKey"].contains("tokenData"))
+            throw runtime_error("that output carries a token, and this wallet cannot redeem it");
         o.fUnspent = true;
-        o.nValue = AmountFromValue(out["value"]);
+        o.nValue = CoinAmountFromValue(coin, out["value"]);
         o.nConfirmations = out.contains("confirmations") && out["confirmations"].is_number_integer()
                                ? out["confirmations"].get<int>() : 0;
     }
@@ -3266,7 +3283,7 @@ static json CoinAuditContract(const string& coin, const json& p)
     // Only what Core sees on its own chain counts: an output it does not see
     // unspent is worth nothing to this side of the swap, whatever a raw
     // transaction claims.
-    j["amount"] = o.fUnspent ? json(ValueFromAmount(o.nValue)) : json(nullptr);
+    j["amount"] = o.fUnspent ? json(CoinValueFromAmount(coin, o.nValue)) : json(nullptr);
     j["unspent"] = o.fUnspent;
     j["confirmations"] = o.nConfirmations;
     j["secondsUntilRefund"] = std::max<int64>(0, c.nLockTime - chain.nMedianTime);
@@ -3310,9 +3327,9 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
         // higher rate (BTC per 1000 vbytes) after the destination.
         if (p.size() > destination + 1 && !p[destination + 1].is_null())
         {
-            nFeeRate = AmountFromValue(p[destination + 1]);
+            nFeeRate = CoinAmountFromValue(coin, p[destination + 1]);
             if (nFeeRate < 1000 || nFeeRate > COIN / 100)
-                throw runtime_error("fee rate out of range (0.00001 to 0.01 " + Ticker(coin) + " per 1000 vbytes)");
+                throw runtime_error("fee rate out of range (" + CoinAmountText(coin, 1000) + " to " + CoinAmountText(coin, COIN / 100) + " " + Ticker(coin) + " per 1000 vbytes)");
         }
     }
     else
@@ -3329,7 +3346,7 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     int64 nFee = 0;
     string err;
     if (!btcswap::BuildSpend(contract, COutPoint(o.txid, o.n), o.nValue, scriptTo,
-                             key, vchPubKey, pSecret, nFeeRate, tx, nFee, err))
+                             key, vchPubKey, pSecret, nFeeRate, tx, nFee, err, chain.fForkId))
         throw runtime_error(err);
     CDataStream ss(SER_NETWORK);
     ss << tx;
@@ -3338,18 +3355,13 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     json j;
     j["txid"] = txid;
     j["tx"] = strHex;
-    j["amount"] = ValueFromAmount(o.nValue - nFee);
-    j["fee"] = ValueFromAmount(nFee);
-    j["feeRatePerKvB"] = ValueFromAmount(nFeeRate);
+    j["amount"] = CoinValueFromAmount(coin, o.nValue - nFee);
+    j["fee"] = CoinValueFromAmount(coin, nFee);
+    j["feeRatePerKvB"] = CoinValueFromAmount(coin, nFeeRate);
     j["to"] = addr;
     // Core checked it into its memory pool; the light client only sent it.
     j["awaitingConfirmation"] = btcswap::UsingLight(coin);
     return j;
-}
-
-static string ChainLogName(const string& coin)
-{
-    return coin == "ltc" ? "litecoin" : "bitcoin";
 }
 
 // btcredeem <contract> <contract tx hex or txid> <secret>
@@ -3420,7 +3432,7 @@ static json CoinFindSecret(const string& coin, const json& p)
     // More than a 48-hour lock: 400 of Bitcoin's blocks, 1728 of Litecoin's.
     int nBack = coin == "ltc" ? 1728 : 400;
     int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
-    if (coin != "btc")
+    if (coin == "ltc")
     {
         // A raw Litecoin block carries MWEB data and a HogEx transaction that
         // this wallet's reader does not take (and need not), so the node is
@@ -3459,7 +3471,7 @@ static json CoinFindSecret(const string& coin, const json& p)
     for (int h = chain.nBlocks; vCandidates.empty() && h >= nFrom; h--)
     {
         json hash = CoinCall(coin, "getblockhash", json::array({ h }));
-        json raw = CoinCall(coin, "getblock", json::array({ hash, 0 }), 64 * 1024 * 1024);
+        json raw = CoinCall(coin, "getblock", json::array({ hash, 0 }), (coin == "btc" ? 64 : 600) * 1024 * 1024);
         vector<CTransaction> txs;
         if (!raw.is_string() || !btcswap::ParseBlockTxs(ParseHex(raw.get<string>()), txs))
             throw runtime_error(strprintf("%s block %d does not decode", btclight::Label(coin).c_str(), h));
@@ -3506,7 +3518,7 @@ static json rpc_btcfindsecret(const json& p)          { return CoinFindSecret("b
 static json CoinDispatch(json (*fn)(const string&, const json&), const char* name, const json& p)
 {
     if (p.empty() || !p[0].is_string())
-        throw runtime_error(string(name) + " <chain: btc or ltc> ...");
+        throw runtime_error(string(name) + " <chain: btc, ltc, bch or xec> ...");
     string coin = p[0].get<string>();
     for (size_t i = 0; i < coin.size(); i++)
         coin[i] = (char)tolower((unsigned char)coin[i]);

@@ -29,7 +29,7 @@ static bool DirExists(const std::string& path);
 
 bool KnownCoin(const std::string& coin)
 {
-    return coin == "btc" || coin == "ltc";
+    return coin == "btc" || coin == "ltc" || coin == "bch" || coin == "xec";
 }
 
 static Config GetConfig(const std::string& coin)
@@ -87,11 +87,13 @@ static std::string ConfiguredChain(const std::string& coin)
 {
     std::string s = GetConfig(coin).strChain;
     if (s.empty())
-        s = !IsTestNet() ? "main" : coin == "btc" ? "testnet4" : "test";
+        s = !IsTestNet() ? "main" : coin == "btc" ? "testnet4" : coin == "bch" ? "test4" : "test";
     if (s == "mainnet")
         s = "main";
     if (s == "testnet" || s == "testnet3")
         s = "test";
+    if (coin == "bch" && s == "testnet4")
+        s = "test4";
     return s;
 }
 
@@ -103,6 +105,20 @@ static int DefaultPort(const std::string& coin, const std::string& chain)
         if (chain == "test")    return 19332;
         if (chain == "regtest") return 19443;
         return 9332;
+    }
+    if (coin == "bch")
+    {
+        // bitcoin-cash-node v29.2.0, src/chainparamsbase.cpp
+        if (chain == "test4")   return 28332;
+        if (chain == "regtest") return 18443;
+        return 8332;
+    }
+    if (coin == "xec")
+    {
+        // bitcoin-abc v0.34.3, src/chainparamsbase.cpp
+        if (chain == "test")    return 18332;
+        if (chain == "regtest") return 18443;
+        return 8332;
     }
     if (chain == "test")     return 18332;
     if (chain == "testnet4") return 48332;
@@ -120,6 +136,7 @@ static std::string ChainSubdir(const std::string& coin, const std::string& chain
         if (chain == "regtest") return "regtest";
         return "";
     }
+    if (chain == "test4")    return "testnet4";
     if (chain == "test")     return "testnet3";
     if (chain == "testnet4") return "testnet4";
     if (chain == "signet")   return "signet";
@@ -141,6 +158,7 @@ static std::string CoreDataDir(const std::string& coin)
     std::string dir = GetConfig(coin).strDataDir;
     if (!dir.empty())
         return dir;
+    // Bitcoin Cash Node and Bitcoin ABC use Bitcoin Core's names.
     std::string name = coin == "ltc" ? "Litecoin" : "Bitcoin";
 #ifdef _WIN32
     const char* local = getenv("LOCALAPPDATA");
@@ -165,6 +183,11 @@ bool UsingLight(const std::string& coin)
     if (!c.strDataDir.empty() || c.nPort || !c.strWallet.empty() || !c.strUser.empty() || !c.strPassword.empty())
         return false;
     // An existing cookie keeps the original automatic node setup working.
+    // Bitcoin Cash Node and Bitcoin ABC keep Bitcoin Core's data directory and
+    // RPC port, so a cookie there says nothing about which chain it is for.
+    // Their own-node mode asks to be named: -bchdatadir, -bchrpcport, ...
+    if (coin == "bch" || coin == "xec")
+        return true;
     std::string sub = ChainSubdir(coin, ConfiguredChain(coin));
     return !DirExists(CoreDataDir(coin) + (sub.empty() ? "" : "/" + sub) + "/.cookie");
 }
@@ -174,9 +197,14 @@ bool UsingLight()
     return UsingLight("btc");
 }
 
+static const char* NodeWord(const std::string& coin)
+{
+    return coin == "bch" || coin == "xec" ? " node" : " Core";
+}
+
 std::string BackendName(const std::string& coin)
 {
-    return btclight::Label(coin) + (UsingLight(coin) ? " light" : " Core");
+    return btclight::Label(coin) + (UsingLight(coin) ? " light" : NodeWord(coin));
 }
 
 bool Call(const std::string& coin, const std::string& method, const json& params, json& resultOut,
@@ -196,7 +224,7 @@ bool Call(const std::string& coin, const std::string& method, const json& params
     }
     Config c = GetConfig(coin);
     LoopbackRpc to;
-    to.strWho = btclight::Label(coin) + " Core";
+    to.strWho = btclight::Label(coin) + NodeWord(coin);
     to.nMaxBytes = nMaxBytes;
     to.nTimeoutSecs = 120;
     to.nPort = c.nPort ? c.nPort : DefaultPort(coin, chain);
@@ -233,7 +261,7 @@ bool CheckChain(const std::string& coin, Chain& out, std::string& errOut)
     }
     std::string want = ConfiguredChain(coin);
     if (UsingLight(coin)) return btclight::CheckChain(coin, want, out, errOut);
-    std::string who = btclight::Label(coin) + " Core";
+    std::string who = btclight::Label(coin) + NodeWord(coin);
     json r;
     if (!Call(coin, "getblockchaininfo", json::array(), r, errOut))
         return false;
@@ -260,6 +288,26 @@ bool CheckChain(const std::string& coin, Chain& out, std::string& errOut)
         }
         out.pkhVersion = net->pkhVersion;
         out.shVersion = net->shVersion;
+        out.cashPrefix = net->cashPrefix;
+        out.fForkId = net->forkId;
+    }
+    // Bitcoin Core, Bitcoin Cash Node and Bitcoin ABC all call their chain
+    // "main" on the same port with the same cookie, and only one of them knows
+    // this prefix. A swap made against the wrong one could not be redeemed.
+    if (coin == "btc" || !out.cashPrefix.empty())
+    {
+        std::string probe = coin != "btc" ? PkhToAddress(out, std::vector<unsigned char>(20, 0))
+                            : out.name == "main" ? "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+                            : out.name == "regtest" ? "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+                            : "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        json v;
+        if (!Call(coin, "validateaddress", json::array({ probe }), v, errOut))
+            return false;
+        if (!v.is_object() || !v.contains("isvalid") || !v["isvalid"].is_boolean() || !v["isvalid"].get<bool>())
+        {
+            errOut = "the node at that port is not on " + btclight::Label(coin);
+            return false;
+        }
     }
     out.nBlocks = r.contains("blocks") && r["blocks"].is_number_integer() ? r["blocks"].get<int>() : 0;
     out.nMedianTime = r.contains("mediantime") && r["mediantime"].is_number_integer() ? r["mediantime"].get<int64>() : 0;
@@ -295,8 +343,127 @@ static std::string Encode(unsigned char nVersion, const std::vector<unsigned cha
     return EncodeBase58Check(v);
 }
 
+// Cashaddr (bitcoin-cash-node v29.2.0, src/cashaddr.cpp): five-bit groups of a
+// version byte and the hash, closed by eight groups of a 40-bit checksum that
+// covers the prefix.
+static uint64_t CashPolyMod(const std::vector<unsigned char>& v)
+{
+    uint64_t c = 1;
+    for (size_t i = 0; i < v.size(); i++)
+    {
+        unsigned char c0 = (unsigned char)(c >> 35);
+        c = ((c & 0x07ffffffffULL) << 5) ^ v[i];
+        if (c0 & 0x01) c ^= 0x98f2bc8e61ULL;
+        if (c0 & 0x02) c ^= 0x79b76d99e2ULL;
+        if (c0 & 0x04) c ^= 0xf33e5fb3c4ULL;
+        if (c0 & 0x08) c ^= 0xae2eabe2a8ULL;
+        if (c0 & 0x10) c ^= 0x1e4f43e470ULL;
+    }
+    return c ^ 1;
+}
+
+static std::vector<unsigned char> CashPrefixBits(const std::string& prefix)
+{
+    std::vector<unsigned char> v;
+    for (size_t i = 0; i < prefix.size(); i++)
+        v.push_back((unsigned char)prefix[i] & 0x1f);
+    v.push_back(0);
+    return v;
+}
+
+static const char CASH_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+std::string CashEncode(const std::string& prefix, unsigned char nType, const std::vector<unsigned char>& hash)
+{
+    std::vector<unsigned char> payload(1, (unsigned char)((nType << 3) | (hash.size() == 32 ? 3 : 0)));
+    payload.insert(payload.end(), hash.begin(), hash.end());
+    std::vector<unsigned char> groups;
+    int nBits = 0, nAcc = 0;
+    for (size_t i = 0; i < payload.size(); i++)
+    {
+        nAcc = (nAcc << 8) | payload[i];
+        nBits += 8;
+        while (nBits >= 5)
+        {
+            nBits -= 5;
+            groups.push_back((nAcc >> nBits) & 0x1f);
+        }
+        nAcc &= (1 << nBits) - 1;
+    }
+    if (nBits)
+        groups.push_back((nAcc << (5 - nBits)) & 0x1f);
+    std::vector<unsigned char> check = CashPrefixBits(prefix);
+    check.insert(check.end(), groups.begin(), groups.end());
+    check.insert(check.end(), 8, 0);
+    uint64_t nCheck = CashPolyMod(check);
+    std::string s = prefix + ":";
+    for (size_t i = 0; i < groups.size(); i++)
+        s += CASH_CHARSET[groups[i]];
+    for (int i = 0; i < 8; i++)
+        s += CASH_CHARSET[(nCheck >> (5 * (7 - i))) & 0x1f];
+    return s;
+}
+
+bool CashDecode(const std::string& prefix, const std::string& addr, unsigned char& nTypeOut, std::vector<unsigned char>& hashOut)
+{
+    std::string s = addr;
+    bool fUpper = false, fLower = false;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        if (s[i] >= 'A' && s[i] <= 'Z') { fUpper = true; s[i] = (char)(s[i] + 32); }
+        else if (s[i] >= 'a' && s[i] <= 'z') fLower = true;
+    }
+    if (fUpper && fLower)
+        return false;
+    size_t nColon = s.find(':');
+    if (nColon != std::string::npos)
+    {
+        if (s.substr(0, nColon) != prefix)
+            return false;
+        s = s.substr(nColon + 1);
+    }
+    std::vector<unsigned char> groups;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        const char* p = s[i] ? strchr(CASH_CHARSET, s[i]) : NULL;
+        if (!p)
+            return false;
+        groups.push_back((unsigned char)(p - CASH_CHARSET));
+    }
+    if (groups.size() < 9)
+        return false;
+    std::vector<unsigned char> check = CashPrefixBits(prefix);
+    check.insert(check.end(), groups.begin(), groups.end());
+    if (CashPolyMod(check) != 0)
+        return false;
+    groups.resize(groups.size() - 8);
+    std::vector<unsigned char> payload;
+    int nBits = 0, nAcc = 0;
+    for (size_t i = 0; i < groups.size(); i++)
+    {
+        nAcc = (nAcc << 5) | groups[i];
+        nBits += 5;
+        if (nBits >= 8)
+        {
+            nBits -= 8;
+            payload.push_back((unsigned char)((nAcc >> nBits) & 0xff));
+        }
+        nAcc &= (1 << nBits) - 1;
+    }
+    if (nBits >= 5 || nAcc || payload.empty() || (payload[0] & 0x80))
+        return false;
+    size_t nHash = (payload[0] & 7) == 0 ? 20 : (payload[0] & 7) == 3 ? 32 : 0;
+    if (!nHash || payload.size() != nHash + 1)
+        return false;
+    nTypeOut = (unsigned char)(payload[0] >> 3);
+    hashOut.assign(payload.begin() + 1, payload.end());
+    return true;
+}
+
 std::string PkhToAddress(const Chain& chain, const std::vector<unsigned char>& pkh)
 {
+    if (!chain.cashPrefix.empty())
+        return CashEncode(chain.cashPrefix, 0, pkh);
     return Encode(chain.pkhVersion, pkh);
 }
 
@@ -304,6 +471,23 @@ bool AddressToPkh(const Chain& chain, const std::string& addr, std::vector<unsig
                   std::string& errOut)
 {
     std::vector<unsigned char> v;
+    if (!chain.cashPrefix.empty())
+    {
+        unsigned char nType = 0;
+        std::vector<unsigned char> hash;
+        if (CashDecode(chain.cashPrefix, addr, nType, hash))
+        {
+            if (nType != 0 || hash.size() != 20)
+            {
+                errOut = "that is not a plain key address; the contract needs " + chain.cashPrefix + ":q...";
+                return false;
+            }
+            pkhOut = hash;
+            return true;
+        }
+        errOut = "need a " + btclight::Label(chain.coin) + " key address (" + chain.cashPrefix + ":q...)";
+        return false;
+    }
     if (!DecodeBase58Check(addr, v) || v.size() != 21)
     {
         errOut = chain.coin == "ltc"
@@ -326,7 +510,10 @@ bool AddressToPkh(const Chain& chain, const std::string& addr, std::vector<unsig
 std::string ScriptAddress(const Chain& chain, const CScript& redeemScript)
 {
     uint160 h = Hash160(redeemScript);
-    return Encode(chain.shVersion, std::vector<unsigned char>(h.begin(), h.end()));
+    std::vector<unsigned char> hash(h.begin(), h.end());
+    if (!chain.cashPrefix.empty())
+        return CashEncode(chain.cashPrefix, 1, hash);
+    return Encode(chain.shVersion, hash);
 }
 
 // ---- reading Bitcoin's serialization
@@ -383,7 +570,9 @@ bool ParseTxAt(const std::vector<unsigned char>& b, size_t& pos, CTransaction& t
         pos += 2;
     size_t bodyStart = pos;
     uint64 nIn = 0, nOut = 0;
-    if (!ReadVarInt(b, pos, nIn) || nIn == 0 || nIn > 100000)
+    // Counts are bounded by the bytes left, not by a number of their own: a
+    // valid transaction over any fixed limit would stop a block scan for good.
+    if (!ReadVarInt(b, pos, nIn) || nIn == 0 || nIn > (b.size() - pos) / 41)
         return false;
     for (uint64 i = 0; i < nIn; i++)
     {
@@ -391,7 +580,7 @@ bool ParseTxAt(const std::vector<unsigned char>& b, size_t& pos, CTransaction& t
         if (!Skip(b, pos, 36) || !ReadVarInt(b, pos, n) || !Skip(b, pos, n) || !Skip(b, pos, 4))
             return false;
     }
-    if (!ReadVarInt(b, pos, nOut) || nOut > 100000)
+    if (!ReadVarInt(b, pos, nOut) || nOut > (b.size() - pos) / 9)
         return false;
     for (uint64 i = 0; i < nOut; i++)
     {
@@ -464,14 +653,20 @@ int64 FeeRatePerKvB(const std::string& coin)
     int64 nRate = 0;
     json r;
     std::string err;
-    if (Call(coin, "estimatesmartfee", json::array({ 6 }), r, err) && r.is_object() &&
+    bool fCash = coin == "bch" || coin == "xec";
+    // Bitcoin Cash Node and Bitcoin ABC have no estimatesmartfee, and their
+    // blocks have room: 1 sat/byte is what everyone pays.
+    if (!fCash && Call(coin, "estimatesmartfee", json::array({ 6 }), r, err) && r.is_object() &&
         r.contains("feerate") && r["feerate"].is_number())
         nRate = (int64)(r["feerate"].get<double>() * COIN + 0.5);
     if (nRate <= 0)
     {
         std::string s = GetConfig(coin).strFeeRate;
-        if (s.empty() || !ParseMoney(s.c_str(), nRate))
-            nRate = 10000;            // 10 sat/vbyte
+        int64_t nConfigured = 0;
+        if (!s.empty() && ParseCoinAmount(coin, s, nConfigured))
+            nRate = nConfigured;
+        else
+            nRate = fCash ? 1000 : 10000; // 1 or 10 sat/vbyte
     }
     // 1000 per 1000 vbytes is the minimum relay fee of Bitcoin Core and of
     // Litecoin Core (litecoin v0.21.4, src/validation.h).
@@ -483,10 +678,38 @@ int64 FeeRatePerKvB()
     return FeeRatePerKvB("btc");
 }
 
+// The signature hash Bitcoin Cash and eCash require, BIP143's layout, which
+// commits to the amount spent. The base type here is always ALL
+// (bitcoin-cash-node v29.2.0, src/script/interpreter.cpp).
+uint256 ForkIdSignatureHash(const CScript& scriptCode, const CTransaction& tx, unsigned int nIn, int64 nAmount,
+                            unsigned int nHashType)
+{
+    CDataStream prevouts(SER_GETHASH), sequences(SER_GETHASH), outputs(SER_GETHASH);
+    for (size_t i = 0; i < tx.vin.size(); i++)
+    {
+        prevouts << tx.vin[i].prevout;
+        sequences << tx.vin[i].nSequence;
+    }
+    for (size_t i = 0; i < tx.vout.size(); i++)
+        outputs << tx.vout[i];
+    CDataStream ss(SER_GETHASH);
+    ss << tx.nVersion
+       << Hash(prevouts.begin(), prevouts.end())
+       << Hash(sequences.begin(), sequences.end())
+       << tx.vin[nIn].prevout
+       << scriptCode
+       << nAmount
+       << tx.vin[nIn].nSequence
+       << Hash(outputs.begin(), outputs.end())
+       << tx.nLockTime
+       << nHashType;
+    return Hash(ss.begin(), ss.end());
+}
+
 bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue, const CScript& scriptTo,
                 CKey& key, const std::vector<unsigned char>& vchPubKey,
                 const std::vector<unsigned char>* pSecret, int64 nFeeRatePerKvB,
-                CTransaction& tx, int64& nFee, std::string& errOut)
+                CTransaction& tx, int64& nFee, std::string& errOut, bool fForkId)
 {
     swap::Contract c;
     if (!swap::ParseContract(contract, c))
@@ -518,14 +741,14 @@ bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue
         }
         tx.vout.assign(1, CTxOut(nValue - nFee, scriptTo));
         tx.vin[0].scriptSig = CScript();
-        uint256 hash = SignatureHash(contract, tx, 0, SIGHASH_ALL);
+        uint256 hash = fForkId ? ForkIdSignatureHash(contract, tx, 0, nValue) : SignatureHash(contract, tx, 0, SIGHASH_ALL);
         std::vector<unsigned char> sig;
         if (!key.Sign(hash, sig))
         {
             errOut = "signing failed";
             return false;
         }
-        sig.push_back((unsigned char)SIGHASH_ALL);
+        sig.push_back((unsigned char)(fForkId ? FORKID_SIGHASH_ALL : SIGHASH_ALL));
         tx.vin[0].scriptSig = pSecret ? swap::RedeemScriptSig(sig, vchPubKey, *pSecret, contract)
                                       : swap::RefundScriptSig(sig, vchPubKey, contract);
         // No witness, so the size is the virtual size.
@@ -540,6 +763,25 @@ bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue
     {
         errOut = "could not settle the fee";
         return false;
+    }
+    if (fForkId)
+    {
+        // Bitflash's interpreter does not know this signature hash, and its
+        // consensus has no reason to, so the contract's conditions are
+        // checked here: the right key and the right secret.
+        uint160 h = Hash160(vchPubKey);
+        std::vector<unsigned char> pkh(h.begin(), h.end());
+        bool fOk = pkh == (pSecret ? c.recipientPkh : c.refundPkh);
+        if (fOk && pSecret)
+        {
+            std::vector<unsigned char> digest(32);
+            SHA256(pSecret->data(), pSecret->size(), digest.data());
+            fOk = pSecret->size() == swap::SECRET_BYTES && digest == c.secretHash;
+        }
+        if (!fOk)
+            errOut = pSecret ? "the redeem does not satisfy the contract -- is that the right secret and key?"
+                             : "the refund does not satisfy the contract";
+        return fOk;
     }
     CScript p2sh;
     p2sh.SetPayToScriptHash(contract);

@@ -117,6 +117,25 @@ int main()
         o.give = "LTC"; o.giveAmount = 200000000; o.want = "BTF"; o.wantAmount = 100000000;
         CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "LTC" && back.want == "BTF",
               "an offer of LTC for BTF");
+        CHECK(SwapAddressShapeOk("BCH", "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
+              SwapAddressShapeOk("BCH", "bchtest:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
+              !SwapAddressShapeOk("BCH", "ecash:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke") &&
+              !SwapAddressShapeOk("BCH", "bitcoincash:pr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
+              !SwapAddressShapeOk("BCH", BTC_ADDR),
+              "a Bitcoin Cash key address has its prefix");
+        CHECK(SwapAddressShapeOk("XEC", "ecash:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke") &&
+              SwapAddressShapeOk("XEC", "ectest:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke") &&
+              !SwapAddressShapeOk("XEC", "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
+              !SwapAddressShapeOk("XEC", "ecash:"),
+              "an eCash key address has its prefix");
+        o.give = "XEC"; o.giveAmount = 123456; o.want = "BTF"; o.wantAmount = 100000000;
+        CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "XEC" && back.giveAmount == 123456,
+              "an offer of XEC for BTF");
+        CHECK(DescribeSwapOffer(back) == "1234.56 XEC for 1 BTF", "the offer counts XEC to two places");
+        o.give = "BCH"; o.giveAmount = 200000000;
+        CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "BCH", "an offer of BCH for BTF");
+        CHECK(!ParseSwapOffer("{\"give\":\"BCH\",\"ga\":1,\"want\":\"XEC\",\"wa\":1}", back, err),
+              "one side of an offer is Bitflash, on these chains too");
         CHECK(!ParseSwapOffer("{\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
               "one side of an offer is always BTF");
         CHECK(!ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
@@ -128,8 +147,10 @@ int main()
               "a lock on Litecoin names its output, as on Bitcoin");
         l.chain = "BTF"; l.to = "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ";
         CHECK(ParseSwapStep(FormatSwapStep(l), step, err), "a Bitflash lock can ask to be paid on Litecoin");
-        CHECK(FormatSwapAmount(150000) == "0.0015" && FormatSwapAmount(100000000) == "1" &&
-              FormatSwapAmount(1) == "0.00000001", "amounts print without trailing zeros");
+        CHECK(FormatSwapAmount("BTC", 150000) == "0.0015" && FormatSwapAmount("BTC", 100000000) == "1" &&
+              FormatSwapAmount("BTC", 1) == "0.00000001", "amounts print without trailing zeros");
+        CHECK(FormatSwapAmount("XEC", 123456) == "1234.56" && FormatSwapAmount("XEC", 100) == "1" &&
+              FormatSwapAmount("XEC", 1) == "0.01", "an XEC is 100 base units");
     }
 
     printf("\n%s (%d failures)\n", g_fail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", g_fail);

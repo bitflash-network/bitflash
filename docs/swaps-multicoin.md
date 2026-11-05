@@ -1,7 +1,7 @@
 # Swaps with more chains (design)
 
-Status: Litecoin implemented (RPC, btfchat and both backends, docs/atomic-swaps.md);
-the others designed. Target: swaps with Litecoin, Dogecoin, Bitcoin Cash,
+Status: Litecoin, Bitcoin Cash and eCash implemented (RPC, btfchat and both
+backends, docs/atomic-swaps.md); the others designed. Target: swaps with Litecoin, Dogecoin, Bitcoin Cash,
 eCash, DigiByte and Ravencoin open on mainnet with Bitcoin's, on 2026-12-25
 12:00 UTC; Zcash (transparent addresses) in January 2027.
 
@@ -35,7 +35,7 @@ memory:
 | Litecoin | litecoin-project/litecoin v0.21.4 | scrypt(1024,1,1) | Bitcoin's, 2016 blocks of 2.5 min | legacy | base58 48/50 (5 legacy), bech32 `ltc` |
 | Dogecoin | dogecoin/dogecoin v1.14.9 | scrypt, merge-mined (AuxPoW, chain id 98) | DigiShield, every block | legacy | base58 30/22 |
 | Bitcoin Cash | bitcoin-cash-node v29.2.0 | SHA-256d | ASERT (aserti3-2d) | FORKID | cashaddr `bitcoincash` (base58 0/5) |
-| eCash | Bitcoin-ABC v0.34.3 | SHA-256d | ASERT | FORKID | cashaddr `ecash` |
+| eCash | Bitcoin-ABC v0.34.3 | SHA-256d | ASERT | FORKID | cashaddr `ecash`; XEC has 2 decimals |
 | DigiByte | digibyte core (tag to name) | five algorithms by version bits | per-algo (MultiShield) | legacy | base58 |
 | Ravencoin | ravencoin (tag to name) | KAWPOW | DarkGravityWave v3 | legacy (FORKID? to check) | base58 |
 
