@@ -91,6 +91,16 @@ static unsigned int Bits(Integer n)
     if (word & 0x00800000) { word >>= 8; ++size; }
     return word | (size << 24);
 }
+// aserti3-2d lowers the difficulty for a chain that claims time has passed,
+// so past the anchor a private fork need pay one real block and then almost
+// nothing. It has to show a sixteenth of the work the real chain did since:
+// a quarter of the blocks at a quarter of the anchor's difficulty, room for
+// the chain's own slumps and a price no peer pays for one swap.
+Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now)
+{
+    int64 blocks = std::max<int64>(0, now-(int64)anchor.time)/net.spacing;
+    return anchor.work+(Integer(1)<<256)/(Target(anchor.bits)+1)*blocks/16;
+}
 unsigned int Retarget(unsigned int bits, int64 elapsed, unsigned int limit)
 {
     elapsed = std::max<int64>(1209600/4, std::min<int64>(1209600*4, elapsed));
@@ -109,6 +119,21 @@ unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int lim
     if (shift) n >>= 1;
     n = n*elapsed/timespan;
     if (shift) n <<= 1;
+    return Bits(n > cap ? cap : n);
+}
+// aserti3-2d (bitcoin-cash-node v29.2.0, src/pow.cpp, CalculateASERT): the
+// anchor's target, doubled for each half-life the chain is behind its ideal
+// schedule. The exponent's division truncates and its shift floors, as there.
+unsigned int Asert(unsigned int anchorBits, int64 timeDiff, int64 heightDiff, int64 spacing, int64 halfLife, unsigned int limit)
+{
+    const int64 exponent = ((timeDiff-spacing*(heightDiff+1))*65536)/halfLife;
+    int64 shifts = exponent >> 16;
+    const uint64_t frac = (uint16_t)exponent;
+    const uint64_t factor = 65536+((195766423245049ULL*frac+971821376ULL*frac*frac+5127ULL*frac*frac*frac+(1ULL<<47)) >> 48);
+    Integer n = Target(anchorBits)*factor, cap = Target(limit);
+    shifts -= 16;
+    if (shifts <= 0) n >>= (unsigned int)-shifts; else n <<= (unsigned int)shifts;
+    if (n == 0) n = 1;
     return Bits(n > cap ? cap : n);
 }
 // Litecoin's proof of work: scrypt with N=1024, r=1, p=1 of the 80-byte
@@ -164,6 +189,73 @@ static const char* LTC_TEST_ANCHOR[] = {
     "0000002040a8bc2019b62a0b2a6e04babf759fd246317c5520f735e67a2cf1a0aacd3e7bf6942267077deee68be5b7978ad6e9a5de5fa366a842b9f6d7255d8c60daac155608e96afcff031de3c89edd", // 5013791
     "00000020c78a61f81591df6ba42729bf1c51fca73794cb5cbcdce06c764a58e50a1a1b2d5fee8d2811c8bc302335386cf549fc00c29b2440adfd34abb052d2183dd7a4ad5808e96affff001d3d4b238f", // 5013792
 };
+// Bitcoin Cash Node v29.2.0 and Bitcoin ABC v0.34.3 start the same way: a run
+// of real headers, read from the chains' own peers on 2026-11-04. Every
+// header from the chain's ASERT anchor to these was checked by a second
+// implementation of aserti3-2d (0 mismatches on the four networks), and the
+// mainnet hashes against two explorers.
+static const int BCH_MAIN_ANCHOR_HEIGHT = 970331;
+static const char* BCH_MAIN_ANCHOR[] = {
+    "00407521fc3e4a9eb87792eee29024d53fddabd1e0e59473fb0ddc6cb90900000000000000b5029f793f1db3677481bb12b65db6f2bf4f76177f4f28da21652bad14b2271e36eb6a6d92161a95044521",
+    "00e016207e525a8b181b91189ceb2d41bea36e4519faccf84542cfb8040300000000000070a52e336120b98edde4782d23815d8d8037266055d23abb99a4b1e5a66256d46e36eb6a3f89161acc853048",
+    "002060254f94c4321ca2ebb68fe6e86221ffbbc6fc93518e332475714213000000000000173915f45596999ff1e33ca5bd20b0a10a05894bcae2acd69ccd1d020b5c69eb2039eb6a427d161a81800e7d",
+    "00a0aa206debb9230e06cfe53116ec5125e66f0dd7543d85bbf8b89cf50f000000000000250d1c385c21d9f2f97ab5635df4ef468c308ab357babd1d1b3914db797244a36b39eb6a627f161ae6840bfc",
+    "00201d25c2f6146756f7203a9cf64eb69c0a2180b7e283e562bd9d246b100000000000002994d492ba20a793a15321fc6f63ab7d3ae372a82a13b491c600bbaf5728d134053beb6a3e73161a0c00f4d4",
+    "0000c621a209845f69a22b835b63e8bb0d87ffac9d6793688a324c97c71200000000000090005dc365c14afde64cbb9ac795f6af2687579b48ff47e1c9afc84274b3b2bf283beb6aeb6e161a660474a5",
+    "004033232a9f2990ba9b9656b717256cb933b862ab2c255f29b2df40ba0e000000000000f0c43df49ebbf8e7536c2ffa3276ed0e8a46c97dcc717c66eb8b88493efa0e2c823beb6af261161a69823808",
+    "00a01d25b96c157d198b0ca1953f17c0f96e970ee735462bfd017e87dc10000000000000f0de870b522a5aec5aeca3c46348d21db9c63222847f39a6d6ef3f9d9364b5b4e33eeb6a3056161af3837f99",
+    "0020a22233943939f1d45ae273d551e983bc2dc083b1012bbf68f90649110000000000006efb1ef4101ab3c19a7454ab3236d69213c196bbb1b79fe58d00f0abcb52dc8a134beb6a555c161aab05818e",
+    "00205a235f3b8cde3e535f0c95879f78b9b0d512f03c94a178d64e7dae0a0000000000005ff10fae229716341dab3a18cde44dc53cf690e3a68598ebe433c8ce5ade983f164deb6a5f96161ad681f562",
+    "00e0742194fd383eeca6a439f6ab7065b8db5d9b9c74a82c6d3d4ee2a3100000000000006b2977767e501da261a3babd0e77a22788b01d392ae9302c7df4c63c2248905cab4eeb6a6694161a888076d1",
+    "0040c421ab6a0d22edd82d3b20083702701f4876fe4cb6c43688c1f6d70f0000000000006c670d599d1efc05335cb167b5b32a9f7f866fefec9cd1f757e4dee9774147ac9b4feb6ad88f161a98824c82",
+};
+static const int BCH_TEST_ANCHOR_HEIGHT = 330867;
+static const char* BCH_TEST_ANCHOR[] = {
+    "004029217b8ed791e1d771622ac59f2127ae887e1152a725eb2dd9987f60000000000000a188eb88435bcd009f6cc394d50c9ce0d8ca2cc86422ef88744000559d7b61e03e3feb6affff001d420054aa",
+    "004024255d0966fafe1f54eb40b81525baaa7ead21791b07463858cae8542600000000000761b9da447ce7c292bfe8f76361448c35f42e375db928222b022378d1b49e8deb42eb6a5403011b7c021750",
+    "0060bf3196baa3a61d9964cdff1d0273d1fe5afe327c218c9a1e79251bac000000000000e14a6c4757f018555452c4d1954af35ea358ba736331d1a22166b0b9b053508dee44eb6af214011b64007fb2",
+    "0060e32577d45cf73f94c1c281db71f43861aef9a26a15870dd22866eda600000000000004fe9b9892b35ddb2de99976b49de1d62b8e43d23eacea23fbd4f4f4e7072dc8f444eb6a7310011bde013a5e",
+    "0000c7242cc0ef6df6901322f7898767b794c58a637cfa2d06b225f9c3b4000000000000d87be52217e79c8fed61fe1611d272ba7b845e807c6f1a706f34dd7acefe1af9e845eb6a01f3001b9e002da4",
+    "0060b120d73b7cdf504526fed007640ecc128e16f8c170bdb8137c664bd80000000000006ae9a08cd2f5eab742068fed812ae1cd3bc8236b76f08fc1e27cc86e1d53fc980448eb6ae8e2001b0000f96e",
+    "00802b219ff68b1f6ecf8aa7b5d1ba33238a36389581516e419833235766000000000000cfef65f0253ae9feeb4846301dc0f67e6656daafe1686941fa9d1510e10b54006c49eb6a4de0001b60001c7e",
+    "006072229e94ee8af4ab835c66deafa5a1960293ce36389a87012d0a9218000000000000f54f393be037476483cb2b09e2668b203905c78a926549ebeea834d419031489324ceb6a2ad6001bc002705f",
+    "00a02a2aa562e996b50313e4d3656e249f7f62da67499b6e9f19cceb4dbf000000000000565bada2f70f8c1ee786c9b00c79caee0a0a62cd6a95f55525deb62589c62b7bec4feb6ac0da001b6401191b",
+    "00c023212db03e1152dff5bc55e85b3de7a3ae0d1e65617c977123f8283a0000000000009cf4e8d0c12dcfdb6cf1088e8fb88d282bcd5fa7d8a33940f7aef63ba75a62eab851eb6a30ea001b060171bd",
+    "00a00a2ad02e941c18b5aa3575ee10729f6d92508b2b1127a9edcdf14a4f000000000000d493a49f912ddea92d266b65067a170513f6bf0be887c92778d701961e421b227856eb6affff001dde00400f",
+    "00a031237cf82772b80750c740d6be79dd59a25b8d3ec55cc8e52114a02000000000000046dce700dc27276991487f68a0fa92aba4359ed0daab57fb414ad0eabb23a0d8c357eb6aa300011bb600a906",
+};
+static const int XEC_MAIN_ANCHOR_HEIGHT = 974096;
+static const char* XEC_MAIN_ANCHOR[] = {
+    "0000b42db33ec8e4e6fc906f2383d3474496c703450fa27e61cdf09a00000000000000009f443c713a4d49dd9e3b40e8af1fa00db638b9f1edb1626a551e214163951381ab4ceb6a81af0019b8c6d75f",
+    "00c0f124d71b42637f45a953dab8687571c6c485667d616d1b0ede75000000000000000089fa46931e7f28c1632ab9bf9f4cef318d60225559aa2c87e9b1b4e85af527a65c4feb6a6daf00191ef94125",
+    "000004204c034cf4e24d64a3274fa156d8d975ed401f03048f7e2319000000000000000010018a68887ccd3567331066db6c3ee68554035ad83bba28578b6c70bcdae4090250eb6a7caf00199e066244",
+    "00a00020e73e4ffbf9d948b6a6409d5533affaee136c79f60928937e0000000000000000973a5570ead554e41550ec23f2f9591538ef3b6c70290f3326af32d7149fe846af53eb6a2eaf00196666d7b3",
+    "00206b256f9dd408f0cf5065d3890e339e6ae71e030a9eb32dd7d36e0000000000000000384a28d5a746612f3535576347ccc427a4b487333984700e87c754bcb09f934d2c54eb6a6baf00194ac08f11",
+    "00005a27904f1183c53509e475de4d0bed226c3b48f2758e6b0f1c1d000000000000000080b942225fbad37d63a7eb7df54cdaf4d520ca5b4181c8456d45bc6563ede4759a55eb6a16af00194128ea31",
+    "00202c24f504d3496682b2bad6fe33e5bbba292e576c6e028db05bad00000000000000005c7474e649d82ec89baf59b80ae9b8edd70999cf9955b9e5682940d72101882d5956eb6aedae0019baad845f",
+    "0020072040f1cba55d10402a8136d649d71c79bfdf4f14c623d03f100000000000000000916cff87211fe11bcfff8cba78f32a28701b0a116cd92bafc51b683b4f55a3cda557eb6aa3ae0019b90d01af",
+    "00c05c202a1bfbbc6da63dde41ffd1960795daeda7f9ac1535b83b7f0000000000000000579555cb77f8b13eec7f00d7faad4621384f93da2e455b3200ce1ad64f8ccdf0de57eb6a73ae001915a5c55e",
+    "0020f923b2928908683b6095ce6171d91cda61606978d4c18a1415a30000000000000000c27cb03a914ea98e2993777b7d221cd6bafe226a0ba8d3eec10d500c3edbf75c665beb6a12ae00197456af91",
+    "00200320c27c2a38436ddbc9fc5734bc6fc273cc3652e573ac6c5d250000000000000000fbc5dbce40ecb0bdfbf282ffde42fe686badc23bee994dca74bb146ee41286578b5eeb6a48ae00195563ea40",
+    "00c08436833aec5d532df796db3e8da81115cd1f744a14c2ab1dc9ac0000000000000000157d1448ba3b3856914d151a44f8c5a9c104ad8d8c25ca2c58cc935f2a54d5f42b60eb6a6dae00191839039e",
+};
+static const int XEC_TEST_ANCHOR_HEIGHT = 1738711;
+static const char* XEC_TEST_ANCHOR[] = {
+    "00000020f000c47a6a7fa73098d5d9bd2fdd750eaea60cb23c2be258150908000000000073aad7dbaa944b7aa25d19625efdb5fd15b58e54c8b2483e97366a8af8140593333aeb6a5896171b09b1a6cf",
+    "000000209dd93b344c270548d86ab4070fef0a89a72f6a8a8dd471c4f1db07000000000092d8b3ada4dbfb4a4e1a72919c369d08ad90f81d61c3b90ef8df4671789649dc3e3eeb6ab89a171b0d006fb2",
+    "00000020edcee752fe71379f50c2f3d7b8bbc9e4ac1ba83ee71dc7d936d61100000000007e3b52ab199c9ccde2d5124512d874fcbb1c4a42dbcee56bccddbbda8a33d87df442eb6affff001dab955fa2",
+    "000000201631c21138d715ff376bec651bd4cc77667bdf396342c0dd230c170b0000000028052175895dd427f9ed05a51b4de4229ce3442b9c7525f93f0536c9d5308152bd45eb6af8b3171b2a0b1120",
+    "0000002030ff5ccf5d7a52b6e82c457f7aa34be76d47a937796a3d7da12e0700000000003ef50d79f21f7f31d6bc5a16f9121c657ac9c9dbecc63778b6879a3af1db5019234aeb6ab8b6171b980f3f4e",
+    "00000020538661e0da99bc2078787f24c82f9f1113d405d37b18628bfbdf1400000000009dc4e8a4c2837c0bc7ac542c7d48d31456696aa240227a03a2ab199bde7dceb0e34eeb6affff001db3d41945",
+    "000000208b164f1efe2c00180406ab5c10173e92c4f9f7edc6b8e1b1ceb92d0300000000991353b3432885f2295262018a1deb11ff18e1091fd786446afa4ce05ad3163e884feb6aa8d2171b3c9c456b",
+    "00000020bbd913dcd8d3b0bc7b6d370c00e41879ef711011cc29ca2deaec07000000000056a0de138f96e5b93b415d0d5d592fe07b73ab2c04321539bc7333ae918a26f86752eb6af8c7171baa50aaa5",
+    "00000020d7f9b7341df48d3693e492ad4c3da82e473e129189b0025dad5c1300000000002d79d28aef6dbb735647c02a519568c5f9fa63eca9648c216be65d08f7afe35fee56eb6a58cb171b8cb2b90b",
+    "000000203b059d38cbb1539e5b3839da14b889e27c14b983c1cc9c3a39d90b0000000000ca53873d21956ebf482f835fc7c7780e005fd51b52e817e167687a6c53ecedc2ee57eb6a08d9171b884f48d3",
+    "0000002036071c0a0e8820ad08445162a4083f4dc55622fb7a340afedbb50b0000000000ccb9f07d4f3019d2f25d475a67a547f24623a62f3fb5b0eea08518813ba9a4a66559eb6a98d0171b46ce6178",
+    "00000020dba2db08ec0a23a6b4c8d573868bc44dc190bc56ba18fde18fae0700000000009fe987574fa40e0179c3f0a03ab6e5b9b45f46329df0feb9491926f60f4440aeb059eb6a18cb171b0b37b60e",
+};
+static const unsigned int XEC_TEST_ASERT_BITS = 0x1d00ffff;
+static const int64 XEC_TEST_ASERT_TIME = 1605445400;
 static Bytes GenesisHeader(unsigned int version, const char* merkle, unsigned int time, unsigned int bits, unsigned int nonce)
 {
     Bytes b; Put(b, version, 4); b.resize(36, 0);
@@ -186,7 +278,10 @@ static std::vector<Net> MakeNets()
     n.genesis = GenesisHeader(1, btcMerkle, 1231006505, 0x1d00ffff, 2083236893);
     v.push_back(n);
     n.name = "testnet4"; n.magic = 0x283f161c; n.port = 48333;
-    n.seeds = {"x49.seed.testnet4.bitcoin.sprovoost.nl", "x49.seed.testnet4.wiz.biz"};
+    // The x49 seeds stopped answering in 2026, and few test peers serve
+    // filters: these five did on 2026-11-04. Peers they name are kept.
+    n.seeds = {"x49.seed.testnet4.bitcoin.sprovoost.nl", "x49.seed.testnet4.wiz.biz", "135.180.99.74:48333", "148.51.196.40:48333",
+               "198.206.204.71:48333", "208.68.4.50:48333", "208.68.4.71:48333", "seed.testnet4.bitcoin.sprovoost.nl", "seed.testnet4.wiz.biz"};
     n.pkhVersion = 111; n.shVersion = 196; n.shVersion2 = 196; n.hrp = "tb";
     n.minDifficulty = true; n.bip94 = true;
     // assumevalid block 123613
@@ -212,7 +307,9 @@ static std::vector<Net> MakeNets()
     l.anchorHeight = 3203424; l.anchor.assign(LTC_MAIN_ANCHOR, LTC_MAIN_ANCHOR + sizeof(LTC_MAIN_ANCHOR)/sizeof(LTC_MAIN_ANCHOR[0]));
     v.push_back(l);
     l.name = "test"; l.magic = 0xf1c8d2fd; l.port = 19335;
-    l.seeds = {"testnet-seed.litecointools.com", "seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io"};
+    // Over Tor these names often do not resolve: five peers that answered on 2026-11-04.
+    l.seeds = {"testnet-seed.litecointools.com", "seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io", "81.17.120.243:19335",
+               "167.172.77.184:19335", "2.29.40.191:19335", "5.253.84.166:19335", "139.162.112.41:19335"};
     l.pkhVersion = 111; l.shVersion = 58; l.shVersion2 = 196; l.hrp = "tltc"; l.minDifficulty = true;
     l.genesis = GenesisHeader(1, ltcMerkle, 1486949366, 0x1e0ffff0, 293345);
     l.anchorHeight = 5013792; l.anchor.assign(LTC_TEST_ANCHOR, LTC_TEST_ANCHOR + sizeof(LTC_TEST_ANCHOR)/sizeof(LTC_TEST_ANCHOR[0]));
@@ -222,6 +319,59 @@ static std::vector<Net> MakeNets()
     l.genesis = GenesisHeader(1, ltcMerkle, 1296688602, 0x207fffff, 0);
     l.anchorHeight = 0; l.anchor.clear();
     v.push_back(l);
+    Net c;
+    c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
+    c.cashPrefix = "bitcoincash"; c.forkId = true;
+    // No BIP157 on Bitcoin Cash Node: payments are found in the window's
+    // blocks, whose limit is 32 MB and adapts upward (ABLA).
+    c.filters = false; c.services = 1; c.blockInv = 2; c.agent = "/Bitflash:bch-light/"; c.maxBlock = 256000000;
+    c.name = "main"; c.magic = 0xe8f3e1e3; c.port = 8333;
+    c.seeds = {"seed.flowee.cash", "seed-bch.bitcoinforks.org", "btccash-seeder.bitcoinunlimited.info", "seed.bchd.cash",
+               "seed.bch.loping.net", "bchseed.c3-soft.com", "bch.bitjson.com"};
+    c.pkhVersion = 0; c.shVersion = 5; c.shVersion2 = 5;
+    c.asertHeight = 661647; c.asertBits = 0x1804dafe; c.asertParentTime = 1605447844; c.asertHalfLife = 172800;
+    c.genesis = GenesisHeader(1, btcMerkle, 1231006505, 0x1d00ffff, 2083236893);
+    c.anchorHeight = BCH_MAIN_ANCHOR_HEIGHT; c.anchor.assign(BCH_MAIN_ANCHOR, BCH_MAIN_ANCHOR + sizeof(BCH_MAIN_ANCHOR)/sizeof(BCH_MAIN_ANCHOR[0]));
+    v.push_back(c);
+    c.name = "test4"; c.magic = 0xafdab7e2; c.port = 28333; c.cashPrefix = "bchtest"; c.minDifficulty = true;
+    c.seeds = {"testnet4-seed-bch.toom.im", "seed.tbch4.loping.net", "testnet4-seed.flowee.cash", "testnet4.bitjson.com",
+               "172.105.82.175:28333", "51.222.248.18:28333", "54.38.193.222:28333", "62.210.216.223:28333", "66.175.208.143:28333"};
+    c.pkhVersion = 111; c.shVersion = 196; c.shVersion2 = 196;
+    c.asertHeight = 16844; c.asertBits = 0x1d00ffff; c.asertParentTime = 1605451779; c.asertHalfLife = 3600;
+    c.genesis = GenesisHeader(1, btcMerkle, 1597811185, 0x1d00ffff, 114152193);
+    c.anchorHeight = BCH_TEST_ANCHOR_HEIGHT; c.anchor.assign(BCH_TEST_ANCHOR, BCH_TEST_ANCHOR + sizeof(BCH_TEST_ANCHOR)/sizeof(BCH_TEST_ANCHOR[0]));
+    v.push_back(c);
+    c.name = "regtest"; c.magic = 0xfabfb5da; c.port = 18444; c.seeds.clear(); c.cashPrefix = "bchreg"; c.minDifficulty = false;
+    c.regtest = true; c.limitBits = 0x207fffff; c.asertHeight = 0;
+    c.genesis = GenesisHeader(1, btcMerkle, 1296688602, 0x207fffff, 2);
+    c.anchorHeight = 0; c.anchor.clear();
+    v.push_back(c);
+    Net x;
+    x.coin = "xec"; x.label = "eCash"; x.timespan = 1209600; x.spacing = 600; x.limitBits = 0x1d00ffff;
+    x.cashPrefix = "ecash"; x.forkId = true;
+    x.filters = false; x.services = 1; x.blockInv = 2; x.agent = "/Bitflash:xec-light/"; x.maxBlock = 256000000;
+    x.name = "main"; x.magic = 0xe8f3e1e3; x.port = 8333;
+    x.seeds = {"seed.bitcoinabc.org", "seeder.fabien.cash", "seeder.status.cash"};
+    x.pkhVersion = 0; x.shVersion = 5; x.shVersion2 = 5;
+    // Bitcoin ABC reads the anchor from the chain at axionHeight, the last
+    // block before eCash and Bitcoin Cash split, and its half-life is two
+    // days on every network.
+    x.asertHeight = 661647; x.asertBits = 0x1804dafe; x.asertParentTime = 1605447844; x.asertHalfLife = 172800;
+    x.genesis = GenesisHeader(1, btcMerkle, 1231006505, 0x1d00ffff, 2083236893);
+    x.anchorHeight = XEC_MAIN_ANCHOR_HEIGHT; x.anchor.assign(XEC_MAIN_ANCHOR, XEC_MAIN_ANCHOR + sizeof(XEC_MAIN_ANCHOR)/sizeof(XEC_MAIN_ANCHOR[0]));
+    v.push_back(x);
+    x.name = "test"; x.magic = 0xf4f3e5f4; x.port = 18333; x.cashPrefix = "ectest"; x.minDifficulty = true;
+    x.seeds = {"testnet-seed.bitcoinabc.org", "testnet-seeder.fabien.cash", "testnet-seeder.status.cash"};
+    x.pkhVersion = 111; x.shVersion = 196; x.shVersion2 = 196;
+    x.asertHeight = 1421481; x.asertBits = XEC_TEST_ASERT_BITS; x.asertParentTime = XEC_TEST_ASERT_TIME;
+    x.genesis = GenesisHeader(1, btcMerkle, 1296688602, 0x1d00ffff, 414098458);
+    x.anchorHeight = XEC_TEST_ANCHOR_HEIGHT; x.anchor.assign(XEC_TEST_ANCHOR, XEC_TEST_ANCHOR + sizeof(XEC_TEST_ANCHOR)/sizeof(XEC_TEST_ANCHOR[0]));
+    v.push_back(x);
+    x.name = "regtest"; x.magic = 0xfabfb5da; x.port = 18444; x.seeds.clear(); x.cashPrefix = "ecregtest"; x.minDifficulty = false;
+    x.regtest = true; x.limitBits = 0x207fffff; x.asertHeight = 0;
+    x.genesis = GenesisHeader(1, btcMerkle, 1296688602, 0x207fffff, 2);
+    x.anchorHeight = 0; x.anchor.clear();
+    v.push_back(x);
     return v;
 }
 static const std::vector<Net>& Nets()
@@ -238,7 +388,7 @@ const Net* FindNet(const std::string& coin, const std::string& network)
 }
 std::string Label(const std::string& coin)
 {
-    return coin == "ltc" ? "Litecoin" : "Bitcoin";
+    return coin == "ltc" ? "Litecoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
 }
 static Header Decode(const Bytes& raw)
 {
@@ -304,6 +454,11 @@ int64 Headers::Median(const Header& header) const
 unsigned int Headers::NextBits(const Header& parent, unsigned int time) const
 {
     if (net->regtest) return parent.bits;
+    if (net->asertHeight)
+    {
+        if (net->minDifficulty && (int64)time > (int64)parent.time+2*net->spacing) return net->limitBits;
+        return Asert(net->asertBits, (int64)parent.time-net->asertParentTime, parent.height-net->asertHeight, net->spacing, net->asertHalfLife, net->limitBits);
+    }
     int next = parent.height+1, interval = net->Interval();
     if (next % interval)
     {
@@ -437,9 +592,9 @@ bool MatchFilter(const uint256& block, const Bytes& filter, const std::vector<By
     }
     catch (...) { match = false; return false; }
 }
-bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& txs)
+bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& txs, size_t maxBlock)
 {
-    if (raw.size() < 81 || raw.size() > 4000000 || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs)) return false;
+    if (raw.size() < 81 || raw.size() > maxBlock || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs)) return false;
     std::vector<uint256> tree;
     for (size_t i = 0; i < txs.size(); ++i) tree.push_back(txs[i].GetHash());
     while (tree.size() > 1)
@@ -462,6 +617,22 @@ bool Destination(const btcswap::Chain& chain, const std::string& addr, CScript& 
     const Net* net = FindNet(chain.coin, chain.name);
     if (!net && chain.coin == "btc" && !chain.fMain) net = FindNet("btc", "testnet4");
     script.clear(); Bytes base;
+    if (!chain.cashPrefix.empty())
+    {
+        // Cashaddr: a key, a script, and on Bitcoin Cash the token-aware forms
+        // of the two, and a script's 32 bytes. Not base58: it reads the same
+        // on Bitcoin, so a Bitcoin address pasted here would pay nobody.
+        unsigned char type = 0; Bytes hash;
+        if (btcswap::CashDecode(chain.cashPrefix, addr, type, hash))
+        {
+            if (type > (chain.coin == "bch" ? 3 : 1)) { err = "that is not a "+Label(chain.coin)+" address this wallet can pay"; return false; }
+            if (type%2 == 0 && hash.size() == 20) { script << OP_DUP << OP_HASH160 << hash << OP_EQUALVERIFY << OP_CHECKSIG; return true; }
+            if (type%2 == 1 && hash.size() == 20) { script << OP_HASH160 << hash << OP_EQUAL; return true; }
+            if (type%2 == 1 && hash.size() == 32 && chain.coin == "bch") { script << OP_HASH256 << hash << OP_EQUAL; return true; }
+            err = "that is not a "+Label(chain.coin)+" address this wallet can pay"; return false;
+        }
+        err = "invalid "+Label(chain.coin)+" destination or wrong network"; return false;
+    }
     if (DecodeBase58Check(addr, base) && base.size() == 21)
     {
         Bytes hash(base.begin()+1, base.end());
@@ -535,13 +706,13 @@ struct Peer
     Bytes Receive(const std::string& wanted)
     {
         // Bound unsolicited traffic as well as individual messages.
-        size_t budget = 16*1024*1024;
+        size_t budget = std::max<size_t>(16*1024*1024, 2*net.maxBlock);
         for (int messages = 0; messages < 256; ++messages)
         {
             Bytes header(24); Transfer(&header[0], 24, false);
             if (LE(header, 0, 4) != magic) throw std::runtime_error("wrong "+net.label+" message magic");
             size_t length = (size_t)LE(header, 16, 4);
-            if (length > 4000000 || length > budget) throw std::runtime_error("oversized "+net.label+" message");
+            if (length > net.maxBlock || length > budget) throw std::runtime_error("oversized "+net.label+" message");
             budget -= length;
             std::string command;
             bool ended = false;
@@ -772,7 +943,7 @@ static void Load(State& s)
         for (const auto& text : j.at("blocks"))
         {
             Bytes b = ParseHex(text.get<std::string>()); Header h = Decode(Bytes(b.begin(), b.begin()+std::min<size_t>(80,b.size())));
-            std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
+            std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs,s.net.maxBlock)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
         }
         for (const auto& text : j.at("pending"))
         {
@@ -849,7 +1020,7 @@ static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_
         lock.unlock(); Bytes block;
         try { block = primary.Receive("block"); lock.lock(); } catch (...) { lock.lock(); throw; }
         std::vector<CTransaction> txs;
-        if (!VerifyBlock(block,s.headers.At(height),txs)) throw std::runtime_error(s.net.label+" block does not match its header");
+        if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock)) throw std::runtime_error(s.net.label+" block does not match its header");
         bool keep = false;
         for (const CTransaction& tx : txs)
         {
@@ -911,6 +1082,8 @@ static void Round(State& s, Peer& primary, Peer* second)
     // A chain started from an anchor counts work only from there; the anchor
     // itself is the checkpoint, and every header after it pays its own work.
     Integer minimum = *s.net.minimumWork && s.net.anchor.empty() ? Number(uint256(s.net.minimumWork)) : Integer(0);
+    if (s.net.asertHeight && !s.net.minDifficulty && !s.net.anchor.empty())
+        minimum = AnchorWorkFloor(s.net, s.headers.At(s.net.anchorHeight), GetTime());
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
         (s.net.regtest || (int64)s.headers.Tip().time > GetTime()-7200);
     // Confirmed transactions remain saved so a reorg can resume rebroadcast.
@@ -1002,7 +1175,7 @@ static void Round(State& s, Peer& primary, Peer* second)
             int height = matched[i];
             Bytes inv; Compact(inv,1); Put(inv,0x40000002,4); HashBytes(inv,s.headers.At(height).hash);
             Bytes block = Fetch(primary,"getdata",inv,"block",lock); std::vector<CTransaction> txs;
-            if (!VerifyBlock(block,s.headers.At(height),txs)) throw std::runtime_error("Bitcoin block merkle root mismatch");
+            if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock)) throw std::runtime_error("Bitcoin block merkle root mismatch");
             s.blocks[s.headers.At(height).hash] = block;
             // Pending transactions are kept until their confirmation is on
             // the active branch; reorgs put them back in the broadcast set.
@@ -1127,7 +1300,7 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
             else state = it->second;
         }
         std::lock_guard<std::recursive_mutex> lock(state->mutex);
-        out.coin = coin; out.name = network; out.fMain = network == "main"; out.pkhVersion = net->pkhVersion; out.shVersion = net->shVersion;
+        out.coin = coin; out.name = network; out.fMain = network == "main"; out.pkhVersion = net->pkhVersion; out.shVersion = net->shVersion; out.cashPrefix = net->cashPrefix; out.fForkId = net->forkId;
         out.nBlocks = state->headers.Tip().height; out.nMedianTime = state->headers.Median(state->headers.Tip());
         return true;
     }
@@ -1235,7 +1408,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     if (funding == txs.end() || output < 0) return j;
     if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
     j["confirmations"] = s.headers.Tip().height-funding->second.height+1; j["unspent"] = true;
-    j["amount"] = (double)funding->second.tx.vout[output].nValue/COIN;
+    j["amount"] = (double)funding->second.tx.vout[output].nValue/CoinUnit(s.net.coin);
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
     for (auto it = txs.begin(); it != txs.end(); ++it)
         for (size_t k = 0; k < it->second.tx.vin.size(); ++k) if (it->second.tx.vin[k].prevout == prev)
@@ -1338,9 +1511,9 @@ int SelfTest()
     Header blockHeader = Decode(rawBlock);
     Compact(rawBlock,1); rawBlock.insert(rawBlock.end(),stream.begin(),stream.end());
     std::vector<CTransaction> blockTxs;
-    check(VerifyBlock(rawBlock,blockHeader,blockTxs) && blockTxs.size() == 1,"verify matched block merkle root");
+    check(VerifyBlock(rawBlock,blockHeader,blockTxs,4000000) && blockTxs.size() == 1,"verify matched block merkle root");
     rawBlock.back() ^= 1;
-    check(!VerifyBlock(rawBlock,blockHeader,blockTxs),"reject matched block with tampered transaction");
+    check(!VerifyBlock(rawBlock,blockHeader,blockTxs,4000000),"reject matched block with tampered transaction");
     check(reg.ActiveHeight(first.hash) == -1 && reg.ActiveHeight(forkHeader.hash) == 1,"disconnected branch cannot prove payments");
     Header cursor = reg.Tip();
     for (int i = 0; i < 12; ++i)
@@ -1408,6 +1581,132 @@ int SelfTest()
     printf("btc-light: %d failure(s)\n",failures); return failures ? 1 : 0;
 }
 
+int SelfTestCash()
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* name) { printf("  %-70s %s\n",name,ok?"ok":"FAILED"); if (!ok) ++failures; };
+    printf("cash-light self-test\n");
+    const Net* bch = FindNet("bch","main"); const Net* bchTest = FindNet("bch","test4"); const Net* bchReg = FindNet("bch","regtest");
+    const Net* xec = FindNet("xec","main"); const Net* xecTest = FindNet("xec","test"); const Net* xecReg = FindNet("xec","regtest");
+    check(bch && bchTest && bchReg && xec && xecTest && xecReg,"Bitcoin Cash and eCash networks");
+    if (!bch || !bchTest || !bchReg || !xec || !xecTest || !xecReg) { printf("cash-light: %d failure(s)\n",failures+1); return 1; }
+    // Genesis fields of the two nodes (chainparams.cpp asserts these hashes).
+    check(Decode(bch->genesis).hash.GetHex() == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f","main genesis");
+    check(Decode(bchTest->genesis).hash.GetHex() == "000000001dd410c49a788668ce26751718cc797474d3152a5fc073dd44fd9f7b","Bitcoin Cash test4 genesis");
+    check(Decode(xecTest->genesis).hash.GetHex() == "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943","eCash test genesis");
+    check(Decode(bchReg->genesis).hash.GetHex() == "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206","regtest genesis");
+
+    // aserti3-2d against the real chain.
+    struct { int parentHeight; int64 parentTime; unsigned int bits; } rows[] = { {661647,1605449609,0x1804e0d0U},{661648,1605449817,0x1804dedcU},{699999,1628513500,0x180606aeU},{799999,1688286172,0x18026bd4U},{899999,1748287553,0x18026f44U} };
+    for (auto& r : rows)
+    {
+        unsigned int got = Asert(bch->asertBits,r.parentTime-bch->asertParentTime,r.parentHeight-bch->asertHeight,600,bch->asertHalfLife,bch->limitBits);
+        check(got == r.bits,"aserti3-2d gives the real chain's bits");
+        check(Asert(bch->asertBits,r.parentTime+1000-bch->asertParentTime,r.parentHeight-bch->asertHeight,600,bch->asertHalfLife,bch->limitBits) != r.bits ||
+              r.parentHeight == bch->asertHeight,"another time gives other bits");
+    }
+    check(Asert(0x1d00ffff,86400*365,1,600,3600,0x1d00ffff) == 0x1d00ffff,"aserti3-2d stops at the proof-of-work limit");
+    check(Asert(0x1804dafe,-(int64)86400*36500,0,600,172800,0x1d00ffff) != 0,"aserti3-2d keeps a target of at least one");
+
+    struct { const Net* net; int height; const char* hash; const char* next[3]; } chains[] = {
+        {bch,970331,"0000000000000a8169cd101774e715c087e26f069d3d81d5a758db30410c9513",{"00c0d42213950c4130db58a7d5813d9d066fe287c015e7741710cd69810a0000000000008595f457a2534e4b41a10eaedd4c8e4e31b5bab0472e1a8b63578662ff270bb08051eb6a9387161aad831263","00c017234da7cd84c004a0dff3e7d88bb97596bd37fb8b1ad42f91967b080000000000004c04e56f27e01cfecde459878a8cf8c67d695f40398f7b5ed8cddc138546c71d1954eb6aec84161a4780bc99","00807923575cbcfdaac76f77d9b6d292f000d215bec03d39767a37d99115000000000000ecb23b568aa993bce9ea2a78c735df01812838f8d492681538021efa5f7704a0c458eb6a7086161a9804d4ca"}},{bchTest,330867,"000000000000df73e882aa0303d88593920f9c18c0c727d2010dd0606459f432",{"0060d32732f4596460d00d01d227c7c0189c0f929385d80303aa82e873df000000000000cce6f4058d409131a35f8825ffd220735ee58e1b13989740549620dfb8b103297f5ceb6affff001ddc010e70","00a0af2dbf40b64fa9a697bc8a6dae02310b6fa520ef0ed0dfd1567f92443c00000000008b2b999f2af8bd594853a8608979548c48f3b80286adc6037c3ca165b7c76fc0415feb6a3012011b92009757","0080a522503ca3bef162e48c98a48b1f52ca23ce3295511e21f6c0b9a284000000000000e4111122a348fb455e1f2e7ec789a3c37d23a8bf78d1705677d8c58aa21790b3ae61eb6ad717011b4e00af23"}},{xec,974096,"000000000000000061d9b8630f8386d3adc91896ee3d79b764e84e51ceb83df3",{"00001020f33db8ce514ee864b7793dee9618c9add386830f63b8d96100000000000000002c8e5e3512715e8548ced5436b66ad7e9b4185188f778517836bccce5c2e32170c62eb6a4cae001913f0256f","0020cd23c8afa5ae08a8d80fbd9963296e60554a9623ba666c4ad405000000000000000066c6810d845aa51deeb73ec5e6cf61f1ed53f1342a817f0d8eb972e9ad04d8763864eb6a37ae00197c0365ae","00805925dd1935ceeaa3723149f337fc0abb48e1ae498f8c085ee0530000000000000000c831447f770906dd7533826f795f7d5633c40d30cc1d714ecf22b1e243a2b6c20466eb6a2fae001938c52691"}},{xecTest,1738711,"000000000000a67398cd330e2d8871c49cb9d8fe97e32730544a72f5b0715293",{"00000020935271b0f5724a543027e397fed8b99cc471882d0e33cd9873a60000000000000c902b8617489cf52f1dd7a07f4cf264764afd55f795b2e3b7dd2a17ecb0f906355ceb6a48be171b83e80c33","000000209d40065d4f69ae958bd72bff7f54f9d5e61818dff5d905f8b5560a00000000007d7c85165a011ad7487c52f8c023f6b88167dc7257fe950beb2ce22b7dc45af0d25feb6a58bf171b8d5ba461","0000002013e1097ee945edbdbdd975de66a0129839cf96616244953ae4d60d0000000000f28a20efd645f65a62f5f9282a472eb9436b8b25b5cda9b423b2965d668ad6cc1e62eb6a48c7171b20a392c6"}} };
+    for (auto& c : chains)
+    {
+        Headers h(*c.net);
+        check(h.Tip().height == c.height && h.Tip().hash == uint256(std::string(c.hash)),"anchor headers chain up to their tip, proof of work included");
+        std::string err;
+        for (const char* raw : c.next) check(h.Add(ParseHex(raw),err),"the next real headers pay aserti3-2d");
+        Bytes flipped = ParseHex(c.next[0]); flipped[72] ^= 1;
+        Headers again(*c.net);
+        check(!again.Add(flipped,err),"a header with other bits is refused");
+        check(c.net->anchor.size() == 12,"twelve anchor headers");
+    }
+    {
+        Headers h(*bch); std::string err; Bytes wrong = ParseHex(chains[2].next[0]);
+        check(!h.Add(wrong,err),"eCash's headers do not continue Bitcoin Cash's");
+    }
+
+    // Cashaddr: bitcoin-cash-node's test vectors and Bitcoin ABC's own output.
+    Bytes hash = ParseHex("F5BF48B397DAE70BE82B3CCA4793F8EB2B6CDAC9");
+    check(btcswap::CashEncode("bitcoincash",0,hash) == "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2","cashaddr key address vector");
+    check(btcswap::CashEncode("bchtest",1,hash) == "bchtest:pr6m7j9njldwwzlg9v7v53unlr4jkmx6eyvwc0uz5t","cashaddr script address vector");
+    check(btcswap::CashEncode("bchtest",3,hash) == "bchtest:rr6m7j9njldwwzlg9v7v53unlr4jkmx6eytyt3jytc","cashaddr token address vector");
+    check(btcswap::CashEncode("ecash",0,ParseHex("1abed8be89284f058bcb9f1b7f5c37d272b6032b")) == "ecash:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke","eCash address from Bitcoin ABC");
+    check(btcswap::CashEncode("ecash",0,ParseHex("ab6ac78ca455a654900b6e4b47786160c2977ce9")) == "ecash:qz4k43uv5326v4yspdhyk3mcv9sv99muaycdj3n5ws","eCash address from Bitcoin ABC, again");
+    unsigned char type = 9; Bytes out;
+    check(btcswap::CashDecode("bitcoincash","bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",type,out) && type == 0 && out == hash,"cashaddr decodes");
+    check(btcswap::CashDecode("bitcoincash","qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",type,out) && out == hash,"cashaddr without its prefix");
+    check(btcswap::CashDecode("bitcoincash","BITCOINCASH:QR6M7J9NJLDWWZLG9V7V53UNLR4JKMX6EYLEP8EKG2",type,out),"cashaddr in capitals");
+    check(!btcswap::CashDecode("bitcoincash","bitcoincash:QR6M7J9NJLDWWZLG9V7V53UNLR4JKMX6EYLEP8EKG2",type,out),"cashaddr in mixed case is refused");
+    check(!btcswap::CashDecode("ecash","bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",type,out),"a Bitcoin Cash address is not an eCash one");
+    check(!btcswap::CashDecode("ecash","qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",type,out),"the prefix is in the checksum");
+    check(!btcswap::CashDecode("bitcoincash","bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg3",type,out),"a mistyped cashaddr is refused");
+
+    btcswap::Chain chain; chain.coin = "bch"; chain.name = "main"; chain.fMain = true; chain.pkhVersion = 0; chain.shVersion = 5;
+    chain.cashPrefix = "bitcoincash"; chain.fForkId = true;
+    CScript dest; std::string err; Bytes pkhBase58; std::string addrBase58;
+    check(Destination(chain,"bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",dest,err) && dest.size() == 25,"Bitcoin Cash key destination");
+    check(Destination(chain,btcswap::CashEncode("bitcoincash",1,hash),dest,err) && dest.size() == 23,"Bitcoin Cash script destination");
+    check(Destination(chain,btcswap::CashEncode("bitcoincash",1,Bytes(32,7)),dest,err) && dest.size() == 35,"Bitcoin Cash 32-byte script destination");
+    check(Destination(chain,btcswap::CashEncode("bitcoincash",2,hash),dest,err) && dest.size() == 25,"Bitcoin Cash token-aware destination");
+    check(!Destination(chain,"1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggu",dest,err),"base58 reads the same on Bitcoin: refused");
+    check(!Destination(chain,"3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",dest,err),"a base58 script address too");
+    check(!btcswap::AddressToPkh(chain,"1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggu",pkhBase58,addrBase58),"and as a contract key");
+    check(!Destination(chain,"ecash:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke",dest,err),"an eCash address is not a Bitcoin Cash destination");
+    check(!Destination(chain,"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",dest,err),"a Bitcoin address is not a Bitcoin Cash destination");
+    Bytes pkh; std::string addrErr;
+    check(btcswap::AddressToPkh(chain,"bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",pkh,addrErr) && pkh == hash,"contract key from a cashaddr");
+    check(!btcswap::AddressToPkh(chain,btcswap::CashEncode("bitcoincash",1,hash),pkh,addrErr),"a contract key is not a script");
+    check(btcswap::PkhToAddress(chain,hash) == "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2","contract key to cashaddr");
+    btcswap::Chain ec = chain; ec.coin = "xec"; ec.cashPrefix = "ecash";
+    check(!Destination(ec,btcswap::CashEncode("ecash",2,hash),dest,err),"no token-aware addresses on eCash");
+    check(!Destination(ec,btcswap::CashEncode("ecash",1,Bytes(32,7)),dest,err),"no 32-byte script addresses on eCash");
+
+    // A valid transaction with more outputs than any fixed limit: a block
+    // holding one must not stop a scan for good.
+    Bytes wide; Bytes header32 = ParseHex("01000000"); wide = header32; wide.push_back(1); wide.insert(wide.end(),36,0); wide.push_back(0); wide.insert(wide.end(),4,0);
+    const uint32_t outputs = 110000; wide.push_back(0xfe); for (int i = 0; i < 4; ++i) wide.push_back((unsigned char)(outputs>>(8*i)));
+    wide.insert(wide.end(),outputs*9,0); wide.insert(wide.end(),4,0);
+    CTransaction wideTx;
+    check(btcswap::ParseTx(wide,wideTx) && wideTx.vout.size() == outputs,"a transaction with 110000 outputs reads");
+    Bytes cut(wide.begin(),wide.end()-100);
+    check(!btcswap::ParseTx(cut,wideTx),"and a cut one does not");
+
+    // aserti3-2d past the anchor: the floor a private fork would have to show.
+    {
+        Headers h(*bch); const Header& a = h.At(bch->anchorHeight); Integer perBlock = (Integer(1)<<256)/(Target(a.bits)+1);
+        check(AnchorWorkFloor(*bch,a,(int64)a.time-5000) == a.work && AnchorWorkFloor(*bch,a,(int64)a.time+500) == a.work,"no floor at the anchor");
+        int64 month = (int64)a.time+30*86400;
+        check(AnchorWorkFloor(*bch,a,month) == a.work+perBlock*4320/16,"a month on, 270 blocks of the anchor's work");
+        // One real block, stamped a month later, then six almost free ones.
+        unsigned int cheap = Asert(bch->asertBits,month-bch->asertParentTime,bch->anchorHeight+1-bch->asertHeight,600,bch->asertHalfLife,bch->limitBits);
+        Integer fork = a.work+perBlock+(Integer(1)<<256)/(Target(cheap)+1)*6;
+        check(Target(cheap) > Target(a.bits)*1000 && fork < AnchorWorkFloor(*bch,a,month),"a cheap fork from the anchor stays under it");
+    }
+
+    // The chain's own signature hash vectors (bitcoin-cash-node, test/data/sighash.json).
+    struct { const char* tx; const char* script; int input; unsigned int type; const char* hash; } sigs[] = { {"13938a7d011e4545c281cbd8c6c85c796194285adb908ab052755cf65b60c5f7fc7e0e125c020000000953530000ac6a526a00d36774ce04d94bb802000000000600516353ac63f9f9fe000000000000b0123a05000000000251ace0b7c10400000000055351abab6300000000","5300655100",0,0x1be50b41U,"6bfb3e169f83f480b12c45223182650ae9dfa1e6be45e42a70b4bfdbf75cf923"},
+        {"753ca84702758209899178670a37c457207494591a31ece76b9654e35d9e38e3e0879462e2030000000952ab515253acab63656d0120aae21ec8043302ace9d58d296672649452875895946eaf44942c410b16df1cef2f020000000400635200ffffffff0348b17202000000000665526a525365d8ada10300000000056563510051d47f54030000000009536aab65abac0052652963ff8d","",0,0x8e0b8841U,"d550d784646703f7db64c8755a5cd58b8ea736e6e344542bd206c21cc569a82e"},
+        {"ddadc1eb045d16b79907449cc9f00f7f74e4b8dc891417c1ffed225d5f6665980ca500d3df0000000005acab53ac5277506c8885fe8846264f4e1d2721b4a4d0795bd55d2cf5a43164713a42b813995408024d0200000007abab00635353abffffffff6992b2678018777756025009c13fec6e53b7d1b59ae5f36cb771c61a43a8161d010000000353ababffffffff0c59a711c690c00a13a9d3a9125d3b45db372c26841d9b902932310246695b1c01000000046a51ac006176e522016ef66d0300000000010000000000","ab6a6a63516aac65",0,0x9f20f041U,"d6fe4e12b301525576c14ca489d6edb914c5326f02c63ed5097b78ad6c51d827"} };
+    for (auto& v : sigs)
+    {
+        CTransaction tx; Bytes raw = ParseHex(v.tx), code = ParseHex(v.script);
+        check(btcswap::ParseTx(raw,tx),"sighash vector transaction");
+        check(btcswap::ForkIdSignatureHash(CScript(code.begin(),code.end()),tx,v.input,0,v.type).GetHex() == v.hash,"ALL|FORKID signature hash vector");
+        check(btcswap::ForkIdSignatureHash(CScript(code.begin(),code.end()),tx,v.input,1,v.type).GetHex() != v.hash,"the amount is in the signature hash");
+    }
+
+    // eCash counts to two places.
+    int64_t n = 0;
+    check(CoinUnit("xec") == 100 && CoinUnit("bch") == 100000000,"an XEC is 100 base units");
+    check(ParseCoinAmount("xec","1234.56",n) && n == 123456 && CoinAmountText("xec",n) == "1234.56","XEC amount and back");
+    check(!ParseCoinAmount("xec","0.001",n),"XEC has no third decimal");
+    check(ParseCoinAmount("bch","0.00000001",n) && n == 1,"Bitcoin Cash has eight");
+    check(ParseCoinAmount("xec","200000000000",n) && n == 20000000000000LL,"more XEC than fit at eight decimals");
+    check(!ParseCoinAmount("xec","99999999999999999999",n),"too many XEC");
+    check(!ParseCoinAmount("bch","1.2.3",n) && !ParseCoinAmount("bch","",n) && !ParseCoinAmount("bch","-1",n),"malformed amounts");
+    printf("cash-light: %d failure(s)\n",failures); return failures ? 1 : 0;
+}
 int SelfTestLitecoin()
 {
     setbuf(stdout, NULL);

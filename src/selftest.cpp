@@ -8009,7 +8009,8 @@ static int RunInvoiceSelfTest()
 //   CHATSWAP_B=port:passfile   Bob's
 //   CHATSWAP_BTC=port          the regtest Core both wallets use (user/pass swap/swap,
 //                              wallet "w" mines)
-//   CHATSWAP_COIN=LTC          swap against Litecoin Core instead
+//   CHATSWAP_COIN=LTC          swap against Litecoin Core instead (or BCH, XEC:
+//                              Bitcoin Cash Node, Bitcoin ABC)
 
 namespace
 {
@@ -8118,7 +8119,7 @@ static void SwapTestLightPerson(btfchat::SwapEngine& e, const btfchat::SwapView*
     }
     if (v->stage == btfchat::SW_WAIT_PAYMENT && !v->paymentAddress.empty() && !paid.count(v->paymentAddress))
     {
-        std::string amount = strprintf("%lld.%08lld", (long long)(v->giveAmount / COIN), (long long)(v->giveAmount % COIN));
+        std::string amount = CoinAmountText(v->give, v->giveAmount);
         nlohmann::json txid = SwapTestBtc(nBtcPort, "sendtoaddress", nlohmann::json::array({ v->paymentAddress, amount }), "/wallet/w");
         printf("    paid %s BTC to the contract %s from an outside wallet (%s)\n", amount.c_str(),
                v->paymentAddress.c_str(), txid.is_string() ? txid.get<std::string>().c_str() : "?");
@@ -8232,7 +8233,8 @@ static int RunChatSwapSelfTest()
     int nBtc = atoi(pszBtc);
     int nFail = 0;
     // CHATSWAP_COIN=LTC: the same swaps on Litecoin, with Litecoin Core on
-    // regtest in Bitcoin Core's place (CHATSWAP_BTC names its port).
+    // regtest in Bitcoin Core's place (CHATSWAP_BTC names its port), and so
+    // on with BCH and XEC.
     const std::string coin = getenv("CHATSWAP_COIN") ? getenv("CHATSWAP_COIN") : "BTC";
     a.addr = "alice.btf";
     b.addr = "bob.btf";
@@ -8256,8 +8258,8 @@ static int RunChatSwapSelfTest()
             nFail += Check(fEnd && m.stage == btfchat::SW_DONE && t.stage == btfchat::SW_DONE,
                            "both sides finish: DONE and DONE") ? 0 : 1;
             nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
-            double got = tx.value("amount", 0.0);
-            nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's Bitcoin Core wallet got %.8f BTC", got).c_str()) ? 0 : 1;
+            double got = tx.value("amount", 0.0) * CoinUnit(coin) / COIN;   // in BTC-sized units on every chain
+            nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
             bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
@@ -8701,6 +8703,8 @@ int RunSelfTest(const std::string& name)
         return btclight::SelfTest();
     if (name == "ltc-light")
         return btclight::SelfTestLitecoin();
+    if (name == "cash-light")
+        return btclight::SelfTestCash();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

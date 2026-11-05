@@ -907,8 +907,8 @@ void DrawCommunity()
 
     // A swap offer: what we give and what we want for it. Posting locks
     // nothing; whoever takes it locks second, after we do.
-    const char* coins[] = { "BTF", "BTC", "LTC" };
-    const char* others[] = { "BTC", "LTC" };
+    const char* coins[] = { "BTF", "BTC", "LTC", "BCH", "XEC" };
+    const char* others[] = { "BTC", "LTC", "BCH", "XEC" };
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::TextUnformatted("swap: give");
     ImGui::PopStyleColor();
@@ -918,7 +918,7 @@ void DrawCommunity()
                              ImGuiInputTextFlags_CharsDecimal);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(64.0f);
-    ImGui::Combo("##offercoin", &g_offerGive, coins, 3);
+    ImGui::Combo("##offercoin", &g_offerGive, coins, 5);
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::Text("for");
@@ -931,7 +931,7 @@ void DrawCommunity()
     if (g_offerGive == 0)
     {
         ImGui::SetNextItemWidth(64.0f);
-        ImGui::Combo("##offerother", &g_offerOther, others, 2);
+        ImGui::Combo("##offerother", &g_offerOther, others, 4);
     }
     else
         ImGui::TextUnformatted("BTF");
@@ -939,9 +939,9 @@ void DrawCommunity()
     btfchat::SwapOffer o;
     o.give = coins[g_offerGive];
     o.want = g_offerGive == 0 ? others[g_offerOther] : "BTF";
-    int64 nGive = 0, nWant = 0;
-    bool fOfferOk = ParseMoney(g_offerGiveBuf, nGive) && nGive > 0 && ParseMoney(g_offerWantBuf, nWant) && nWant > 0 &&
-                    !Busy();
+    int64_t nGive = 0, nWant = 0;
+    bool fOfferOk = ParseCoinAmount(o.give, g_offerGiveBuf, nGive) && nGive > 0 &&
+                    ParseCoinAmount(o.want, g_offerWantBuf, nWant) && nWant > 0 && !Busy();
     if (!fOfferOk) ImGui::BeginDisabled();
     if (ImGui::Button("offer"))
     {
@@ -975,8 +975,8 @@ void DrawSwaps(const std::string& peer)
                    : (s.stage == btfchat::SW_FAILED ? COL_BAD : (fFinal ? COL_DIM : COL_WARN));
         ImGui::PushStyleColor(ImGuiCol_Text, col);
         ImGui::TextWrapped("[SWAP] you give %s %s, get %s %s -- %s",
-                           btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str(),
-                           btfchat::FormatSwapAmount(s.wantAmount).c_str(), s.want.c_str(), s.status.c_str());
+                           btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str(),
+                           btfchat::FormatSwapAmount(s.want, s.wantAmount).c_str(), s.want.c_str(), s.status.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered() && (!s.myTxid.empty() || !s.theirTxid.empty()))
             ImGui::SetTooltip("ours   %s\ntheirs %s\nredeem %s\nrefund %s", s.myTxid.c_str(), s.theirTxid.c_str(),
@@ -984,7 +984,10 @@ void DrawSwaps(const std::string& peer)
         if (!fFinal)
         {
             const std::string coinOther = s.give == "BTF" ? s.want : s.give;
-            const bool fLtc = coinOther == "LTC";
+            const char* coinLabel = coinOther == "LTC" ? "your Litecoin receiving address" : coinOther == "BCH" ? "your Bitcoin Cash receiving address"
+                                    : coinOther == "XEC" ? "your eCash receiving address" : "your Bitcoin receiving address";
+            const char* coinHint = coinOther == "LTC" ? "L... / M... / ltc1... / tltc1..." : coinOther == "BCH" ? "bitcoincash:q... / bchtest:q..."
+                                   : coinOther == "XEC" ? "ecash:q... / ectest:q..." : "1... / 3... / bc1... / tb1... / bcrt1...";
             ImGui::PushID(s.id.c_str());
             static std::map<std::string, std::string> destinations;
             std::string& text = destinations[s.id];
@@ -992,15 +995,14 @@ void DrawSwaps(const std::string& peer)
             char address[96] = {0}; strncpy(address, text.c_str(), sizeof(address)-1);
             bool editable = s.myTxid.empty() && s.paymentAddress.empty();
             if (!editable) ImGui::BeginDisabled();
-            if (ImGui::InputTextWithHint(fLtc ? "your Litecoin receiving address" : "your Bitcoin receiving address",
-                                         fLtc ? "L... / M... / ltc1... / tltc1..." : "1... / 3... / bc1... / tb1... / bcrt1...", address, sizeof(address)))
+            if (ImGui::InputTextWithHint(coinLabel, coinHint, address, sizeof(address)))
                 text = address;
             ImGui::SameLine();
             if (ImGui::SmallButton("save address")) btfchat::ChatSwapBitcoinDestination(s.id, text);
             if (!editable) ImGui::EndDisabled();
             if (s.stage == btfchat::SW_WAIT_PAYMENT)
             {
-                ImGui::TextWrapped("Waiting for you to pay the contract. Pay exactly %s %s.", btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str());
+                ImGui::TextWrapped("Waiting for you to pay the contract. Pay exactly %s %s.", btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str());
                 ImGui::TextWrapped("%s", s.paymentAddress.c_str());
                 if (ImGui::SmallButton("copy payment address")) ImGui::SetClipboardText(s.paymentAddress.c_str());
             }
@@ -1010,7 +1012,7 @@ void DrawSwaps(const std::string& peer)
         if (s.fNeedsMe)
         {
             std::string label = strprintf("%s: lock %s %s", s.fMaker ? "accept" : "go on",
-                                          btfchat::FormatSwapAmount(s.giveAmount).c_str(), s.give.c_str());
+                                          btfchat::FormatSwapAmount(s.give, s.giveAmount).c_str(), s.give.c_str());
             if (fBusy) ImGui::BeginDisabled();
             if (g_swapConfirm != s.id)
             {

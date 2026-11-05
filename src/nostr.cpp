@@ -599,6 +599,11 @@ public:
     // Connect and perform the WebSocket handshake. url = wss://host[:port]/path
     bool Connect(const string& url, int timeoutSec)
     {
+        // Every relay goes through here: an isolated bench says nothing to
+        // the public relays, whatever mode it runs in (a bench node in
+        // -operator mode used to announce itself as a pool).
+        if (fBtfIsolated)
+            return false;
         string u = url;
         int port = 443;
         fTls = true;

@@ -11,7 +11,7 @@
 #include <map>
 
 // The embedded light client: another chain's P2P protocol, over Tor, to that
-// chain's own peers. One instance per chain and network (Bitcoin, Litecoin),
+// chain's own peers. One instance per chain and network (Bitcoin, Litecoin, ...),
 // each with its own header store, peers and worker thread.
 namespace btclight
 {
@@ -37,6 +37,13 @@ struct Net
     bool minDifficulty = false;   // testnet: a block after 2 spacings may be at the limit
     bool bip94 = false;           // testnet4: the period's first bits, and no time warp
     bool regtest = false;         // no retarget, no minimum work, no time check
+    std::string cashPrefix;       // addresses are cashaddr with this prefix
+    bool forkId = false;          // spends sign with SIGHASH_FORKID
+    size_t maxBlock = 4000000;    // the largest block or message taken from a peer
+    // aserti3-2d, from the block before the upgrade: height, bits, its parent's time.
+    int asertHeight = 0;
+    unsigned int asertBits = 0;
+    int64 asertParentTime = 0, asertHalfLife = 0;
     bool filters = false;         // payments found by BIP157 filters; else by blocks in the window
     uint64_t services = 0;        // what a peer must offer
     unsigned int blockInv = 2;    // the inventory type asked for a block
@@ -93,10 +100,12 @@ private:
 
 unsigned int Retarget(unsigned int bits, int64 elapsed, unsigned int limit);
 unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int limit);
+Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now);
+unsigned int Asert(unsigned int anchorBits, int64 timeDiff, int64 heightDiff, int64 spacing, int64 halfLife, unsigned int limit);
 Bytes EncodeFilter(const uint256& block, const std::vector<Bytes>& scripts);
 // A malformed filter is an error, never evidence that a payment is absent.
 bool MatchFilter(const uint256& block, const Bytes& filter, const std::vector<Bytes>& scripts, bool& match);
-bool VerifyBlock(const Bytes& raw, const Header& header, std::vector<CTransaction>& txs);
+bool VerifyBlock(const Bytes& raw, const Header& header, std::vector<CTransaction>& txs, size_t maxBlock);
 bool Destination(const btcswap::Chain& chain, const std::string& address, CScript& script, std::string& err);
 
 bool CheckChain(const std::string& coin, const std::string& network, btcswap::Chain& chain, std::string& err);
@@ -105,5 +114,6 @@ bool Call(const btcswap::Chain& chain, const std::string& method, const nlohmann
 nlohmann::json Find(const btcswap::Chain& chain, const CScript& contract, const std::string& ref, bool secret);
 int SelfTest();
 int SelfTestLitecoin();
+int SelfTestCash();
 }
 #endif

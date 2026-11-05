@@ -304,9 +304,76 @@ other chain), and a refund on each backend, refused before the lock and
 confirmed after it, all of it with and without MWEB active on the chain. Live
 on Litecoin's test network over Tor, the light
 client followed the headers to the explorer's tip and scanned a contract's
-window of real blocks, MWEB blocks included. A swap on Litecoin's test and
-main networks is still to do (docs/swaps-multicoin.md, "Proof before
-opening").
+window of real blocks, MWEB blocks included. A public swap on Litecoin's test
+network and the Bitflash testnet, both wallets on the light client, was made
+on 2026-11-04. One on the main network is still to do (docs/swaps-multicoin.md,
+"Proof before opening").
+
+### Bitcoin Cash and eCash
+
+The same `coin*` calls with `bch` or `xec` first, the same contract, and
+`offer 100 BTF for 2 BCH` in the chat. What differs from Bitcoin:
+
+- **Addresses** are cashaddr with the chain's prefix: `bitcoincash:`,
+  `bchtest:`, `bchreg:`, `ecash:`, `ectest:`, `ecregtest:`. A contract's key
+  address is `...:q...`. An address of one chain is refused on the other,
+  because the prefix is in its checksum. Base58 addresses are refused: they
+  read the same on Bitcoin. A destination can be a key or a script, and on
+  Bitcoin Cash a token-aware or 32-byte script form.
+- **Signatures** are made with `SIGHASH_FORKID`, the BIP143 layout, which signs
+  the amount spent. Bitflash's script interpreter does not run them, so
+  before a spend is returned the wallet checks the key and secret against the
+  contract, and the chain's own nodes check the rest.
+- **XEC counts to two places.** One XEC is 100 of the chain's base units, not
+  100000000. RPC and the chat speak XEC; amounts inside are base units.
+- **Mainnet confirmations:** 4 on Bitcoin Cash and 6 on eCash, about 40 minutes
+  and an hour. Their blocks take as long as Bitcoin's, but they run Bitcoin's
+  SHA-256 with a sliver of its hash rate, so a block can be rented.
+- **The fee** has no estimate there: 1 sat/byte, what everyone pays,
+  unless `-bchfeerate` or `-xecfeerate` says otherwise (in the coin, per 1000
+  bytes). A stuck redeem cannot be replaced, as these chains have no RBF, but
+  blocks there have room.
+
+Unlike Bitcoin Core and Litecoin Core, the own node is used only when named,
+with `-bchdatadir`, `-bchrpcport`, `-bchrpcuser`/`-bchrpcpassword`, `-bchwallet`
+and the same with `-xec`. Bitcoin Cash Node, Bitcoin ABC and Bitcoin Core share a data
+directory and an RPC port, so a cookie found there says nothing about the
+chain. For the same reason, and for Bitcoin too, the wallet asks the node to
+validate an address only its own chain has, and refuses a node that does not
+know it. A contract output carrying a CashToken is refused, as this wallet
+could not redeem it. Otherwise it is the embedded light client. `-bchchain` is `main`, `test4` (default on Bitflash testnet) or
+`regtest`; `-xecchain` is `main`, `test` or `regtest`; `-bchpeer` and
+`-xecpeer` name peers.
+
+The light client checks each header's SHA-256 and aserti3-2d, Bitcoin Cash's
+and eCash's difficulty rule, with each network's half-life and test
+minimum-difficulty rule, starting from twelve real headers. As for Litecoin
+it fetches the blocks in a swap's window, up to 256 MB each, as these chains
+have no BIP157 filters to ask. Bitcoin Cash and eCash share a network magic and
+the first 661647 blocks; a peer on the other chain fails at the first header.
+On a main network it reports nothing until the headers carry a sixteenth of
+the work the chain did since the anchor, because aserti3-2d lets a private
+fork claim the time passed and mine the rest almost free.
+State: `bch-light-<network>.*`, `xec-light-<network>.*`.
+
+`-selftest=cash-light` checks the genesis hashes, the anchors and the real
+headers after them, the real chain's bits at five heights, one bit flipped
+and the other chain's headers refused, the nodes' own cashaddr and signature
+hash vectors, and the XEC unit. The anchors and the rule were also checked by
+a second implementation of aserti3-2d against every header of the four
+networks since the upgrade, about 1.25 million, with no mismatch.
+
+Proven with coins against Bitcoin Cash Node 29.2.0 and Bitcoin ABC 0.34.3 on
+regtest, on the node and on the light client: `-selftest=chat-swap` with
+`CHATSWAP_COIN=BCH` and `XEC`, a swap each way and a maker who vanishes, and a
+contract output carrying a token refused by a real node. A public swap on Bitcoin
+Cash's testnet4 and the Bitflash testnet, both wallets on the light client, was
+made on 2026-11-05.
+
+Bitcoin ABC schedules a change of the fork value in its signature hash for
+each next upgrade (`sandersActivationTime`, 2027-05-15 in v0.34.3), and each
+release so far has moved the date. If it ever went through, eCash swaps would
+need the new value in `ForkIdSignatureHash`.
 
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its

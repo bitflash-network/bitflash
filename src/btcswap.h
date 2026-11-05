@@ -31,6 +31,7 @@
 #ifndef BITFLASH_BTCSWAP_H
 #define BITFLASH_BTCSWAP_H
 
+#include "coinunit.h"
 #include "rpcclient.h"
 
 #include <string>
@@ -61,11 +62,13 @@ bool KnownCoin(const std::string& strCoin);
 
 struct Chain
 {
-    std::string coin = "btc";    // which chain: btc, ltc
-    std::string name;            // as getblockchaininfo says: main, test, testnet4, signet, regtest
+    std::string coin = "btc";    // which chain: btc, ltc, bch, xec
+    std::string name;            // as getblockchaininfo says: main, test, testnet4, test4, signet, regtest
     bool fMain = false;
     unsigned char pkhVersion = 0;
     unsigned char shVersion = 5;
+    std::string cashPrefix;      // addresses are cashaddr with this prefix
+    bool fForkId = false;        // spends sign with SIGHASH_FORKID
     int nBlocks = 0;
     int64 nMedianTime = 0;
 };
@@ -85,6 +88,11 @@ std::string BackendName(const std::string& strCoin);
 // this Bitflash network or with -btcchain.
 bool CheckChain(Chain& out, std::string& errOut);
 bool CheckChain(const std::string& strCoin, Chain& out, std::string& errOut);
+
+// Cashaddr. nType: 0 a key hash, 1 a script hash, and on Bitcoin Cash 2 and 3
+// the token-aware forms of the same.
+std::string CashEncode(const std::string& prefix, unsigned char nType, const std::vector<unsigned char>& hash);
+bool CashDecode(const std::string& prefix, const std::string& addr, unsigned char& nTypeOut, std::vector<unsigned char>& hashOut);
 
 std::string PkhToAddress(const Chain& chain, const std::vector<unsigned char>& pkh);
 // Only P2PKH: the contract holds a Hash160 of a key, nothing else.
@@ -110,10 +118,17 @@ int64 FeeRatePerKvB(const std::string& strCoin);
 // given, else refund (nLockTime set to the contract's). One output, to
 // scriptTo, the fee taken from the contract's coins. Checked against the
 // contract before it is returned.
+// fForkId: Bitcoin Cash and eCash's signature, which the wallet cannot run
+// through its own interpreter, so only the contract's conditions are checked.
 bool BuildSpend(const CScript& contract, const COutPoint& outpoint, int64 nValue, const CScript& scriptTo,
                 CKey& key, const std::vector<unsigned char>& vchPubKey,
                 const std::vector<unsigned char>* pSecret, int64 nFeeRatePerKvB,
-                CTransaction& txOut, int64& nFeeOut, std::string& errOut);
+                CTransaction& txOut, int64& nFeeOut, std::string& errOut, bool fForkId = false);
+
+// SIGHASH_ALL|SIGHASH_FORKID, fork value 0.
+static const unsigned int FORKID_SIGHASH_ALL = 0x41;
+uint256 ForkIdSignatureHash(const CScript& scriptCode, const CTransaction& tx, unsigned int nIn, int64 nAmount,
+                            unsigned int nHashType = FORKID_SIGHASH_ALL);
 
 } // namespace btcswap
 

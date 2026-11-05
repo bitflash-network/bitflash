@@ -30,6 +30,7 @@
 
 #include <string>
 #include <stdint.h>
+#include "coinunit.h"
 
 namespace btfchat
 {
@@ -88,7 +89,7 @@ bool SwapCoinOk(const std::string& coin);
 // address for BTC (1..., m..., n...). The wallet checks the checksum.
 bool SwapAddressShapeOk(const std::string& coin, const std::string& addr);
 
-std::string FormatSwapAmount(int64_t n);
+std::string FormatSwapAmount(const std::string& coin, int64_t n);
 
 } // namespace btfchat
 

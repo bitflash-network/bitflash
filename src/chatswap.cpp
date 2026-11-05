@@ -17,7 +17,7 @@ namespace btfchat
 
 bool SwapCoinOk(const std::string& coin)
 {
-    return coin == "BTF" || coin == "BTC" || coin == "LTC";
+    return coin == "BTF" || coin == "BTC" || coin == "LTC" || coin == "BCH" || coin == "XEC";
 }
 
 static bool IsHexString(const std::string& s)
@@ -32,6 +32,21 @@ static bool IsHexString(const std::string& s)
 
 bool SwapAddressShapeOk(const std::string& coin, const std::string& addr)
 {
+    if (coin == "BCH" || coin == "XEC")
+    {
+        // A key address in cashaddr, with its prefix: what a contract holds.
+        size_t nColon = addr.find(':');
+        if (nColon == std::string::npos || nColon + 34 > addr.size() || addr.size() > 60 || addr[nColon + 1] != 'q')
+            return false;
+        std::string prefix = addr.substr(0, nColon);
+        if (coin == "BCH" ? prefix != "bitcoincash" && prefix != "bchtest" && prefix != "bchreg"
+                          : prefix != "ecash" && prefix != "ectest" && prefix != "ecregtest")
+            return false;
+        for (size_t i = nColon + 1; i < addr.size(); i++)
+            if (!strchr("qpzry9x8gf2tvdw0s3jn54khce6mua7l", addr[i]))
+                return false;
+        return true;
+    }
     static const char* b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     if (addr.size() < 25 || addr.size() > 35)
         return false;
@@ -47,11 +62,9 @@ bool SwapAddressShapeOk(const std::string& coin, const std::string& addr)
     return false;
 }
 
-std::string FormatSwapAmount(int64_t n)
+std::string FormatSwapAmount(const std::string& coin, int64_t n)
 {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%lld.%08lld", (long long)(n / 100000000), (long long)(n % 100000000));
-    std::string s = buf;
+    std::string s = CoinAmountText(coin, n);
     while (s.size() > 1 && s[s.size() - 1] == '0')
         s.erase(s.size() - 1);
     if (s[s.size() - 1] == '.')
@@ -115,7 +128,7 @@ std::string FormatSwapOffer(const SwapOffer& o)
 
 std::string DescribeSwapOffer(const SwapOffer& o)
 {
-    return FormatSwapAmount(o.giveAmount) + " " + o.give + " for " + FormatSwapAmount(o.wantAmount) + " " + o.want;
+    return FormatSwapAmount(o.give, o.giveAmount) + " " + o.give + " for " + FormatSwapAmount(o.want, o.wantAmount) + " " + o.want;
 }
 
 bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
@@ -164,7 +177,8 @@ bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
             // The maker wants the other coin. From a Bitflash lock this cannot
             // tell which, so any of them will do here; the contract built on
             // that chain refuses an address of the wrong network.
-            bool fShape = s.chain == "BTF" ? SwapAddressShapeOk("BTC", s.to) || SwapAddressShapeOk("LTC", s.to)
+            bool fShape = s.chain == "BTF" ? SwapAddressShapeOk("BTC", s.to) || SwapAddressShapeOk("LTC", s.to) ||
+                                                 SwapAddressShapeOk("BCH", s.to) || SwapAddressShapeOk("XEC", s.to)
                                            : SwapAddressShapeOk("BTF", s.to);
             if (!fShape) { errOut = "lock1 needs an address for the coin it receives"; return false; }
         }
