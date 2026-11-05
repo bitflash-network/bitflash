@@ -907,8 +907,8 @@ void DrawCommunity()
 
     // A swap offer: what we give and what we want for it. Posting locks
     // nothing; whoever takes it locks second, after we do.
-    const char* coins[] = { "BTF", "BTC", "LTC", "BCH", "XEC" };
-    const char* others[] = { "BTC", "LTC", "BCH", "XEC" };
+    const char* coins[] = { "BTF", "BTC", "LTC", "DOGE", "BCH", "XEC" };
+    const char* others[] = { "BTC", "LTC", "DOGE", "BCH", "XEC" };
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::TextUnformatted("swap: give");
     ImGui::PopStyleColor();
@@ -918,7 +918,7 @@ void DrawCommunity()
                              ImGuiInputTextFlags_CharsDecimal);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(64.0f);
-    ImGui::Combo("##offercoin", &g_offerGive, coins, 5);
+    ImGui::Combo("##offercoin", &g_offerGive, coins, 6);
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::Text("for");
@@ -931,7 +931,7 @@ void DrawCommunity()
     if (g_offerGive == 0)
     {
         ImGui::SetNextItemWidth(64.0f);
-        ImGui::Combo("##offerother", &g_offerOther, others, 4);
+        ImGui::Combo("##offerother", &g_offerOther, others, 5);
     }
     else
         ImGui::TextUnformatted("BTF");
@@ -984,9 +984,9 @@ void DrawSwaps(const std::string& peer)
         if (!fFinal)
         {
             const std::string coinOther = s.give == "BTF" ? s.want : s.give;
-            const char* coinLabel = coinOther == "LTC" ? "your Litecoin receiving address" : coinOther == "BCH" ? "your Bitcoin Cash receiving address"
+            const char* coinLabel = coinOther == "LTC" ? "your Litecoin receiving address" : coinOther == "DOGE" ? "your Dogecoin receiving address" : coinOther == "BCH" ? "your Bitcoin Cash receiving address"
                                     : coinOther == "XEC" ? "your eCash receiving address" : "your Bitcoin receiving address";
-            const char* coinHint = coinOther == "LTC" ? "L... / M... / ltc1... / tltc1..." : coinOther == "BCH" ? "bitcoincash:q... / bchtest:q..."
+            const char* coinHint = coinOther == "LTC" ? "L... / M... / ltc1... / tltc1..." : coinOther == "DOGE" ? "D... / A... / 9... / n..." : coinOther == "BCH" ? "bitcoincash:q... / bchtest:q..."
                                    : coinOther == "XEC" ? "ecash:q... / ectest:q..." : "1... / 3... / bc1... / tb1... / bcrt1...";
             ImGui::PushID(s.id.c_str());
             static std::map<std::string, std::string> destinations;

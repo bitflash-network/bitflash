@@ -117,6 +117,12 @@ int main()
         o.give = "LTC"; o.giveAmount = 200000000; o.want = "BTF"; o.wantAmount = 100000000;
         CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "LTC" && back.want == "BTF",
               "an offer of LTC for BTF");
+        CHECK(SwapAddressShapeOk("DOGE", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L") && !SwapAddressShapeOk("DOGE", "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ") &&
+              !SwapAddressShapeOk("DOGE", "1111111111111111111114oLvT2"),
+              "a Dogecoin key address");
+        o.give = "DOGE"; o.giveAmount = 10000000000LL; o.want = "BTF"; o.wantAmount = 100000000;
+        CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "DOGE" && DescribeSwapOffer(back) == "100 DOGE for 1 BTF",
+              "an offer of DOGE for BTF");
         CHECK(SwapAddressShapeOk("BCH", "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
               SwapAddressShapeOk("BCH", "bchtest:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2") &&
               !SwapAddressShapeOk("BCH", "ecash:qqdtak973y5y7pvtew03kl6uxlf89dsr9vzx7jeyke") &&
@@ -138,8 +144,12 @@ int main()
               "one side of an offer is Bitflash, on these chains too");
         CHECK(!ParseSwapOffer("{\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
               "one side of an offer is always BTF");
-        CHECK(!ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"give\":\"RVN\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
               "a chain this wallet does not know is refused");
+        CHECK(!ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":1999999,\"want\":\"BTF\",\"wa\":1}", back, err) &&
+              !ParseSwapOffer("{\"give\":\"BTF\",\"ga\":1,\"want\":\"DOGE\",\"wa\":1999999}", back, err) &&
+              ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":2000000,\"want\":\"BTF\",\"wa\":1}", back, err),
+              "a Dogecoin contract under 0.02 DOGE could not be spent");
         SwapStep l, step;
         l.swap = std::string(32, 'c'); l.step = "lock1"; l.chain = "LTC"; l.contract = "00"; l.txid = std::string(64, 'a');
         l.vout = 2; l.to = BTF_ADDR;

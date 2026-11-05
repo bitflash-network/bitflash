@@ -37,6 +37,10 @@ struct Net
     bool minDifficulty = false;   // testnet: a block after 2 spacings may be at the limit
     bool bip94 = false;           // testnet4: the period's first bits, and no time warp
     bool regtest = false;         // no retarget, no minimum work, no time check
+    bool digishield = false;      // Dogecoin's retarget, every block
+    bool auxPow = false;          // headers may be merged-mined
+    bool strictChainId = false;   // the header names auxChainId, and its parent another
+    int auxChainId = 0;
     std::string cashPrefix;       // addresses are cashaddr with this prefix
     bool forkId = false;          // spends sign with SIGHASH_FORKID
     size_t maxBlock = 4000000;    // the largest block or message taken from a peer
@@ -74,7 +78,8 @@ class Headers
 public:
     explicit Headers(const std::string& network);   // Bitcoin's
     explicit Headers(const Net& net);
-    bool Add(const Bytes& raw, std::string& err);
+    // aux: the AuxPoW that came with a merged-mined header.
+    bool Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux = NULL);
     const Header& Tip() const;
     const Header& At(int height) const;
     int ActiveHeight(const uint256& hash) const;
@@ -100,12 +105,15 @@ private:
 
 unsigned int Retarget(unsigned int bits, int64 elapsed, unsigned int limit);
 unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int limit);
+unsigned int DigiShield(unsigned int bits, int64 elapsed, unsigned int limit);
+bool CheckAuxPow(const btcswap::AuxPow& aux, const uint256& block, int chainId, bool strict, std::string& err);
 Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now);
+bool RefusesTx(const Bytes& reject);
 unsigned int Asert(unsigned int anchorBits, int64 timeDiff, int64 heightDiff, int64 spacing, int64 halfLife, unsigned int limit);
 Bytes EncodeFilter(const uint256& block, const std::vector<Bytes>& scripts);
 // A malformed filter is an error, never evidence that a payment is absent.
 bool MatchFilter(const uint256& block, const Bytes& filter, const std::vector<Bytes>& scripts, bool& match);
-bool VerifyBlock(const Bytes& raw, const Header& header, std::vector<CTransaction>& txs, size_t maxBlock);
+bool VerifyBlock(const Bytes& raw, const Header& header, std::vector<CTransaction>& txs, size_t maxBlock, bool auxPow = false);
 bool Destination(const btcswap::Chain& chain, const std::string& address, CScript& script, std::string& err);
 
 bool CheckChain(const std::string& coin, const std::string& network, btcswap::Chain& chain, std::string& err);
@@ -115,5 +123,6 @@ nlohmann::json Find(const btcswap::Chain& chain, const CScript& contract, const 
 int SelfTest();
 int SelfTestLitecoin();
 int SelfTestCash();
+int SelfTestDogecoin();
 }
 #endif

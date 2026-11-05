@@ -375,6 +375,59 @@ each next upgrade (`sandersActivationTime`, 2027-05-15 in v0.34.3), and each
 release so far has moved the date. If it ever went through, eCash swaps would
 need the new value in `ForkIdSignatureHash`.
 
+### Dogecoin
+
+The same `coin*` calls with `doge` first, the same contract, and
+`offer 100 BTF for 5000 DOGE` in the chat. What differs from Bitcoin:
+
+- **Addresses** are base58 only: `D...` on the main network, `n...` or `m...` on
+  the test network. Dogecoin has no SegWit.
+- **Mainnet confirmations:** 20, about 20 minutes, the time Bitcoin's two take.
+- **The fee** is in its own coin: 0.01 DOGE per 1000 bytes, the rate Dogecoin
+  Core recommends, unless `-dogefeerate` says otherwise (in the coin, per 1000
+  bytes, up to 1 DOGE). An offer or a contract under 0.02 DOGE is refused, as its
+  redeem would leave dust, and so is a spend that would leave under 0.01 DOGE.
+- **The refund** waits for the median time of the last eleven blocks, as on
+  every chain here. Dogecoin never activated BIP113, so its nodes judge the lock
+  by the time of the next block: they would take the refund a little sooner than
+  this wallet offers it.
+
+As for Litecoin, a Dogecoin Core with a cookie in its data directory is found by
+itself, or named with `-dogedatadir`, `-dogerpcport` and
+`-dogerpcuser`/`-dogerpcpassword`; otherwise it is the embedded light client.
+Dogecoin Core 1.14 has one wallet, so `-dogewallet` does not choose one.
+`-dogechain` is `main`, `test` (default on Bitflash testnet) or `regtest`;
+`-dogepeer` names a peer.
+Dogecoin Core 1.14 answers `validateaddress`, not `getaddressinfo`, and takes a
+boolean in `getblock`; the wallet speaks both.
+
+The light client checks each header's DigiShield step and its proof of work:
+scrypt on an old-style block, and on a merge-mined one the AuxPoW that Dogecoin's
+`CAuxPow::check` asks for, with the parent's scrypt, the merkle branches, the
+chain id, the slot and the marker in the coinbase. It starts from twelve real
+headers, and the anchor plays the part of a checkpoint. As for Litecoin it
+fetches the blocks in a swap's window, up to 32 MB each, with their AuxPoW
+stepped over. On the main network it reports nothing until the headers carry a
+sixteenth of the work the chain did since the anchor: DigiShield eases by half
+a step on each block that claims a long gap, so a private fork that only paid
+the rule would reach the minimum difficulty in about 65 blocks. Peers that
+refuse a broadcast say so, and that stops nothing. State:
+`doge-light-<network>.*`.
+
+`-selftest=doge-light` checks the genesis hashes, the anchors and the real
+headers after them, real DigiShield steps and their limits, a real AuxPoW and
+each way of bending it (no proof, the parent changed, the wrong slot, another
+coinbase, no block in it, a second marker), a block with an AuxPoW, the work
+floor against a cheap fork, and the addresses of other chains refused. The
+anchors came through a second implementation of DigiShield and AuxPoW: about
+6000 headers on the main network and every one of the test network's since
+its last checkpoint, 62 million, with no mismatch. The main anchor's hash was
+checked against two explorers.
+
+Proven with coins against Dogecoin Core 1.14.9 on regtest, on the node and on
+the light client: `-selftest=chat-swap` with `CHATSWAP_COIN=DOGE`, a swap each
+way and a maker who vanishes.
+
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
 lock) and `-selftest=btc-swap` (Bitcoin addresses, reading Bitcoin's witness
