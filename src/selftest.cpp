@@ -8009,8 +8009,8 @@ static int RunInvoiceSelfTest()
 //   CHATSWAP_B=port:passfile   Bob's
 //   CHATSWAP_BTC=port          the regtest Core both wallets use (user/pass swap/swap,
 //                              wallet "w" mines)
-//   CHATSWAP_COIN=LTC          swap against Litecoin Core instead (or BCH, XEC:
-//                              Bitcoin Cash Node, Bitcoin ABC)
+//   CHATSWAP_COIN=LTC          swap against Litecoin Core instead (or DOGE, BCH,
+//                              XEC: Dogecoin Core, Bitcoin Cash Node, Bitcoin ABC)
 
 namespace
 {
@@ -8062,7 +8062,8 @@ static nlohmann::json SwapTestBtc(int nPort, const std::string& method, const nl
 {
     LoopbackRpc to;
     to.nPort = nPort;
-    to.strPath = path;
+    // Dogecoin Core 1.14 has one wallet and no /wallet/ path.
+    to.strPath = getenv("CHATSWAP_COIN") && std::string(getenv("CHATSWAP_COIN")) == "DOGE" ? "/" : path;
     to.strAuth = "swap:swap";
     to.strWho = "Bitcoin Core";
     nlohmann::json r;
@@ -8259,7 +8260,8 @@ static int RunChatSwapSelfTest()
                            "both sides finish: DONE and DONE") ? 0 : 1;
             nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
             double got = tx.value("amount", 0.0) * CoinUnit(coin) / COIN;   // in BTC-sized units on every chain
-            nFail += Check(got > 0.0499 && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
+            // Dogecoin's fee is a thousand times Bitcoin's, as a share of this amount.
+            nFail += Check(got > (coin == "DOGE" ? 0.04 : 0.0499) && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
             bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
@@ -8705,6 +8707,8 @@ int RunSelfTest(const std::string& name)
         return btclight::SelfTestLitecoin();
     if (name == "cash-light")
         return btclight::SelfTestCash();
+    if (name == "doge-light")
+        return btclight::SelfTestDogecoin();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

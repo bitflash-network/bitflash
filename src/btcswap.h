@@ -62,7 +62,7 @@ bool KnownCoin(const std::string& strCoin);
 
 struct Chain
 {
-    std::string coin = "btc";    // which chain: btc, ltc, bch, xec
+    std::string coin = "btc";    // which chain: btc, ltc, doge, bch, xec
     std::string name;            // as getblockchaininfo says: main, test, testnet4, test4, signet, regtest
     bool fMain = false;
     unsigned char pkhVersion = 0;
@@ -106,8 +106,19 @@ std::string ScriptAddress(const Chain& chain, const CScript& redeemScript);
 bool ParseTx(const std::vector<unsigned char>& raw, CTransaction& txOut);
 // One transaction at `pos`, which is moved past it.
 bool ParseTxAt(const std::vector<unsigned char>& raw, size_t& pos, CTransaction& txOut);
-// Every transaction in a raw block.
-bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut);
+// A merged-mined header's proof: the parent chain's coinbase and block.
+struct AuxPow
+{
+    CTransaction tx;
+    std::vector<uint256> branch, chainBranch;
+    int nIndex = 0, nChainIndex = 0;
+    std::vector<unsigned char> parent;
+};
+// The AuxPoW at `pos`, which is moved past it (dogecoin v1.14.9, src/auxpow.h).
+bool ParseAuxPow(const std::vector<unsigned char>& raw, size_t& pos, AuxPow& out);
+// Every transaction in a raw block. fAuxPow: the chain's headers can carry an
+// AuxPoW, between the 80 bytes and the transactions.
+bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow = false);
 
 // Fee rate to use, satoshis per 1000 vbytes: Core's estimate for 6 blocks,
 // else the configured one; never under 1 sat/vbyte.

@@ -639,9 +639,9 @@ static void ParseStartupArguments(int argc, char* argv[])
                        argval2(argc, argv, "/ltcrpcuser", "-ltcrpcuser"),
                        argval2(argc, argv, "/ltcrpcpassword", "-ltcrpcpassword"),
                        argval2(argc, argv, "/ltcfeerate", "-ltcfeerate"));
-    // Bitcoin Cash and eCash (-bchchain ..., -xecchain ...): Bitcoin Cash Node
-    // or Bitcoin ABC when one is named, else the light client.
-    for (const char* coin : { "bch", "xec" })
+    // Dogecoin, Bitcoin Cash and eCash (-dogechain, -bchchain, -xecchain ...):
+    // their own node, else the light client.
+    for (const char* coin : { "doge", "bch", "xec" })
     {
         auto opt = [&](const char* name) {
             return argval2(argc, argv, (std::string("/") + coin + name).c_str(), (std::string("-") + coin + name).c_str());

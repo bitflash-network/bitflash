@@ -29,7 +29,7 @@ static bool DirExists(const std::string& path);
 
 bool KnownCoin(const std::string& coin)
 {
-    return coin == "btc" || coin == "ltc" || coin == "bch" || coin == "xec";
+    return coin == "btc" || coin == "ltc" || coin == "doge" || coin == "bch" || coin == "xec";
 }
 
 static Config GetConfig(const std::string& coin)
@@ -106,6 +106,13 @@ static int DefaultPort(const std::string& coin, const std::string& chain)
         if (chain == "regtest") return 19443;
         return 9332;
     }
+    if (coin == "doge")
+    {
+        // dogecoin v1.14.9, src/chainparamsbase.cpp
+        if (chain == "test")    return 44555;
+        if (chain == "regtest") return 18332;
+        return 22555;
+    }
     if (coin == "bch")
     {
         // bitcoin-cash-node v29.2.0, src/chainparamsbase.cpp
@@ -159,13 +166,13 @@ static std::string CoreDataDir(const std::string& coin)
     if (!dir.empty())
         return dir;
     // Bitcoin Cash Node and Bitcoin ABC use Bitcoin Core's names.
-    std::string name = coin == "ltc" ? "Litecoin" : "Bitcoin";
+    std::string name = coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : "Bitcoin";
 #ifdef _WIN32
     const char* local = getenv("LOCALAPPDATA");
     const char* roam = getenv("APPDATA");
     std::string a = std::string(local ? local : ".") + "\\" + name;
     std::string b = std::string(roam ? roam : ".") + "\\" + name;
-    if (coin == "ltc")
+    if (coin == "ltc" || coin == "doge")
         return b;
     return DirExists(b) && !DirExists(a) ? b : a;
 #elif defined(__APPLE__)
@@ -173,7 +180,7 @@ static std::string CoreDataDir(const std::string& coin)
     return std::string(home ? home : ".") + "/Library/Application Support/" + name;
 #else
     const char* home = getenv("HOME");
-    return std::string(home ? home : ".") + (coin == "ltc" ? "/.litecoin" : "/.bitcoin");
+    return std::string(home ? home : ".") + (coin == "ltc" ? "/.litecoin" : coin == "doge" ? "/.dogecoin" : "/.bitcoin");
 #endif
 }
 
@@ -228,7 +235,8 @@ bool Call(const std::string& coin, const std::string& method, const json& params
     to.nMaxBytes = nMaxBytes;
     to.nTimeoutSecs = 120;
     to.nPort = c.nPort ? c.nPort : DefaultPort(coin, chain);
-    if (!c.strWallet.empty())
+    // Dogecoin Core 1.14 has one wallet and no such path.
+    if (!c.strWallet.empty() && coin != "doge")
         to.strPath = "/wallet/" + c.strWallet;
     if (!c.strUser.empty())
         to.strAuth = c.strUser + ":" + c.strPassword;
@@ -630,12 +638,46 @@ bool ParseTx(const std::vector<unsigned char>& raw, CTransaction& txOut)
     return ParseTxAt(raw, pos, txOut) && pos == raw.size();
 }
 
-bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut)
+static bool ReadHashList(const std::vector<unsigned char>& b, size_t& pos, std::vector<uint256>& out)
+{
+    uint64 n = 0;
+    if (!ReadVarInt(b, pos, n) || n > (b.size() - pos) / 32)
+        return false;
+    out.resize((size_t)n);
+    for (uint64 i = 0; i < n; i++, pos += 32)
+        out[(size_t)i] = uint256(std::vector<unsigned char>(b.begin() + pos, b.begin() + pos + 32));
+    return true;
+}
+
+bool ParseAuxPow(const std::vector<unsigned char>& b, size_t& pos, AuxPow& out)
+{
+    if (!ParseTxAt(b, pos, out.tx) || !Skip(b, pos, 32) || !ReadHashList(b, pos, out.branch) || b.size() - pos < 4)
+        return false;
+    out.nIndex = (int)(b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16) | ((unsigned int)b[pos + 3] << 24));
+    pos += 4;
+    if (!ReadHashList(b, pos, out.chainBranch) || b.size() - pos < 84)
+        return false;
+    out.nChainIndex = (int)(b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16) | ((unsigned int)b[pos + 3] << 24));
+    pos += 4;
+    out.parent.assign(b.begin() + pos, b.begin() + pos + 80);
+    pos += 80;
+    return true;
+}
+
+bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow)
 {
     txsOut.clear();
     size_t pos = 80;
     uint64 n = 0;
-    if (raw.size() < 81 || !ReadVarInt(raw, pos, n) || n == 0 || n > 1000000)
+    if (raw.size() < 81)
+        return false;
+    if (fAuxPow && (raw[1] & 1))    // VERSION_AUXPOW, 1 << 8
+    {
+        AuxPow aux;
+        if (!ParseAuxPow(raw, pos, aux))
+            return false;
+    }
+    if (!ReadVarInt(raw, pos, n) || n == 0 || n > 1000000)
         return false;
     txsOut.reserve((size_t)n);
     for (uint64 i = 0; i < n; i++)
@@ -654,8 +696,11 @@ int64 FeeRatePerKvB(const std::string& coin)
     json r;
     std::string err;
     bool fCash = coin == "bch" || coin == "xec";
-    // Bitcoin Cash Node and Bitcoin ABC have no estimatesmartfee, and their
-    // blocks have room: 1 sat/byte is what everyone pays.
+    // Dogecoin counts fees in its own coin: 0.01 DOGE per 1000 bytes is the
+    // recommended rate (dogecoin v1.14.9, src/policy/policy.h), and it often
+    // has no estimate. Bitcoin Cash Node and Bitcoin ABC have no
+    // estimatesmartfee, and their blocks have room: 1 sat/byte is what
+    // everyone pays.
     if (!fCash && Call(coin, "estimatesmartfee", json::array({ 6 }), r, err) && r.is_object() &&
         r.contains("feerate") && r["feerate"].is_number())
         nRate = (int64)(r["feerate"].get<double>() * COIN + 0.5);
@@ -666,8 +711,10 @@ int64 FeeRatePerKvB(const std::string& coin)
         if (!s.empty() && ParseCoinAmount(coin, s, nConfigured))
             nRate = nConfigured;
         else
-            nRate = fCash ? 1000 : 10000; // 1 or 10 sat/vbyte
+            nRate = coin == "doge" ? COIN / 100 : fCash ? 1000 : 10000; // 1 or 10 sat/vbyte
     }
+    if (coin == "doge")
+        return std::max<int64>(nRate, COIN / 100);
     // 1000 per 1000 vbytes is the minimum relay fee of Bitcoin Core and of
     // Litecoin Core (litecoin v0.21.4, src/validation.h).
     return std::max<int64>(nRate, 1000);

@@ -92,14 +92,22 @@ static unsigned int Bits(Integer n)
     return word | (size << 24);
 }
 // aserti3-2d lowers the difficulty for a chain that claims time has passed,
-// so past the anchor a private fork need pay one real block and then almost
-// nothing. It has to show a sixteenth of the work the real chain did since:
+// and DigiShield eases by half a step on each block that claims a long gap,
+// so past the anchor a private fork need pay little more than one real block
+// and then almost nothing. It has to show a sixteenth of the work the real chain did since:
 // a quarter of the blocks at a quarter of the anchor's difficulty, room for
 // the chain's own slumps and a price no peer pays for one swap.
 Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now)
 {
     int64 blocks = std::max<int64>(0, now-(int64)anchor.time)/net.spacing;
     return anchor.work+(Integer(1)<<256)/(Target(anchor.bits)+1)*blocks/16;
+}
+// Peers that still send "reject" (Dogecoin Core 1.14) send it for a broadcast
+// too, a replaced spend or one under their fee. That answers no request of
+// ours: the transaction goes on waiting and the blocks still have to be read.
+bool RefusesTx(const Bytes& reject)
+{
+    return reject.size() >= 3 && reject[0] == 2 && reject[1] == 't' && reject[2] == 'x';
 }
 unsigned int Retarget(unsigned int bits, int64 elapsed, unsigned int limit)
 {
@@ -120,6 +128,54 @@ unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int lim
     n = n*elapsed/timespan;
     if (shift) n <<= 1;
     return Bits(n > cap ? cap : n);
+}
+// Dogecoin's DigiShield (v1.14.9, src/dogecoin.cpp): a retarget every block,
+// on the last block's time, an eighth of the way and within a band.
+unsigned int DigiShield(unsigned int bits, int64 elapsed, unsigned int limit)
+{
+    const int64 timespan = 60;
+    int64 modulated = timespan+(elapsed-timespan)/8;
+    modulated = std::max<int64>(timespan-timespan/4, std::min<int64>(timespan+timespan/2, modulated));
+    Integer n = Target(bits)*modulated/timespan, cap = Target(limit);
+    return Bits(n > cap ? cap : n);
+}
+static uint256 ClimbBranch(uint256 hash, const std::vector<uint256>& branch, int index)
+{
+    if (index == -1) return uint256(0);
+    for (size_t i = 0; i < branch.size(); ++i, index >>= 1)
+        hash = (index&1) ? Joined(branch[i],hash) : Joined(hash,branch[i]);
+    return hash;
+}
+// CAuxPow::check (dogecoin v1.14.9, src/auxpow.cpp): the block's hash is in a
+// chain merkle tree whose root sits in the coinbase of a parent block, so the
+// parent's proof of work is paid for this block too.
+bool CheckAuxPow(const btcswap::AuxPow& aux, const uint256& block, int chainId, bool strict, std::string& err)
+{
+    err = "AuxPoW is not valid";
+    if (aux.nIndex != 0 || aux.chainBranch.size() > 30 || aux.parent.size() != 80 || aux.tx.vin.empty()) return false;
+    if (strict && (int)((uint32_t)LE(aux.parent,0,4) >> 16) == chainId) return false;
+    uint256 rootHash = ClimbBranch(block,aux.chainBranch,aux.nChainIndex);
+    Bytes root(rootHash.begin(),rootHash.end()); std::reverse(root.begin(),root.end());
+    if (ClimbBranch(aux.tx.GetHash(),aux.branch,aux.nIndex) != ReadHash(aux.parent,36)) return false;
+    const CScript& script = aux.tx.vin[0].scriptSig;
+    const Bytes code(script.begin(),script.end());
+    static const unsigned char head[4] = {0xfa,0xbe,0x6d,0x6d};
+    Bytes::const_iterator headAt = std::search(code.begin(),code.end(),head,head+4);
+    Bytes::const_iterator rootAt = std::search(code.begin(),code.end(),root.begin(),root.end());
+    if (rootAt == code.end()) return false;
+    if (headAt != code.end())
+    {
+        if (std::search(headAt+1,code.end(),head,head+4) != code.end() || headAt+4 != rootAt) return false;
+    }
+    else if (rootAt-code.begin() > 20) return false;
+    size_t after = (rootAt-code.begin())+root.size();
+    if (code.size()-after < 8) return false;
+    uint32_t size = (uint32_t)LE(code,after,4), nonce = (uint32_t)LE(code,after+4,4);
+    unsigned int height = (unsigned int)aux.chainBranch.size();
+    if (size != (1u<<height)) return false;
+    uint32_t slot = nonce*1103515245u+12345u; slot += (uint32_t)chainId; slot = slot*1103515245u+12345u;
+    if (aux.nChainIndex != (int)(slot%(1u<<height))) return false;
+    err.clear(); return true;
 }
 // aserti3-2d (bitcoin-cash-node v29.2.0, src/pow.cpp, CalculateASERT): the
 // anchor's target, doubled for each half-life the chain is behind its ideal
@@ -256,6 +312,41 @@ static const char* XEC_TEST_ANCHOR[] = {
 };
 static const unsigned int XEC_TEST_ASERT_BITS = 0x1d00ffff;
 static const int64 XEC_TEST_ASERT_TIME = 1605445400;
+// Dogecoin starts the same way, from dogecoin v1.14.9's rules: twelve real
+// headers from the chain's peers, each DigiShield step and AuxPoW since the
+// last checkpoint checked by a second implementation, and the main hash
+// against two explorers. A merged-mined header's proof is not kept: the
+// anchor is a checkpoint, as Litecoin's.
+static const int DOGE_MAIN_ANCHOR_HEIGHT = 6445060;
+static const char* DOGE_MAIN_ANCHOR[] = {
+    "040162003f485b8fdd2a9a67907de787b76c5ff0af99798e6ef564a7783e889812a0d57e48e7ef929220fc0f6d4c4a9d62cc63d308385dc45b3d6771c2270351c1513f95f385ec6a5990461900000000",
+    "040162005bf700f27fa036bfe66dda564978be945b1f1fa770ddb95505e55f57e112e1e160a5e9fbd430387fc8182311348dd496f3d80ac81024ee5823ada399f658b61e3886ec6a59904619beba0df0",
+    "040162000320cae3249c43b8c4e5039143708c98df01c64157f568b555bb75658c62928f0af35e20238cee2e7aaa2a83d9e914b3ac550771773c861276b4541b204d77fef986ec6a6bbd471900000000",
+    "04016200a829921d306bb8019508397a57a2f27fe9913b34ff5d9bcec22594a3120655fb418ee2f61c1a7f2076cdc298a0f3cd79db1e964a7036b576dbf5e93146bded701887ec6adcde5a1900000000",
+    "040162005a582324f3ad7dbe8ca7c5a73dac9ea4c60a31f7d6e0b17d0b331e1b1973b626856f8a805f0791f43f2a6c00ecdd120c53005f1ebb4392dec806d6b0488ebbf93387ec6ab753561900000000",
+    "04016200932ca87c510ef505294c5d8594a570f9487229658ce232974aabbf80649b876a9c548c224de32b7c7a851a6bfe51e02601006554dc9dd63dede67e25e571dcd54587ec6a6692501900000000",
+    "04016200e248d92b49ec86027c4aa5476857bc27cfac321c80540c03a5c3c245d717d11bd28c71c6fb9ea1dc9f4e24a10e9bf1534baae9b299f4f95d90ac970102ca87904f87ec6a88db491900000000",
+    "0401620006e64c2b71153f0214c45907e32532a940f7e98d768e0e5dcdd8aee81d4023d20e3338403f17feaf1dd3adddda72c0b87be6d2ca8673547f62b52a59cfaff52c5687ec6ac778421900000000",
+    "040162004f8e9711ae94c4db9008d9f938bad85aa5667814546ba2614a8f8ad51bdc1bdd0819512fbd83f5433df27ea4ccd1d267f6f16b5f4aa1927dd196e5ac589d3d096d87ec6a19d33b1900000000",
+    "04016200fae1a39019b2855155bfb1c0fd987142ca5bb05a2b75b364d86b17fe1db5c6b274919041df40ccdb01e52c0f65bc94206d37381977b0c85ed39c65e0eeda6f49ce87ec6a17d6371900000000",
+    "0401620061d2ff115906ba3862f7ed4a9a42ed04a47337821b35020e5d1a9808d1babb7b1405d1f2c091613c845b2f65968c7b1ce1a64a4654bacb76f81e33a70930fc34ea87ec6a078f3b1900000000",
+    "040162000b12bd55ff99fcf2fe3ec492c735a111f4f629c4910d01cfa6b9c2034339aee322718ee2d024df81061723af943f839d93659679775e5c959da5c4761ebff97b1988ec6a8f96371900000000",
+};
+static const int DOGE_TEST_ANCHOR_HEIGHT = 68043613;
+static const char* DOGE_TEST_ANCHOR[] = {
+    "04006200db7ad3d79394a31fff098f06e6d751c78453df18f3b6562570a9c4298cd24e95f09d3691116f8c10250142b2a343bcce06b64731e57279d7d01312f0653e981f23bdec6a28230a1e00082124",
+    "040062008a071c72b24a4bac3b4108ea57b3bbea784b3c296fa18e4f88b45813405ce6547b70a5187b7fb1e87017d2ec0813051cbbe36e3f500b7d44b617c2fb77146acf58bdec6aeaa40a1ed0d50000",
+    "0400620027be1adf3d92e04ba20328d301f38bb7ff8642e97394d39e684114701e854dc27ab9fb4a2bb6af2c6f2cad4a14442091c57f31e2b573117f58ce5909cc28ad4764bdec6aeaa40a1e0003a88f",
+    "0400620028657d8c9ce8b29a3519a0f24d9f8a51e21171d0bc8af9635c90be2e57b3dbacc761e8bfd55b0e09c3f5c19c65f2361b122ccdda7d5338e13e6d11650dbc2841f1bdec6affff0f1e80018ca3",
+    "04006200175b7f2e88088002c4cae17658b4d847a9d3fa3182e64abe576f818939fdd6bb77a409006db88bd25e0d7d612c1df3997a9f865ecad36870633cab06f49215f7f9bdec6affff0f1e0007e9e4",
+    "0400620071648cabeb2d779c74b9461ad2eb8cba79e5fce26c920e310f887761220153b1a0a62567c3c6c6095643f57e084ac6e79f8f77fa7bba9b7afcc217c966e1dd561dbeec6a65660e1e8002e276",
+    "04006200335065410dcc0013789ce2cebfccc545c98309861011dff5a43c21c95c5bdb0cbea63067cdfd3c65badd6d7a7f7d4e603da53f23186e81a8af5939a3e7e482b72bbeec6a13ae0d1e000a1954",
+    "0400620087d32da16b40c4d9dbd671d41f154a54036605e0b3139a74e0937f48be1cdc1b00d74e20357eef9ad306b7a1d162d9f0458303c552916453ba593b67addbd5045bbeec6a3c8a0c1e80028fc4",
+    "0400620015957ed38fff53e6fce950e16a523d6feb0b6cf3a0d8d98e17b4af0b3c640ecd84090c1a208481194c110f6c7b3fd4f9d04daef03841a39d725cac33664dbb5668beec6abb540c1e800416fd",
+    "0400620012644ca45f99ab01224f65df168dd19e8154302f19d7c61a90058551231d90387c86b91d375041c57d894adff474207a59a511bb93d8f4b3bbe904d0fdca49a07dbeec6aab4d0b1e80033b05",
+    "04006200a0e3cc34d6072dcd7f6f4f0cacf4401ef29b2174714d05fb1b408e8f2227f616b27af2fb2b2c94ee46b98bed7f90ea6f3a59de48afb25906c4f7272aa27a031d8dbeec6ac18c0a1e80048764",
+    "0400620023b2f3abce84f31464f8ba171faea6a85b584934625d09c86a977d98f164ca21bc67a16b1e7986b8238d7873b2a6ebd78aa6d129c02fb4fcf8b6a64b0ba93b9aa3beec6ab0ab091e80080bb9",
+};
 static Bytes GenesisHeader(unsigned int version, const char* merkle, unsigned int time, unsigned int bits, unsigned int nonce)
 {
     Bytes b; Put(b, version, 4); b.resize(36, 0);
@@ -319,6 +410,29 @@ static std::vector<Net> MakeNets()
     l.genesis = GenesisHeader(1, ltcMerkle, 1296688602, 0x207fffff, 0);
     l.anchorHeight = 0; l.anchor.clear();
     v.push_back(l);
+    Net d;
+    const char* dogeMerkle = "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69";
+    d.coin = "doge"; d.label = "Dogecoin"; d.timespan = 60; d.spacing = 60; d.scrypt = true; d.digishield = true; d.auxPow = true;
+    d.auxChainId = 98; d.limitBits = 0x1e0fffff;
+    // No BIP157; a block is up to 1 MB, but a headers message of AuxPoWs is more.
+    d.filters = false; d.services = 1; d.blockInv = 2; d.agent = "/Bitflash:doge-light/"; d.maxBlock = 32000000;
+    d.name = "main"; d.magic = 0xc0c0c0c0; d.port = 22556; d.strictChainId = true;
+    d.seeds = {"seed.multidoge.org", "seed2.multidoge.org"};
+    d.pkhVersion = 30; d.shVersion = 22; d.shVersion2 = 22;
+    d.genesis = GenesisHeader(1, dogeMerkle, 1386325540, 0x1e0ffff0, 99943);
+    d.anchorHeight = DOGE_MAIN_ANCHOR_HEIGHT; d.anchor.assign(DOGE_MAIN_ANCHOR, DOGE_MAIN_ANCHOR + sizeof(DOGE_MAIN_ANCHOR)/sizeof(DOGE_MAIN_ANCHOR[0]));
+    v.push_back(d);
+    d.name = "test"; d.magic = 0xdcb7c1fc; d.port = 44556; d.strictChainId = false; d.minDifficulty = true;
+    d.seeds = {"testseed.jrn.me.uk"};
+    d.pkhVersion = 113; d.shVersion = 196; d.shVersion2 = 196;
+    d.genesis = GenesisHeader(1, dogeMerkle, 1391503289, 0x1e0ffff0, 997879);
+    d.anchorHeight = DOGE_TEST_ANCHOR_HEIGHT; d.anchor.assign(DOGE_TEST_ANCHOR, DOGE_TEST_ANCHOR + sizeof(DOGE_TEST_ANCHOR)/sizeof(DOGE_TEST_ANCHOR[0]));
+    v.push_back(d);
+    d.name = "regtest"; d.magic = 0xdab5bffa; d.port = 18444; d.seeds.clear(); d.minDifficulty = false; d.regtest = true; d.strictChainId = true;
+    d.pkhVersion = 111; d.limitBits = 0x207fffff;
+    d.genesis = GenesisHeader(1, dogeMerkle, 1296688602, 0x207fffff, 2);
+    d.anchorHeight = 0; d.anchor.clear();
+    v.push_back(d);
     Net c;
     c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
     c.cashPrefix = "bitcoincash"; c.forkId = true;
@@ -388,7 +502,7 @@ const Net* FindNet(const std::string& coin, const std::string& network)
 }
 std::string Label(const std::string& coin)
 {
-    return coin == "ltc" ? "Litecoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
+    return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
 }
 static Header Decode(const Bytes& raw)
 {
@@ -454,6 +568,11 @@ int64 Headers::Median(const Header& header) const
 unsigned int Headers::NextBits(const Header& parent, unsigned int time) const
 {
     if (net->regtest) return parent.bits;
+    if (net->digishield)
+    {
+        if (net->minDifficulty && (int64)time > (int64)parent.time+2*net->spacing) return net->limitBits;
+        return DigiShield(parent.bits, (int64)parent.time-(int64)nodes.at(parent.prev).time, net->limitBits);
+    }
     if (net->asertHeight)
     {
         if (net->minDifficulty && (int64)time > (int64)parent.time+2*net->spacing) return net->limitBits;
@@ -479,7 +598,7 @@ unsigned int Headers::NextBits(const Header& parent, unsigned int time) const
     // BIP94 preserves the first block's difficulty across testnet4 periods.
     return Retarget(net->bip94 ? first->bits : parent.bits, (int64)parent.time-first->time, net->limitBits);
 }
-bool Headers::Add(const Bytes& raw, std::string& err)
+bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux)
 {
     try
     {
@@ -489,7 +608,18 @@ bool Headers::Add(const Bytes& raw, std::string& err)
         if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
         const Header& p = it->second;
         Integer target = Target(h.bits), limit = Target(net->limitBits);
-        if (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(raw)) : h.hash) > target)
+        // A merged-mined header's work is its parent's, by a proof that does
+        // not stay in the header store: read once, from the peer.
+        const int version = (int)(uint32_t)LE(raw,0,4);
+        const bool merged = net->auxPow && (version&0x100);
+        if (net->auxPow && !storedHeaders)
+        {
+            std::string auxErr;
+            if (merged != (aux != NULL)) throw std::runtime_error("invalid "+net->label+" AuxPoW");
+            if (net->strictChainId && !net->regtest && (version>>16) != net->auxChainId) throw std::runtime_error("invalid "+net->label+" chain id");
+            if (merged && !CheckAuxPow(*aux,h.hash,version>>16,net->strictChainId,auxErr)) throw std::runtime_error("invalid "+net->label+" AuxPoW");
+        }
+        if (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target)
             throw std::runtime_error("invalid "+net->label+" proof of work");
         if (h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
         if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
@@ -592,9 +722,9 @@ bool MatchFilter(const uint256& block, const Bytes& filter, const std::vector<By
     }
     catch (...) { match = false; return false; }
 }
-bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& txs, size_t maxBlock)
+bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& txs, size_t maxBlock, bool auxPow)
 {
-    if (raw.size() < 81 || raw.size() > maxBlock || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs)) return false;
+    if (raw.size() < 81 || raw.size() > maxBlock || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs, auxPow)) return false;
     std::vector<uint256> tree;
     for (size_t i = 0; i < txs.size(); ++i) tree.push_back(txs[i].GetHash());
     while (tree.size() > 1)
@@ -643,7 +773,7 @@ bool Destination(const btcswap::Chain& chain, const std::string& addr, CScript& 
     for (size_t i = 0; i < lower.size(); ++i) { if (lower[i] >= 'A' && lower[i] <= 'Z') upper = true; if (lower[i] >= 'a' && lower[i] <= 'z') small = true; lower[i] = (char)tolower((unsigned char)lower[i]); }
     size_t sep = lower.rfind('1');
     std::string hrp = net ? net->hrp : chain.fMain ? "bc" : "tb";
-    if (addr.size() <= 90 && !(upper && small) && sep != std::string::npos && lower.substr(0, sep) == hrp && sep+7 < lower.size())
+    if (!hrp.empty() && addr.size() <= 90 && !(upper && small) && sep != std::string::npos && lower.substr(0, sep) == hrp && sep+7 < lower.size())
     {
         uint32_t check = 1;
         auto feed = [&](unsigned int v) {
@@ -727,7 +857,7 @@ struct Peer
             if (!std::equal(hash.begin(), hash.begin()+4, header.begin()+20)) throw std::runtime_error(net.label+" checksum mismatch");
             if (command == wanted) return payload;
             if (command == "ping") { if (length != 8) throw std::runtime_error("invalid ping"); Send("pong", payload); }
-            if (command == "reject" || command == "notfound") throw std::runtime_error(net.label+" peer rejected request");
+            if ((command == "reject" && !RefusesTx(payload)) || command == "notfound") throw std::runtime_error(net.label+" peer rejected request");
         }
         throw std::runtime_error(net.label+" peer did not answer request");
     }
@@ -943,7 +1073,7 @@ static void Load(State& s)
         for (const auto& text : j.at("blocks"))
         {
             Bytes b = ParseHex(text.get<std::string>()); Header h = Decode(Bytes(b.begin(), b.begin()+std::min<size_t>(80,b.size())));
-            std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs,s.net.maxBlock)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
+            std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs,s.net.maxBlock,s.net.auxPow)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
         }
         for (const auto& text : j.at("pending"))
         {
@@ -1020,7 +1150,7 @@ static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_
         lock.unlock(); Bytes block;
         try { block = primary.Receive("block"); lock.lock(); } catch (...) { lock.lock(); throw; }
         std::vector<CTransaction> txs;
-        if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock)) throw std::runtime_error(s.net.label+" block does not match its header");
+        if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock,s.net.auxPow)) throw std::runtime_error(s.net.label+" block does not match its header");
         bool keep = false;
         for (const CTransaction& tx : txs)
         {
@@ -1048,11 +1178,13 @@ static uint64_t PullHeaders(State& s, Peer& peer, std::unique_lock<std::recursiv
     {
         if (response.size()-pos < 81) throw std::runtime_error("truncated Bitcoin headers");
         Bytes raw(response.begin()+pos,response.begin()+pos+80); pos += 80;
+        btcswap::AuxPow aux; const bool merged = s.net.auxPow && (LE(raw,0,4)&0x100);
+        if (merged && !btcswap::ParseAuxPow(response,pos,aux)) throw std::runtime_error("truncated "+s.net.label+" AuxPoW");
         if (Count(response,pos,0) != 0) throw std::runtime_error("header has transactions");
         Header h = Decode(raw);
         if (i && h.prev != last) throw std::runtime_error("discontinuous Bitcoin headers");
         bool known = s.headers.Contains(h.hash);
-        std::string err; if (!s.headers.Add(raw,err)) throw std::runtime_error(err);
+        std::string err; if (!s.headers.Add(raw,err,merged ? &aux : NULL)) throw std::runtime_error(err);
         if (!s.headers.Contains(h.hash)) throw std::runtime_error("header index insertion failed");
         if (!known) AppendHeader(s,raw); last = h.hash;
     }
@@ -1082,7 +1214,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     // A chain started from an anchor counts work only from there; the anchor
     // itself is the checkpoint, and every header after it pays its own work.
     Integer minimum = *s.net.minimumWork && s.net.anchor.empty() ? Number(uint256(s.net.minimumWork)) : Integer(0);
-    if (s.net.asertHeight && !s.net.minDifficulty && !s.net.anchor.empty())
+    if ((s.net.asertHeight || s.net.digishield) && !s.net.minDifficulty && !s.net.anchor.empty())
         minimum = AnchorWorkFloor(s.net, s.headers.At(s.net.anchorHeight), GetTime());
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
         (s.net.regtest || (int64)s.headers.Tip().time > GetTime()-7200);
@@ -1091,7 +1223,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it)
         if (s.headers.ActiveHeight(it->first) >= 0)
         {
-            std::vector<CTransaction> txs; btcswap::ParseBlockTxs(it->second,txs);
+            std::vector<CTransaction> txs; btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow);
             for (const auto& tx : txs) confirmed.insert(tx.GetHash());
         }
     std::vector<Bytes> broadcasts;
@@ -1175,7 +1307,7 @@ static void Round(State& s, Peer& primary, Peer* second)
             int height = matched[i];
             Bytes inv; Compact(inv,1); Put(inv,0x40000002,4); HashBytes(inv,s.headers.At(height).hash);
             Bytes block = Fetch(primary,"getdata",inv,"block",lock); std::vector<CTransaction> txs;
-            if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock)) throw std::runtime_error("Bitcoin block merkle root mismatch");
+            if (!VerifyBlock(block,s.headers.At(height),txs,s.net.maxBlock,s.net.auxPow)) throw std::runtime_error("Bitcoin block merkle root mismatch");
             s.blocks[s.headers.At(height).hash] = block;
             // Pending transactions are kept until their confirmation is on
             // the active branch; reorgs put them back in the broadcast set.
@@ -1345,7 +1477,7 @@ static std::map<uint256, Located> Transactions(State& s)
         Header h = Decode(Bytes(it->second.begin(),it->second.begin()+80));
         // The height is in the coinbase only on modern networks; use the
         // header index instead of trusting an unvalidated coinbase field.
-        std::vector<CTransaction> txs; if (!btcswap::ParseBlockTxs(it->second,txs)) continue;
+        std::vector<CTransaction> txs; if (!btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow)) continue;
         int height = s.headers.ActiveHeight(h.hash);
         if (height >= 0)
             for (size_t i = 0; i < txs.size(); ++i) out[txs[i].GetHash()] = Located{txs[i],height};
@@ -1706,6 +1838,97 @@ int SelfTestCash()
     check(!ParseCoinAmount("xec","99999999999999999999",n),"too many XEC");
     check(!ParseCoinAmount("bch","1.2.3",n) && !ParseCoinAmount("bch","",n) && !ParseCoinAmount("bch","-1",n),"malformed amounts");
     printf("cash-light: %d failure(s)\n",failures); return failures ? 1 : 0;
+}
+int SelfTestDogecoin()
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* name) { printf("  %-70s %s\n",name,ok?"ok":"FAILED"); if (!ok) ++failures; };
+    printf("doge-light self-test\n");
+    const Net* mainNet = FindNet("doge","main"); const Net* testNet = FindNet("doge","test"); const Net* regNet = FindNet("doge","regtest");
+    check(mainNet && testNet && regNet,"Dogecoin networks: main, test, regtest");
+    if (!mainNet || !testNet || !regNet) { printf("doge-light: %d failure(s)\n",failures+1); return 1; }
+    // dogecoin v1.14.9's chainparams.cpp asserts these hashes.
+    check(Decode(mainNet->genesis).hash.GetHex() == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691","main genesis hash");
+    check(Decode(testNet->genesis).hash.GetHex() == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e","test genesis hash");
+    check(Decode(regNet->genesis).hash.GetHex() == "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5","regtest genesis hash");
+    check(Number(Scrypt(mainNet->genesis)) <= Target(0x1e0ffff0),"scrypt proof of work of the main genesis");
+
+    // DigiShield against the real chain.
+    struct { unsigned int bits; int64 elapsed; unsigned int next; } steps[] = { {0x194d1e75U,5,0x19456836U},{0x1947bd6bU,193,0x195adedcU},{0x1949db88U,10,0x194278c7U},{0x19441587U,826,0x1966204aU},{0x196c2fd0U,55,0x196c2fd0U} };
+    for (auto& r : steps) check(DigiShield(r.bits,r.elapsed,0x1e0fffff) == r.next,"DigiShield gives the real chain's bits");
+    check(DigiShield(0x1e0fffff,3600,0x1e0fffff) == 0x1e0fffff,"DigiShield stops at the proof-of-work limit");
+    Integer slow = Target(0x1b0404cb), fast = slow;
+    check(Target(DigiShield(0x1b0404cb,100000,0x1e0fffff)) > slow*14/10 && Target(DigiShield(0x1b0404cb,100000,0x1e0fffff)) <= slow*15/10,"a long gap moves the target at most 3/2");
+    check(Target(DigiShield(0x1b0404cb,-100000,0x1e0fffff)) >= fast*7/10 && Target(DigiShield(0x1b0404cb,-100000,0x1e0fffff)) < fast*8/10,"a block from the future moves it at most 3/4");
+
+    struct { const Net* net; int height; const char* hash; const char* next[3]; } chains[] = { {mainNet,6445060,"54fff389d18fc451605d06a7173e5774df4d2d20fa51681b82b1fd2fbe786b80",{"04016200806b78be2ffdb1821b6851fa202d4ddf74573e17a7065d6051c48fd189f3ff54f00948b1e110aa6951a3afe2460988cbacba06ee95e83194fb8c20ab0afa6ebbdc88ec6a61a936190000000001000000010000000000000000000000000000000000000000000000000000000000000000ffffffff64039ff2302cfabe6d6d91ff6513b9644bf941c66d44c231c6af294df615e00d3abe167fbb8d2e24ce1020000000f09f909f092f4632506f6f6c2f6400000000000000000000000000000000000000000000000000000000000000000000000500f90f0000000000000250015725000000001976a914dfd88711bf5d20f2ac7049ba28d053a89186ce9288ac0000000000000000266a24aa21a9ede95bfb806dede2f1803efb5ce5a921152fe58e6732799c6f4ce6828901301bff46235845548d4733e81ceffa84ba3dfb0bc9da05a95d46ff4c97eb082a0000000000000009734362c54b3f6f285234e3c5a87dadf570e3206827d1ce78b723c3d2dfe93a55779695c32c391b8b4984b515696937bba61642f8c2b81edb406f351a76fcf46f3b31b484fdd8d79391a7c0af48c72e895700228ea7e7ef098041c8b68931d187203cdfc0530b4246f49a803978c8ecfe1ba5a7beee95bd9da44ac5af79a69fcbeb32ee3723653bc758047c63622f77808425d8f7122b05730aefce54303655986b4cb160b87f2ba87331c313badc777fa3dd9fd0c3b5f65226644c7c270f1be8a0fb676b1533c1ba5700f468f495ba73110d11e5e4ab9d9454ee921c66b3cdac9c1e3541cfa7ca48e115b3c7aaa543d17508bd5afc2e0db20bbf8dfeac7dbd63abb45fc9c79e78542891ffd8278ee0d25008c6faacec3ce4db35a2e1fd4b3d7200000000050900000000000000000000000000000000000000000000000000000000000000af09df5d2d23e3873c9c04cbe183ddd004503311b734a5fb3d364bd242084acab58d63cd5e34858cecf95f8f4ef6118124125fde91b129bc0bcbd47d0c32eab1e4b2e25910150cba609207bc0258757dea692f7ae114927b0762cdcbfc2404c8ad11d36c1e67ce3741bedda751dc1cd0212763dedfa10f659ec6d9ad298959f308000000140000205e3498b4c50fec0d0c92e89210303c4b0826361833b2446b61345e17daf1eb13d3189529497d7bd39d030e17473ac3f9afac205cf3c77e11c44d7d30fe5266c3e788ec6ae0eb2b19339c92d7","040162007e033840b342762c3e2ede82bf918cfc07237cbf0e97f2527dd700462e0d9d721253659ceba3eb48e8479166fdda6904702641f0d0ace93c5c0196ae654ea2600e89ec6af23c45190000000001000000010000000000000000000000000000000000000000000000000000000000000000ffffffff6403a0f2302cfabe6d6d4c4e476801a47d2c39312825007d840f4f7c21d9fab121940717341c1e0af8f220000000f09f909f092f4632506f6f6c2f65000000000000000000000000000000000000000000000000000000000000000000000005009ab6ca4c1400ca4c02d8454825000000001976a914dfd88711bf5d20f2ac7049ba28d053a89186ce9288ac0000000000000000266a24aa21a9ed70ac251e29b30e699c3c4c25adffdcd5f13da812bac539ddbf4336b6e57ecc6d2a88bb3e8b88122348ac1f45462ee08934ad606b2f7be655d955ec9e4100000000000000074b4f2cd20fc3ae62600878d087e00648389c29e6ec1031a44a93d159cb305ec04f35bbca54b8f9255b3464e3d696c7fa7639ef484aca1d70100a46d7bbaaacb4dbda8f4e7964b9b2e0dec0327cf9a2f656706222d1744cce4d356be0008ce912eb7e6783df5d16b9a0d9c35f4ccd54a1a6b96cc6a1c654b37ffd32b39f2eb416676fc41e6bf156d16e5b3ea772dacb74e5d10c2ad55228fbb697b52176290c18a7bf3e863d8e6e8c29f04a13a89ef66ac53fffad645ec563b1486207c4d5116990414dbfd65b8a53d600ef0296ce447750aa39b7aa1e66bf40a6d95b0ec4c0c40000000005090000000000000000000000000000000000000000000000000000000000000084a5579c8d0d89e29a20e0fca19c455e6c13f43a0d5544dab12c72553e7a54bf47837d6eb6907e7221093532899717a218345125ca85ee6883131e61938339a70740480bf5824a3b443716d119c8fd9e09e9bf59b4812d630e67cb7cfe0cf7eb98c9a6aa9bba89af0c50a7402ef8d51bc763a659b65ca70706adc65d4e2561740800000014000020d4f8270c4ada3fd122481137115f5d31b445c23ac37592ef4ae8f3da5040a92200cd420fe6c63c0565d0c6b1483deaef6d9ae6acc85104166bc2ae27b369b8580e89ec6ae0eb2b19ff0698e4","040162003f60909b9a8472aedf98e8ef9d8d66ec81cd9f3dc0baa4473b322207e94c33311768905d77d1a2f8e129c4a7676c65d1b9e3a7827822b83c063659ca13f5cb43488cec6a871544190000000001000000010000000000000000000000000000000000000000000000000000000000000000ffffffff6203a0f2301b2f5669614254432f4d696e656420627920616c656b736c3030372f2cfabe6d6d36655be62ce7f47e61f817653cbf0dcb24634cf518d14d1d261b49ef3f2018a6200000000000000010335a2d01b3bcf1768d153d067d723b007d723b00ffffffff02c6ff8f25000000001976a91493e278b485679cfd2d21441a94bb29dd7c99d72088ac0000000000000000266a24aa21a9ed37144b19c0ffca72143052b533571b3e83e1ebce841889f5034ebac562e6d892000000007766caa122d24a37806450b4640c2100e671129f4f1506520d462d14efe930660b7df322bcf3f3c670e33454adf96aa3bb1e5bda015fe78ae964135b9199724b9a177e795fd7f142f0c912a09bcf5a1c924e663f8bc4a67855d01d5d2322587c99b5c4450b187a9be4f332c570738b7315e2693187036a7f372f8b98368aa8aa40403279769f8ef48ebbb012e0cef40225e593683a30203ea9d464cdfa0cf48300b399e8cadb31863dd53e9245d84678718710e5a6ee505ccecf91eb1ca7de2f85711d9c3cd33ddbfd39d1f179889c5997b7ca51a882c2022ae9fa663c90ec27aee1d7cd37e422f455f60f93d920c1b93e232484ba8d3bb150d347d739848dd1b5a556f5a49048367d663bd8038097f868def94a9fee6078eb4a27b19b580f618ebed4f42a0418fb0017d130c29b68e12bc2e75440b4bb2361fce785ee83f3eb0a3ba8f9c4fa171bbb0f6afd8aa6bd82b5b6c8188bd7cb97d30b0553b78079c71e10beaec0f259ad413d61116c4fbb31a07b4ec749615833b638f0fe1441095c4b00000000050000000000000000000000000000000000000000000000000000000000000000e2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf97d24db2bfa41474bfb2f877d688fac5faa5e10a2808cf9de307370b93352e548f31c8add9a607b0be34d795c949dd8798ff6904f9ff2ddf55b872833f54d1c1dfd409908f49b8f3317b604408dac9d1a45c69a068f74dc0503364737cb07d75f1800000000000020d4f8270c4ada3fd122481137115f5d31b445c23ac37592ef4ae8f3da5040a92223c096db17ec34a0f5a6c2ecdd42904c849ebab47dd073000a84653159d37575868bec6ae0eb2b1923f07ca1"}},{testNet,68043613,"f2afbcfce7ab352bf5e907f402eddcac80cd575243f253ff1c2b2fc92256054d",{"040062004d055622c92f2b1cff53f2435257cd80acdced02f407e9f52b35abe7fcbcaff26ea30c1ed9968ea1d2f5ef0b1162f9a70083d339f3da2345b1fb91ea4ca3e89e06bfec6aa406091e800039dd","04006200d610696413d1c60d78247cad66b1694c0e0a01369f7fd082057eb1501f0954d03c4be8551a0efba1d632090937d2bb6c4445d1178421f4516051d296ee41a3aa15bfec6aaea0091ec0002250","04006200334819a9f7732df16306de860980ac6bbd0032b49356e7ffa934dec1c329a5eda3db5a0f646a152002d5404779ff3b83a7f1f1231af545ffdcafc8a328a62b5816bfec6a4ad3081e80001031"}} };
+    for (auto& c : chains)
+    {
+        Headers h(*c.net); std::string err;
+        check(h.Tip().height == c.height && h.Tip().hash == uint256(std::string(c.hash)),"anchor headers link up to their tip");
+        for (const char* text : c.next)
+        {
+            Bytes full = ParseHex(text), raw(full.begin(),full.begin()+80); size_t pos = 80; btcswap::AuxPow aux;
+            if (full.size() == 80) { check(h.Add(raw,err),"the next real headers pay DigiShield and their own scrypt"); continue; }
+            check(btcswap::ParseAuxPow(full,pos,aux) && pos == full.size(),"a real AuxPoW reads to its end");
+            Headers without(*c.net), sameBlock(*c.net);
+            btcswap::AuxPow bent = aux; bent.parent[79] ^= 1;
+            if (&text == &c.next[0] || text == c.next[0])
+            {
+                check(!without.Add(raw,err),"a merged-mined header without its proof is refused");
+                check(!sameBlock.Add(raw,err,&bent),"a proof whose parent was changed is refused");
+                bent = aux; bent.nChainIndex ^= 1;
+                check(!sameBlock.Add(raw,err,&bent),"a proof in the wrong slot is refused");
+                bent = aux; if (!bent.branch.empty()) bent.branch[0] = Joined(bent.branch[0],bent.branch[0]); else bent.tx.vin[0].scriptSig << OP_0;
+                check(!sameBlock.Add(raw,err,&bent),"a proof with another coinbase is refused");
+                bent = aux; bent.tx.vin[0].scriptSig = CScript();
+                check(!sameBlock.Add(raw,err,&bent),"a coinbase without the block in it is refused");
+                std::string auxErr;
+                check(CheckAuxPow(aux,Decode(raw).hash,(int)((uint32_t)LE(raw,0,4)>>16),c.net->strictChainId,auxErr),"the real proof passes");
+                check(!CheckAuxPow(aux,Joined(Decode(raw).hash,Decode(raw).hash),(int)((uint32_t)LE(raw,0,4)>>16),c.net->strictChainId,auxErr),"and proves no other block");
+                // CAuxPow::check refuses a second marker, not a second root.
+                uint256 rootHash = ClimbBranch(Decode(raw).hash,aux.chainBranch,aux.nChainIndex);
+                Bytes again(rootHash.begin(),rootHash.end()); std::reverse(again.begin(),again.end());
+                btcswap::AuxPow twice = aux; twice.branch.clear(); twice.nIndex = 0;
+                twice.tx.vin[0].scriptSig.insert(twice.tx.vin[0].scriptSig.end(),again.begin(),again.end());
+                uint256 merkle = twice.tx.GetHash(); std::copy(merkle.begin(),merkle.end(),twice.parent.begin()+36);
+                check(CheckAuxPow(twice,Decode(raw).hash,(int)((uint32_t)LE(raw,0,4)>>16),c.net->strictChainId,auxErr),"a coinbase that repeats the root is valid, as in CAuxPow::check");
+                static const unsigned char marker[4] = {0xfa,0xbe,0x6d,0x6d};
+                twice.tx.vin[0].scriptSig.insert(twice.tx.vin[0].scriptSig.end(),marker,marker+4);
+                merkle = twice.tx.GetHash(); std::copy(merkle.begin(),merkle.end(),twice.parent.begin()+36);
+                check(!CheckAuxPow(twice,Decode(raw).hash,(int)((uint32_t)LE(raw,0,4)>>16),c.net->strictChainId,auxErr),"a coinbase with a second marker is not");
+            }
+            check(h.Add(raw,err,&aux),"the next real headers pay DigiShield and their parent's scrypt");
+        }
+        // A block with an AuxPoW between its header and its transactions.
+        if (strlen(c.next[0]) == 160) continue;
+        Bytes block = ParseHex(c.next[0]);
+        Bytes coinbase = ParseHex("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100e1f505000000000000000000");
+        block.push_back(1); block.insert(block.end(),coinbase.begin(),coinbase.end());
+        std::vector<CTransaction> txs;
+        check(btcswap::ParseBlockTxs(block,txs,true) && txs.size() == 1,"a block with an AuxPoW reads");
+        check(!btcswap::ParseBlockTxs(block,txs),"and not without being told of it");
+    }
+
+    {
+        // A fork that stamps long gaps gets the easing for free.
+        Header a = Headers(*mainNet).Tip(); int64 month = (int64)a.time+2592000;
+        Integer perBlock = (Integer(1)<<256)/(Target(a.bits)+1), floor = AnchorWorkFloor(*mainNet,a,month), work = a.work;
+        check(AnchorWorkFloor(*mainNet,a,(int64)a.time+30) == a.work,"no floor at the anchor");
+        check(floor == a.work+perBlock*43200/16,"a month on, 2700 blocks of the anchor's work");
+        unsigned int bits = a.bits;
+        for (int i = 0; i < 2000; ++i) { bits = DigiShield(bits,300,mainNet->limitBits); work += (Integer(1)<<256)/(Target(bits)+1); }
+        check(bits == mainNet->limitBits && work < floor,"a long fork at the eased difficulty stays under it");
+    }
+    check(RefusesTx(ParseHex("02747842")) && !RefusesTx(ParseHex("0767657464617461")),"a refused broadcast stops nothing, a refused request does");
+
+    btcswap::Chain chain; chain.coin = "doge"; chain.name = "main"; chain.fMain = true; chain.pkhVersion = 30; chain.shVersion = 22; CScript dest; std::string err;
+    Bytes hash = ParseHex("751e76e8199196d454941c45d1b3a323f1433bd6"); std::string address = btcswap::PkhToAddress(chain,hash);
+    check(address[0] == 'D' && Destination(chain,address,dest,err) && dest.size() == 25,"Dogecoin key address (D...)");
+    check(!Destination(chain,"1111111111111111111114oLvT2",dest,err),"a Bitcoin address is not a Dogecoin destination");
+    check(!Destination(chain,"LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ",dest,err),"nor a Litecoin one");
+    check(!Destination(chain,"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",dest,err),"nor a bech32 one");
+    printf("doge-light: %d failure(s)\n",failures); return failures ? 1 : 0;
 }
 int SelfTestLitecoin()
 {

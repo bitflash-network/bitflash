@@ -17,7 +17,7 @@ namespace btfchat
 
 bool SwapCoinOk(const std::string& coin)
 {
-    return coin == "BTF" || coin == "BTC" || coin == "LTC" || coin == "BCH" || coin == "XEC";
+    return coin == "BTF" || coin == "BTC" || coin == "LTC" || coin == "DOGE" || coin == "BCH" || coin == "XEC";
 }
 
 static bool IsHexString(const std::string& s)
@@ -59,6 +59,8 @@ bool SwapAddressShapeOk(const std::string& coin, const std::string& addr)
         return addr[0] == '1' || addr[0] == 'm' || addr[0] == 'n';
     if (coin == "LTC")
         return addr[0] == 'L' || addr[0] == 'm' || addr[0] == 'n';
+    if (coin == "DOGE")
+        return addr[0] == 'D' || addr[0] == 'm' || addr[0] == 'n';
     return false;
 }
 
@@ -93,6 +95,13 @@ static bool OfferFromJson(const json& j, SwapOffer& o, std::string& errOut)
     if (!AmountOk(j, "ga", o.giveAmount) || !AmountOk(j, "wa", o.wantAmount))
     {
         errOut = "an offer needs two amounts, more than zero and at most 21 million";
+        return false;
+    }
+    // Under this a contract's redeem would leave dust (the RPC refuses it too):
+    // a taker could lock coins for a contract it could never spend.
+    if ((o.give == "DOGE" && o.giveAmount < 2000000) || (o.want == "DOGE" && o.wantAmount < 2000000))
+    {
+        errOut = "the least Dogecoin a contract can hold is 0.02 DOGE";
         return false;
     }
     o.note = j.contains("note") && j["note"].is_string() ? j["note"].get<std::string>() : std::string();
@@ -178,6 +187,7 @@ bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
             // tell which, so any of them will do here; the contract built on
             // that chain refuses an address of the wrong network.
             bool fShape = s.chain == "BTF" ? SwapAddressShapeOk("BTC", s.to) || SwapAddressShapeOk("LTC", s.to) ||
+                                                 SwapAddressShapeOk("DOGE", s.to) ||
                                                  SwapAddressShapeOk("BCH", s.to) || SwapAddressShapeOk("XEC", s.to)
                                            : SwapAddressShapeOk("BTF", s.to);
             if (!fShape) { errOut = "lock1 needs an address for the coin it receives"; return false; }
