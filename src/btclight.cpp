@@ -423,7 +423,9 @@ static std::vector<Net> MakeNets()
     d.anchorHeight = DOGE_MAIN_ANCHOR_HEIGHT; d.anchor.assign(DOGE_MAIN_ANCHOR, DOGE_MAIN_ANCHOR + sizeof(DOGE_MAIN_ANCHOR)/sizeof(DOGE_MAIN_ANCHOR[0]));
     v.push_back(d);
     d.name = "test"; d.magic = 0xdcb7c1fc; d.port = 44556; d.strictChainId = false; d.minDifficulty = true;
-    d.seeds = {"testseed.jrn.me.uk"};
+    // Six peers that answered over Tor on 2026-11-05.
+    d.seeds = {"testseed.jrn.me.uk", "107.6.112.101:44556", "135.181.168.83:44556", "185.232.70.226:44556",
+               "209.126.12.41:44556", "23.92.177.93:44556", "89.58.9.219:44556"};
     d.pkhVersion = 113; d.shVersion = 196; d.shVersion2 = 196;
     d.genesis = GenesisHeader(1, dogeMerkle, 1391503289, 0x1e0ffff0, 997879);
     d.anchorHeight = DOGE_TEST_ANCHOR_HEIGHT; d.anchor.assign(DOGE_TEST_ANCHOR, DOGE_TEST_ANCHOR + sizeof(DOGE_TEST_ANCHOR)/sizeof(DOGE_TEST_ANCHOR[0]));
@@ -475,7 +477,8 @@ static std::vector<Net> MakeNets()
     x.anchorHeight = XEC_MAIN_ANCHOR_HEIGHT; x.anchor.assign(XEC_MAIN_ANCHOR, XEC_MAIN_ANCHOR + sizeof(XEC_MAIN_ANCHOR)/sizeof(XEC_MAIN_ANCHOR[0]));
     v.push_back(x);
     x.name = "test"; x.magic = 0xf4f3e5f4; x.port = 18333; x.cashPrefix = "ectest"; x.minDifficulty = true;
-    x.seeds = {"testnet-seed.bitcoinabc.org", "testnet-seeder.fabien.cash", "testnet-seeder.status.cash"};
+    x.seeds = {"testnet-seed.bitcoinabc.org", "testnet-seeder.fabien.cash", "testnet-seeder.status.cash",
+               "5.189.141.79:18333", "51.79.81.158:18333"};
     x.pkhVersion = 111; x.shVersion = 196; x.shVersion2 = 196;
     x.asertHeight = 1421481; x.asertBits = XEC_TEST_ASERT_BITS; x.asertParentTime = XEC_TEST_ASERT_TIME;
     x.genesis = GenesisHeader(1, btcMerkle, 1296688602, 0x1d00ffff, 414098458);

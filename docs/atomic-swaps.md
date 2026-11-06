@@ -426,7 +426,10 @@ checked against two explorers.
 
 Proven with coins against Dogecoin Core 1.14.9 on regtest, on the node and on
 the light client: `-selftest=chat-swap` with `CHATSWAP_COIN=DOGE`, a swap each
-way and a maker who vanishes.
+way and a maker who vanishes. A public swap on Dogecoin's test network and the
+Bitflash testnet, both wallets on the light client, was made on 2026-11-05. Its
+contract was paid by the coinbase of a mined block, so it also waited out the
+240 blocks a coinbase takes to mature on that network.
 
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
