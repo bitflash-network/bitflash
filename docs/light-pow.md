@@ -38,6 +38,12 @@ checkpoint) and AlgoLock, which has the same effect as v8's `IsAlgoActive`
 after Odocrypt. Recheck against the running release before each Bitflash
 release.
 
+## DigiByte's other networks
+
+`dgbpow::Params` holds what differs from the main network: the first supported
+height, Odocrypt's interval, and the longest timespan a retarget takes. The test
+network's is 810 seconds against the main network's 870.
+
 ## Supported checkpoints and caller contract
 
 | Chain | First supported height | Mainnet block ID |

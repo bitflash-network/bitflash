@@ -41,7 +41,8 @@ struct Net
     bool auxPow = false;          // headers may be merged-mined
     bool strictChainId = false;   // the header names auxChainId, and its parent another
     int auxChainId = 0;
-    bool nodeOnly = false;        // no light client for this chain: its own node or nothing
+    bool multiAlgo = false;       // DigiByte's five algorithms: dgb_pow.h decides a header
+    int protocol = 70016;         // the version told to peers, at least their minimum
     std::string cashPrefix;       // addresses are cashaddr with this prefix
     bool forkId = false;          // spends sign with SIGHASH_FORKID
     size_t maxBlock = 4000000;    // the largest block or message taken from a peer
@@ -125,5 +126,6 @@ int SelfTest();
 int SelfTestLitecoin();
 int SelfTestCash();
 int SelfTestDogecoin();
+int SelfTestDigiByte();
 }
 #endif

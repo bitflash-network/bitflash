@@ -434,10 +434,8 @@ contract was paid by the coinbase of a mined block, so it also waited out the
 ### DigiByte
 
 The same `coin*` calls with `dgb` first, the same contract, and
-`offer 100 BTF for 50000 DGB` in the chat. It runs through DigiByte Core for now:
-the embedded light client comes after its proof of work and difficulty are
-wired in (docs/light-pow.md), and until then a wallet without the node is told
-so. What differs from Bitcoin:
+`offer 100 BTF for 50000 DGB` in the chat, through DigiByte Core or the embedded
+light client. What differs from Bitcoin:
 
 - **Addresses** in the contract are legacy keys: `D...` on the main network,
   `s...` or `t...` on the test network and regtest. `dgb1` and `dgbt1` cannot be
@@ -458,14 +456,30 @@ so. What differs from Bitcoin:
   again, so only the first one can take a minute or two.
 
 DigiByte Core keeps its data in `DigiByte` under `%APPDATA%`, or `~/.digibyte`,
-and a cookie there is found by itself; otherwise name it with `-dgbdatadir`,
-`-dgbrpcport`, `-dgbwallet` and `-dgbrpcuser`/`-dgbrpcpassword`. `-dgbchain` is
-`main`, `test` (default on Bitflash testnet) or `regtest`. Its test network was
-started over in 2026 and lives in `testnet26`.
+and a cookie there is found by itself, or named with `-dgbdatadir`,
+`-dgbrpcport`, `-dgbwallet` and `-dgbrpcuser`/`-dgbrpcpassword`; otherwise it is
+the embedded light client. `-dgbchain` is `main`, `test` (default on Bitflash
+testnet) or `regtest`; `-dgbpeer` names a peer. Its test network was started
+over in 2026 and lives in `testnet26`.
 
-Proven with coins against DigiByte Core 9.26.7 on regtest, on the node:
-`-selftest=chat-swap` with `CHATSWAP_COIN=DGB`, a swap each way and a maker who
-vanishes. Nothing on a public network yet.
+The light client starts from 240 real headers and checks every header after
+them with `dgb_pow.h`: the proof of whichever of the five algorithms it names,
+MultiShield's difficulty for that algorithm, and DigiByte's own measure of work,
+which is what picks the best chain. Its peers want protocol 70017 or later, so it
+says 70019. A default node serves no BIP157 filters: as for Litecoin, it reads
+the blocks of the contract's window, here four times as many. Past the anchor a
+chain has to show a sixteenth of the work the real one did since, as for the
+chains that retarget every block.
+
+The same checks took every real header of the main network from 24,000,401 to
+24,516,451, 516,051 of them, and of the test network from 37,000 to 604,411, with
+no mismatch. The test network's retarget stops at 810 seconds, not 870
+(`nMaxActualTimespanV4` is worked out from a different limit there), and its
+Odocrypt changes shape daily, not every ten days.
+
+Proven with coins against DigiByte Core 9.26.7 on regtest, on the node and on the
+light client: `-selftest=chat-swap` with `CHATSWAP_COIN=DGB`, a swap each way and
+a maker who vanishes. Nothing on a public network yet.
 
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its

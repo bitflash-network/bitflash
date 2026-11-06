@@ -370,6 +370,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=ltc-light
 	./bitflash.exe -selftest=cash-light
 	./bitflash.exe -selftest=doge-light
+	./bitflash.exe -selftest=dgb-light
 	./bitflash.exe -selftest=swap-wait-payment
 	./bitflash.exe -selftest=fee-policy
 	./bitflash.exe -selftest=invoice
