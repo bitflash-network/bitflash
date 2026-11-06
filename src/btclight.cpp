@@ -5,6 +5,9 @@
 #include "btclight.h"
 #include "dgb_anchors.h"
 #include "dgb_pow.h"
+#include "rvn_anchors.h"
+#include "rvn_kawpow.h"
+#include "x16rv2.h"
 #include "proxy.h"
 #include "swap.h"
 #include <fstream>
@@ -488,14 +491,22 @@ static std::vector<Net> MakeNets()
     g.genesis = GenesisHeader(1, "72ddd9496b004221ed0557358846d9248ecd4c440ebd28ed901efc18757d0fad", 1519460922, 0x207fffff, 4);
     g.anchorHeight = 0; g.anchor.clear();
     v.push_back(g);
-    // Ravencoin: the addresses, for its own node. ravencoin v4.8.0, src/chainparams.cpp.
+    // ravencoin v4.8.0, src/chainparams.cpp. Its peers want KAWPOW's protocol.
     Net r;
-    r.coin = "rvn"; r.label = "Ravencoin"; r.nodeOnly = true;
-    r.name = "main"; r.pkhVersion = 60; r.shVersion = 122; r.shVersion2 = 122;
+    r.coin = "rvn"; r.label = "Ravencoin"; r.protocol = 70028; r.timespan = 60; r.spacing = 60; r.maxBlock = 8000000;
+    r.filters = false; r.services = 1; r.blockInv = 2; r.agent = "/Bitflash:rvn-light/";
+    r.name = "main"; r.magic = 0x4e564152; r.port = 8767; r.pkhVersion = 60; r.shVersion = 122; r.shVersion2 = 122;
+    r.kawpow = true; r.headerSize = 120; r.limitBits = 0x1e00ffff;
+    // Over Tor these names often do not resolve: two peers that answered on 2026-11-06.
+    r.seeds = {"seed-raven.bitactivate.com", "seed-raven.ravencoin.com", "seed-raven.ravencoin.org", "142.93.153.10:8767", "143.198.227.50:8767"};
+    r.anchorHeight = RVN_MAIN_ANCHOR_HEIGHT; r.anchor.assign(RVN_MAIN_ANCHOR, RVN_MAIN_ANCHOR + sizeof(RVN_MAIN_ANCHOR)/sizeof(RVN_MAIN_ANCHOR[0]));
     v.push_back(r);
-    r.name = "test"; r.pkhVersion = 111; r.shVersion = 196; r.shVersion2 = 196;
+    // No peer of the test network answered on 2026-11-06, and so no anchor: its node or nothing.
+    r.name = "test"; r.nodeOnly = true; r.pkhVersion = 111; r.shVersion = 196; r.shVersion2 = 196; r.seeds.clear(); r.anchorHeight = 0; r.anchor.clear();
     v.push_back(r);
-    r.name = "regtest"; r.regtest = true;
+    r.name = "regtest"; r.nodeOnly = false; r.regtest = true; r.kawpow = false; r.x16rv2 = true; r.headerSize = 80; r.magic = 0x574f5243; r.port = 18444; r.limitBits = 0x207fffff;
+    r.genesis = GenesisHeader(4, "28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516", 1524179366, 0x207fffff, 1);
+    r.genesisId = "0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c";
     v.push_back(r);
     Net c;
     c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
@@ -569,10 +580,30 @@ std::string Label(const std::string& coin)
 {
     return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : coin == "rvn" ? "Ravencoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
 }
-static Header Decode(const Bytes& raw)
+static uint256 HashOf(const lightpow::Hash& bytes)
 {
-    if (raw.size() != 80) throw std::runtime_error("Bitcoin header must be 80 bytes");
+    uint256 out;
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+// A Ravencoin block is named by the KAWPOW mix its header carries; it is only
+// to be trusted once Headers::Add has recomputed that.
+static Header Decode(const Bytes& raw, const Net* net = NULL)
+{
+    if (raw.size() != (net ? net->headerSize : 80)) throw std::runtime_error("Bitcoin header must be 80 bytes");
     Header h; h.raw = raw; h.hash = Digest(raw); h.prev = ReadHash(raw, 4); h.merkle = ReadHash(raw, 36);
+    if (net && net->kawpow)
+    {
+        rvnpow::Header parsed; std::string err;
+        if (!rvnpow::ParseHeader(raw.data(), raw.size(), parsed, err)) throw std::runtime_error(err);
+        h.hash = HashOf(rvnpow::BlockHash(parsed));
+    }
+    if (net && net->x16rv2)
+    {
+        lightpow::Hash id{};
+        x16rv2::Hash(raw.data(), id.data());
+        h.hash = HashOf(id);
+    }
     h.time = (unsigned int)LE(raw, 68, 4); h.bits = (unsigned int)LE(raw, 72, 4); return h;
 }
 Headers::Headers(const std::string& net) : network(net), net(FindNet("btc", net))
@@ -620,7 +651,8 @@ void Headers::Start(const Net& n)
 {
     if (n.anchor.empty())
     {
-        Header h = Decode(n.genesis);
+        Header h = Decode(n.genesis, &n);
+        if (*n.genesisId) h.hash = uint256(n.genesisId);
         h.work = (Integer(1)<<256)/(Target(h.bits)+1);
         nodes[h.hash] = h; active.push_back(h.hash); base = 0;
         return;
@@ -630,7 +662,7 @@ void Headers::Start(const Net& n)
     base = n.anchorHeight-(int)n.anchor.size()+1;
     for (size_t i = 0; i < n.anchor.size(); ++i)
     {
-        Header h = Decode(ParseHex(n.anchor[i]));
+        Header h = Decode(ParseHex(n.anchor[i]), &n);
         if (i && h.prev != active.back()) throw std::runtime_error(n.label+" anchor headers do not link");
         h.height = base+(int)i;
         h.work = i ? nodes.at(active.back()).work+(Integer(1)<<256)/(Target(h.bits)+1) : Integer(0);
@@ -709,7 +741,7 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
 {
     try
     {
-        Header h = Decode(raw);
+        Header h = Decode(raw, net);
         if (nodes.count(h.hash)) return true;
         std::map<uint256, Header>::const_iterator it = nodes.find(h.prev);
         if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
@@ -719,6 +751,25 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
             throw std::runtime_error(net->label+" header forks from before the anchor");
         Integer target = Target(h.bits), limit = Target(net->limitBits);
         Integer step = (Integer(1)<<256)/(target+1);
+        // Ravencoin: DGW over the last 180 blocks, then KAWPOW. From the store
+        // the proof is not done again, as for scrypt below.
+        if (net->kawpow)
+        {
+            rvnpow::Header parsed; std::string powErr; lightpow::Hash work{};
+            if (!rvnpow::ParseHeader(raw.data(),raw.size(),parsed,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr);
+            std::vector<lightpow::PastBlock> parents;
+            for (const Header* walk = &p; parents.size() < 180; walk = &nodes.at(walk->prev))
+            {
+                lightpow::PastBlock past; past.height = walk->height; past.time = walk->time; past.bits = walk->bits;
+                parents.push_back(past);
+                if (walk->height <= base) break;
+            }
+            std::reverse(parents.begin(),parents.end());
+            if (!storedHeaders) { if (!rvnpow::ValidateHeader(parents,parsed,work,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr); }
+            else if (rvnpow::NextWorkRequired(parents,powErr) != h.bits || !rvnpow::BlockProof(h.bits,work,powErr))
+                throw std::runtime_error("invalid "+net->label+" header: "+powErr);
+            step = DgbWork(work);
+        }
         // DigiByte: which algorithm, whose retarget and whose work. A header
         // from the store is not hashed again, like scrypt below.
         if (net->multiAlgo)
@@ -751,9 +802,9 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
             if (net->strictChainId && !net->regtest && (version>>16) != net->auxChainId) throw std::runtime_error("invalid "+net->label+" chain id");
             if (merged && !CheckAuxPow(*aux,h.hash,version>>16,net->strictChainId,auxErr)) throw std::runtime_error("invalid "+net->label+" AuxPoW");
         }
-        if (!net->multiAlgo && (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target))
+        if (!net->multiAlgo && !net->kawpow && (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target))
             throw std::runtime_error("invalid "+net->label+" proof of work");
-        if (!net->multiAlgo && h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
+        if (!net->multiAlgo && !net->kawpow && h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
         if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
         if (net->bip94 && (p.height+1)%net->Interval() == 0 && (int64)h.time < (int64)p.time-600)
             throw std::runtime_error("testnet4 timewarp");
@@ -856,7 +907,7 @@ bool MatchFilter(const uint256& block, const Bytes& filter, const std::vector<By
 }
 bool VerifyBlock(const Bytes& raw, const Header& h, std::vector<CTransaction>& txs, size_t maxBlock, bool auxPow)
 {
-    if (raw.size() < 81 || raw.size() > maxBlock || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs, auxPow)) return false;
+    if (raw.size() < h.raw.size()+1 || raw.size() > maxBlock || !std::equal(h.raw.begin(), h.raw.end(), raw.begin()) || !btcswap::ParseBlockTxs(raw, txs, auxPow, h.raw.size())) return false;
     std::vector<uint256> tree;
     for (size_t i = 0; i < txs.size(); ++i) tree.push_back(txs[i].GetHash());
     while (tree.size() > 1)
@@ -1170,9 +1221,9 @@ static void Load(State& s)
     std::ifstream f((s.path+".headers").c_str(), std::ios::binary);
     if (f)
     {
-        Bytes raw(80); std::string err;
+        Bytes raw(s.net.headerSize); std::string err;
         s.headers.storedHeaders = true;
-        while (f.read((char*)raw.data(), 80))
+        while (f.read((char*)raw.data(), raw.size()))
         {
             // A later release can start from a later anchor: what is stored
             // from before it no longer connects, and is not needed.
@@ -1204,7 +1255,7 @@ static void Load(State& s)
         for (const auto& text : j.at("watched")) { Bytes b = ParseHex(text.get<std::string>()); if (b.size() != 23) throw std::runtime_error("invalid saved contract script"); s.watched.insert(b); }
         for (const auto& text : j.at("blocks"))
         {
-            Bytes b = ParseHex(text.get<std::string>()); Header h = Decode(Bytes(b.begin(), b.begin()+std::min<size_t>(80,b.size())));
+            Bytes b = ParseHex(text.get<std::string>()); Header h = Decode(Bytes(b.begin(), b.begin()+std::min<size_t>(s.net.headerSize,b.size())), &s.net);
             std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs,s.net.maxBlock,s.net.auxPow)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
         }
         for (const auto& text : j.at("pending"))
@@ -1250,13 +1301,14 @@ static std::map<uint256, Located> Transactions(State& s);
 // A chain whose peers serve no filters: every block from the contract's
 // window to the tip (Watch), each checked against its header's merkle root,
 // and those that pay a watched contract or spend such a payment kept.
+// A new tip can come from the second peer, and a Core node asked for a block
+// it has not got says nothing. Every 15 seconds that would be a timeout and a
+// new circuit: DigiByte's last two blocks wait for the next round.
+static int ScanLag(const Net& net) { return net.multiAlgo && !net.regtest ? 2 : 0; }
 static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
 {
     int tip = s.headers.Tip().height;
-    // A new tip can come from the second peer, and a Core node asked for a
-    // block it has not got says nothing. Every 15 seconds that would be a
-    // timeout and a new circuit: the last two blocks wait for the next round.
-    if (s.net.multiAlgo && !s.net.regtest) tip -= 2;
+    tip -= ScanLag(s.net);
     if (!s.synced) return;
     // With nothing watched the cursor follows the tip, so a first contract
     // looks back as far as it needs (Watch) and not to the starting point.
@@ -1312,12 +1364,12 @@ static uint64_t PullHeaders(State& s, Peer& peer, std::unique_lock<std::recursiv
     uint256 last(0);
     for (uint64_t i = 0; i < n; ++i)
     {
-        if (response.size()-pos < 81) throw std::runtime_error("truncated Bitcoin headers");
-        Bytes raw(response.begin()+pos,response.begin()+pos+80); pos += 80;
+        if (response.size()-pos < s.net.headerSize+1) throw std::runtime_error("truncated Bitcoin headers");
+        Bytes raw(response.begin()+pos,response.begin()+pos+s.net.headerSize); pos += s.net.headerSize;
         btcswap::AuxPow aux; const bool merged = s.net.auxPow && (LE(raw,0,4)&0x100);
         if (merged && !btcswap::ParseAuxPow(response,pos,aux)) throw std::runtime_error("truncated "+s.net.label+" AuxPoW");
         if (Count(response,pos,0) != 0) throw std::runtime_error("header has transactions");
-        Header h = Decode(raw);
+        Header h = Decode(raw, &s.net);
         if (i && h.prev != last) throw std::runtime_error("discontinuous Bitcoin headers");
         bool known = s.headers.Contains(h.hash);
         std::string err; if (!s.headers.Add(raw,err,merged ? &aux : NULL)) throw std::runtime_error(err);
@@ -1350,7 +1402,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     // A chain started from an anchor counts work only from there; the anchor
     // itself is the checkpoint, and every header after it pays its own work.
     Integer minimum = *s.net.minimumWork && s.net.anchor.empty() ? Number(uint256(s.net.minimumWork)) : Integer(0);
-    if ((s.net.asertHeight || s.net.digishield) && !s.net.minDifficulty && !s.net.anchor.empty())
+    if ((s.net.asertHeight || s.net.digishield || s.net.kawpow) && !s.net.minDifficulty && !s.net.anchor.empty())
         minimum = AnchorWorkFloor(s.net, s.headers.At(s.net.anchorHeight), GetTime());
     if (s.net.multiAlgo && s.net.name == "main") minimum = DgbWorkFloor(s.net, s.headers, GetTime());
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
@@ -1360,7 +1412,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it)
         if (s.headers.ActiveHeight(it->first) >= 0)
         {
-            std::vector<CTransaction> txs; btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow);
+            std::vector<CTransaction> txs; btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow,s.net.headerSize);
             for (const auto& tx : txs) confirmed.insert(tx.GetHash());
         }
     std::vector<Bytes> broadcasts;
@@ -1612,10 +1664,10 @@ static std::map<uint256, Located> Transactions(State& s)
     std::map<uint256, Located> out;
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it)
     {
-        Header h = Decode(Bytes(it->second.begin(),it->second.begin()+80));
+        Header h = Decode(Bytes(it->second.begin(),it->second.begin()+s.net.headerSize), &s.net);
         // The height is in the coinbase only on modern networks; use the
         // header index instead of trusting an unvalidated coinbase field.
-        std::vector<CTransaction> txs; if (!btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow)) continue;
+        std::vector<CTransaction> txs; if (!btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow,s.net.headerSize)) continue;
         int height = s.headers.ActiveHeight(h.hash);
         if (height >= 0)
             for (size_t i = 0; i < txs.size(); ++i) out[txs[i].GetHash()] = Located{txs[i],height};
@@ -1652,7 +1704,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
 {
     Watch(chain, contract); State& s = StateOf(chain); std::lock_guard<std::recursive_mutex> lock(s.mutex);
     if (!s.error.empty()) throw std::runtime_error(s.error);
-    if (!s.synced || s.scan < s.headers.Tip().height+1)
+    if (!s.synced || s.scan < s.headers.Tip().height+1-ScanLag(s.net))
         throw std::runtime_error(s.net.label+(s.net.filters ? " light is synchronizing headers and contract filters" : " light is synchronizing headers and scanning blocks"));
     CScript script; script.SetPayToScriptHash(contract);
     auto txs = Transactions(s); uint256 txid(0); int output = -1;
@@ -1677,7 +1729,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     json j = {{"contractTxid",txid.GetHex()},{"vout",output},{"unspent",false},{"confirmations",0},{"amount",nullptr},{"spent",false},{"found",false}};
     if (funding == txs.end() || output < 0) return j;
     if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
-    j["confirmations"] = s.net.multiAlgo ? DgbConfirmations(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
+    j["confirmations"] = s.net.multiAlgo || s.net.kawpow ? DgbConfirmations(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
     j["unspent"] = true;
     j["amount"] = (double)funding->second.tx.vout[output].nValue/CoinUnit(s.net.coin);
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
@@ -2070,6 +2122,41 @@ int SelfTestRavencoin()
         );
     std::vector<CTransaction> txs;
     check(btcswap::ParseBlockTxs(raw,txs,false,120) && txs.size() == 2,"a main network block's two transactions");
+    {
+        Headers h(*mainNet);
+        check(h.Tip().height == mainNet->anchorHeight,"the anchor loads and links");
+        const Header& tip = h.Tip();
+        Bytes forged = tip.raw;
+        uint256 parent = tip.hash;
+        std::copy(parent.begin(),parent.end(),forged.begin()+4);
+        uint32_t next = (uint32_t)tip.height+1, later = tip.time+60;
+        for (int i = 0; i < 4; ++i) { forged[76+i] = (next>>(8*i))&255; forged[68+i] = (later>>(8*i))&255; }
+        std::string powErr;
+        check(!h.Add(forged,powErr) && powErr.find("difficulty") != std::string::npos,"a header with its parent's bits is refused");
+        std::vector<lightpow::PastBlock> parents;
+        for (int i = mainNet->anchorHeight-179; i <= mainNet->anchorHeight; ++i)
+        {
+            lightpow::PastBlock past; past.height = i; past.time = h.At(i).time; past.bits = h.At(i).bits;
+            parents.push_back(past);
+        }
+        uint32_t bits = rvnpow::NextWorkRequired(parents,powErr);
+        for (int i = 0; i < 4; ++i) forged[72+i] = (bits>>(8*i))&255;
+        powErr.clear();
+        check(bits != 0 && !h.Add(forged,powErr) && !powErr.empty() && powErr.find("difficulty") == std::string::npos,"a header without its proof of work is refused");
+        const Header& inside = h.At(mainNet->anchorHeight-1);
+        parent = inside.hash;
+        std::copy(parent.begin(),parent.end(),forged.begin()+4);
+        check(!h.Add(forged,powErr) && powErr.find("before the anchor") != std::string::npos,"a fork from inside the anchor is refused");
+    }
+    {
+        // Real regtest blocks: Ravencoin 4.8.0 named them so.
+        Headers h(*regNet);
+        check(h.Tip().hash.GetHex() == regNet->genesisId,"regtest genesis");
+        Bytes first = ParseHex("000000203c0a200804deb8290a7a1a95aca2bcdd5548be853be3c4363ab63bc93d702c0b3753b16d85cf74d5ad1b6f03b9d7adac47f002e217f8a791ea3112527226e556dd34ee6affff7f2003000000");
+        check(Decode(first,regNet).hash.GetHex() == "54f0497b2b2b4fb82bb53e91d796744cf614c19238c1c1820b51934c82a36160","X16RV2 names a real regtest block");
+        std::string addErr;
+        check(h.Add(first,addErr) && h.Tip().height == 1,"and it joins the chain");
+    }
     std::vector<uint256> tree;
     for (size_t i = 0; i < txs.size(); ++i) tree.push_back(txs[i].GetHash());
     check(tree.size() == 2 && Joined(tree[0],tree[1]) == uint256(Bytes(raw.begin()+36,raw.begin()+68)),"their merkle root is the header's");

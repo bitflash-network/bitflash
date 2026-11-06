@@ -496,8 +496,10 @@ takes to mature.
 ### Ravencoin
 
 The same `coin*` calls with `rvn` first, the same contract, and
-`offer 100 BTF for 5000 RVN` in the chat. It runs through its own node, Ravencoin
-4.8.0: a wallet without one is told so. What differs from Bitcoin:
+`offer 100 BTF for 5000 RVN` in the chat, through Ravencoin 4.8.0 or, on the main
+network and regtest, the embedded light client. Its test network has only the node:
+no peer of it answered on 2026-11-06, so the client has nowhere to start from. What
+differs from Bitcoin:
 
 - **Addresses** are base58 only: `R...` on the main network, `n...` or `m...` on
   the test network. No SegWit addresses.
@@ -514,16 +516,27 @@ The same `coin*` calls with `rvn` first, the same contract, and
 
 Ravencoin keeps its data in `Raven` under `%APPDATA%`, or `~/.raven`, and a
 cookie there is found by itself, or named with `-rvndatadir`, `-rvnrpcport`,
-`-rvnwallet` and `-rvnrpcuser`/`-rvnrpcpassword`. It answers `validateaddress`, not
-`getaddressinfo`. `-rvnchain` is `main`, `test` (default on Bitflash testnet, in
-`testnet7`) or `regtest`.
+`-rvnwallet` and `-rvnrpcuser`/`-rvnrpcpassword`; otherwise it is the embedded
+light client. It answers `validateaddress`, not `getaddressinfo`. `-rvnchain` is
+`main`, `test` (default on Bitflash testnet, in `testnet7`) or `regtest`;
+`-rvnpeer` names a peer.
 
-Proven with coins against Ravencoin 4.8.0 on regtest, on the node:
-`-selftest=chat-swap` with `CHATSWAP_COIN=RVN`, a swap each way and a maker who
-vanishes. `-selftest=rvn-chain` reads a real main network block. `rvnpow` took
-every main network header from 4,507,691 to 4,614,104, 106,414 of them, DGW and
-the full KAWPOW proof, with no mismatch. Nothing on a public network yet: the
-eight test network peers its seeds gave did not answer on 2026-11-06.
+The light client starts from 200 real headers and checks every header after them
+with `rvn_kawpow.h`: its height, DarkGravityWave over the last 180 blocks, then
+KAWPOW. As for DigiByte, a contract's confirmations count by the work over it, and
+past the anchor a chain has to show a sixteenth of the work the real one did since.
+A block's name is the mix its header carries, trusted only once the proof has
+recomputed it. On regtest, where KAWPOW never activates, blocks are named by
+X16RV2 (`x16rv2.h`), which is there for that alone.
+
+Proven with coins against Ravencoin 4.8.0 on regtest, on the node and on the light
+client: `-selftest=chat-swap` with `CHATSWAP_COIN=RVN`, a swap each way and a maker
+who vanishes. `-selftest=rvn-chain` reads a real main network block, and has
+X16RV2 name a real regtest block. `rvnpow` took every main network header from
+4,507,691 to 4,614,104, 106,414 of them, DGW and the full KAWPOW proof, with no
+mismatch. Nothing on a public network yet: the eight test network peers its seeds
+gave did not answer on 2026-11-06, so the first public swap will be on the main
+network.
 
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
