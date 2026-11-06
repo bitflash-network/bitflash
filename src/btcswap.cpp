@@ -262,8 +262,8 @@ bool Call(const std::string& coin, const std::string& method, const json& params
     to.nMaxBytes = nMaxBytes;
     to.nTimeoutSecs = 120;
     to.nPort = c.nPort ? c.nPort : DefaultPort(coin, chain);
-    // Dogecoin Core 1.14 has one wallet and no such path. Nor does Ravencoin need it.
-    if (!c.strWallet.empty() && coin != "doge" && coin != "rvn")
+    // Dogecoin Core 1.14 has one wallet and no such path.
+    if (!c.strWallet.empty() && coin != "doge")
         to.strPath = "/wallet/" + c.strWallet;
     if (!c.strUser.empty())
         to.strAuth = c.strUser + ":" + c.strPassword;
@@ -361,6 +361,13 @@ bool CheckChain(const std::string& coin, Chain& out, std::string& errOut)
         r["initialblockdownload"].get<bool>() && out.fMain)
     {
         errOut = who + " is still downloading the chain; a swap needs it at the tip";
+        return false;
+    }
+    // Not every node has that flag, and it clears a day behind. The time left
+    // on a contract is read off this node's chain: behind, it overstates it.
+    if (out.fMain && out.nMedianTime && GetTime() - out.nMedianTime > 6 * 3600)
+    {
+        errOut = who + " is hours behind; a swap needs it at the tip";
         return false;
     }
     return true;

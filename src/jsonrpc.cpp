@@ -3510,8 +3510,17 @@ static json CoinFindSecret(const string& coin, const json& p)
         json raw = CoinCall(coin, "getblock", json::array({ hash, coin == "doge" ? json(false) : json(0) }), (coin == "btc" ? 64 : 600) * 1024 * 1024);
         vector<CTransaction> txs;
         vector<unsigned char> vchBlock = raw.is_string() ? ParseHex(raw.get<string>()) : vector<unsigned char>();
-        // A Ravencoin block's header is KAWPOW's 120 bytes, but on regtest.
-        if (!raw.is_string() || !btcswap::ParseBlockTxs(vchBlock, txs, coin == "doge", coin == "rvn" && chain.name != "regtest" ? 120 : 80))
+        // A Ravencoin block's header is KAWPOW's 120 bytes from a set time on
+        // (nKAAAWWWPOWActivationTime in chainparams.cpp), which regtest never reaches.
+        size_t nHeader = 80;
+        if (coin == "rvn" && vchBlock.size() >= 72)
+        {
+            int64 nStamp = (int64)vchBlock[68] | ((int64)vchBlock[69] << 8) | ((int64)vchBlock[70] << 16) | ((int64)vchBlock[71] << 24);
+            int64 nKawpow = chain.name == "main" ? 1588788000 : chain.name == "test" ? 1585159200 : 3582830167LL;
+            if (nStamp >= nKawpow)
+                nHeader = 120;
+        }
+        if (!raw.is_string() || !btcswap::ParseBlockTxs(vchBlock, txs, coin == "doge", nHeader))
             throw runtime_error(strprintf("%s block %d does not decode", btclight::Label(coin).c_str(), h));
         if (fDgbWindow)
         {

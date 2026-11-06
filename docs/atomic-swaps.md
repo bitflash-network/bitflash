@@ -501,18 +501,20 @@ The same `coin*` calls with `rvn` first, the same contract, and
 
 - **Addresses** are base58 only: `R...` on the main network, `n...` or `m...` on
   the test network. No SegWit addresses.
-- **Mainnet confirmations:** 40, about 40 minutes. KAWPOW's hash rate can be
-  rented, so it gets the time Bitcoin Cash gets.
+- **Mainnet confirmations:** 60, about an hour. KAWPOW's hash rate can be rented,
+  and past 60 blocks Ravencoin's nodes refuse a reorganization.
 - **The fee** is what the node estimates, at least 0.01 RVN per 1000 bytes, its
   minimum relay fee; `-rvnfeerate` sets it when there is no estimate. An offer or
   a contract under 0.1 RVN is refused, and so is a spend that would leave under
   0.0001 RVN.
-- **Blocks:** a KAWPOW header is 120 bytes, not 80. Ravencoin's regtest stays on
-  the 80-byte header, as KAWPOW never activates there.
+- **Blocks:** a KAWPOW header is 120 bytes, not 80, from May 2020 on. Ravencoin's
+  regtest stays on the 80-byte header, as KAWPOW never activates there.
+- **Amounts:** an offer holds at most 21 million, far under Ravencoin's supply of
+  21 billion.
 
 Ravencoin keeps its data in `Raven` under `%APPDATA%`, or `~/.raven`, and a
-cookie there is found by itself, or named with `-rvndatadir`, `-rvnrpcport` and
-`-rvnrpcuser`/`-rvnrpcpassword`. It answers `validateaddress`, not
+cookie there is found by itself, or named with `-rvndatadir`, `-rvnrpcport`,
+`-rvnwallet` and `-rvnrpcuser`/`-rvnrpcpassword`. It answers `validateaddress`, not
 `getaddressinfo`. `-rvnchain` is `main`, `test` (default on Bitflash testnet, in
 `testnet7`) or `regtest`.
 
