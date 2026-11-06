@@ -124,6 +124,9 @@ int main()
               "a DigiByte key address");
         CHECK(SwapAddressShapeOk("DGB", "skzSdPmkCiRX64ocF1LJKmF7CXh6st1PTb") && SwapAddressShapeOk("DGB", "t6Y6ZDtbMbXvkRjwYkpGFFGVaJMpDxkvwS"),
               "a DigiByte test address starts with s or t");
+        CHECK(SwapAddressShapeOk("RVN", "RJqN4M2FWfvYjxZ4GvCmG4iTjf7rUPKFzD") && SwapAddressShapeOk("RVN", "n47dpAWoRUWWbYvERemvndUGEGe6x8jYwX") &&
+              !SwapAddressShapeOk("RVN", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L"),
+              "a Ravencoin key address");
         o.give = "DGB"; o.giveAmount = 9999999; o.want = "BTF"; o.wantAmount = 100000000;
         CHECK(!ParseSwapOffer(FormatSwapOffer(o), back, err), "an offer under what a DigiByte contract can hold is refused");
         o.giveAmount = 100000000000LL;

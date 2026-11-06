@@ -62,7 +62,7 @@ bool KnownCoin(const std::string& strCoin);
 
 struct Chain
 {
-    std::string coin = "btc";    // which chain: btc, ltc, doge, bch, xec
+    std::string coin = "btc";    // which chain: btc, ltc, doge, bch, xec, dgb, rvn
     std::string name;            // as getblockchaininfo says: main, test, testnet4, test4, signet, regtest
     bool fMain = false;
     unsigned char pkhVersion = 0;
@@ -117,8 +117,9 @@ struct AuxPow
 // The AuxPoW at `pos`, which is moved past it (dogecoin v1.14.9, src/auxpow.h).
 bool ParseAuxPow(const std::vector<unsigned char>& raw, size_t& pos, AuxPow& out);
 // Every transaction in a raw block. fAuxPow: the chain's headers can carry an
-// AuxPoW, between the 80 bytes and the transactions.
-bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow = false);
+// AuxPoW, between the 80 bytes and the transactions. nHeaderSize: Ravencoin's
+// KAWPOW header is 120.
+bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow = false, size_t nHeaderSize = 80);
 
 // Fee rate to use, satoshis per 1000 vbytes: Core's estimate for 6 blocks,
 // else the configured one; never under 1 sat/vbyte.

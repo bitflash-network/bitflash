@@ -8063,7 +8063,7 @@ static nlohmann::json SwapTestBtc(int nPort, const std::string& method, const nl
     LoopbackRpc to;
     to.nPort = nPort;
     // Dogecoin Core 1.14 has one wallet and no /wallet/ path.
-    to.strPath = getenv("CHATSWAP_COIN") && std::string(getenv("CHATSWAP_COIN")) == "DOGE" ? "/" : path;
+    to.strPath = getenv("CHATSWAP_COIN") && (std::string(getenv("CHATSWAP_COIN")) == "DOGE" || std::string(getenv("CHATSWAP_COIN")) == "RVN") ? "/" : path;
     to.strAuth = "swap:swap";
     to.strWho = "Bitcoin Core";
     nlohmann::json r;
@@ -8237,8 +8237,8 @@ static int RunChatSwapSelfTest()
     // regtest in Bitcoin Core's place (CHATSWAP_BTC names its port), and so
     // on with BCH and XEC.
     const std::string coin = getenv("CHATSWAP_COIN") ? getenv("CHATSWAP_COIN") : "BTC";
-    // A DigiByte contract holds at least 0.1 DGB.
-    const int64_t nScale = coin == "DGB" ? 10 : 1;
+    // A DigiByte or Ravencoin contract holds at least 0.1.
+    const int64_t nScale = coin == "DGB" || coin == "RVN" ? 10 : 1;
     a.addr = "alice.btf";
     b.addr = "bob.btf";
     a.other = &b;
@@ -8263,7 +8263,7 @@ static int RunChatSwapSelfTest()
             nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
             double got = tx.value("amount", 0.0) * CoinUnit(coin) / COIN;   // in BTC-sized units on every chain
             // Dogecoin's fee is a thousand times Bitcoin's, as a share of this amount.
-            nFail += Check(got > (coin == "DOGE" ? 0.04 : 0.0499) * nScale && got <= 0.05 * nScale, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
+            nFail += Check(got > (coin == "DOGE" ? 0.04 : coin == "RVN" ? 0.049 : 0.0499) * nScale && got <= 0.05 * nScale, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
             bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
@@ -8713,6 +8713,8 @@ int RunSelfTest(const std::string& name)
         return btclight::SelfTestDogecoin();
     if (name == "dgb-light")
         return btclight::SelfTestDigiByte();
+    if (name == "rvn-chain")
+        return btclight::SelfTestRavencoin();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

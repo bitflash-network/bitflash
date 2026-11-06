@@ -2950,7 +2950,7 @@ static json rpc_swapextractsecret(const json& p)
 static btcswap::Chain RequireChain(const string& coin)
 {
     if (!btcswap::KnownCoin(coin))
-        throw runtime_error("unknown chain \"" + coin + "\" (btc, ltc, doge, bch, xec or dgb)");
+        throw runtime_error("unknown chain \"" + coin + "\" (btc, ltc, doge, bch, xec, dgb or rvn)");
     btcswap::Chain chain;
     string err;
     if (!btcswap::CheckChain(coin, chain, err))
@@ -2969,12 +2969,12 @@ static json CoinCall(const string& coin, const string& method, const json& param
 
 static string Ticker(const string& coin)
 {
-    return coin == "ltc" ? "LTC" : coin == "doge" ? "DOGE" : coin == "dgb" ? "DGB" : coin == "bch" ? "BCH" : coin == "xec" ? "XEC" : "BTC";
+    return coin == "ltc" ? "LTC" : coin == "doge" ? "DOGE" : coin == "dgb" ? "DGB" : coin == "rvn" ? "RVN" : coin == "bch" ? "BCH" : coin == "xec" ? "XEC" : "BTC";
 }
 
 static string ChainLogName(const string& coin)
 {
-    return coin == "ltc" ? "litecoin" : coin == "doge" ? "dogecoin" : coin == "dgb" ? "digibyte" : coin == "bch" ? "bitcoincash" : coin == "xec" ? "ecash" : "bitcoin";
+    return coin == "ltc" ? "litecoin" : coin == "doge" ? "dogecoin" : coin == "dgb" ? "digibyte" : coin == "rvn" ? "ravencoin" : coin == "bch" ? "bitcoincash" : coin == "xec" ? "ecash" : "bitcoin";
 }
 
 static string UtcText(int64 t)
@@ -3024,6 +3024,8 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
     // Its wallets pay 0.1 DGB per 1000 bytes: the estimate lands near that.
     if (chain.coin == "dgb" && nValue < COIN / 10)
         throw runtime_error("the least DigiByte a contract can hold is 0.1 DGB");
+    if (chain.coin == "rvn" && nValue < COIN / 10)
+        throw runtime_error("the least Ravencoin a contract can hold is 0.1 RVN");
     CScript contract = swap::BuildContract(c);
     string strAddr = btcswap::ScriptAddress(chain, contract);
     if (btcswap::UsingLight(chain.coin))
@@ -3335,8 +3337,8 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
         if (p.size() > destination + 1 && !p[destination + 1].is_null())
         {
             nFeeRate = CoinAmountFromValue(coin, p[destination + 1]);
-            int64 nFeeRateMin = coin == "doge" ? COIN / 100 : coin == "dgb" ? COIN / 1000 : 1000;
-            int64 nFeeRateMax = coin == "doge" || coin == "dgb" ? COIN : COIN / 100;
+            int64 nFeeRateMin = coin == "doge" || coin == "rvn" ? COIN / 100 : coin == "dgb" ? COIN / 1000 : 1000;
+            int64 nFeeRateMax = coin == "doge" || coin == "dgb" || coin == "rvn" ? COIN : COIN / 100;
             if (nFeeRate < nFeeRateMin || nFeeRate > nFeeRateMax)
                 throw runtime_error("fee rate out of range (" + CoinAmountText(coin, nFeeRateMin) + " to " + CoinAmountText(coin, nFeeRateMax) + " " + Ticker(coin) + " per 1000 vbytes)");
         }
@@ -3344,8 +3346,8 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     else
     {
         addr = CoinCall(coin, "getnewaddress", json::array());
-        // Dogecoin Core 1.14 has only the older call, with the same field.
-        json info = CoinCall(coin, coin == "doge" ? "validateaddress" : "getaddressinfo", json::array({ addr }));
+        // Dogecoin Core 1.14 and Ravencoin have only the older call, with the same field.
+        json info = CoinCall(coin, coin == "doge" || coin == "rvn" ? "validateaddress" : "getaddressinfo", json::array({ addr }));
         if (!info.is_object() || !info.contains("scriptPubKey") || !info["scriptPubKey"].is_string())
             throw runtime_error(btcswap::BackendName(coin) + " gave no address to be paid to");
         vector<unsigned char> vchTo = ParseHex(info["scriptPubKey"].get<string>());
@@ -3362,8 +3364,8 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     if (coin == "doge" && o.nValue - nFee < COIN / 100)
         throw runtime_error("what is left after the fee is under Dogecoin's dust limit of 0.01 DOGE");
     // DigiByte's, for the largest output a spend makes here (policy.h: 3 sat/byte).
-    if (coin == "dgb" && o.nValue - nFee < COIN / 10000)
-        throw runtime_error("what is left after the fee is under DigiByte's dust limit");
+    if ((coin == "dgb" || coin == "rvn") && o.nValue - nFee < COIN / 10000)
+        throw runtime_error("what is left after the fee is under " + btclight::Label(coin) + "'s dust limit");
     CDataStream ss(SER_NETWORK);
     ss << tx;
     string strHex = HexStr(ss.begin(), ss.end(), false);
@@ -3449,7 +3451,7 @@ static json CoinFindSecret(const string& coin, const json& p)
     }
     // More than a 48-hour lock: 400 of Bitcoin's blocks, 1728 of Litecoin's,
     // 3000 of Dogecoin's, 13000 of DigiByte's.
-    int nBack = coin == "dgb" ? 13000 : coin == "doge" ? 3000 : coin == "ltc" ? 1728 : 400;
+    int nBack = coin == "dgb" ? 13000 : coin == "doge" || coin == "rvn" ? 3000 : coin == "ltc" ? 1728 : 400;
     int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
     // That is minutes of calls on DigiByte, with this RPC waiting, and a swap
     // asks every round: what was searched is not searched again, but for a
@@ -3508,7 +3510,8 @@ static json CoinFindSecret(const string& coin, const json& p)
         json raw = CoinCall(coin, "getblock", json::array({ hash, coin == "doge" ? json(false) : json(0) }), (coin == "btc" ? 64 : 600) * 1024 * 1024);
         vector<CTransaction> txs;
         vector<unsigned char> vchBlock = raw.is_string() ? ParseHex(raw.get<string>()) : vector<unsigned char>();
-        if (!raw.is_string() || !btcswap::ParseBlockTxs(vchBlock, txs, coin == "doge"))
+        // A Ravencoin block's header is KAWPOW's 120 bytes, but on regtest.
+        if (!raw.is_string() || !btcswap::ParseBlockTxs(vchBlock, txs, coin == "doge", coin == "rvn" && chain.name != "regtest" ? 120 : 80))
             throw runtime_error(strprintf("%s block %d does not decode", btclight::Label(coin).c_str(), h));
         if (fDgbWindow)
         {
@@ -3564,7 +3567,7 @@ static json rpc_btcfindsecret(const json& p)          { return CoinFindSecret("b
 static json CoinDispatch(json (*fn)(const string&, const json&), const char* name, const json& p)
 {
     if (p.empty() || !p[0].is_string())
-        throw runtime_error(string(name) + " <chain: btc, ltc, doge, bch, xec or dgb> ...");
+        throw runtime_error(string(name) + " <chain: btc, ltc, doge, bch, xec, dgb or rvn> ...");
     string coin = p[0].get<string>();
     for (size_t i = 0; i < coin.size(); i++)
         coin[i] = (char)tolower((unsigned char)coin[i]);
