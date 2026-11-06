@@ -1250,13 +1250,14 @@ static std::map<uint256, Located> Transactions(State& s);
 // A chain whose peers serve no filters: every block from the contract's
 // window to the tip (Watch), each checked against its header's merkle root,
 // and those that pay a watched contract or spend such a payment kept.
+// A new tip can come from the second peer, and a Core node asked for a block
+// it has not got says nothing. Every 15 seconds that would be a timeout and a
+// new circuit: DigiByte's last two blocks wait for the next round.
+static int ScanLag(const Net& net) { return net.multiAlgo && !net.regtest ? 2 : 0; }
 static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
 {
     int tip = s.headers.Tip().height;
-    // A new tip can come from the second peer, and a Core node asked for a
-    // block it has not got says nothing. Every 15 seconds that would be a
-    // timeout and a new circuit: the last two blocks wait for the next round.
-    if (s.net.multiAlgo && !s.net.regtest) tip -= 2;
+    tip -= ScanLag(s.net);
     if (!s.synced) return;
     // With nothing watched the cursor follows the tip, so a first contract
     // looks back as far as it needs (Watch) and not to the starting point.
@@ -1652,7 +1653,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
 {
     Watch(chain, contract); State& s = StateOf(chain); std::lock_guard<std::recursive_mutex> lock(s.mutex);
     if (!s.error.empty()) throw std::runtime_error(s.error);
-    if (!s.synced || s.scan < s.headers.Tip().height+1)
+    if (!s.synced || s.scan < s.headers.Tip().height+1-ScanLag(s.net))
         throw std::runtime_error(s.net.label+(s.net.filters ? " light is synchronizing headers and contract filters" : " light is synchronizing headers and scanning blocks"));
     CScript script; script.SetPayToScriptHash(contract);
     auto txs = Transactions(s); uint256 txid(0); int output = -1;
