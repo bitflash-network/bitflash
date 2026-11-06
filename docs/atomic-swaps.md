@@ -469,7 +469,15 @@ which is what picks the best chain. Its peers want protocol 70017 or later, so i
 says 70019. A default node serves no BIP157 filters: as for Litecoin, it reads
 the blocks of the contract's window, here four times as many. Past the anchor a
 chain has to show a sixteenth of the work the real one did since, as for the
-chains that retarget every block.
+chains that retarget every block. The anchor is a checkpoint: nothing forks from
+inside it.
+
+Blocks count for what they cost. MultiShield eases for a chain that claims time
+has passed, and a private chain of 160 blocks can hold the work of about 40. So
+the light client reports a contract's confirmations by the work over it, in steps
+of the 240 blocks before it, and never more than the blocks there are. The last
+two blocks are read a round later: a tip every 15 seconds would otherwise keep
+asking a peer for a block it has not got.
 
 The same checks took every real header of the main network from 24,000,401 to
 24,516,451, 516,051 of them, and of the test network from 37,000 to 604,411, with
@@ -479,7 +487,11 @@ Odocrypt changes shape daily, not every ten days.
 
 Proven with coins against DigiByte Core 9.26.7 on regtest, on the node and on the
 light client: `-selftest=chat-swap` with `CHATSWAP_COIN=DGB`, a swap each way and
-a maker who vanishes. Nothing on a public network yet.
+a maker who vanishes, on a chain of more than 3000 blocks. A public swap on
+DigiByte's test network and the Bitflash testnet, both wallets on the light
+client, was made on 2026-11-06. Its contract was paid by the coinbase of a block
+mined on a CPU with Odocrypt, so it also waited out the 100 blocks a coinbase
+takes to mature.
 
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its

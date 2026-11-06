@@ -43,6 +43,8 @@ struct Net
     int auxChainId = 0;
     bool multiAlgo = false;       // DigiByte's five algorithms: dgb_pow.h decides a header
     int protocol = 70016;         // the version told to peers, at least their minimum
+    size_t maxHeaders = 2000;     // the most a peer sends in one headers message
+    int scanBatch = 20;           // blocks asked for at a time, without filters
     std::string cashPrefix;       // addresses are cashaddr with this prefix
     bool forkId = false;          // spends sign with SIGHASH_FORKID
     size_t maxBlock = 4000000;    // the largest block or message taken from a peer
