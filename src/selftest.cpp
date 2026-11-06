@@ -8237,6 +8237,8 @@ static int RunChatSwapSelfTest()
     // regtest in Bitcoin Core's place (CHATSWAP_BTC names its port), and so
     // on with BCH and XEC.
     const std::string coin = getenv("CHATSWAP_COIN") ? getenv("CHATSWAP_COIN") : "BTC";
+    // A DigiByte contract holds at least 0.1 DGB.
+    const int64_t nScale = coin == "DGB" ? 10 : 1;
     a.addr = "alice.btf";
     b.addr = "bob.btf";
     a.other = &b;
@@ -8250,7 +8252,7 @@ static int RunChatSwapSelfTest()
             btfchat::SwapEngine ea(&a), eb(&b);
             btfchat::SwapOffer o;
             o.give = "BTF"; o.giveAmount = COIN;
-            o.want = coin; o.wantAmount = 5000000;
+            o.want = coin; o.wantAmount = 5000000 * nScale;
             a.offers["11111111111111111111111111111111"] = o;
             std::string id, err;
             nFail += Check(eb.Take(a.addr, "11111111111111111111111111111111", o, id, err), "Bob takes the offer") ? 0 : 1;
@@ -8261,7 +8263,7 @@ static int RunChatSwapSelfTest()
             nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
             double got = tx.value("amount", 0.0) * CoinUnit(coin) / COIN;   // in BTC-sized units on every chain
             // Dogecoin's fee is a thousand times Bitcoin's, as a share of this amount.
-            nFail += Check(got > (coin == "DOGE" ? 0.04 : coin == "DGB" ? 0.049 : 0.0499) && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
+            nFail += Check(got > (coin == "DOGE" ? 0.04 : 0.0499) * nScale && got <= 0.05 * nScale, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
             bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&
@@ -8279,7 +8281,7 @@ static int RunChatSwapSelfTest()
             a.convo.clear();
             b.convo.clear();
             btfchat::SwapOffer o;
-            o.give = coin; o.giveAmount = 4000000;
+            o.give = coin; o.giveAmount = 4000000 * nScale;
             o.want = "BTF"; o.wantAmount = 80000000;
             b.offers["22222222222222222222222222222222"] = o;
             std::string id, err;
@@ -8294,9 +8296,9 @@ static int RunChatSwapSelfTest()
         try {
             printf("  3. Alice offers 0.5 BTF for 0.03 BTC; Bob locks; Alice vanishes\n");
             btfchat::SwapConfig cfg;
-            // Short locks (test chains only): 6 Bitflash blocks for Alice, 15
+            // Short locks (test chains only): 12 Bitflash blocks for Alice, 15
             // minutes of Bitcoin median time for Bob, and the margins to match.
-            cfg.nBtfInitiatorBlocks = 6;
+            cfg.nBtfInitiatorBlocks = 12;
             cfg.nBtcParticipantSecs = 900;
             cfg.nTakerMinLeft = 240;
             cfg.nMakerMinLeft = 60;
@@ -8305,7 +8307,7 @@ static int RunChatSwapSelfTest()
             b.convo.clear();
             btfchat::SwapOffer o;
             o.give = "BTF"; o.giveAmount = 50000000;
-            o.want = coin; o.wantAmount = 3000000;
+            o.want = coin; o.wantAmount = 3000000 * nScale;
             a.offers["33333333333333333333333333333333"] = o;
             std::string id, err;
             nFail += Check(eb.Take(a.addr, "33333333333333333333333333333333", o, id, err), "Bob takes it") ? 0 : 1;

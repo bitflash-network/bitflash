@@ -16,6 +16,7 @@
 // every request carries HTTP Basic credentials, and the comparison is constant
 // time. What the exchange runs beside the daemon can talk to it; nothing else.
 
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include "headers.h"
 #include "btfsock.h"
@@ -2949,7 +2950,7 @@ static json rpc_swapextractsecret(const json& p)
 static btcswap::Chain RequireChain(const string& coin)
 {
     if (!btcswap::KnownCoin(coin))
-        throw runtime_error("unknown chain \"" + coin + "\" (btc, ltc)");
+        throw runtime_error("unknown chain \"" + coin + "\" (btc, ltc, doge, bch, xec or dgb)");
     btcswap::Chain chain;
     string err;
     if (!btcswap::CheckChain(coin, chain, err))
@@ -3020,8 +3021,9 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
     // What is left after the spend's fee has to clear Dogecoin's dust limit.
     if (chain.coin == "doge" && nValue < COIN / 50)
         throw runtime_error("the least Dogecoin a contract can hold is 0.02 DOGE");
-    if (chain.coin == "dgb" && nValue < COIN / 1000)
-        throw runtime_error("the least DigiByte a contract can hold is 0.001 DGB");
+    // Its wallets pay 0.1 DGB per 1000 bytes: the estimate lands near that.
+    if (chain.coin == "dgb" && nValue < COIN / 10)
+        throw runtime_error("the least DigiByte a contract can hold is 0.1 DGB");
     CScript contract = swap::BuildContract(c);
     string strAddr = btcswap::ScriptAddress(chain, contract);
     if (btcswap::UsingLight(chain.coin))
@@ -3374,7 +3376,9 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     j["feeRatePerKvB"] = CoinValueFromAmount(coin, nFeeRate);
     j["to"] = addr;
     // Core checked it into its memory pool; the light client only sent it.
-    j["awaitingConfirmation"] = btcswap::UsingLight(coin);
+    // DigiByte Core holds a new transaction apart for Dandelion for a while,
+    // saved nowhere and told to no wallet, so a restart there loses it.
+    j["awaitingConfirmation"] = btcswap::UsingLight(coin) || coin == "dgb";
     return j;
 }
 
@@ -3447,6 +3451,20 @@ static json CoinFindSecret(const string& coin, const json& p)
     // 3000 of Dogecoin's, 13000 of DigiByte's.
     int nBack = coin == "dgb" ? 13000 : coin == "doge" ? 3000 : coin == "ltc" ? 1728 : 400;
     int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
+    // That is minutes of calls on DigiByte, with this RPC waiting, and a swap
+    // asks every round: what was searched is not searched again, but for a
+    // reorganization, and nothing older than the contract's window is read.
+    static std::mutex mutexSearched;
+    static std::map<string, int> mapSearched;
+    const string strSearched = strTxid + ":" + std::to_string(n);
+    const bool fDgbWindow = coin == "dgb" && p.size() < 3;
+    if (fDgbWindow)
+    {
+        std::lock_guard<std::mutex> lock(mutexSearched);
+        std::map<string, int>::const_iterator it = mapSearched.find(strSearched);
+        if (it != mapSearched.end())
+            nFrom = std::max(nFrom, it->second - 200);
+    }
     if (coin == "ltc")
     {
         // A raw Litecoin block carries MWEB data and a HogEx transaction that
@@ -3489,8 +3507,15 @@ static json CoinFindSecret(const string& coin, const json& p)
         // Dogecoin Core 1.14 takes a boolean here, and its blocks carry an AuxPoW.
         json raw = CoinCall(coin, "getblock", json::array({ hash, coin == "doge" ? json(false) : json(0) }), (coin == "btc" ? 64 : 600) * 1024 * 1024);
         vector<CTransaction> txs;
-        if (!raw.is_string() || !btcswap::ParseBlockTxs(ParseHex(raw.get<string>()), txs, coin == "doge"))
+        vector<unsigned char> vchBlock = raw.is_string() ? ParseHex(raw.get<string>()) : vector<unsigned char>();
+        if (!raw.is_string() || !btcswap::ParseBlockTxs(vchBlock, txs, coin == "doge"))
             throw runtime_error(strprintf("%s block %d does not decode", btclight::Label(coin).c_str(), h));
+        if (fDgbWindow)
+        {
+            int64 nTime = (int64)vchBlock[68] | ((int64)vchBlock[69] << 8) | ((int64)vchBlock[70] << 16) | ((int64)vchBlock[71] << 24);
+            if (nTime + 50 * 3600 < c.nLockTime)
+                break;
+        }
         for (size_t i = 0; i < txs.size(); i++)
             for (size_t k = 0; k < txs[i].vin.size(); k++)
                 if (txs[i].vin[k].prevout == outpoint)
@@ -3501,6 +3526,11 @@ static json CoinFindSecret(const string& coin, const json& p)
     }
     if (vCandidates.empty())
     {
+        if (fDgbWindow)
+        {
+            std::lock_guard<std::mutex> lock(mutexSearched);
+            mapSearched[strSearched] = chain.nBlocks;
+        }
         j["found"] = false;
         return j;
     }
@@ -3534,7 +3564,7 @@ static json rpc_btcfindsecret(const json& p)          { return CoinFindSecret("b
 static json CoinDispatch(json (*fn)(const string&, const json&), const char* name, const json& p)
 {
     if (p.empty() || !p[0].is_string())
-        throw runtime_error(string(name) + " <chain: btc, ltc, doge, bch or xec> ...");
+        throw runtime_error(string(name) + " <chain: btc, ltc, doge, bch, xec or dgb> ...");
     string coin = p[0].get<string>();
     for (size_t i = 0; i < coin.size(); i++)
         coin[i] = (char)tolower((unsigned char)coin[i]);

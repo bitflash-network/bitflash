@@ -62,7 +62,7 @@ bool SwapAddressShapeOk(const std::string& coin, const std::string& addr)
     if (coin == "DOGE")
         return addr[0] == 'D' || addr[0] == 'm' || addr[0] == 'n';
     if (coin == "DGB")
-        return addr[0] == 'D' || addr[0] == 's';
+        return addr[0] == 'D' || addr[0] == 's' || addr[0] == 't';
     return false;
 }
 
@@ -106,9 +106,9 @@ static bool OfferFromJson(const json& j, SwapOffer& o, std::string& errOut)
         errOut = "the least Dogecoin a contract can hold is 0.02 DOGE";
         return false;
     }
-    if ((o.give == "DGB" && o.giveAmount < 100000) || (o.want == "DGB" && o.wantAmount < 100000))
+    if ((o.give == "DGB" && o.giveAmount < 10000000) || (o.want == "DGB" && o.wantAmount < 10000000))
     {
-        errOut = "the least DigiByte a contract can hold is 0.001 DGB";
+        errOut = "the least DigiByte a contract can hold is 0.1 DGB";
         return false;
     }
     o.note = j.contains("note") && j["note"].is_string() ? j["note"].get<std::string>() : std::string();

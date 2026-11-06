@@ -29,7 +29,7 @@ static json SwapToJson(const ChatSwap& s)
     j["secret"] = s.secret; j["hash"] = s.secretHash;
     j["myC"] = s.myContract; j["myTx"] = s.myTxid; j["myN"] = s.myVout;
     j["thC"] = s.theirContract; j["thTx"] = s.theirTxid; j["thN"] = s.theirVout;
-    j["redeem"] = s.redeemTxid; j["refund"] = s.refundTxid;
+    j["redeem"] = s.redeemTxid; j["refund"] = s.refundTxid; j["refundSince"] = s.refundSince;
     j["stage"] = s.stage; j["ok"] = s.fUserOk; j["inv"] = s.fInvited; j["sent"] = s.fSentLock;
     j["status"] = s.status; j["err"] = s.lastError;
     j["created"] = s.created; j["updated"] = s.updated; j["since"] = s.theirSince;
@@ -55,6 +55,7 @@ static bool SwapFromJson(const json& j, ChatSwap& s)
         s.theirContract = j.value("thC", std::string()); s.theirTxid = j.value("thTx", std::string());
         s.theirVout = j.value("thN", -1);
         s.redeemTxid = j.value("redeem", std::string()); s.refundTxid = j.value("refund", std::string());
+        s.refundSince = j.value("refundSince", (int64_t)0);
         s.stage = j.value("stage", (int)SW_FAILED); s.fUserOk = j.value("ok", false);
         s.fInvited = j.value("inv", false); s.fSentLock = j.value("sent", false);
         s.status = j.value("status", std::string()); s.lastError = j.value("err", std::string());
@@ -171,11 +172,12 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
     if (IsTestNet())
         return 1;
     // A private fork is stopped by the time it takes to mine, so Litecoin's
-    // blocks, four to Bitcoin's one, Dogecoin's, ten, and DigiByte's, forty, are
-    // asked for in the same time: 20 min.
+    // blocks, four to Bitcoin's one, and Dogecoin's, ten, are asked for in the
+    // same time: 20 min.
     // Bitcoin Cash and eCash run Bitcoin's SHA-256 with a sliver of its hash
-    // rate, so anyone can rent their next block: there, more time.
-    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 80 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
+    // rate, so anyone can rent their next block: there, more time. DigiByte's
+    // five algorithms include SHA-256 and scrypt, as rentable: 40 min, at 15 s.
+    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)
@@ -371,6 +373,25 @@ void SwapEngine::TryRefund(ChatSwap& s)
 {
     int64_t nLeft = 1;
     std::string err;
+    if (s.refundSince)
+    {
+        // DigiByte Core may lose a transaction it holds for Dandelion: a
+        // refund counts from a block, and goes out again if none comes.
+        bool fGone = false, fByRefund = false;
+        std::string found;
+        if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fGone, found, fByRefund, err) && fGone)
+            s.refundSince = 0;
+        else if (GetTime() - s.refundSince >= config.nRedeemBumpAfter)
+        {
+            s.refundSince = 0;
+            s.refundTxid.clear();
+        }
+        else
+        {
+            s.status = "refund sent; waiting for " + CoinName(s.give) + " to confirm it";
+            return;
+        }
+    }
     if (!s.fMaker && !s.refundTxid.empty())
     {
         // Our refund went out, but the maker holds the secret and can still
@@ -441,6 +462,13 @@ void SwapEngine::TryRefund(ChatSwap& s)
                refundParams, r, err) && r.is_object())
     {
         s.refundTxid = r.value("txid", std::string());
+        if (s.give == "DGB" && r.value("awaitingConfirmation", false))
+        {
+            s.refundSince = GetTime();
+            s.stage = SW_REFUNDING;
+            s.status = "refund sent; waiting for " + CoinName(s.give) + " to confirm it";
+            return;
+        }
         if (!s.fMaker && !s.theirContract.empty())
         {
             s.stage = SW_REFUNDING;

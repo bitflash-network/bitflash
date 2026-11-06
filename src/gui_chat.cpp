@@ -987,7 +987,7 @@ void DrawSwaps(const std::string& peer)
             const char* coinLabel = coinOther == "LTC" ? "your Litecoin receiving address" : coinOther == "DOGE" ? "your Dogecoin receiving address" : coinOther == "BCH" ? "your Bitcoin Cash receiving address"
                                     : coinOther == "XEC" ? "your eCash receiving address" : coinOther == "DGB" ? "your DigiByte receiving address" : "your Bitcoin receiving address";
             const char* coinHint = coinOther == "LTC" ? "L... / M... / ltc1... / tltc1..." : coinOther == "DOGE" ? "D... / A... / 9... / n..." : coinOther == "BCH" ? "bitcoincash:q... / bchtest:q..."
-                                   : coinOther == "XEC" ? "ecash:q... / ectest:q..." : coinOther == "DGB" ? "D... / s..." : "1... / 3... / bc1... / tb1... / bcrt1...";
+                                   : coinOther == "XEC" ? "ecash:q... / ectest:q..." : coinOther == "DGB" ? "D... / s... / t..." : "1... / 3... / bc1... / tb1... / bcrt1...";
             ImGui::PushID(s.id.c_str());
             static std::map<std::string, std::string> destinations;
             std::string& text = destinations[s.id];

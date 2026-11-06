@@ -513,7 +513,7 @@ bool AddressToPkh(const Chain& chain, const std::string& addr, std::vector<unsig
     if (!DecodeBase58Check(addr, v) || v.size() != 21)
     {
         errOut = chain.coin == "dgb"
-                     ? "need a legacy DigiByte key address (D... on main, s... on test chains); "
+                     ? "need a legacy DigiByte key address (D... on main, s... or t... on test chains); "
                        "dgb1/dgbt1 addresses cannot be in this contract"
                  : chain.coin == "ltc"
                      ? "need a legacy Litecoin key address (L... on main, m... or n... on test chains); "
