@@ -323,6 +323,7 @@ INDEX_HTML = r"""<!doctype html>
 <script src="explorer.js" defer></script>
 </head>
 <body>
+<p class="notice">First exchange listing: the community campaign on NonKYC is open until 2027-02-04. It needs 100 backers, and $5 counts as one. Pledges are donations, refunded if the listing is not completed. <a href="https://nonkyc.io/listing/campaign/BTF">Back the campaign &rarr;</a></p>
 <header class="topbar">
   <a class="brand" href="https://bitflash.network/"><img src="logo.png" width="22" height="22" alt="">Bitflash</a>
   <nav aria-label="Bitflash sites">
@@ -368,6 +369,8 @@ STYLE_CSS = r""":root{
 *{box-sizing:border-box;}
 html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--mono);-webkit-text-size-adjust:100%;}
 a{color:var(--accent);}
+.notice{margin:0;padding:.55rem clamp(.9rem,2.5vw,3rem);background:var(--accent);color:var(--bg);font-size:.86rem;line-height:1.5;}
+.notice a,.notice a:visited{color:var(--bg);font-weight:bold;white-space:nowrap;}
 .topbar{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;min-height:var(--bar);
         padding:.5rem clamp(.9rem,2.5vw,3rem);border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5;}
 .brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--fg);font-weight:bold;}
