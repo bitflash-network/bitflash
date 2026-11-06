@@ -1,7 +1,7 @@
 # Swaps with more chains (design)
 
 Status: Litecoin, Dogecoin, Bitcoin Cash, eCash and DigiByte implemented (RPC, btfchat and
-both backends, docs/atomic-swaps.md); Ravencoin designed. Target: swaps with Litecoin, Dogecoin, Bitcoin Cash,
+both backends, docs/atomic-swaps.md); Ravencoin through its own node. Target: swaps with Litecoin, Dogecoin, Bitcoin Cash,
 eCash, DigiByte and Ravencoin open on mainnet with Bitcoin's, on 2026-12-25
 12:00 UTC; Zcash (transparent addresses) in January 2027.
 
@@ -37,7 +37,7 @@ memory:
 | Bitcoin Cash | bitcoin-cash-node v29.2.0 | SHA-256d | ASERT (aserti3-2d) | FORKID | cashaddr `bitcoincash` (base58 0/5) |
 | eCash | Bitcoin-ABC v0.34.3 | SHA-256d | ASERT | FORKID | cashaddr `ecash`; XEC has 2 decimals |
 | DigiByte | DigiByte-Core/digibyte v9.26.7 | five algorithms by version bits | per-algo (MultiShield) | legacy | base58 |
-| Ravencoin | ravencoin (tag to name) | KAWPOW | DarkGravityWave v3 | legacy (FORKID? to check) | base58 |
+| Ravencoin | RavenProject/Ravencoin v4.8.0 | KAWPOW | DarkGravityWave v3 | legacy | base58 |
 
 The DigiByte and Ravencoin proof-of-work and difficulty modules are written
 separately (branch `light/dgb-rvn-pow`, docs/light-pow.md) and plugged in here.

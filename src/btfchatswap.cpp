@@ -149,7 +149,7 @@ static std::string Ref(const std::string& coin, const std::string& txid, int vou
 
 static std::string CoinName(const std::string& coin)
 {
-    return coin == "LTC" ? "Litecoin" : coin == "DOGE" ? "Dogecoin" : coin == "DGB" ? "DigiByte" : coin == "BCH" ? "Bitcoin Cash" : coin == "XEC" ? "eCash" : coin == "BTC" ? "Bitcoin" : "Bitflash";
+    return coin == "LTC" ? "Litecoin" : coin == "DOGE" ? "Dogecoin" : coin == "DGB" ? "DigiByte" : coin == "RVN" ? "Ravencoin" : coin == "BCH" ? "Bitcoin Cash" : coin == "XEC" ? "eCash" : coin == "BTC" ? "Bitcoin" : "Bitflash";
 }
 
 // The chain that is not Bitflash, in a swap that has one Bitflash side.
@@ -177,7 +177,9 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
     // Bitcoin Cash and eCash run Bitcoin's SHA-256 with a sliver of its hash
     // rate, so anyone can rent their next block: there, more time. DigiByte's
     // five algorithms include SHA-256 and scrypt, as rentable: 40 min, at 15 s.
-    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
+    // KAWPOW's hash rate can be rented too, and past 60 blocks Ravencoin's nodes
+    // refuse a reorganization: 60, an hour, at a minute.
+    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "RVN" ? 60 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)
@@ -1227,6 +1229,13 @@ static bool WalletCanSwap(const std::string& a, const std::string& b, std::strin
         if (!fReady)
         {
             err = "the " + CoinName(coin) + " side is not ready: " + err;
+            return false;
+        }
+        // A node that answers but whose wallet does not, say two loaded and
+        // none named, could not spend what the swap gives it.
+        if (r.is_object() && r.contains("walletError"))
+        {
+            err = "the " + CoinName(coin) + " side is not ready: " + r["walletError"].dump();
             return false;
         }
     }

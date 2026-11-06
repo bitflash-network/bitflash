@@ -488,6 +488,15 @@ static std::vector<Net> MakeNets()
     g.genesis = GenesisHeader(1, "72ddd9496b004221ed0557358846d9248ecd4c440ebd28ed901efc18757d0fad", 1519460922, 0x207fffff, 4);
     g.anchorHeight = 0; g.anchor.clear();
     v.push_back(g);
+    // Ravencoin: the addresses, for its own node. ravencoin v4.8.0, src/chainparams.cpp.
+    Net r;
+    r.coin = "rvn"; r.label = "Ravencoin"; r.nodeOnly = true;
+    r.name = "main"; r.pkhVersion = 60; r.shVersion = 122; r.shVersion2 = 122;
+    v.push_back(r);
+    r.name = "test"; r.pkhVersion = 111; r.shVersion = 196; r.shVersion2 = 196;
+    v.push_back(r);
+    r.name = "regtest"; r.regtest = true;
+    v.push_back(r);
     Net c;
     c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
     c.cashPrefix = "bitcoincash"; c.forkId = true;
@@ -558,7 +567,7 @@ const Net* FindNet(const std::string& coin, const std::string& network)
 }
 std::string Label(const std::string& coin)
 {
-    return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
+    return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : coin == "rvn" ? "Ravencoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
 }
 static Header Decode(const Bytes& raw)
 {
@@ -1545,6 +1554,7 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
         const Net* net = FindNet(coin, network);
         if (!net) throw std::runtime_error(Label(coin)+" light does not support the network "+network);
         if ((network == "main") == IsTestNet()) throw std::runtime_error(net->label+" and Bitflash networks must match");
+        if (net->nodeOnly) throw std::runtime_error(net->label+" has no light client yet: run its node, and name it with -"+coin+"rpcport");
         State* state = NULL;
         {
             std::lock_guard<std::mutex> start(startMutex);
@@ -2036,6 +2046,40 @@ int SelfTestDigiByte()
     std::vector<unsigned char> pkh; std::string err;
     check(btcswap::AddressToPkh(chain,"skzSdPmkCiRX64ocF1LJKmF7CXh6st1PTb",pkh,err) && HexStr(pkh.begin(),pkh.end(),false) == "255748c1a58483cb7df2984d06247f95add99b45","a regtest address and its key hash");
     printf("dgb-light: %d failure(s)\n",failures); return failures ? 1 : 0;
+}
+int SelfTestRavencoin()
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* name) { printf("  %-70s %s\n",name,ok?"ok":"FAILED"); if (!ok) ++failures; };
+    printf("rvn-chain self-test\n");
+    const Net* mainNet = FindNet("rvn","main"); const Net* testNet = FindNet("rvn","test"); const Net* regNet = FindNet("rvn","regtest");
+    check(mainNet && testNet && regNet,"Ravencoin networks: main, test, regtest");
+    if (!mainNet || !testNet || !regNet) { printf("rvn-chain: %d failure(s)\n",failures+1); return 1; }
+    // A real block of the main network, from a peer: a KAWPOW header is 120 bytes.
+    Bytes raw = ParseHex(
+        "0000003065cb92a590ffa08b299bdc1ca012c333334f78843e134c435fc9000000000000915dd8f01b4714617eee681dab7f"
+        "0941f69f2eb2800ec27f50e9b498ebd157352c1bee6ac3e0091bd6674600db6aab70edd60088b0efb232b893bb0f5832d4a0"
+        "d0bc92d6eded86379c8a8eae8821c845bb5b9f20020100000001000000000000000000000000000000000000000000000000"
+        "0000000000000000ffffffff2e03d66746042c1bee6a040664330f000000001b324d696e6572732068747470733a2f2f326d"
+        "696e6572732e636f6dffffffff02c093971a1d0000001976a91459d584c2da3735f24af4ed3eb8e2abeb63fbffd688ac0000"
+        "000000000000266a24aa21a9edb5604b382d9312f67c5ffb5a3ea2483e05f8d88724d2eb461973bc14c61a70f50000000001"
+        "000000019a614a378d9024fbbee86ed7af6b1524cc5c50c949ea197870978d13f432c8b0000000006b483045022100ebb5fe"
+        "9cf85f60de298d81fca83a441656d410f27d9b00482d81d0fa9ef833f402201b153fc088638165c46b4fb067e6aa4a2f8034"
+        "03b87fd41ef90737607069b93d012103cdb01feecc586680868e78dcc52872c634589ee3589d5faaaa1e7a7d6b274cac0000"
+        "00000140b0911a1d0000001976a914f011ee20f3a4b8286d4536cb79f3404b064c771088ac00000000"
+        );
+    std::vector<CTransaction> txs;
+    check(btcswap::ParseBlockTxs(raw,txs,false,120) && txs.size() == 2,"a main network block's two transactions");
+    std::vector<uint256> tree;
+    for (size_t i = 0; i < txs.size(); ++i) tree.push_back(txs[i].GetHash());
+    check(tree.size() == 2 && Joined(tree[0],tree[1]) == uint256(Bytes(raw.begin()+36,raw.begin()+68)),"their merkle root is the header's");
+    check(!btcswap::ParseBlockTxs(raw,txs,false,80),"read as 80 bytes it does not decode");
+    btcswap::Chain chain; chain.coin = "rvn"; chain.name = "regtest"; chain.pkhVersion = regNet->pkhVersion; chain.shVersion = regNet->shVersion;
+    std::vector<unsigned char> pkh; std::string err;
+    check(btcswap::AddressToPkh(chain,"n47dpAWoRUWWbYvERemvndUGEGe6x8jYwX",pkh,err) && HexStr(pkh.begin(),pkh.end(),false) == "f7e1e61c66d3d7d1e7b87324d2841293eb52333e","a regtest address and its key hash");
+    chain.pkhVersion = mainNet->pkhVersion;
+    check(!btcswap::AddressToPkh(chain,"n47dpAWoRUWWbYvERemvndUGEGe6x8jYwX",pkh,err),"a test address is refused on main");
+    printf("rvn-chain: %d failure(s)\n",failures); return failures ? 1 : 0;
 }
 int SelfTestDogecoin()
 {

@@ -42,6 +42,7 @@ struct Net
     bool strictChainId = false;   // the header names auxChainId, and its parent another
     int auxChainId = 0;
     bool multiAlgo = false;       // DigiByte's five algorithms: dgb_pow.h decides a header
+    bool nodeOnly = false;        // no light client for this chain: its own node or nothing
     int protocol = 70016;         // the version told to peers, at least their minimum
     size_t maxHeaders = 2000;     // the most a peer sends in one headers message
     int scanBatch = 20;           // blocks asked for at a time, without filters
@@ -129,5 +130,6 @@ int SelfTestLitecoin();
 int SelfTestCash();
 int SelfTestDogecoin();
 int SelfTestDigiByte();
+int SelfTestRavencoin();
 }
 #endif

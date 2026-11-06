@@ -493,6 +493,38 @@ client, was made on 2026-11-06. Its contract was paid by the coinbase of a block
 mined on a CPU with Odocrypt, so it also waited out the 100 blocks a coinbase
 takes to mature.
 
+### Ravencoin
+
+The same `coin*` calls with `rvn` first, the same contract, and
+`offer 100 BTF for 5000 RVN` in the chat. It runs through its own node, Ravencoin
+4.8.0: a wallet without one is told so. What differs from Bitcoin:
+
+- **Addresses** are base58 only: `R...` on the main network, `n...` or `m...` on
+  the test network. No SegWit addresses.
+- **Mainnet confirmations:** 60, about an hour. KAWPOW's hash rate can be rented,
+  and past 60 blocks Ravencoin's nodes refuse a reorganization.
+- **The fee** is what the node estimates, at least 0.01 RVN per 1000 bytes, its
+  minimum relay fee; `-rvnfeerate` sets it when there is no estimate. An offer or
+  a contract under 0.1 RVN is refused, and so is a spend that would leave under
+  0.0001 RVN.
+- **Blocks:** a KAWPOW header is 120 bytes, not 80, from May 2020 on. Ravencoin's
+  regtest stays on the 80-byte header, as KAWPOW never activates there.
+- **Amounts:** an offer holds at most 21 million, far under Ravencoin's supply of
+  21 billion.
+
+Ravencoin keeps its data in `Raven` under `%APPDATA%`, or `~/.raven`, and a
+cookie there is found by itself, or named with `-rvndatadir`, `-rvnrpcport`,
+`-rvnwallet` and `-rvnrpcuser`/`-rvnrpcpassword`. It answers `validateaddress`, not
+`getaddressinfo`. `-rvnchain` is `main`, `test` (default on Bitflash testnet, in
+`testnet7`) or `regtest`.
+
+Proven with coins against Ravencoin 4.8.0 on regtest, on the node:
+`-selftest=chat-swap` with `CHATSWAP_COIN=RVN`, a swap each way and a maker who
+vanishes. `-selftest=rvn-chain` reads a real main network block. `rvnpow` took
+every main network header from 4,507,691 to 4,614,104, 106,414 of them, DGW and
+the full KAWPOW proof, with no mismatch. Nothing on a public network yet: the
+eight test network peers its seeds gave did not answer on 2026-11-06.
+
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
 lock) and `-selftest=btc-swap` (Bitcoin addresses, reading Bitcoin's witness

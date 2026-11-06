@@ -29,7 +29,7 @@ static bool DirExists(const std::string& path);
 
 bool KnownCoin(const std::string& coin)
 {
-    return coin == "btc" || coin == "ltc" || coin == "doge" || coin == "bch" || coin == "xec" || coin == "dgb";
+    return coin == "btc" || coin == "ltc" || coin == "doge" || coin == "bch" || coin == "xec" || coin == "dgb" || coin == "rvn";
 }
 
 static Config GetConfig(const std::string& coin)
@@ -120,6 +120,13 @@ static int DefaultPort(const std::string& coin, const std::string& chain)
         if (chain == "regtest") return 18443;
         return 14022;
     }
+    if (coin == "rvn")
+    {
+        // ravencoin v4.8.0, src/chainparamsbase.cpp
+        if (chain == "test")    return 18766;
+        if (chain == "regtest") return 18443;
+        return 8766;
+    }
     if (coin == "bch")
     {
         // bitcoin-cash-node v29.2.0, src/chainparamsbase.cpp
@@ -157,6 +164,12 @@ static std::string ChainSubdir(const std::string& coin, const std::string& chain
         if (chain == "regtest") return "regtest";
         return "";
     }
+    if (coin == "rvn")
+    {
+        if (chain == "test")    return "testnet7";
+        if (chain == "regtest") return "regtest";
+        return "";
+    }
     if (chain == "test4")    return "testnet4";
     if (chain == "test")     return "testnet3";
     if (chain == "testnet4") return "testnet4";
@@ -180,13 +193,13 @@ static std::string CoreDataDir(const std::string& coin)
     if (!dir.empty())
         return dir;
     // Bitcoin Cash Node and Bitcoin ABC use Bitcoin Core's names.
-    std::string name = coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : "Bitcoin";
+    std::string name = coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : coin == "rvn" ? "Raven" : "Bitcoin";
 #ifdef _WIN32
     const char* local = getenv("LOCALAPPDATA");
     const char* roam = getenv("APPDATA");
     std::string a = std::string(local ? local : ".") + "\\" + name;
     std::string b = std::string(roam ? roam : ".") + "\\" + name;
-    if (coin == "ltc" || coin == "doge" || coin == "dgb")
+    if (coin == "ltc" || coin == "doge" || coin == "dgb" || coin == "rvn")
         return b;
     return DirExists(b) && !DirExists(a) ? b : a;
 #elif defined(__APPLE__)
@@ -194,7 +207,7 @@ static std::string CoreDataDir(const std::string& coin)
     return std::string(home ? home : ".") + "/Library/Application Support/" + name;
 #else
     const char* home = getenv("HOME");
-    return std::string(home ? home : ".") + (coin == "ltc" ? "/.litecoin" : coin == "doge" ? "/.dogecoin" : coin == "dgb" ? "/.digibyte" : "/.bitcoin");
+    return std::string(home ? home : ".") + (coin == "ltc" ? "/.litecoin" : coin == "doge" ? "/.dogecoin" : coin == "dgb" ? "/.digibyte" : coin == "rvn" ? "/.raven" : "/.bitcoin");
 #endif
 }
 
@@ -348,6 +361,13 @@ bool CheckChain(const std::string& coin, Chain& out, std::string& errOut)
         r["initialblockdownload"].get<bool>() && out.fMain)
     {
         errOut = who + " is still downloading the chain; a swap needs it at the tip";
+        return false;
+    }
+    // Not every node has that flag, and it clears a day behind. The time left
+    // on a contract is read off this node's chain: behind, it overstates it.
+    if (out.fMain && out.nMedianTime && GetTime() - out.nMedianTime > 6 * 3600)
+    {
+        errOut = who + " is hours behind; a swap needs it at the tip";
         return false;
     }
     return true;
@@ -512,7 +532,9 @@ bool AddressToPkh(const Chain& chain, const std::string& addr, std::vector<unsig
     }
     if (!DecodeBase58Check(addr, v) || v.size() != 21)
     {
-        errOut = chain.coin == "dgb"
+        errOut = chain.coin == "rvn"
+                     ? "need a Ravencoin key address (R... on main, m... or n... on test chains)"
+                 : chain.coin == "dgb"
                      ? "need a legacy DigiByte key address (D... on main, s... or t... on test chains); "
                        "dgb1/dgbt1 addresses cannot be in this contract"
                  : chain.coin == "ltc"
@@ -681,12 +703,12 @@ bool ParseAuxPow(const std::vector<unsigned char>& b, size_t& pos, AuxPow& out)
     return true;
 }
 
-bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow)
+bool ParseBlockTxs(const std::vector<unsigned char>& raw, std::vector<CTransaction>& txsOut, bool fAuxPow, size_t nHeaderSize)
 {
     txsOut.clear();
-    size_t pos = 80;
+    size_t pos = nHeaderSize;
     uint64 n = 0;
-    if (raw.size() < 81)
+    if (raw.size() < nHeaderSize + 1)
         return false;
     if (fAuxPow && (raw[1] & 1))    // VERSION_AUXPOW, 1 << 8
     {
@@ -728,9 +750,10 @@ int64 FeeRatePerKvB(const std::string& coin)
         if (!s.empty() && ParseCoinAmount(coin, s, nConfigured))
             nRate = nConfigured;
         else
-            nRate = coin == "doge" ? COIN / 100 : coin == "dgb" ? COIN / 1000 : fCash ? 1000 : 10000; // 1 or 10 sat/vbyte
+            nRate = coin == "doge" || coin == "rvn" ? COIN / 100 : coin == "dgb" ? COIN / 1000 : fCash ? 1000 : 10000; // 1 or 10 sat/vbyte
     }
-    if (coin == "doge")
+    // Ravencoin's minimum relay fee is the same (ravencoin v4.8.0, src/validation.h).
+    if (coin == "doge" || coin == "rvn")
         return std::max<int64>(nRate, COIN / 100);
     // DigiByte's minimum relay fee (digibyte v9.26.7, src/policy/policy.h).
     if (coin == "dgb")
