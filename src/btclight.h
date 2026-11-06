@@ -46,6 +46,7 @@ struct Net
     bool kawpow = false;          // Ravencoin: rvn_kawpow.h decides a header, 120 bytes
     bool x16rv2 = false;          // Ravencoin's regtest: blocks are named by X16RV2
     size_t headerSize = 80;
+    int maxReorg = 0;             // the depth its nodes refuse a fork from, while the tip is recent
     const char* genesisId = "";   // when the genesis block's name is not its header's hash
     int protocol = 70016;         // the version told to peers, at least their minimum
     size_t maxHeaders = 2000;     // the most a peer sends in one headers message
@@ -88,7 +89,10 @@ public:
     explicit Headers(const std::string& network);   // Bitcoin's
     explicit Headers(const Net& net);
     // aux: the AuxPoW that came with a merged-mined header.
-    bool Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux = NULL);
+    // proven: the caller already checked the proof of work, outside its lock.
+    bool Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux = NULL, bool proven = false);
+    // Ravencoin: all a header needs short of KAWPOW, which takes 11 ms.
+    bool CheckContext(const Bytes& raw, std::string& err) const;
     const Header& Tip() const;
     const Header& At(int height) const;
     int ActiveHeight(const uint256& hash) const;

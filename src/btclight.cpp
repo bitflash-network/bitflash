@@ -500,7 +500,9 @@ static std::vector<Net> MakeNets()
     // Over Tor these names often do not resolve: two peers that answered on 2026-11-06.
     r.seeds = {"seed-raven.bitactivate.com", "seed-raven.ravencoin.com", "seed-raven.ravencoin.org", "142.93.153.10:8767", "143.198.227.50:8767"};
     r.anchorHeight = RVN_MAIN_ANCHOR_HEIGHT; r.anchor.assign(RVN_MAIN_ANCHOR, RVN_MAIN_ANCHOR + sizeof(RVN_MAIN_ANCHOR)/sizeof(RVN_MAIN_ANCHOR[0]));
+    r.maxReorg = 60;
     v.push_back(r);
+    r.maxReorg = 0;
     // No peer of the test network answered on 2026-11-06, and so no anchor: its node or nothing.
     r.name = "test"; r.nodeOnly = true; r.pkhVersion = 111; r.shVersion = 196; r.shVersion2 = 196; r.seeds.clear(); r.anchorHeight = 0; r.anchor.clear();
     v.push_back(r);
@@ -615,6 +617,19 @@ Headers::Headers(const std::string& net) : network(net), net(FindNet("btc", net)
     Start(*this->net);
 }
 Headers::Headers(const Net& n) : network(n.name), net(&n) { Start(n); }
+// The 180 parents of a Ravencoin header's DarkGravityWave, oldest first.
+static std::vector<lightpow::PastBlock> RvnParents(const std::map<uint256, Header>& nodes, const Header& parent, int base)
+{
+    std::vector<lightpow::PastBlock> out;
+    for (const Header* walk = &parent; out.size() < 180; walk = &nodes.at(walk->prev))
+    {
+        lightpow::PastBlock past; past.height = walk->height; past.time = walk->time; past.bits = walk->bits;
+        out.push_back(past);
+        if (walk->height <= base) break;
+    }
+    std::reverse(out.begin(),out.end());
+    return out;
+}
 // What dgbpow needs of a network (CMainParams, CTestNetParams, CRegTestParams).
 static dgbpow::Params DgbParams(const Net& net)
 {
@@ -737,7 +752,22 @@ unsigned int Headers::NextBits(const Header& parent, unsigned int time) const
     // BIP94 preserves the first block's difficulty across testnet4 periods.
     return Retarget(net->bip94 ? first->bits : parent.bits, (int64)parent.time-first->time, net->limitBits);
 }
-bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux)
+bool Headers::CheckContext(const Bytes& raw, std::string& err) const
+{
+    try
+    {
+        Header h = Decode(raw, net);
+        std::map<uint256, Header>::const_iterator it = nodes.find(h.prev);
+        if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
+        rvnpow::Header parsed; std::string powErr;
+        if (!rvnpow::ParseHeader(raw.data(),raw.size(),parsed,powErr) || (int)parsed.Height() != it->second.height+1 ||
+            rvnpow::NextWorkRequired(RvnParents(nodes,it->second,base),powErr) != h.bits)
+            throw std::runtime_error("invalid "+net->label+" header: "+powErr);
+        return true;
+    }
+    catch (const std::exception& e) { err = e.what(); return false; }
+}
+bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux, bool proven)
 {
     try
     {
@@ -746,9 +776,17 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
         std::map<uint256, Header>::const_iterator it = nodes.find(h.prev);
         if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
         const Header& p = it->second;
-        // The anchor is a checkpoint: nothing forks from inside it.
-        if (!storedHeaders && !net->anchor.empty() && p.height < net->anchorHeight)
+        // The anchor is a checkpoint: nothing forks from inside it. What a store
+        // kept from before a later release's anchor is simply no longer needed.
+        if (!net->anchor.empty() && p.height < net->anchorHeight)
+        {
+            if (storedHeaders) return true;
             throw std::runtime_error(net->label+" header forks from before the anchor");
+        }
+        // Ravencoin's nodes stay on their tip against a fork this deep, while
+        // that tip is recent (validation.cpp, bad-fork-prior-to-maxreorgdepth).
+        if (net->maxReorg && !storedHeaders && Tip().height-p.height >= net->maxReorg && GetTime()-(int64)Tip().time <= 12*3600)
+            throw std::runtime_error(net->label+" header forks deeper than its nodes follow");
         Integer target = Target(h.bits), limit = Target(net->limitBits);
         Integer step = (Integer(1)<<256)/(target+1);
         // Ravencoin: DGW over the last 180 blocks, then KAWPOW. From the store
@@ -757,17 +795,15 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
         {
             rvnpow::Header parsed; std::string powErr; lightpow::Hash work{};
             if (!rvnpow::ParseHeader(raw.data(),raw.size(),parsed,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr);
-            std::vector<lightpow::PastBlock> parents;
-            for (const Header* walk = &p; parents.size() < 180; walk = &nodes.at(walk->prev))
+            // From the store the header was accepted once: its bits give its
+            // work, and walking 180 parents for each would cost a minute a year.
+            if (storedHeaders) { if (!rvnpow::BlockProof(h.bits,work,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr); }
+            else
             {
-                lightpow::PastBlock past; past.height = walk->height; past.time = walk->time; past.bits = walk->bits;
-                parents.push_back(past);
-                if (walk->height <= base) break;
+                if (proven ? !CheckContext(raw,powErr) || !rvnpow::BlockProof(h.bits,work,powErr)
+                           : !rvnpow::ValidateHeader(RvnParents(nodes,p,base),parsed,work,powErr))
+                    throw std::runtime_error("invalid "+net->label+" header: "+powErr);
             }
-            std::reverse(parents.begin(),parents.end());
-            if (!storedHeaders) { if (!rvnpow::ValidateHeader(parents,parsed,work,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr); }
-            else if (rvnpow::NextWorkRequired(parents,powErr) != h.bits || !rvnpow::BlockProof(h.bits,work,powErr))
-                throw std::runtime_error("invalid "+net->label+" header: "+powErr);
             step = DgbWork(work);
         }
         // DigiByte: which algorithm, whose retarget and whose work. A header
@@ -1303,8 +1339,9 @@ static std::map<uint256, Located> Transactions(State& s);
 // and those that pay a watched contract or spend such a payment kept.
 // A new tip can come from the second peer, and a Core node asked for a block
 // it has not got says nothing. Every 15 seconds that would be a timeout and a
-// new circuit: DigiByte's last two blocks wait for the next round.
-static int ScanLag(const Net& net) { return net.multiAlgo && !net.regtest ? 2 : 0; }
+// new circuit: DigiByte's last two blocks wait for the next round, and
+// Ravencoin's last one, at a minute a block.
+static int ScanLag(const Net& net) { return net.multiAlgo && !net.regtest ? 2 : net.kawpow ? 1 : 0; }
 static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
 {
     int tip = s.headers.Tip().height;
@@ -1372,7 +1409,18 @@ static uint64_t PullHeaders(State& s, Peer& peer, std::unique_lock<std::recursiv
         Header h = Decode(raw, &s.net);
         if (i && h.prev != last) throw std::runtime_error("discontinuous Bitcoin headers");
         bool known = s.headers.Contains(h.hash);
-        std::string err; if (!s.headers.Add(raw,err,merged ? &aux : NULL)) throw std::runtime_error(err);
+        std::string err; bool proven = false;
+        // KAWPOW takes 11 ms, 22 seconds a batch, and every RPC call waits on
+        // this lock: the proof runs outside it. This thread alone adds headers.
+        if (s.net.kawpow && !known)
+        {
+            rvnpow::Header parsed;
+            if (!s.headers.CheckContext(raw,err) || !rvnpow::ParseHeader(raw.data(),raw.size(),parsed,err)) throw std::runtime_error(err);
+            lock.unlock();
+            try { proven = rvnpow::CheckProofOfWork(parsed,err); lock.lock(); } catch (...) { lock.lock(); throw; }
+            if (!proven) throw std::runtime_error("invalid "+s.net.label+" header: "+err);
+        }
+        if (!s.headers.Add(raw,err,merged ? &aux : NULL,proven)) throw std::runtime_error(err);
         if (!s.headers.Contains(h.hash)) throw std::runtime_error("header index insertion failed");
         if (!known) AppendHeader(s,raw); last = h.hash;
     }
@@ -1566,8 +1614,14 @@ static void Worker(State* s)
             if (!configured.empty()) choices = configured;
             else
             {
-                std::lock_guard<std::recursive_mutex> lock(s->mutex); choices = s->peers;
-                choices.insert(choices.end(), net.seeds.begin(), net.seeds.end());
+                // Saved addresses come from peers, and most do not answer over
+                // Tor: behind all 256 of them the seeds would wait half an hour.
+                std::lock_guard<std::recursive_mutex> lock(s->mutex);
+                for (size_t i = 0; i < std::max(net.seeds.size(), s->peers.size()); ++i)
+                {
+                    if (i < net.seeds.size()) choices.push_back(net.seeds[net.seeds.size()-1-i]);
+                    if (i < s->peers.size()) choices.push_back(s->peers[i]);
+                }
             }
             if (choices.empty()) throw std::runtime_error("regtest needs -"+net.coin+"peer=host:port");
             Peer primary(net); primary.Connect(choices[rotation++%choices.size()],port);
@@ -1588,7 +1642,7 @@ static void Worker(State* s)
             {
                 Round(*s,primary,second.get());
                 bool synced;
-                { std::lock_guard<std::recursive_mutex> lock(s->mutex); s->error.clear(); synced = s->synced && (s->watched.empty() || s->scan >= (s->net.filters ? (int)s->filters.size() : s->headers.Tip().height+1)); }
+                { std::lock_guard<std::recursive_mutex> lock(s->mutex); s->error.clear(); synced = s->synced && (s->watched.empty() || s->scan >= (s->net.filters ? (int)s->filters.size() : s->headers.Tip().height+1-ScanLag(s->net))); }
                 for (int i = 0; i < (synced ? 200 : 1) && !fShutdown; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
@@ -2147,6 +2201,8 @@ int SelfTestRavencoin()
         parent = inside.hash;
         std::copy(parent.begin(),parent.end(),forged.begin()+4);
         check(!h.Add(forged,powErr) && powErr.find("before the anchor") != std::string::npos,"a fork from inside the anchor is refused");
+        h.storedHeaders = true;
+        check(h.Add(forged,powErr) && !h.Contains(Decode(forged,mainNet).hash),"from an older store it is passed over, not fatal");
     }
     {
         // Real regtest blocks: Ravencoin 4.8.0 named them so.
