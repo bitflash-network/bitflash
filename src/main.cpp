@@ -3524,9 +3524,14 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         AddTimeData(pfrom->addr.ip, nTime);
 
-        // Ask the first connected node for block updates
+        // Ask the first connected node for block updates, and ask again when
+        // a node is the only one there is: the first may be long gone, and
+        // nothing else would ask before the next block is announced.
         static bool fAskedForBlocks;
-        if (!fAskedForBlocks && !pfrom->fClient)
+        bool fOnlyPeer = false;
+        CRITICAL_BLOCK(cs_vNodes)
+            fOnlyPeer = (vNodes.size() <= 1);
+        if ((!fAskedForBlocks || fOnlyPeer) && !pfrom->fClient)
         {
             fAskedForBlocks = true;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
