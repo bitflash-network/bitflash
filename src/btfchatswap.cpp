@@ -148,7 +148,7 @@ static std::string Ref(const std::string& coin, const std::string& txid, int vou
 
 static std::string CoinName(const std::string& coin)
 {
-    return coin == "LTC" ? "Litecoin" : coin == "DOGE" ? "Dogecoin" : coin == "BCH" ? "Bitcoin Cash" : coin == "XEC" ? "eCash" : coin == "BTC" ? "Bitcoin" : "Bitflash";
+    return coin == "LTC" ? "Litecoin" : coin == "DOGE" ? "Dogecoin" : coin == "DGB" ? "DigiByte" : coin == "BCH" ? "Bitcoin Cash" : coin == "XEC" ? "eCash" : coin == "BTC" ? "Bitcoin" : "Bitflash";
 }
 
 // The chain that is not Bitflash, in a swap that has one Bitflash side.
@@ -171,11 +171,11 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
     if (IsTestNet())
         return 1;
     // A private fork is stopped by the time it takes to mine, so Litecoin's
-    // blocks, four to Bitcoin's one, and Dogecoin's, ten, are asked for in the
-    // same time: 20 min.
+    // blocks, four to Bitcoin's one, Dogecoin's, ten, and DigiByte's, forty, are
+    // asked for in the same time: 20 min.
     // Bitcoin Cash and eCash run Bitcoin's SHA-256 with a sliver of its hash
     // rate, so anyone can rent their next block: there, more time.
-    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
+    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 80 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)

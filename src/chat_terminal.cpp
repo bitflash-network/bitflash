@@ -688,7 +688,7 @@ void Command(const std::string& line)
     }
     if (cmd == "offer")
     {
-        // offer AMOUNT BTF|BTC|LTC|DOGE|BCH|XEC for AMOUNT [BTC|LTC|DOGE|BCH|XEC]
+        // offer AMOUNT BTF|BTC|LTC|DOGE|BCH|XEC|DGB for AMOUNT [BTC|LTC|DOGE|BCH|XEC|DGB]
         std::istringstream a(rest);
         std::string sGive, coin, sFor, sWant, wantCoin;
         a >> sGive >> coin >> sFor >> sWant >> wantCoin;
@@ -701,7 +701,7 @@ void Command(const std::string& line)
             (coin != "BTF" && wantCoin != "BTF") || sFor != "for" ||
             !ParseCoinAmount(coin, sGive, nGive) || nGive <= 0 || !ParseCoinAmount(wantCoin, sWant, nWant) || nWant <= 0)
         {
-            Say("in an open room: offer AMOUNT BTF for AMOUNT [BTC|LTC|DOGE|BCH|XEC]   (or AMOUNT BTC|LTC|DOGE|BCH|XEC for AMOUNT)");
+            Say("in an open room: offer AMOUNT BTF for AMOUNT [BTC|LTC|DOGE|BCH|XEC|DGB]   (or AMOUNT BTC|LTC|DOGE|BCH|XEC|DGB for AMOUNT)");
             return;
         }
         btfchat::SwapOffer o;

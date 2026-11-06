@@ -8261,7 +8261,7 @@ static int RunChatSwapSelfTest()
             nlohmann::json tx = SwapTestBtc(nBtc, "gettransaction", nlohmann::json::array({ m.redeemTxid }), "/wallet/w");
             double got = tx.value("amount", 0.0) * CoinUnit(coin) / COIN;   // in BTC-sized units on every chain
             // Dogecoin's fee is a thousand times Bitcoin's, as a share of this amount.
-            nFail += Check(got > (coin == "DOGE" ? 0.04 : 0.0499) && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
+            nFail += Check(got > (coin == "DOGE" ? 0.04 : coin == "DGB" ? 0.049 : 0.0499) && got <= 0.05, strprintf("Alice's node wallet got %.8f of 0.05 in base units", got).c_str()) ? 0 : 1;
             nlohmann::json bt;
             std::string e2;
             bool fGot = LoopbackRpcCall(b.wallet, "gettransaction", nlohmann::json::array({ t.redeemTxid }), bt, e2) &&

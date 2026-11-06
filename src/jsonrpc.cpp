@@ -2968,12 +2968,12 @@ static json CoinCall(const string& coin, const string& method, const json& param
 
 static string Ticker(const string& coin)
 {
-    return coin == "ltc" ? "LTC" : coin == "doge" ? "DOGE" : coin == "bch" ? "BCH" : coin == "xec" ? "XEC" : "BTC";
+    return coin == "ltc" ? "LTC" : coin == "doge" ? "DOGE" : coin == "dgb" ? "DGB" : coin == "bch" ? "BCH" : coin == "xec" ? "XEC" : "BTC";
 }
 
 static string ChainLogName(const string& coin)
 {
-    return coin == "ltc" ? "litecoin" : coin == "doge" ? "dogecoin" : coin == "bch" ? "bitcoincash" : coin == "xec" ? "ecash" : "bitcoin";
+    return coin == "ltc" ? "litecoin" : coin == "doge" ? "dogecoin" : coin == "dgb" ? "digibyte" : coin == "bch" ? "bitcoincash" : coin == "xec" ? "ecash" : "bitcoin";
 }
 
 static string UtcText(int64 t)
@@ -3020,6 +3020,8 @@ static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c
     // What is left after the spend's fee has to clear Dogecoin's dust limit.
     if (chain.coin == "doge" && nValue < COIN / 50)
         throw runtime_error("the least Dogecoin a contract can hold is 0.02 DOGE");
+    if (chain.coin == "dgb" && nValue < COIN / 1000)
+        throw runtime_error("the least DigiByte a contract can hold is 0.001 DGB");
     CScript contract = swap::BuildContract(c);
     string strAddr = btcswap::ScriptAddress(chain, contract);
     if (btcswap::UsingLight(chain.coin))
@@ -3331,7 +3333,8 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
         if (p.size() > destination + 1 && !p[destination + 1].is_null())
         {
             nFeeRate = CoinAmountFromValue(coin, p[destination + 1]);
-            int64 nFeeRateMin = coin == "doge" ? COIN / 100 : 1000, nFeeRateMax = coin == "doge" ? COIN : COIN / 100;
+            int64 nFeeRateMin = coin == "doge" ? COIN / 100 : coin == "dgb" ? COIN / 1000 : 1000;
+            int64 nFeeRateMax = coin == "doge" || coin == "dgb" ? COIN : COIN / 100;
             if (nFeeRate < nFeeRateMin || nFeeRate > nFeeRateMax)
                 throw runtime_error("fee rate out of range (" + CoinAmountText(coin, nFeeRateMin) + " to " + CoinAmountText(coin, nFeeRateMax) + " " + Ticker(coin) + " per 1000 vbytes)");
         }
@@ -3356,6 +3359,9 @@ static json BtcSpend(const string& coin, const json& p, const vector<unsigned ch
     // Dogecoin's peers would not relay it, and it would wait forever.
     if (coin == "doge" && o.nValue - nFee < COIN / 100)
         throw runtime_error("what is left after the fee is under Dogecoin's dust limit of 0.01 DOGE");
+    // DigiByte's, for the largest output a spend makes here (policy.h: 3 sat/byte).
+    if (coin == "dgb" && o.nValue - nFee < COIN / 10000)
+        throw runtime_error("what is left after the fee is under DigiByte's dust limit");
     CDataStream ss(SER_NETWORK);
     ss << tx;
     string strHex = HexStr(ss.begin(), ss.end(), false);
@@ -3438,8 +3444,8 @@ static json CoinFindSecret(const string& coin, const json& p)
             vCandidates.push_back(tx);
     }
     // More than a 48-hour lock: 400 of Bitcoin's blocks, 1728 of Litecoin's,
-    // 3000 of Dogecoin's.
-    int nBack = coin == "doge" ? 3000 : coin == "ltc" ? 1728 : 400;
+    // 3000 of Dogecoin's, 13000 of DigiByte's.
+    int nBack = coin == "dgb" ? 13000 : coin == "doge" ? 3000 : coin == "ltc" ? 1728 : 400;
     int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
     if (coin == "ltc")
     {
