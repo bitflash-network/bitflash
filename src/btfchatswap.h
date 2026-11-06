@@ -142,6 +142,7 @@ struct ChatSwap
     bool        fUserOk = false, fInvited = false, fSentLock = false;
     std::string status, lastError;
     int64_t     created = 0, updated = 0, theirSince = 0;
+    int64_t     refundSince = 0;   // a DigiByte refund sent, no block has it yet
     int64_t     redeemSince = 0, redeemFeeRate = 0;   // a Bitcoin redeem the light client sent, not yet confirmed
 };
 

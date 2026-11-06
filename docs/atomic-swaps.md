@@ -431,6 +431,42 @@ Bitflash testnet, both wallets on the light client, was made on 2026-11-05. Its
 contract was paid by the coinbase of a mined block, so it also waited out the
 240 blocks a coinbase takes to mature on that network.
 
+### DigiByte
+
+The same `coin*` calls with `dgb` first, the same contract, and
+`offer 100 BTF for 50000 DGB` in the chat. It runs through DigiByte Core for now:
+the embedded light client comes after its proof of work and difficulty are
+wired in (docs/light-pow.md), and until then a wallet without the node is told
+so. What differs from Bitcoin:
+
+- **Addresses** in the contract are legacy keys: `D...` on the main network,
+  `s...` or `t...` on the test network and regtest. `dgb1` and `dgbt1` cannot be
+  in it.
+- **Mainnet confirmations:** 160, about 40 minutes at 15 seconds a block. Two of
+  its five algorithms, SHA-256 and scrypt, have hash rate for rent, so it gets
+  the time Bitcoin Cash gets.
+- **The fee** is what DigiByte Core estimates, at least 0.001 DGB per 1000 bytes,
+  its minimum relay fee; `-dgbfeerate` sets it when there is no estimate. An
+  offer or a contract under 0.1 DGB is refused, as DigiByte wallets pay
+  0.1 DGB per 1000 bytes and a smaller contract could cost more to spend than it
+  holds. A spend that would leave under 0.0001 DGB is refused too.
+- **Dandelion:** DigiByte Core holds a new transaction apart for up to about 30
+  seconds, and a restart in that time loses it. So a redeem or a refund counts
+  only from a block, and goes out again after an hour without one.
+- **Finding a secret** looks back up to 13000 blocks, a little more than a
+  48-hour lock, one block at a time. A search that found nothing is not done
+  again, so only the first one can take a minute or two.
+
+DigiByte Core keeps its data in `DigiByte` under `%APPDATA%`, or `~/.digibyte`,
+and a cookie there is found by itself; otherwise name it with `-dgbdatadir`,
+`-dgbrpcport`, `-dgbwallet` and `-dgbrpcuser`/`-dgbrpcpassword`. `-dgbchain` is
+`main`, `test` (default on Bitflash testnet) or `regtest`. Its test network was
+started over in 2026 and lives in `testnet26`.
+
+Proven with coins against DigiByte Core 9.26.7 on regtest, on the node:
+`-selftest=chat-swap` with `CHATSWAP_COIN=DGB`, a swap each way and a maker who
+vanishes. Nothing on a public network yet.
+
 Checked by `-selftest=rules-v3` (the template byte for byte, redeem and
 refund on the Bitflash side, the wrong secret or key, a refund before its
 lock) and `-selftest=btc-swap` (Bitcoin addresses, reading Bitcoin's witness

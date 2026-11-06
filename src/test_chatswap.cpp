@@ -120,6 +120,15 @@ int main()
         CHECK(SwapAddressShapeOk("DOGE", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L") && !SwapAddressShapeOk("DOGE", "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ") &&
               !SwapAddressShapeOk("DOGE", "1111111111111111111114oLvT2"),
               "a Dogecoin key address");
+        CHECK(SwapAddressShapeOk("DGB", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L") && !SwapAddressShapeOk("DGB", "LVuDpNCSSj6pQ7t9Pv6d6sUkLKoqDEVUnJ"),
+              "a DigiByte key address");
+        CHECK(SwapAddressShapeOk("DGB", "skzSdPmkCiRX64ocF1LJKmF7CXh6st1PTb") && SwapAddressShapeOk("DGB", "t6Y6ZDtbMbXvkRjwYkpGFFGVaJMpDxkvwS"),
+              "a DigiByte test address starts with s or t");
+        o.give = "DGB"; o.giveAmount = 9999999; o.want = "BTF"; o.wantAmount = 100000000;
+        CHECK(!ParseSwapOffer(FormatSwapOffer(o), back, err), "an offer under what a DigiByte contract can hold is refused");
+        o.giveAmount = 100000000000LL;
+        CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "DGB" && DescribeSwapOffer(back) == "1000 DGB for 1 BTF",
+              "an offer for DigiByte");
         o.give = "DOGE"; o.giveAmount = 10000000000LL; o.want = "BTF"; o.wantAmount = 100000000;
         CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "DOGE" && DescribeSwapOffer(back) == "100 DOGE for 1 BTF",
               "an offer of DOGE for BTF");

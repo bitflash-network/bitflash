@@ -435,6 +435,15 @@ static std::vector<Net> MakeNets()
     d.genesis = GenesisHeader(1, dogeMerkle, 1296688602, 0x207fffff, 2);
     d.anchorHeight = 0; d.anchor.clear();
     v.push_back(d);
+    // DigiByte: the addresses, for its own node. digibyte v9.26.7, src/kernel/chainparams.cpp.
+    Net g;
+    g.coin = "dgb"; g.label = "DigiByte"; g.nodeOnly = true;
+    g.name = "main"; g.pkhVersion = 30; g.shVersion = 63; g.shVersion2 = 5; g.hrp = "dgb";
+    v.push_back(g);
+    g.name = "test"; g.pkhVersion = 126; g.shVersion = 140; g.shVersion2 = 140; g.hrp = "dgbt";
+    v.push_back(g);
+    g.name = "regtest"; g.hrp = "dgbrt"; g.regtest = true;
+    v.push_back(g);
     Net c;
     c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
     c.cashPrefix = "bitcoincash"; c.forkId = true;
@@ -505,7 +514,7 @@ const Net* FindNet(const std::string& coin, const std::string& network)
 }
 std::string Label(const std::string& coin)
 {
-    return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
+    return coin == "ltc" ? "Litecoin" : coin == "doge" ? "Dogecoin" : coin == "dgb" ? "DigiByte" : coin == "bch" ? "Bitcoin Cash" : coin == "xec" ? "eCash" : "Bitcoin";
 }
 static Header Decode(const Bytes& raw)
 {
@@ -1420,6 +1429,7 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
         const Net* net = FindNet(coin, network);
         if (!net) throw std::runtime_error(Label(coin)+" light does not support the network "+network);
         if ((network == "main") == IsTestNet()) throw std::runtime_error(net->label+" and Bitflash networks must match");
+        if (net->nodeOnly) throw std::runtime_error(net->label+" has no light client yet: run its node, and name it with -"+coin+"rpcport");
         State* state = NULL;
         {
             std::lock_guard<std::mutex> start(startMutex);
