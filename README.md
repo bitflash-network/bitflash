@@ -11,8 +11,11 @@ CPU-only cryptocurrency. A revival of Bitcoin 0.1.0 with RandomX proof of work a
 ![Tor](https://img.shields.io/badge/tor-onion%20service-7d4698?style=for-the-badge)
 ![Fair Launch](https://img.shields.io/badge/premine-none-2ea44f?style=for-the-badge)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge)](https://discord.gg/kcgeg696YE)
+[![X](https://img.shields.io/badge/x-@BTFBitflash-000000?style=for-the-badge)](https://x.com/BTFBitflash)
 
 **[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/kcgeg696YE)**
+
+**First exchange listing:** the community campaign on NonKYC is open until 2027-02-04. It needs 100 backers, and $5 counts as one. Pledges are donations, refunded if the listing is not completed. **[Back the campaign →](https://nonkyc.io/listing/campaign/BTF)**
 
 </div>
 
