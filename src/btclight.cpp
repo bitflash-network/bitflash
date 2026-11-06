@@ -1996,7 +1996,8 @@ int SelfTestDigiByte()
         Bytes forged(net == mainNet ? 80 : 80,0);
         const Header& tip = h.Tip();
         std::copy(tip.raw.begin(),tip.raw.end(),forged.begin());
-        for (int i = 0; i < 32; ++i) forged[4+i] = tip.hash.begin()[i];
+        uint256 parent = tip.hash;
+        for (int i = 0; i < 32; ++i) forged[4+i] = parent.begin()[i];
         uint32_t later = tip.time+15;
         for (int i = 0; i < 4; ++i) forged[68+i] = (later>>(8*i))&255;
         std::string err;
@@ -2015,7 +2016,8 @@ int SelfTestDigiByte()
         err.clear();
         check(bits != 0 && !h.Add(forged,err) && err.find("proof hash") != std::string::npos,"a header without proof of work is refused");
         const Header& inside = h.At(net->anchorHeight-1);
-        for (int i = 0; i < 32; ++i) forged[4+i] = inside.hash.begin()[i];
+        parent = inside.hash;
+        for (int i = 0; i < 32; ++i) forged[4+i] = parent.begin()[i];
         check(!h.Add(forged,err) && err.find("before the anchor") != std::string::npos,"a fork from inside the anchor is refused");
     }
     {
