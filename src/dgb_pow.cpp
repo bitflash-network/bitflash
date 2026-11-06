@@ -46,11 +46,11 @@ Algo Algorithm(const Header& header)
     }
 }
 
-uint32_t OdoKey(uint32_t time)
+uint32_t OdoKey(uint32_t time, const Params& params)
 {
     // v8.22.2 src/primitives/block.cpp OdoKey and CMainParams: ten UTC days,
     // anchored at Unix zero, rather than an epoch counted from activation.
-    return time - time % (10U * 24 * 60 * 60);
+    return time - time % params.odoInterval;
 }
 
 bool ParseHeader(const unsigned char* raw, size_t size, Header& out, std::string& err)
@@ -72,7 +72,7 @@ lightpow::Hash BlockHash(const Header& header)
     return lightpow::detail::DoubleSHA(header.raw.data(), header.raw.size());
 }
 
-bool PoWHash(const Header& header, lightpow::Hash& hash, std::string& err)
+bool PoWHash(const Header& header, lightpow::Hash& hash, std::string& err, const Params& params)
 {
     err.clear();
     hash.fill(0);
@@ -135,7 +135,7 @@ bool PoWHash(const Header& header, lightpow::Hash& hash, std::string& err)
             alignas(16) char state[100] = {};
             std::memcpy(state, header.raw.data(), HEADER_SIZE);
             state[HEADER_SIZE] = 1;
-            OdoCrypt(OdoKey(header.Time())).Encrypt(state, state);
+            OdoCrypt(OdoKey(header.Time(), params)).Encrypt(state, state);
             KeccakP800_Permute_12rounds(state);
             std::memcpy(hash.data(), state, hash.size());
             return true;
@@ -145,16 +145,16 @@ bool PoWHash(const Header& header, lightpow::Hash& hash, std::string& err)
     }
 }
 
-bool CheckProofOfWork(const Header& header, int height, std::string& err)
+bool CheckProofOfWork(const Header& header, int height, std::string& err, const Params& params)
 {
     err.clear();
-    if (height < CHECKPOINT_HEIGHT)
+    if (height < params.checkpoint)
         return Fail(err, "DigiByte header precedes the supported checkpoint");
     UInt target;
     if (!lightpow::detail::Target(header.Bits(), PowLimit(), target))
         return Fail(err, "invalid DigiByte compact target");
     lightpow::Hash hash{};
-    if (!PoWHash(header, hash, err))
+    if (!PoWHash(header, hash, err, params))
         return false;
     if (lightpow::detail::Number(hash) > target)
         return Fail(err, "DigiByte proof hash exceeds the target");
@@ -170,9 +170,9 @@ static int64_t Median(const std::vector<PastBlock>& history, size_t pos)
     return times[5];
 }
 
-static bool History(const std::vector<PastBlock>& history, std::string& err)
+static bool History(const std::vector<PastBlock>& history, std::string& err, const Params& params)
 {
-    if (history.size() < 61 || history.back().height < CHECKPOINT_HEIGHT - 1)
+    if (history.size() < 61 || history.back().height < params.checkpoint - 1)
         return Fail(err, "DigiByte retarget requires 61 checkpoint-context parents");
     for (size_t i = 0; i < history.size(); ++i)
     {
@@ -187,7 +187,7 @@ static bool History(const std::vector<PastBlock>& history, std::string& err)
     return true;
 }
 
-static uint32_t Next(const std::vector<PastBlock>& history, Algo algo, std::string& err)
+static uint32_t Next(const std::vector<PastBlock>& history, Algo algo, std::string& err, const Params& params)
 {
     if (!Active(algo))
     {
@@ -211,7 +211,7 @@ static uint32_t Next(const std::vector<PastBlock>& history, Algo algo, std::stri
     const size_t last = history.size() - 1;
     int64_t elapsed = Median(history, last) - Median(history, last - 50);
     elapsed = 750 + (elapsed - 750) / 4;
-    elapsed = std::max<int64_t>(690, std::min<int64_t>(870, elapsed));
+    elapsed = std::max<int64_t>(690, std::min<int64_t>(params.maxTimespan, elapsed));
     UInt target;
     lightpow::detail::Target(history[previous].bits, PowLimit(), target);
     target *= elapsed;
@@ -245,12 +245,12 @@ static uint32_t Next(const std::vector<PastBlock>& history, Algo algo, std::stri
     return lightpow::detail::Compact(target);
 }
 
-uint32_t NextWorkRequired(const std::vector<PastBlock>& history, Algo algo, std::string& err)
+uint32_t NextWorkRequired(const std::vector<PastBlock>& history, Algo algo, std::string& err, const Params& params)
 {
     err.clear();
-    if (!History(history, err))
+    if (!History(history, err, params))
         return 0;
-    return Next(history, algo, err);
+    return Next(history, algo, err, params);
 }
 
 static UInt ApproxFifthRoot(const UInt& value)
@@ -274,16 +274,16 @@ static UInt ApproxFifthRoot(const UInt& value)
 }
 
 bool BlockProof(const std::vector<PastBlock>& history, const Header& header,
-                int height, lightpow::Hash& work, std::string& err)
+                int height, lightpow::Hash& work, std::string& err, const Params& params)
 {
     err.clear();
     work.fill(0);
-    if (!History(history, err))
+    if (!History(history, err, params))
         return false;
-    if (height < CHECKPOINT_HEIGHT || history.back().height == (std::numeric_limits<int>::max)() ||
+    if (height < params.checkpoint || history.back().height == (std::numeric_limits<int>::max)() ||
         height != history.back().height + 1)
         return Fail(err, "DigiByte work requires the candidate's actual height");
-    const uint32_t expected = Next(history, Algorithm(header), err);
+    const uint32_t expected = Next(history, Algorithm(header), err, params);
     if (expected == 0)
         return err.empty() ? Fail(err, "DigiByte retarget gave no target") : false;
     if (header.Bits() != expected)
@@ -295,7 +295,7 @@ bool BlockProof(const std::vector<PastBlock>& history, const Header& header,
     UInt average = 1;
     for (Algo algo : algorithms)
     {
-        const uint32_t bits = Next(history, algo, err);
+        const uint32_t bits = Next(history, algo, err, params);
         if (bits == 0)
             return false;
         UInt target;
@@ -308,22 +308,22 @@ bool BlockProof(const std::vector<PastBlock>& history, const Header& header,
 }
 
 bool ValidateHeader(const std::vector<PastBlock>& parents, const Header& header,
-                    int height, lightpow::Hash& work, std::string& err)
+                    int height, lightpow::Hash& work, std::string& err, const Params& params)
 {
     err.clear();
     work.fill(0);
-    if (!History(parents, err))
+    if (!History(parents, err, params))
         return false;
-    if (height < CHECKPOINT_HEIGHT || parents.back().height == (std::numeric_limits<int>::max)() ||
+    if (height < params.checkpoint || parents.back().height == (std::numeric_limits<int>::max)() ||
         height != parents.back().height + 1)
         return Fail(err, "DigiByte header height is not its parent's plus one");
-    const uint32_t expected = Next(parents, Algorithm(header), err);
+    const uint32_t expected = Next(parents, Algorithm(header), err, params);
     if (expected == 0)
         return err.empty() ? Fail(err, "DigiByte retarget gave no target") : false;
     if (header.Bits() != expected)
         return Fail(err, "DigiByte header difficulty does not match its history");
-    if (!CheckProofOfWork(header, height, err))
+    if (!CheckProofOfWork(header, height, err, params))
         return false;
-    return BlockProof(parents, header, height, work, err);
+    return BlockProof(parents, header, height, work, err, params);
 }
 }

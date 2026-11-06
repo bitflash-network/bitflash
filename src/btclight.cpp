@@ -3,6 +3,8 @@
 
 #include "headers.h"
 #include "btclight.h"
+#include "dgb_anchors.h"
+#include "dgb_pow.h"
 #include "proxy.h"
 #include "swap.h"
 #include <fstream>
@@ -101,6 +103,32 @@ Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now)
 {
     int64 blocks = std::max<int64>(0, now-(int64)anchor.time)/net.spacing;
     return anchor.work+(Integer(1)<<256)/(Target(anchor.bits)+1)*blocks/16;
+}
+// DigiByte's MultiShield eases too, up to 16% a block for a chain that claims
+// time has passed. Each block's work is on its own scale: the anchor's last.
+Integer DgbWorkFloor(const Net& net, const Headers& headers, int64 now)
+{
+    const Header& anchor = headers.At(net.anchorHeight);
+    int64 blocks = std::max<int64>(0, now-(int64)anchor.time)/net.spacing;
+    return anchor.work+(anchor.work-headers.At(net.anchorHeight-1).work)*blocks/16;
+}
+// A count of blocks says nothing of what they cost. A private chain that claims
+// time has passed eases as it grows: 160 blocks can hold the work of 40. So on
+// DigiByte the blocks over a contract count by their work, in the steps of the
+// blocks before it.
+int WorkConfirmations(const Integer& workSince, const Integer& step, int counted)
+{
+    if (step <= 0) return counted;
+    Integer steps = workSince/step+1;
+    return steps < counted ? steps.convert_to<int>() : counted;
+}
+static int DgbConfirmations(const Net& net, const Headers& headers, int funded)
+{
+    const int counted = headers.Tip().height-funded+1;
+    if (net.regtest || net.anchor.empty() || funded <= net.anchorHeight || headers.ActiveHeight(headers.At(funded).hash) < 0) return counted;
+    const int from = std::max(net.anchorHeight, funded-240);
+    const Integer step = (headers.At(funded).work-headers.At(from).work)/(funded-from);
+    return WorkConfirmations(headers.Tip().work-headers.At(funded).work, step, counted);
 }
 // Peers that still send "reject" (Dogecoin Core 1.14) send it for a broadcast
 // too, a replaced spend or one under their fee. That answers no request of
@@ -435,14 +463,30 @@ static std::vector<Net> MakeNets()
     d.genesis = GenesisHeader(1, dogeMerkle, 1296688602, 0x207fffff, 2);
     d.anchorHeight = 0; d.anchor.clear();
     v.push_back(d);
-    // DigiByte: the addresses, for its own node. digibyte v9.26.7, src/kernel/chainparams.cpp.
+    // digibyte v9.26.7, src/kernel/chainparams.cpp. Its peers refuse anything under 70017.
     Net g;
-    g.coin = "dgb"; g.label = "DigiByte"; g.nodeOnly = true;
-    g.name = "main"; g.pkhVersion = 30; g.shVersion = 63; g.shVersion2 = 5; g.hrp = "dgb";
+    g.coin = "dgb"; g.label = "DigiByte"; g.multiAlgo = true; g.protocol = 70019; g.timespan = 15; g.spacing = 15;
+    g.limitBits = 0x1e0fffff;
+    // MAX_HEADERS_RESULTS in net_processing.cpp: 20000 in v9, 10000 in v8.
+    g.maxHeaders = 20000;
+    // No BIP157 in a default node: the window's blocks are read, and at 15
+    // seconds a block there are many, most of them a few hundred bytes.
+    g.filters = false; g.services = 1; g.blockInv = 2; g.agent = "/Bitflash:dgb-light/"; g.scanBatch = 200;
+    g.name = "main"; g.magic = 0xdab6c3fa; g.port = 12024; g.pkhVersion = 30; g.shVersion = 63; g.shVersion2 = 5; g.hrp = "dgb";
+    // Over Tor these names often do not resolve: nine peers that answered on 2026-11-06.
+    g.seeds = {"seed.digibyte.io", "seed.diginode.tools", "seed.digibyte.link", "seed.aroundtheblock.app", "seed.tuyul.cc",
+               "23.252.125.42:12024", "24.116.234.41:12024", "32.220.187.168:12024", "35.132.227.95:12024", "35.87.253.194:12024",
+               "45.229.196.41:12024", "47.243.23.126:12024", "51.159.211.131:12024", "64.182.71.16:12024"};
+    g.anchorHeight = DGB_MAIN_ANCHOR_HEIGHT; g.anchor.assign(DGB_MAIN_ANCHOR, DGB_MAIN_ANCHOR + sizeof(DGB_MAIN_ANCHOR)/sizeof(DGB_MAIN_ANCHOR[0]));
     v.push_back(g);
-    g.name = "test"; g.pkhVersion = 126; g.shVersion = 140; g.shVersion2 = 140; g.hrp = "dgbt";
+    g.name = "test"; g.magic = 0xe7b9c6fe; g.port = 12033; g.pkhVersion = 126; g.shVersion = 140; g.shVersion2 = 140; g.hrp = "dgbt";
+    // The one peer the seeds gave on 2026-11-06.
+    g.seeds = {"testnetseed.digibyte.io", "testnetseed.digibyte.link", "64.182.71.16:12033"};
+    g.anchorHeight = DGB_TEST_ANCHOR_HEIGHT; g.anchor.assign(DGB_TEST_ANCHOR, DGB_TEST_ANCHOR + sizeof(DGB_TEST_ANCHOR)/sizeof(DGB_TEST_ANCHOR[0]));
     v.push_back(g);
-    g.name = "regtest"; g.hrp = "dgbrt"; g.regtest = true;
+    g.name = "regtest"; g.magic = 0xdab5bffa; g.port = 18444; g.hrp = "dgbrt"; g.regtest = true; g.seeds.clear(); g.limitBits = 0x207fffff;
+    g.genesis = GenesisHeader(1, "72ddd9496b004221ed0557358846d9248ecd4c440ebd28ed901efc18757d0fad", 1519460922, 0x207fffff, 4);
+    g.anchorHeight = 0; g.anchor.clear();
     v.push_back(g);
     Net c;
     c.coin = "bch"; c.label = "Bitcoin Cash"; c.timespan = 1209600; c.spacing = 600; c.limitBits = 0x1d00ffff;
@@ -531,6 +575,38 @@ Headers::Headers(const std::string& net) : network(net), net(FindNet("btc", net)
     Start(*this->net);
 }
 Headers::Headers(const Net& n) : network(n.name), net(&n) { Start(n); }
+// What dgbpow needs of a network (CMainParams, CTestNetParams, CRegTestParams).
+static dgbpow::Params DgbParams(const Net& net)
+{
+    dgbpow::Params p;
+    if (net.name != "main") p.checkpoint = 0;
+    if (net.name == "test") { p.odoInterval = 24*60*60; p.maxTimespan = 810; }
+    return p;
+}
+// The parents one header's retarget and work read, oldest first: 61, and on
+// back to the latest block of each of the five algorithms.
+static std::vector<dgbpow::PastBlock> DgbParents(const std::map<uint256, Header>& nodes, const Header& parent, int base)
+{
+    std::vector<dgbpow::PastBlock> out;
+    std::set<int> seen;
+    const Header* h = &parent;
+    for (;;)
+    {
+        dgbpow::Header parsed; std::copy(h->raw.begin(), h->raw.end(), parsed.raw.begin());
+        dgbpow::PastBlock past; past.height = h->height; past.time = h->time; past.bits = h->bits; past.algo = dgbpow::Algorithm(parsed);
+        out.push_back(past); seen.insert((int)past.algo);
+        if ((out.size() >= 61 && seen.size() >= 5) || h->height <= base) break;
+        h = &nodes.at(h->prev);
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+static Integer DgbWork(const lightpow::Hash& work)
+{
+    Integer n = 0;
+    for (size_t i = work.size(); i > 0; --i) n = (n<<8)|work[i-1];
+    return n;
+}
 void Headers::Start(const Net& n)
 {
     if (n.anchor.empty())
@@ -549,6 +625,16 @@ void Headers::Start(const Net& n)
         if (i && h.prev != active.back()) throw std::runtime_error(n.label+" anchor headers do not link");
         h.height = base+(int)i;
         h.work = i ? nodes.at(active.back()).work+(Integer(1)<<256)/(Target(h.bits)+1) : Integer(0);
+        // The anchor's end carries DigiByte's own measure: the work floor reads it.
+        if (n.multiAlgo && i+1 == n.anchor.size())
+        {
+            dgbpow::Header parsed; std::string proofErr; lightpow::Hash proof;
+            std::copy(h.raw.begin(), h.raw.end(), parsed.raw.begin());
+            const Header& parent = nodes.at(h.prev);
+            if (!dgbpow::BlockProof(DgbParents(nodes,parent,base),parsed,h.height,proof,proofErr,DgbParams(n)))
+                throw std::runtime_error(n.label+" anchor: "+proofErr);
+            h.work = parent.work+DgbWork(proof);
+        }
         nodes[h.hash] = h; active.push_back(h.hash);
     }
 }
@@ -619,7 +705,32 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
         std::map<uint256, Header>::const_iterator it = nodes.find(h.prev);
         if (it == nodes.end()) throw std::runtime_error("unknown "+net->label+" header parent");
         const Header& p = it->second;
+        // The anchor is a checkpoint: nothing forks from inside it.
+        if (!storedHeaders && !net->anchor.empty() && p.height < net->anchorHeight)
+            throw std::runtime_error(net->label+" header forks from before the anchor");
         Integer target = Target(h.bits), limit = Target(net->limitBits);
+        Integer step = (Integer(1)<<256)/(target+1);
+        // DigiByte: which algorithm, whose retarget and whose work. A header
+        // from the store is not hashed again, like scrypt below.
+        if (net->multiAlgo)
+        {
+            dgbpow::Header parsed; std::string powErr; lightpow::Hash work{}, hash{};
+            const dgbpow::Params params = DgbParams(*net);
+            if (!dgbpow::ParseHeader(raw.data(),raw.size(),parsed,powErr)) throw std::runtime_error("invalid "+net->label+" header: "+powErr);
+            if (net->regtest)
+            {
+                if (!storedHeaders && (!dgbpow::PoWHash(parsed,hash,powErr,params) || DgbWork(hash) > target || target > limit))
+                    throw std::runtime_error("invalid "+net->label+" proof of work");
+            }
+            else
+            {
+                std::vector<dgbpow::PastBlock> parents = DgbParents(nodes,p,base);
+                if (!(storedHeaders ? dgbpow::BlockProof(parents,parsed,p.height+1,work,powErr,params)
+                                    : dgbpow::ValidateHeader(parents,parsed,p.height+1,work,powErr,params)))
+                    throw std::runtime_error("invalid "+net->label+" header: "+powErr);
+                step = DgbWork(work);
+            }
+        }
         // A merged-mined header's work is its parent's, by a proof that does
         // not stay in the header store: read once, from the peer.
         const int version = (int)(uint32_t)LE(raw,0,4);
@@ -631,13 +742,13 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
             if (net->strictChainId && !net->regtest && (version>>16) != net->auxChainId) throw std::runtime_error("invalid "+net->label+" chain id");
             if (merged && !CheckAuxPow(*aux,h.hash,version>>16,net->strictChainId,auxErr)) throw std::runtime_error("invalid "+net->label+" AuxPoW");
         }
-        if (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target)
+        if (!net->multiAlgo && (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target))
             throw std::runtime_error("invalid "+net->label+" proof of work");
-        if (h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
+        if (!net->multiAlgo && h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
         if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
         if (net->bip94 && (p.height+1)%net->Interval() == 0 && (int64)h.time < (int64)p.time-600)
             throw std::runtime_error("testnet4 timewarp");
-        h.height = p.height+1; h.work = p.work+(Integer(1)<<256)/(target+1);
+        h.height = p.height+1; h.work = p.work+step;
         nodes[h.hash] = h;
         if (h.work > Tip().work)
         {
@@ -902,7 +1013,7 @@ struct Peer
 #endif
         setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-        Bytes version; Put(version, 70016, 4); Put(version, 0, 8); Put(version, GetTime(), 8);
+        Bytes version; Put(version, net.protocol, 4); Put(version, 0, 8); Put(version, GetTime(), 8);
         version.resize(72, 0); uint64_t nonce; randombytes_buf(&nonce, sizeof(nonce)); Put(version, nonce, 8);
         std::string agent = net.agent; Compact(version, agent.size()); version.insert(version.end(), agent.begin(), agent.end());
         Put(version, 0, 4); version.push_back(0);
@@ -1133,6 +1244,10 @@ static std::map<uint256, Located> Transactions(State& s);
 static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_mutex>& lock)
 {
     int tip = s.headers.Tip().height;
+    // A new tip can come from the second peer, and a Core node asked for a
+    // block it has not got says nothing. Every 15 seconds that would be a
+    // timeout and a new circuit: the last two blocks wait for the next round.
+    if (s.net.multiAlgo && !s.net.regtest) tip -= 2;
     if (!s.synced) return;
     // With nothing watched the cursor follows the tip, so a first contract
     // looks back as far as it needs (Watch) and not to the starting point.
@@ -1152,7 +1267,7 @@ static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_
         }
     // Twenty at a time: over Tor a peer that drops the connection costs at
     // most twenty blocks, and the cursor is saved after each batch.
-    int from = s.scan, stop = std::min(from+19, tip);
+    int from = s.scan, stop = std::min(from+s.net.scanBatch-1, tip);
     Bytes inv; Compact(inv,stop-from+1);
     for (int height = from; height <= stop; ++height) { Put(inv,s.net.blockInv,4); HashBytes(inv,s.headers.At(height).hash); }
     lock.unlock();
@@ -1181,10 +1296,10 @@ static void ScanBlocks(State& s, Peer& primary, std::unique_lock<std::recursive_
 // same checks whoever sent it, and the most work wins.
 static uint64_t PullHeaders(State& s, Peer& peer, std::unique_lock<std::recursive_mutex>& lock)
 {
-    Bytes request; Put(request,70016,4); std::vector<uint256> locator = s.headers.Locator(); Compact(request,locator.size());
+    Bytes request; Put(request,s.net.protocol,4); std::vector<uint256> locator = s.headers.Locator(); Compact(request,locator.size());
     for (size_t i = 0; i < locator.size(); ++i) HashBytes(request,locator[i]); HashBytes(request,uint256(0));
     Bytes response = Fetch(peer,"getheaders",request,"headers",lock);
-    size_t pos = 0; uint64_t n = Count(response,pos,2000);
+    size_t pos = 0; uint64_t n = Count(response,pos,s.net.maxHeaders);
     uint256 last(0);
     for (uint64_t i = 0; i < n; ++i)
     {
@@ -1228,6 +1343,7 @@ static void Round(State& s, Peer& primary, Peer* second)
     Integer minimum = *s.net.minimumWork && s.net.anchor.empty() ? Number(uint256(s.net.minimumWork)) : Integer(0);
     if ((s.net.asertHeight || s.net.digishield) && !s.net.minDifficulty && !s.net.anchor.empty())
         minimum = AnchorWorkFloor(s.net, s.headers.At(s.net.anchorHeight), GetTime());
+    if (s.net.multiAlgo && s.net.name == "main") minimum = DgbWorkFloor(s.net, s.headers, GetTime());
     s.synced = n < 2000 && s.headers.Tip().work >= minimum &&
         (s.net.regtest || (int64)s.headers.Tip().time > GetTime()-7200);
     // Confirmed transactions remain saved so a reorg can resume rebroadcast.
@@ -1429,7 +1545,6 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
         const Net* net = FindNet(coin, network);
         if (!net) throw std::runtime_error(Label(coin)+" light does not support the network "+network);
         if ((network == "main") == IsTestNet()) throw std::runtime_error(net->label+" and Bitflash networks must match");
-        if (net->nodeOnly) throw std::runtime_error(net->label+" has no light client yet: run its node, and name it with -"+coin+"rpcport");
         State* state = NULL;
         {
             std::lock_guard<std::mutex> start(startMutex);
@@ -1552,7 +1667,8 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     json j = {{"contractTxid",txid.GetHex()},{"vout",output},{"unspent",false},{"confirmations",0},{"amount",nullptr},{"spent",false},{"found",false}};
     if (funding == txs.end() || output < 0) return j;
     if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
-    j["confirmations"] = s.headers.Tip().height-funding->second.height+1; j["unspent"] = true;
+    j["confirmations"] = s.net.multiAlgo ? DgbConfirmations(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
+    j["unspent"] = true;
     j["amount"] = (double)funding->second.tx.vout[output].nValue/CoinUnit(s.net.coin);
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
     for (auto it = txs.begin(); it != txs.end(); ++it)
@@ -1851,6 +1967,75 @@ int SelfTestCash()
     check(!ParseCoinAmount("xec","99999999999999999999",n),"too many XEC");
     check(!ParseCoinAmount("bch","1.2.3",n) && !ParseCoinAmount("bch","",n) && !ParseCoinAmount("bch","-1",n),"malformed amounts");
     printf("cash-light: %d failure(s)\n",failures); return failures ? 1 : 0;
+}
+int SelfTestDigiByte()
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* name) { printf("  %-70s %s\n",name,ok?"ok":"FAILED"); if (!ok) ++failures; };
+    printf("dgb-light self-test\n");
+    const Net* mainNet = FindNet("dgb","main"); const Net* testNet = FindNet("dgb","test"); const Net* regNet = FindNet("dgb","regtest");
+    check(mainNet && testNet && regNet,"DigiByte networks: main, test, regtest");
+    if (!mainNet || !testNet || !regNet) { printf("dgb-light: %d failure(s)\n",failures+1); return 1; }
+    // digibyte v9.26.7's chainparams.cpp asserts this hash.
+    check(Decode(regNet->genesis).hash.GetHex().compare(0,16,"4598a0f2b823aaf9") == 0,"regtest genesis hash");
+    check(mainNet->protocol >= 70017 && testNet->protocol >= 70017,"at least the peers' minimum protocol");
+    for (const Net* net : {mainNet,testNet})
+    {
+        Headers h(*net);
+        check(h.Tip().height == net->anchorHeight,"the anchor loads, links and proves its end");
+        check(DgbParents(*std::unique_ptr<std::map<uint256,Header>>(new std::map<uint256,Header>()),h.Tip(),h.Tip().height).size() == 1,"history stops at the base");
+        std::vector<int> algos;
+        for (int i = net->anchorHeight; i > net->anchorHeight-200; --i)
+        {
+            dgbpow::Header parsed; std::string err; const Header& one = h.At(i);
+            check(dgbpow::ParseHeader(one.raw.data(),one.raw.size(),parsed,err),"an anchor header parses");
+            if (std::find(algos.begin(),algos.end(),(int)dgbpow::Algorithm(parsed)) == algos.end()) algos.push_back((int)dgbpow::Algorithm(parsed));
+        }
+        check(algos.size() == 5,"the anchor holds all five algorithms");
+        // A header on the anchor: no proof of work, then the wrong difficulty.
+        Bytes forged(net == mainNet ? 80 : 80,0);
+        const Header& tip = h.Tip();
+        std::copy(tip.raw.begin(),tip.raw.end(),forged.begin());
+        uint256 parent = tip.hash;
+        for (int i = 0; i < 32; ++i) forged[4+i] = parent.begin()[i];
+        uint32_t later = tip.time+15;
+        for (int i = 0; i < 4; ++i) forged[68+i] = (later>>(8*i))&255;
+        std::string err;
+        check(!h.Add(forged,err) && err.find("difficulty") != std::string::npos,"a header with its parent's bits is refused");
+        dgbpow::Header parsed; std::copy(forged.begin(),forged.end(),parsed.raw.begin());
+        // The next bits of its own algorithm: only the proof can fail now.
+        std::vector<dgbpow::PastBlock> parents;
+        for (int i = net->anchorHeight-199; i <= net->anchorHeight; ++i)
+        {
+            dgbpow::Header one; std::copy(h.At(i).raw.begin(),h.At(i).raw.end(),one.raw.begin());
+            dgbpow::PastBlock past; past.height = i; past.time = one.Time(); past.bits = one.Bits(); past.algo = dgbpow::Algorithm(one);
+            parents.push_back(past);
+        }
+        uint32_t bits = dgbpow::NextWorkRequired(parents,dgbpow::Algorithm(parsed),err,DgbParams(*net));
+        for (int i = 0; i < 4; ++i) forged[72+i] = (bits>>(8*i))&255;
+        err.clear();
+        check(bits != 0 && !h.Add(forged,err) && err.find("proof hash") != std::string::npos,"a header without proof of work is refused");
+        const Header& inside = h.At(net->anchorHeight-1);
+        parent = inside.hash;
+        for (int i = 0; i < 32; ++i) forged[4+i] = parent.begin()[i];
+        check(!h.Add(forged,err) && err.find("before the anchor") != std::string::npos,"a fork from inside the anchor is refused");
+    }
+    {
+        // The floor: a month on, a chain has to show 1/16 of a month of work.
+        Headers h(*mainNet);
+        const Header& a = h.At(mainNet->anchorHeight); const Header& b = h.At(mainNet->anchorHeight-1);
+        int64 month = (int64)a.time+30*86400;
+        check(DgbWorkFloor(*mainNet,h,(int64)a.time+10) == a.work,"no floor at the anchor");
+        check(DgbWorkFloor(*mainNet,h,month) == a.work+(a.work-b.work)*(30*86400/15)/16,"a month on");
+    }
+    check(WorkConfirmations(Integer(1000),Integer(10),160) == 101 && WorkConfirmations(Integer(10000),Integer(10),160) == 160,"blocks count for their work, at most for themselves");
+    check(WorkConfirmations(Integer(400),Integer(10),160) == 41,"160 blocks with the work of 40");
+    check(mainNet->maxHeaders == 20000 && mainNet->scanBatch == 200,"a peer's 20000 headers, 200 blocks at a time");
+    // A real address of each network, as DigiByte Core gave them.
+    btcswap::Chain chain; chain.coin = "dgb"; chain.name = "regtest"; chain.pkhVersion = regNet->pkhVersion; chain.shVersion = regNet->shVersion;
+    std::vector<unsigned char> pkh; std::string err;
+    check(btcswap::AddressToPkh(chain,"skzSdPmkCiRX64ocF1LJKmF7CXh6st1PTb",pkh,err) && HexStr(pkh.begin(),pkh.end(),false) == "255748c1a58483cb7df2984d06247f95add99b45","a regtest address and its key hash");
+    printf("dgb-light: %d failure(s)\n",failures); return failures ? 1 : 0;
 }
 int SelfTestDogecoin()
 {

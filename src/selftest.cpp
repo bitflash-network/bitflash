@@ -8711,6 +8711,8 @@ int RunSelfTest(const std::string& name)
         return btclight::SelfTestCash();
     if (name == "doge-light")
         return btclight::SelfTestDogecoin();
+    if (name == "dgb-light")
+        return btclight::SelfTestDigiByte();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")
