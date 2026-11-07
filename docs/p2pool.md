@@ -47,7 +47,8 @@ A share carries:
 
 The coinbase commits to the share chain: its scriptSig, after the block height
 (rules v2 / BIP34), carries `"p2p"` and the 32-byte hash of the share's own
-data (`ShareData`: its parent, uncles, share height, target and payout script). The PoW therefore cannot be lifted from one share chain onto another.
+data (`ShareData`: its parent, uncles, share height, target and payout
+script). The PoW therefore cannot be lifted from one share chain onto another.
 
 **Valid share:** the header hashes (RandomX, the main chain's own PoW v2) under
 the share target; the coinbase outputs equal the payout list computed from the
