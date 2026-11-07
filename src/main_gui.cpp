@@ -240,6 +240,12 @@ static void PrintUsage()
     printf("  /btcdatadir=DIR /btcrpcport=N /btcwallet=NAME  (where this machine's Bitcoin Core is;\n");
     printf("                              its .cookie is read, or /btcrpcuser=U /btcrpcpassword=P)\n");
     printf("  /btcfeerate=BTC            (per 1000 vbytes, when Core has no fee estimate)\n");
+    printf("  -btcpeer=HOST:PORT         (the light client dials only these peers; repeatable,\n");
+    printf("                              and written with a dash)\n");
+    printf("  /ltc... /doge... /bch... /xec... /dgb... /rvn...  (the same options for the other\n");
+    printf("                              chains: /ltcchain, /ltcdatadir, /ltcrpcport, -ltcpeer...)\n");
+    printf("  /isolate                   (test bench: dial nothing but /connectbtf and the /XXXpeer\n");
+    printf("                              peers; /benchrulesv4=TIME moves rules v4 there, testnet only)\n");
     printf("  /invoicewebhook=URL        (invoices: POST each status change to http://host[:port]/path)\n");
     printf("  /invoicewebhooksecret=S    (sign those POSTs: X-Bitflash-Signature: sha256=HMAC(S, body))\n");
     printf("  /invoicenotify=CMD         (invoices: run CMD on each status change, %%s = invoice id)\n");

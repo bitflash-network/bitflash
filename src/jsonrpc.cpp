@@ -3729,6 +3729,8 @@ static json rpc_help(const json&)
            "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
            "btcswapinfo btcnewaddress btcvalidatedestination btcinitiate btcparticipate btcauditcontract btcredeem btcrefund btcfindsecret "
            "coinswapinfo coinnewaddress coinvalidatedestination coininitiate coinparticipate coinauditcontract coinredeem coinrefund coinfindsecret "
+           "templatehash spendscript vaultcreate vaultunvault vaultwithdraw vaultrecover ctvbatch ctvexpand listv4contracts "
+           "inheritcreate inheritinfo inheritrenew inheritcancel inheritpackage inheritimport inheritclaim "
            "gettorinfo settorbridges gettreasuryinfo donate sendburn help";
 }
 

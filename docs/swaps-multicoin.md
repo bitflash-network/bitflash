@@ -36,11 +36,13 @@ memory:
 | Dogecoin | dogecoin/dogecoin v1.14.9 | scrypt, merge-mined (AuxPoW, chain id 98) | DigiShield, every block | legacy | base58 30/22 |
 | Bitcoin Cash | bitcoin-cash-node v29.2.0 | SHA-256d | ASERT (aserti3-2d) | FORKID | cashaddr `bitcoincash` (base58 0/5) |
 | eCash | Bitcoin-ABC v0.34.3 | SHA-256d | ASERT | FORKID | cashaddr `ecash`; XEC has 2 decimals |
-| DigiByte | DigiByte-Core/digibyte v9.26.7 | five algorithms by version bits | per-algo (MultiShield) | legacy | base58 |
-| Ravencoin | RavenProject/Ravencoin v4.8.0 | KAWPOW | DarkGravityWave v3 | legacy | base58 |
+| DigiByte | DigiByte-Core/digibyte v9.26.7 (network), v8.22.2 (PoW code) | five algorithms by version bits | per-algo (MultiShield) | legacy | base58 |
+| Ravencoin | RavenProject/Ravencoin v4.8.0 (network), v4.6.1 (PoW code) | KAWPOW | DarkGravityWave v3 | legacy | base58 |
 
-The DigiByte and Ravencoin proof-of-work and difficulty modules are written
-separately (branch `light/dgb-rvn-pow`, docs/light-pow.md) and plugged in here.
+For DigiByte and Ravencoin the network parameters (ports, seeds, protocol
+version) come from the newer tag and the proof-of-work code from the older one,
+pinned in `src/pow_vendor` (docs/light-pow.md); neither chain's proof of work
+changed between them.
 
 ## Two ways to watch a chain
 
@@ -73,12 +75,11 @@ protocol, over Tor, to the chain's own peers, with no server of anyone's.
   with faster blocks asks for as much time as Bitcoin's confirmations cost,
   not the same count.
 
-Embedded on 2026-12-25: Litecoin, Dogecoin, Bitcoin Cash and eCash, whose
-proof of work this client can check (scrypt, AuxPoW over scrypt, SHA-256d).
-DigiByte and Ravencoin open that day with the own-node mode, and their
-embedded client follows when their PoW modules are proven. Any chain whose
-embedded client is not proven with coins by 2026-12-15 opens with the
-own-node mode only. The date does not move.
+All six have an embedded client: Litecoin, Dogecoin, Bitcoin Cash and eCash
+(scrypt, AuxPoW over scrypt, SHA-256d), DigiByte (its five algorithms) and
+Ravencoin (KAWPOW; main network only, since no test network peer answers).
+Any chain whose embedded client is not proven with coins by 2026-12-15 opens
+on 2026-12-25 with the own-node mode only. The date does not move.
 
 ## Structure in the code
 
