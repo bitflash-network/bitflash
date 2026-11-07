@@ -28,8 +28,6 @@ from pathlib import Path
 
 import bitflash_chain as chain
 
-TESTNET_MAGIC = bytes([0xCE, 0xE2, 0xC0, 0xFF])
-TESTNET_GENESIS_HASH = "a9d11c6d697bcb7aea0653bc088b12dcf9f44e732df205162cf085fd9d9963eb"
 
 ADDRESS_VERSION = 25
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -158,8 +156,7 @@ def scan(blocks, treasury_hex):
 
 def build(args):
     if args.testnet:
-        chain.MAGIC = TESTNET_MAGIC
-        chain.GENESIS_HASH = TESTNET_GENESIS_HASH
+        chain.use_testnet()
     m, n, keys = parse_script(args.script)
     blocks = chain.read_blocks(args.datadir, 0)
     try:

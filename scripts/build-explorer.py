@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ def hash160(b):
 # The treasury's output script, hex, when given with --treasury: its outputs
 # are labelled so a reader can tell a share to the fund from any other multisig.
 TREASURY_HEX = None
+TESTNET = False
 
 
 def spk_info(script_hex):
@@ -91,6 +93,8 @@ def explorer_tx(tx):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--datadir", help="Bitflash data directory containing blk*.dat")
+    ap.add_argument("--testnet", action="store_true",
+                    help="the blocks are the public test chain's")
     ap.add_argument("--max-blocks", type=int, default=0,
                     help="number of blocks to scan; 0 means all block files")
     ap.add_argument("--treasury", default=None,
@@ -98,8 +102,11 @@ def parse_args(argv):
     ap.add_argument("paths", nargs="+",
                     help="with --datadir: <out-dir>; otherwise: <blk*.dat>... <out-dir>")
     args = ap.parse_args(argv)
-    global TREASURY_HEX
+    global TREASURY_HEX, TESTNET
     TREASURY_HEX = args.treasury.lower() if args.treasury else None
+    TESTNET = args.testnet
+    if TESTNET:
+        chain.use_testnet()
     if args.datadir:
         if len(args.paths) != 1:
             raise SystemExit("usage with --datadir: build-explorer.py --datadir DATADIR <out-dir>")
@@ -213,6 +220,7 @@ def build_explorer(raw_blocks, out_dir):
     BLOCK_CHUNK = 1000  # blocks per file; keeps the deploy well under Cloudflare Pages' 20k-file cap
     summaries = []
     chunks = {}
+    txids = {}
     for height, block in enumerate(blocks):
         txs = [explorer_tx(tx) for tx in block["transactions"]]
         detail = {
@@ -238,6 +246,8 @@ def build_explorer(raw_blocks, out_dir):
             "cbAddr": cb.get("address", ""),
         })
         chunks.setdefault(height // BLOCK_CHUNK, {})[str(height)] = detail
+        for tx in txs:
+            txids.setdefault(tx["txid"][:2], {})[tx["txid"]] = height
 
     for ci, group in chunks.items():
         (out / "block" / ("%d.json" % ci)).write_text(
@@ -245,11 +255,22 @@ def build_explorer(raw_blocks, out_dir):
             encoding="ascii",
         )
 
+    # txid to height, in up to 256 files by the first byte. A swap is proven by
+    # naming its transactions, and without this a reader has to know the block.
+    shutil.rmtree(out / "tx", ignore_errors=True)
+    (out / "tx").mkdir(parents=True, exist_ok=True)
+    for prefix, group in txids.items():
+        (out / "tx" / ("%s.json" % prefix)).write_text(
+            json.dumps(group, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+
     summaries.sort(key=lambda x: -x["height"])
     estimate = network_estimate(blocks)
+    network = "bitflash-testnet" if TESTNET else "bitflash"
     (out / "blocks.json").write_text(
         json.dumps({
-            "network": "bitflash",
+            "network": network,
             "tipHeight": len(blocks) - 1,
             "count": len(blocks),
             "estimate": estimate,
@@ -261,7 +282,7 @@ def build_explorer(raw_blocks, out_dir):
     # blocks.json has both but is megabytes; this is the few bytes it needs.
     (out / "tip.json").write_text(
         json.dumps({
-            "network": "bitflash",
+            "network": network,
             "height": len(blocks) - 1,
             "time": blocks[-1]["time"] if blocks else None,
             "hashrate": (estimate or {}).get("hashrate"),
@@ -287,18 +308,40 @@ def build_explorer(raw_blocks, out_dir):
     #
     # The hash only changes when the file does, so this costs nothing per deploy
     # and makes a stale asset impossible rather than unlikely.
-    js_tag = hashlib.sha256(EXPLORER_JS.encode("utf-8")).hexdigest()[:8]
+    page, script = testnet_page() if TESTNET else (INDEX_HTML, EXPLORER_JS)
+    js_tag = hashlib.sha256(script.encode("utf-8")).hexdigest()[:8]
     css_tag = hashlib.sha256(STYLE_CSS.encode("utf-8")).hexdigest()[:8]
-    index = (INDEX_HTML
+    index = (page
              .replace('href="style.css"', 'href="style.css?v=%s"' % css_tag)
              .replace('src="explorer.js"', 'src="explorer.js?v=%s"' % js_tag))
     (out / "index.html").write_text(index, encoding="utf-8")
     (out / "style.css").write_text(STYLE_CSS, encoding="utf-8")
-    (out / "explorer.js").write_text(EXPLORER_JS, encoding="utf-8")
+    (out / "explorer.js").write_text(script, encoding="utf-8")
     logo = Path(__file__).resolve().parents[1] / "docs" / "logo.png"
     if logo.exists():
         shutil.copyfile(logo, out / "logo.png")
     return len(blocks), len(blocks) - 1
+
+
+def testnet_page():
+    """The same page, saying which chain it shows: its coins are not worth anything."""
+    page = re.sub(r'<p class="notice">.*?</p>\n', '', INDEX_HTML)
+    for old, new in (
+        ('<title>Bitflash Block Explorer</title>', '<title>Bitflash Testnet Explorer</title>'),
+        ('Read-only Bitflash block explorer', 'Read-only explorer of the Bitflash test chain,'),
+        ('<body>\n', '<body>\n<p class="notice">Public test chain: tBTF has no value and this chain can be reset. '
+                     'Some for testing: <a href="https://faucet.bitflash.network/">the faucet</a>.</p>\n'),
+        ('alt="">Bitflash</a>', 'alt="">Bitflash testnet</a>'),
+        ('<a href="https://explorer.bitflash.network/" aria-current="page">', '<a href="https://explorer.bitflash.network/">'),
+        ('<a href="https://testnet-explorer.bitflash.network/">', '<a href="https://testnet-explorer.bitflash.network/" aria-current="page">'),
+        ('<h1>Block explorer ', '<h1>Testnet explorer '),
+        ('Read-only view of the main chain:', 'Read-only view of the test chain:'),
+    ):
+        assert old in page, old
+        page = page.replace(old, new)
+    script = EXPLORER_JS.replace('+" BTF"; }', '+" tBTF"; }')
+    assert script != EXPLORER_JS
+    return page, script
 
 
 def main(argv):
@@ -332,6 +375,7 @@ INDEX_HTML = r"""<!doctype html>
     <a href="https://docs.bitflash.network/">docs</a>
     <a href="https://releases.bitflash.network/">downloads</a>
     <a href="https://explorer.bitflash.network/" aria-current="page">explorer</a>
+    <a href="https://testnet-explorer.bitflash.network/">testnet</a>
     <a href="https://faucet.bitflash.network/">faucet</a>
   </nav>
   <span class="meta" id="tip"></span>
@@ -342,7 +386,7 @@ INDEX_HTML = r"""<!doctype html>
   <p class="note">Read-only view of the main chain: blocks, their transactions, and the coinbase payout. There is no mempool and no per-address history here.</p>
   <p class="note" id="netnote" hidden></p>
   <div id="listview">
-    <input id="q" placeholder="Search by height or block hash">
+    <input id="q" placeholder="Search by height, block hash or txid">
     <div class="scroll"><table>
       <thead><tr><th>Height</th><th>Time (UTC)</th><th>Txs</th><th>Size</th><th>Coinbase</th><th>To</th></tr></thead>
       <tbody id="rows"></tbody>
@@ -400,6 +444,7 @@ code{font-size:.8rem;word-break:break-all;color:var(--fg);}
 .kv{display:grid;grid-template-columns:11rem 1fr;gap:.25rem .8rem;font-size:.82rem;}
 .kv div:nth-child(odd){color:var(--dim);}
 .tx{border-top:1px solid var(--line);padding:.7rem 0;}
+.tx.hit{border-left:3px solid var(--accent);padding-left:.8rem;}
 .io{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
 @media (max-width:640px){.io{grid-template-columns:1fr;}.kv{grid-template-columns:7rem 1fr;}.topbar .meta{margin-left:0;width:100%;}}
 .pill{display:inline-block;font-size:.68rem;padding:.05rem .5rem;border:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:.05em;}
@@ -433,6 +478,7 @@ function renderList(filter){
   var q=(filter||"").trim().toLowerCase(), rows=document.getElementById('rows');
   clear(rows);
   var list = q ? SUM.filter(function(b){ return String(b.height)===q || b.hash.indexOf(q)===0; }) : SUM.slice(0,SHOWN);
+  if(!list.length && /^[0-9a-f]{64}$/.test(q)){ openTx(q); return; }
   if(!list.length){
     var empty = E('tr');
     var td = E('td', 'mut', 'no match');
@@ -459,10 +505,22 @@ function ioSide(title, items, render){
   items.forEach(function(item){ append(side, render(item)); });
   return side;
 }
-function openBlock(h){
+function openTx(id){
+  fetch('tx/'+id.slice(0,2)+'.json').then(function(r){ return r.ok ? r.json() : {}; }).then(function(heights){
+    if(heights[id] !== undefined){ openBlock(heights[id], id); return; }
+    var detail = document.getElementById('detail');
+    clear(detail);
+    append(detail, E('h2', '', 'Transaction not found'), append(E('p'), code(id)));
+    document.getElementById('listview').hidden = true;
+    detail.hidden = false;
+    document.getElementById('home').hidden = false;
+  });
+}
+function openBlock(h, txid){
   h = parseInt(h, 10);
   if(!(h >= 0)) return;
-  if(location.hash !== '#block/'+h) history.replaceState(null, '', '#block/'+h);
+  var here = txid ? '#tx/'+txid : '#block/'+h;
+  if(location.hash !== here) history.replaceState(null, '', here);
   fetch('block/'+Math.floor(h/1000)+'.json').then(function(r){return r.json();}).then(function(chunk){
     var b=chunk[h];
     if(!b){var dd=document.getElementById('detail');clear(dd);append(dd,E('h2','','Block '+h+' not found'));return;}
@@ -487,6 +545,7 @@ function openBlock(h){
     kv(grid, 'Bits / Nonce', b.bits.toString(16)+' / '+b.nonce);
     kv(grid, 'Size / Txs', b.size+' B / '+b.txs.length);
     append(card, grid); append(detail, card);
+    var hit = null;
     b.txs.forEach(function(t, i){
       var tx = E('div', 'tx');
       var head = E('div');
@@ -495,9 +554,11 @@ function openBlock(h){
       var io = E('div', 'io');
       append(io, ioSide('Inputs', t.vin, function(v){
         var d = E('div');
-        if(v.coinbase) append(d, E('span', 'pill', 'coinbase'));
-        else append(d, code(short(v.prev)+':'+v.vout));
-        return d;
+        if(v.coinbase){ append(d, E('span', 'pill', 'coinbase')); return d; }
+        var spent = E('button', 'link');
+        append(spent, code(short(v.prev)+':'+v.vout));
+        spent.onclick = function(){ openTx(v.prev); };
+        return append(d, spent);
       }));
       append(io, ioSide('Outputs', t.vout, function(o){
         var d = E('div');
@@ -506,11 +567,12 @@ function openBlock(h){
         return d;
       }));
       append(tx, head, io); append(detail, tx);
+      if(t.txid === txid){ tx.className = 'tx hit'; hit = tx; }
     });
     document.getElementById('listview').hidden = true;
     detail.hidden = false;
     document.getElementById('home').hidden = false;
-    window.scrollTo(0,0);
+    if(hit) hit.scrollIntoView(); else window.scrollTo(0,0);
   });
 }
 document.getElementById('home').onclick=function(){
@@ -522,6 +584,8 @@ document.getElementById('home').onclick=function(){
 function openFromHash(){
   var m = /^#block\/(\d+)$/.exec(location.hash);
   if(m) openBlock(m[1]);
+  m = /^#tx\/([0-9a-f]{64})$/.exec(location.hash);
+  if(m) openTx(m[1]);
 }
 window.addEventListener('hashchange', openFromHash);
 document.getElementById('q').oninput=function(){ renderList(this.value); };
