@@ -328,7 +328,9 @@ The same `coin*` calls with `bch` or `xec` first, the same contract, and
   100000000. RPC and the chat speak XEC; amounts inside are base units.
 - **Mainnet confirmations:** 4 on Bitcoin Cash and 6 on eCash, about 40 minutes
   and an hour. Their blocks take as long as Bitcoin's, but they run Bitcoin's
-  SHA-256 with a sliver of its hash rate, so a block can be rented.
+  SHA-256 with a sliver of its hash rate, so a block can be rented. ASERT eases
+  for a chain that claims time has passed, so on the main networks the light
+  client counts them by the work over the contract, as for DigiByte below.
 - **The fee** has no estimate there: 1 sat/byte, what everyone pays,
   unless `-bchfeerate` or `-xecfeerate` says otherwise (in the coin, per 1000
   bytes). A stuck redeem cannot be replaced, as these chains have no RBF, but
@@ -383,6 +385,7 @@ The same `coin*` calls with `doge` first, the same contract, and
 - **Addresses** are base58 only: `D...` on the main network, `n...` or `m...` on
   the test network. Dogecoin has no SegWit.
 - **Mainnet confirmations:** 20, about 20 minutes, the time Bitcoin's two take.
+  DigiShield eases too, so the light client counts them by work, as for DigiByte.
 - **The fee** is in its own coin: 0.01 DOGE per 1000 bytes, the rate Dogecoin
   Core recommends, unless `-dogefeerate` says otherwise (in the coin, per 1000
   bytes, up to 1 DOGE). An offer or a contract under 0.02 DOGE is refused, as its
