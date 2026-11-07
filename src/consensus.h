@@ -59,10 +59,10 @@ bool RulesV3Active(unsigned int nBlockTime);
 // the scriptSigs field), OP_CHECKSIGFROMSTACK (BIP348). Only after rules v3:
 // they need P2SH and median-time-past finality.
 //
-// Mainnet: 0, never, until the founder fixes the date (planned May 2027).
-static const unsigned int RULES_V4_TIME_MAINNET = 0;
-// Testnet: 2026-12-25 12:00 UTC at the latest.
-static const unsigned int RULES_V4_TIME_TESTNET = 1798200000;
+// Mainnet: 2026-12-25 12:00 UTC, with the swaps.
+static const unsigned int RULES_V4_TIME_MAINNET = 1798200000;
+// Testnet: 2026-11-20 12:00 UTC, five weeks ahead of it.
+static const unsigned int RULES_V4_TIME_TESTNET = 1795176000;
 
 unsigned int RulesV4Time();
 bool RulesV4Active(unsigned int nBlockTime);
