@@ -487,6 +487,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=dgb-light
 	./bitflash-node -selftest=rvn-chain
 	./bitflash-node -selftest=explorer
+	./bitflash-node -selftest=db-locks
 	./bitflash-node -selftest=swap-wait-payment
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice

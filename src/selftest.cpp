@@ -361,6 +361,70 @@ static int RunExplorerSelfTest()
     return nFail ? 1 : 0;
 }
 
+// A transaction holds a lock on every page it touches until it commits, and
+// connecting a block is one transaction. Past the limit the node stops on that
+// block, while others with their pages elsewhere accept it.
+static int RunDbLocksSelfTest()
+{
+    printf("db-locks self-test\n");
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    {
+        CTxDB txdb("cr+");
+        // Filled in small transactions, as blocks fill it: years of a chain.
+        CTxIndex txindex(CDiskTxPos(1, 1, 1), 1);
+        const int nFill = 600000, nStep = 2000;
+        for (int i = 0; i < nFill && nFail == 0; i += nStep)
+        {
+            nFail += txdb.TxnBegin() ? 0 : 1;
+            for (int j = i; j < i + nStep; j++)
+            {
+                uint256 hash = Hash(BEGIN(j), END(j));
+                nFail += txdb.UpdateTxIndex(hash, txindex) ? 0 : 1;
+            }
+            nFail += txdb.TxnCommit() ? 0 : 1;
+        }
+        nFail += Check(nFail == 0, "the index fills") ? 0 : 1;
+
+        // A full block of the smallest transactions, 16000 of them: each writes
+        // its own entry and the one it spends, and random keys land on their
+        // own pages.
+        const int nWrites = 32000;
+        int nDone = 0;
+        nFail += txdb.TxnBegin() ? 0 : 1;
+        for (int i = 0; i < nWrites; i++)
+        {
+            int nKey = i * 18;
+            uint256 hash = Hash(BEGIN(nKey), END(nKey));
+            if (!txdb.UpdateTxIndex(hash, txindex))
+                break;
+            nDone++;
+        }
+        printf("  %d of %d writes in one transaction\n", nDone, nWrites);
+        DB_LOCK_STAT* pstat = NULL;
+        if (GetDbEnv().lock_stat(&pstat, 0) == 0 && pstat)
+        {
+            printf("  at most %u locks held, limit %u\n", pstat->st_maxnlocks, pstat->st_maxlocks);
+            // Locks grow with the index: 17588 at 1.8 million entries, where
+            // the old limit of 10000 stopped the node on this very block.
+            nFail += Check(pstat->st_maxlocks >= 50 * pstat->st_maxnlocks, "the limit leaves the index room to grow") ? 0 : 1;
+            free(pstat);
+        }
+        nFail += Check(nDone == nWrites, "they all fit under the lock limit") ? 0 : 1;
+        nFail += Check(nDone == nWrites ? txdb.TxnCommit() : txdb.TxnAbort(), "and it ends cleanly") ? 0 : 1;
+    }
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("db-locks: %d failure(s)\n", nFail);
+    return nFail ? 1 : 0;
+}
+
 static int RunWalletKeyPoolSelfTest()
 {
     fflush(stdout);
@@ -8764,6 +8828,8 @@ int RunSelfTest(const std::string& name)
         return RunWalletFormatSelfTest();
     if (name == "wallet-storage-sanity")
         return RunWalletStorageSanitySelfTest();
+    if (name == "db-locks")
+        return RunDbLocksSelfTest();
     if (name == "db-env-reopen")
         return RunDbEnvReopenSelfTest();
     if (name == "wallet-sqlite")

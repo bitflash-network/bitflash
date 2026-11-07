@@ -183,7 +183,7 @@ static void PrintUsage()
     printf("  /gen\n");
     printf("  /nogui or /daemon\n");
     printf("  /selftest=wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity,\n");
-    printf("            db-env-reopen, wallet-sqlite, wallet-sqlite-migration,\n");
+    printf("            db-env-reopen, db-locks, wallet-sqlite, wallet-sqlite-migration,\n");
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
     printf("            consensus-limits, pool-stratum,\n");

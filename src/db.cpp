@@ -308,8 +308,12 @@ CDB::CDB(const char* pszFile, const char* pszMode, bool fTxn) : pdb(NULL)
             DbEnv& env = GetDbEnv();
             env.set_lg_dir(strLogDir.c_str());
             env.set_lg_max(10000000);
-            env.set_lk_max_locks(10000);
-            env.set_lk_max_objects(10000);
+            // Whether a block connects must not depend on how this node's
+            // pages happen to lie: a transaction holds a lock per page until
+            // it commits, so these cover a full block of the smallest
+            // transactions, as Bitcoin found out in March 2013.
+            env.set_lk_max_locks(537000);
+            env.set_lk_max_objects(537000);
             pdbErrFile = fopen("db.log", "a"); /// debug
             if (pdbErrFile)
                 env.set_errfile(pdbErrFile);
