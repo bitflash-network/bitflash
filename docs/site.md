@@ -59,6 +59,15 @@ https://releases.bitflash.network/bitflash-node-latest-x86_64
 The aliases are convenience only. Verification must still require the pinned
 release key documented in `docs/release-verification.md`.
 
+## The Wallet's Explorer
+
+The wallet has its own: Explorer in the menu, and `view` beside each transaction.
+It reads this node's files and nothing else, so looking something up tells no site
+what was interesting, and it keeps working with every site down. It finds a block
+by height or hash and a transaction by id, including one still waiting, and shows
+the fee and, for each output, the transaction that spent it. That last part is
+what a website built from block files does not have.
+
 ## Static Explorer
 
 `scripts/build-explorer.py` writes a static explorer with no backend:

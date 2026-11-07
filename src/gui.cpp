@@ -24,6 +24,8 @@
 #include "walletcmd.h"
 #include "tor.h"
 #include "treasury.h"
+#include "explorer.h"
+#include "gui_explorer.h"
 #include "bip21.h"
 #include "qrcodegen.hpp"
 #include "font_roboto.h"
@@ -103,13 +105,7 @@ static std::string g_speedUpStatus;   // what the last "speed up" did
 // ---------------------------------------------------------------------------
 static std::string FmtMoney(int64 n)
 {
-    bool neg = n < 0; if (neg) n = -n;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s%lld.%08lld",
-             neg?"-":"", (long long)(n/COIN), (long long)(n%COIN));
-    char* dot = strchr(buf, '.');
-    if (dot) { char* e = buf+strlen(buf)-1; while(e>dot+2&&*e=='0') *e--='\0'; }
-    return buf;
+    return explorer::Money(n);
 }
 
 static std::string FmtAge(int64 createdAt)
@@ -433,6 +429,7 @@ static void DrawMainWindow()
         }
         if (ImGui::MenuItem("Options")) g_showOptions = true;
         if (ImGui::MenuItem("Wallet Safety")) g_showWalletSafety = true;
+        if (ImGui::MenuItem("Explorer")) g_showExplorer = true;
         if (ImGui::MenuItem("Diagnostics")) g_showDiagnostics = true;
         if (ImGui::MenuItem("About"))   g_showAbout   = true;
         ImGui::EndMenuBar();
@@ -611,6 +608,9 @@ static void DrawMainWindow()
             ImGui::TextDisabled("%s", row.date.c_str());
             ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted(row.desc.c_str());
+            ImGui::SameLine(0.0f, 12.0f);
+            if (ImGui::TextLink(("view##" + row.hash.GetHex()).c_str()))
+                ExplorerOpenTx(row.hash);
             ImGui::TableSetColumnIndex(3);
             if (row.amount >= 0)
                 ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.35f, 1.0f),
@@ -1966,6 +1966,7 @@ int RunGUI(int argc, char* argv[])
         DrawCreatePhraseDialog();
         DrawRestorePhraseDialog();
         DrawDiagnosticsDialog();
+        DrawExplorerWindow();
         DrawAboutDialog();
         DrawBackendWizardDialog();
         DrawStatusBar();
