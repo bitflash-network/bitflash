@@ -177,8 +177,8 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
     // Bitcoin Cash and eCash run Bitcoin's SHA-256 with a sliver of its hash
     // rate, so anyone can rent their next block: there, more time. DigiByte's
     // five algorithms include SHA-256 and scrypt, as rentable: 40 min, at 15 s.
-    // KAWPOW's hash rate can be rented too, and past 60 blocks Ravencoin's nodes
-    // refuse a reorganization: 60, an hour, at a minute.
+    // KAWPOW's hash rate can be rented too, and honest nodes and this wallet's
+    // light client stay on their tip against a fork 60 blocks deep: 60, an hour.
     return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "RVN" ? 60 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
 }
 

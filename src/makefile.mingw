@@ -48,7 +48,7 @@ IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
 # `override`: a CXXFLAGS given on the command line must not drop these flags
 # (the build broke, or the vendored code silently built with -fpermissive).
 # sphlib's portable byte loads avoid unaligned accesses under UBSan.
-LIGHT_POW_SOURCES = dgb_pow.cpp \
+LIGHT_POW_SOURCES = dgb_pow.cpp x16rv2.cpp pow_vendor/x16/tiger.cpp \
     rvn_kawpow.cpp \
     pow_vendor/dgb/KeccakP-800-reference.cpp \
     pow_vendor/dgb/cubehash.cpp \
@@ -60,7 +60,7 @@ LIGHT_POW_SOURCES = dgb_pow.cpp \
     pow_vendor/dgb/skein.cpp \
     pow_vendor/rvn/crypto/ethash/lib/ethash/ethash.cpp \
     pow_vendor/rvn/crypto/ethash/lib/ethash/progpow.cpp
-LIGHT_POW_C_SOURCES = pow_vendor/rvn/crypto/ethash/lib/ethash/primes.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccak.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf1600.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf800.c
+LIGHT_POW_C_SOURCES = pow_vendor/x16/blake.c pow_vendor/x16/bmw.c pow_vendor/x16/fugue.c pow_vendor/x16/groestl.c pow_vendor/x16/hamsi.c pow_vendor/x16/jh.c pow_vendor/x16/keccak.c pow_vendor/x16/shabal.c pow_vendor/x16/sph_sha2big.c pow_vendor/x16/whirlpool.c pow_vendor/rvn/crypto/ethash/lib/ethash/primes.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccak.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf1600.c pow_vendor/rvn/crypto/ethash/lib/keccak/keccakf800.c
 LIGHT_POW_HEADERS = dgb_pow.h rvn_kawpow.h light_pow_common.h light_pow_internal.h \
     pow_vendor/dgb/aes_helper.cpp \
     pow_vendor/dgb/KeccakP-800-SnP.h \
@@ -149,7 +149,7 @@ obj-chat/bitflash_res.o: bitflash.rc rc/bitcoin.ico headers_core.h
 	windres $(RCFLAGS) -DBITFLASH_CHAT_APP -o $@ -i bitflash.rc
 
 # Keep upstream Keccak translation units in C, as their declarations require.
-LIGHT_POW_CFLAGS = -std=c99 -O2 -Ipow_vendor/rvn -fno-strict-aliasing
+LIGHT_POW_CFLAGS = -std=c99 -O2 -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
 obj/%.o: %.c $(LIGHT_POW_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) -c $(LIGHT_POW_CFLAGS) -o $@ $<
