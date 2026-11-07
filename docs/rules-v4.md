@@ -145,12 +145,15 @@ BIP340 module built in.
 
 ## What old nodes see
 
-As with `OP_CHECKLOCKTIMEVERIFY`, a node from before v4 never runs a P2SH
-redeem script beyond checking its hash, so a contract in P2SH looks like any
-P2SH spend to it. The relative-lock rule only removes transactions from what a
-block may hold. A bare script with one of the new bytes fails on an old node
-and is not relayed by anyone (non-standard). Miners must upgrade before the
-switch; other nodes should.
+**Every node must upgrade before the switch, not only miners.** Since rules
+v3, every node runs a P2SH redeem script, and on a node without these dates
+the three new bytes fail the script, as they always have (they were never
+no-ops here). So the first block after the switch that spends a vault, a batch
+or an inheritance is valid to an upgraded node and invalid to an old one, and
+the old node stops following the chain there. On mainnet that means every node
+on 1.2.31 or older; on testnet, every node older than 1.2.32, whose date moved
+from 2026-12-25 to 2026-11-20. The relative-lock rule only removes transactions
+from what a block may hold.
 
 ## In the wallet: a vault and a batch
 

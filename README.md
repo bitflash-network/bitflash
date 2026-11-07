@@ -652,7 +652,7 @@ windows-tor` to require the extra signature check.
 | Wallet recovery | Twelve-word phrase (BIP39 + BIP32 + BIP44, coin type 4346950), plus file backup |
 | Wallet storage | SQLite `wallet.sqlite` by default, or Berkeley DB `wallet.dat` |
 | Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, lock-time finality by median time, `OP_VER`/`OP_VERIF`/`OP_VERNOTIF` invalid; soft fork on mainnet at 2026-11-21 12:00 UTC |
-| Rules v4 | Relative lock times (`OP_CHECKSEQUENCEVERIFY`, BIP68/112), `OP_CHECKTEMPLATEVERIFY` and `OP_CHECKSIGFROMSTACK`; soft fork on testnet at 2026-11-20 12:00 UTC and on mainnet at 2026-12-25 12:00 UTC. Nodes on 1.2.31 or older leave the main chain at its first v4 spend: upgrade before then. See [docs/rules-v4.md](docs/rules-v4.md) |
+| Rules v4 | Relative lock times (`OP_CHECKSEQUENCEVERIFY`, BIP68/112), `OP_CHECKTEMPLATEVERIFY` and `OP_CHECKSIGFROMSTACK`; on testnet from 2026-11-20 12:00 UTC and on mainnet from 2026-12-25 12:00 UTC. Every node must upgrade before then: one on 1.2.31 or older leaves the chain at its first v4 spend. See [docs/rules-v4.md](docs/rules-v4.md) |
 | Platforms | Windows, Linux (x86_64), macOS (Apple silicon, Terminal only) |
 
 The halving interval is the number most people get wrong coming from Bitcoin.
