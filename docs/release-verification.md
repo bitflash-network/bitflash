@@ -120,7 +120,9 @@ or on your own runner. Then compare its `SHA256SUMS` with the signed one.
 Push a branch at that commit and dispatch the workflow there; a tag would
 also run the publishing step. The packages match when the tools match:
 - Linux packages are built on `ubuntu-24.04`;
-- macOS packages are built on `macos-15`;
+- macOS packages are built on `macos-15` (1.2.31 and older on `macos-14`,
+  which GitHub retired on 2026-11-02, so those can no longer be rebuilt
+  there);
 - Windows packages are built with MSYS2 UCRT64 at the package versions the
   runner installs.
 
