@@ -22,7 +22,8 @@
 #include "p2pool_chain.h"
 
 // Handles a P2Pool message; false when strCommand is not one. Called from
-// ProcessMessage, under cs_main.
+// ProcessMessages without cs_main (it takes cs_p2pool, and never cs_main
+// inside it: the template code takes cs_main first).
 bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv);
 
 // After the version handshake: ask the peer for its line if ours is empty.

@@ -1,6 +1,7 @@
 # P2Pool inside the node: pooled mining with no pool
 
-Status: implemented (steps 1 to 6 below); being proven on testnet (step 7).
+Status: implemented (steps 1 to 6 below) and proven on testnet (step 7): a
+block found through it paid two miners, matured and was spent.
 Mainnet consensus does not change; this ships in an ordinary release.
 
 ## Why
@@ -45,8 +46,8 @@ A share carries:
 - the share chain height and the share difficulty.
 
 The coinbase commits to the share chain: its scriptSig, after the block height
-(rules v2 / BIP34), carries `"p2p"` and the 32-byte id of the share's parent
-data. The PoW therefore cannot be lifted from one share chain onto another.
+(rules v2 / BIP34), carries `"p2p"` and the 32-byte hash of the share's own
+data (`ShareData`: its parent, uncles, share height, target and payout script). The PoW therefore cannot be lifted from one share chain onto another.
 
 **Valid share:** the header hashes (RandomX, the main chain's own PoW v2) under
 the share target; the coinbase outputs equal the payout list computed from the
@@ -111,13 +112,14 @@ The coinbase of every template pays the last **2160 shares** (about 6 hours at
 - no dust floor is needed: at 50 BTF a block and 2160 shares, one share is
   worth about 0.023 BTF;
 - the block finder gets no bonus. There is nothing to race for;
-- a treasury share (see `treasury.md`), when the operator of a node chose one,
-  is that node's own choice and comes out of its own shares only.
+- no treasury share: the coinbase must equal the payout list exactly, so a
+  block found through P2Pool pays the miners and nothing else.
 
 **Size:** 1 MB blocks hold the coinbase easily. 1000 distinct miners in a
 window is ~34 KB of outputs.
 
-**Maturity:** coinbase outputs mature after 100 blocks, as every coinbase.
+**Maturity:** coinbase outputs can be spent after 100 blocks, as every
+coinbase; the wallet counts them as balance after 120, as it does for any.
 
 ## Network
 
@@ -193,8 +195,8 @@ share's validity depend on what else a node holds.
 ## What changes for whom
 
 - **Miners:** run a node (the wallet is one), add `-p2pool`, point XMRig at
-  `127.0.0.1:3333`. Payouts arrive in their own wallet, matured after 100
-  blocks.
+  `127.0.0.1:3333` (`-p2poolport` for another port). Payouts arrive in their
+  own wallet, spendable 120 blocks later.
 - **The central pool:** keeps running until P2Pool is proven on mainnet with
   real blocks paid to several miners. Then it is switched off.
 - **Everyone else:** nothing. Main-chain rules do not change.

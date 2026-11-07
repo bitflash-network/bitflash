@@ -191,9 +191,10 @@ bool P2PoolAwaitingHistory()
     return P2PoolChain().Empty() && nFirstHistoryAsk && GetTime() - nFirstHistoryAsk < SYNC_ANSWER_WINDOW;
 }
 
-// Ids of shares whose parent was missing and whose work was checked lately,
-// queued or not. The queue holds 256; without this a peer cycling 257
-// precomputed orphans cost a RandomX hash per message, for nothing. A share
+// Shares, by the hash of the whole share, whose parent was missing and whose
+// work was checked lately, queued or not. The queue holds 256; without this a
+// peer cycling 257 precomputed orphans cost a RandomX hash per message, for
+// nothing. A share
 // seen here is hashed again only when its parent is here, and it is checked
 // in full. Under cs_p2pool.
 static set<uint256> setOrphanSeen;
@@ -331,6 +332,28 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
         CBigNum bnTipNext;   // the target a share on our tip must meet
         CRITICAL_BLOCK(cs_p2pool)
         {
+            nTipHeight = P2PoolChain().Height(P2PoolChain().Tip());
+            bnTipNext.SetCompact(P2PoolChain().NextShareBits(P2PoolChain().Tip()));
+        }
+        // A share far easier than one on our tip is valid on its own line --
+        // a new chain starts at the floor, about 4096 hashes -- but nothing
+        // this node keeps or passes on: anybody could fill every node's share
+        // chain with such lines, and send them again once evicted. Policy,
+        // not validity: a history this node asked for is taken as it comes.
+        if (!fHistory && nTipHeight >= 0)
+        {
+            CBigNum bnCur;
+            bnCur.SetCompact(cur.data.nShareBits);
+            if (bnCur > bnTipNext * 4)
+            {
+                LogPrint("p2pool", "p2pool: share %s is far easier than our tip's; not kept\n",
+                         id.ToString().substr(0, 12).c_str());
+                fFirst = false;
+                continue;
+            }
+        }
+        CRITICAL_BLOCK(cs_p2pool)
+        {
             fOk = P2PoolChain().Add(cur, main, err, &vMissing, &fBlock);
             nTipHeight = P2PoolChain().Height(P2PoolChain().Tip());
             bnTipNext.SetCompact(P2PoolChain().NextShareBits(P2PoolChain().Tip()));
@@ -369,7 +392,7 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
             bnCur.SetCompact(cur.data.nShareBits);
             // Nothing is spent on a share too far below our tip to matter, or
             // far easier than one on it: an archive of old honest shares,
-            // replayed, cost a RandomX hash each under cs_main.
+            // replayed, cost a RandomX hash each.
             if (nTipHeight >= 0 &&
                 ((int64)cur.data.nShareHeight + (int64)HISTORY_SHARES < (int64)nTipHeight || bnCur > bnTipNext * 4))
             {
@@ -381,11 +404,18 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
             // after the hash once, and the same share sent over and over cost
             // a RandomX hash each time; and dropping it instead left a child
             // whose uncle came after its parent waiting for good.
+            // Kept by the hash of the whole share, not its id: the id is the
+            // header's, and the parts a work check looks at besides (the
+            // commitment, the branch, the coinbase) are tied to it only once
+            // that check passes. By id, a copy with its branch changed, sent
+            // first, marked the real share bad, and its honest sender was
+            // banned for it.
+            uint256 hashWhole = SerializeHash(cur);
             bool fSeen, fBad;
             CRITICAL_BLOCK(cs_p2pool)
             {
-                fSeen = OrphanSeen(id);
-                fBad = !fSeen && OrphanBadWork(id);
+                fSeen = OrphanSeen(hashWhole);
+                fBad = !fSeen && OrphanBadWork(hashWhole);
             }
             if (fBad)
             {
@@ -405,9 +435,9 @@ static bool AcceptShare(const Share& s, CNode* pfrom, bool fHistory)
                 CRITICAL_BLOCK(cs_p2pool)
                 {
                     if (fWork)
-                        MarkOrphanSeen(id);
+                        MarkOrphanSeen(hashWhole);
                     else
-                        MarkOrphanBadWork(id);
+                        MarkOrphanBadWork(hashWhole);
                 }
                 if (!fWork)
                 {
