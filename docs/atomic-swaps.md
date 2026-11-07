@@ -139,7 +139,10 @@ Bitcoin side, the embedded light client above or Bitcoin Core on the same machin
   0.001 BTC**. Two presses.
 - **Then nobody presses anything.** The maker's chat checks the taker's
   contract the same way (paying the maker, under the maker's secret hash, at
-  least 6 hours left) and takes it, which shows the secret on that chain. The
+  least 6 hours left) and takes it, which shows the secret on that chain.
+  On mainnet a Bitflash contract counts once 30 blocks (an hour) are over it:
+  RandomX can be rented by the hour, and a shorter wait would let a taker
+  undo their own lock after the secret is out. The
   taker's chat reads the secret **off the chain** -- not from a message -- and
   takes the maker's.
 - **If it does not finish**, each side's coins come back by themselves when

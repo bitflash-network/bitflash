@@ -602,9 +602,12 @@ static void ParseStartupArguments(int argc, char* argv[])
     {
         string strRpcPort = argval2(argc, argv, "/rpcport", "-rpcport");
         int nP2P = (int)ntohs(nListenPort);
-        int nRpc = atoi(strRpcPort.c_str());
-        if (!strRpcPort.empty() && (nRpc == nP2P || nRpc == nP2P + 1))
-            StartupRefuse(strprintf("-rpcport=%d is a port this node publishes on its onion", nRpc),
+        // Unset is the default port, which a -port next to it publishes too
+        // (-port=8431 puts 8432 on the onion).
+        int nRpc = strRpcPort.empty() ? (IsTestNet() ? 18432 : 8432) : atoi(strRpcPort.c_str());
+        if (nRpc == nP2P || nRpc == nP2P + 1)
+            StartupRefuse(strprintf("%s %d is a port this node publishes on its onion",
+                                    strRpcPort.empty() ? "the default RPC port" : "-rpcport", nRpc),
                           strprintf("Ports %d and %d are reachable by anybody over Tor; pick another for the RPC server.",
                                     nP2P, nP2P + 1));
     }

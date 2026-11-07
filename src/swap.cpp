@@ -68,6 +68,12 @@ bool ParseContract(const CScript& script, Contract& out)
     out.recipientPkh = ops[9].second;
     out.refundPkh    = ops[16].second;
     out.nLockTime    = (int64_t)n;
+    // The same ops can be pushed the long way (OP_PUSHDATA1 for 32 bytes).
+    // Bitcoin Cash and eCash refuse such a push in a spend, the others will
+    // not relay it: a redeem of that contract never confirms, and its maker
+    // refunds. Only the bytes this wallet would have written are a contract.
+    if (BuildContract(out) != script)
+        return false;
     return true;
 }
 

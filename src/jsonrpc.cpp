@@ -1568,6 +1568,23 @@ static bool OutputSpent(const COutPoint& outpoint)
            !txindex.vSpent[outpoint.n].IsNull();
 }
 
+// The transaction that spent an output, from the memory pool or the chain.
+static bool SpenderOf(const COutPoint& outpoint, CTransaction& txOut)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(outpoint);
+        if (mi != mapNextTx.end() && mi->second.ptx)
+        {
+            txOut = *mi->second.ptx;
+            return true;
+        }
+    }
+    CTxIndex txindex;
+    return CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && outpoint.n < txindex.vSpent.size() &&
+           !txindex.vSpent[outpoint.n].IsNull() && txOut.ReadFromDisk(txindex.vSpent[outpoint.n]);
+}
+
 // Spend a contract output: redeem with the secret, or refund after the lock.
 static json SpendContract(const CScript& contract, const swap::Contract& c, const uint256& txid,
                           const vector<unsigned char>* pSecret)
@@ -1843,21 +1860,60 @@ static json LoadV4Contracts()
     }
     catch (...)
     {
-        throw runtime_error(V4ContractsPath() + " is unreadable; it holds the scripts of your vaults and batches -- restore it from a backup");
+        throw runtime_error(V4ContractsPath() + " is unreadable; it holds the scripts of your vaults and batches -- restore it from a backup "
+                            "(the version before the last change is " + V4ContractsPath() + ".bak)");
     }
+}
+
+// Written whole to the side, flushed to the disk, then put in place in one
+// step: a full disk or a crash leaves the old file, never half of the new one
+// or none. The one before is kept as .bak.
+static void WriteFileAtomic(const string& path, const string& data)
+{
+    string tmp = path + ".new";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f)
+        throw runtime_error("could not write " + tmp);
+    bool fOk = fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (fflush(f))
+        fOk = false;
+#ifdef _WIN32
+    if (_commit(_fileno(f)))
+        fOk = false;
+#else
+    if (fsync(fileno(f)))
+        fOk = false;
+#endif
+    if (fclose(f))
+        fOk = false;
+    if (!fOk)
+    {
+        remove(tmp.c_str());
+        throw runtime_error("could not write " + tmp + " (disk full?)");
+    }
+#ifdef _WIN32
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+#else
+    if (rename(tmp.c_str(), path.c_str()))
+#endif
+        throw runtime_error("could not replace " + path);
 }
 
 static void SaveV4Contracts(const json& j)
 {
-    string tmp = V4ContractsPath() + ".new";
-    FILE* f = fopen(tmp.c_str(), "w");
-    if (!f)
-        throw runtime_error("could not write " + tmp);
-    string s = j.dump(2);
-    fwrite(s.data(), 1, s.size(), f);
-    fclose(f);
-    remove(V4ContractsPath().c_str());
-    rename(tmp.c_str(), V4ContractsPath().c_str());
+    string strOld;
+    FILE* f = fopen(V4ContractsPath().c_str(), "rb");
+    if (f)
+    {
+        char buf[4096];
+        size_t r;
+        while ((r = fread(buf, 1, sizeof(buf), f)) > 0)
+            strOld.append(buf, r);
+        fclose(f);
+    }
+    if (!strOld.empty())
+        WriteFileAtomic(V4ContractsPath() + ".bak", strOld);
+    WriteFileAtomic(V4ContractsPath(), j.dump(2));
 }
 
 // Before rules v4, OP_CHECKSEQUENCEVERIFY and OP_CHECKTEMPLATEVERIFY are
@@ -1886,6 +1942,28 @@ static void SetV4Contract(const string& strAddr, const json& rec)
         json all = LoadV4Contracts();
         all[strAddr] = rec;
         SaveV4Contracts(all);
+    }
+}
+
+// Before coins go into a new script: the file that will keep it reads and
+// writes now, so a broken one stops the call while the coins are still ours.
+static void CheckV4ContractsWritable()
+{
+    CRITICAL_BLOCK(cs_v4contracts)
+        SaveV4Contracts(LoadV4Contracts());
+}
+
+// After: the coins are in, so the record must reach the caller even if the
+// file cannot take it.
+static void KeepNewV4Contract(const string& strAddr, const json& rec, json& result)
+{
+    try
+    {
+        SetV4Contract(strAddr, rec);
+    }
+    catch (std::exception& e)
+    {
+        result["saveError"] = string(e.what()) + " -- the coins are locked already: keep this whole answer, it is the only copy of the script";
     }
 }
 
@@ -1968,6 +2046,7 @@ static json rpc_vaultcreate(const json& p)
     CScript vault = CtvScript(TemplateHashFor(vUnvault));
     string strVault = Hash160ToScriptAddress(Hash160(vault));
 
+    CheckV4ContractsWritable();
     CWalletTx wtx = FundScript(vault, nAmount);
     json rec;
     rec["type"] = "vault";
@@ -1982,9 +2061,9 @@ static json rpc_vaultcreate(const json& p)
     rec["amount"] = ValueFromAmount(nAmount);
     rec["unvaultAmount"] = ValueFromAmount(nAmount - nFee);
     rec["fundTxid"] = wtx.GetHash().GetHex();
-    SetV4Contract(strVault, rec);
 
     json j = rec;
+    KeepNewV4Contract(strVault, rec, j);
     j["vaultAddress"] = strVault;
     if (fRecoveryHere)
         j["warning"] = "the recovery key is in this same wallet; for a vault worth the name, give the address of a key kept somewhere else";
@@ -2006,6 +2085,18 @@ static json rpc_vaultunvault(const json& p)
         again["rebroadcast"] = true;
         return again;
     }
+    // Somebody else's unvault: nothing to send, the delay is already running.
+    if (FindUnvault(p[0].get<string>(), rec))
+    {
+        json done = json::object();
+        done["txid"] = rec["unvaultTxid"];
+        done["unvaultedElsewhere"] = true;
+        done["unvaultAddress"] = rec["unvaultAddress"];
+        done["withdrawFrom"] = strprintf("unvaulted by a transaction this wallet did not send; if that was not you, "
+                                         "vaultrecover now, before %u blocks pass after it confirms",
+                                         rec["delay"].get<unsigned int>());
+        return done;
+    }
     json out;
     out[rec["unvaultAddress"].get<string>()] = rec["unvaultAmount"];
     json r = rpc_spendscript(json::array({ rec["vaultRedeem"], rec["fundTxid"], json::array(), out,
@@ -2019,12 +2110,40 @@ static json rpc_vaultunvault(const json& p)
     return r;
 }
 
+// The unvault needs no key, so anybody can broadcast it -- a thief with the
+// hot key first of all. Whoever did, the vault's output was spent by it:
+// find that spend and keep its txid, so the recovery key can still act.
+static bool FindUnvault(const string& strVault, json& rec)
+{
+    if (rec.contains("unvaultTxid"))
+        return true;
+    CTransaction txFund, txSpend;
+    unsigned int nOut = 0;
+    vector<unsigned char> vchRedeem = ParseHex(rec["vaultRedeem"].get<string>());
+    FindContractOutput(CScript(vchRedeem.begin(), vchRedeem.end()), uint256(rec["fundTxid"].get<string>()), txFund, nOut);
+    if (!SpenderOf(COutPoint(txFund.GetHash(), nOut), txSpend))
+        return false;
+    // The template allows one spend only; check it all the same.
+    vector<unsigned char> vchUnvault = ParseHex(rec["unvaultRedeem"].get<string>());
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(CScript(vchUnvault.begin(), vchUnvault.end()));
+    bool fPays = false;
+    foreach(const CTxOut& txout, txSpend.vout)
+        if (txout.scriptPubKey == p2sh)
+            fPays = true;
+    if (!fPays)
+        throw runtime_error("the vault was spent by " + txSpend.GetHash().GetHex() + ", which does not pay its unvault script");
+    rec["unvaultTxid"] = txSpend.GetHash().GetHex();
+    SetV4Contract(strVault, rec);
+    return true;
+}
+
 // The unvault output to `to`, by the hot key (fHot: after the delay) or the
 // recovery key (at once).
 static json SpendUnvault(const string& strVault, const json& p, bool fHot)
 {
     json rec = V4Contract(strVault, "vault");
-    if (!rec.contains("unvaultTxid"))
+    if (!FindUnvault(strVault, rec))
         throw runtime_error("not unvaulted yet: vaultunvault first");
     if (p.size() < 2 || !p[1].is_string())
         throw runtime_error(fHot ? "vaultwithdraw <vault address> <to address> [fee=0.01]"
@@ -2083,6 +2202,7 @@ static json rpc_ctvbatch(const json& p)
         nTotal += o.nValue;
     CScript batch = CtvScript(TemplateHashFor(vout));
     string strBatch = Hash160ToScriptAddress(Hash160(batch));
+    CheckV4ContractsWritable();
     CWalletTx wtx = FundScript(batch, nTotal + nFee);
     json rec;
     rec["type"] = "batch";
@@ -2090,8 +2210,8 @@ static json rpc_ctvbatch(const json& p)
     rec["outputs"] = p[0];
     rec["fee"] = ValueFromAmount(nFee);
     rec["fundTxid"] = wtx.GetHash().GetHex();
-    SetV4Contract(strBatch, rec);
     json j = rec;
+    KeepNewV4Contract(strBatch, rec, j);
     j["batchAddress"] = strBatch;
     return j;
 }
@@ -2445,6 +2565,7 @@ static json rpc_inheritcreate(const json& p)
         vector<unsigned char> vchOwner = FreshWalletKey();
         CScript redeem = InheritScript(Hash160(vchOwner), hashHeir, nSequence);
         string strAddr = Hash160ToScriptAddress(Hash160(redeem));
+        CheckV4ContractsWritable();
         CWalletTx wtx = FundScript(redeem, nAmount);
         json rec;
         rec["type"] = "inheritance";
@@ -2458,9 +2579,9 @@ static json rpc_inheritcreate(const json& p)
         rec["renewFee"] = ValueFromAmount(nFee);
         rec["autoRenew"] = true;
         rec["fundTxid"] = wtx.GetHash().GetHex();
-        SetV4Contract(strAddr, rec);
 
         json j = rec;
+        KeepNewV4Contract(strAddr, rec, j);
         j["address"] = strAddr;
         j["heirPackage"] = InheritPackage(strAddr, rec);
         if (IsMineAddress(strHeir))
@@ -2639,6 +2760,9 @@ static void InheritanceTick()
             continue;
         try
         {
+            // cs_main first, as an RPC call holds it before inheritrenew takes
+            // cs_inherit: the other order deadlocks the node.
+            CRITICAL_BLOCK(cs_main)
             CRITICAL_BLOCK(cs_inherit)
             {
                 CTransaction tx;

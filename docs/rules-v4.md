@@ -20,8 +20,7 @@ not need an absolute deadline, congestion batching (one output that unfolds
 into many payments later), and oracle-signed contracts. None of them changes
 what a coin is or adds new money.
 
-Not in v4: SegWit and Taproot. The work they would take goes into the
-shielded pool instead (see the privacy roadmap). That choice shapes CTV below.
+Not in v4: SegWit and Taproot. That choice shapes CTV below.
 
 ## Switch
 
