@@ -481,7 +481,9 @@ inside it.
 Blocks count for what they cost. MultiShield eases for a chain that claims time
 has passed, and a private chain of 160 blocks can hold the work of about 40. So
 the light client reports a contract's confirmations by the work over it, in steps
-of the 240 blocks before it, and never more than the blocks there are. The last
+of the 240 blocks before it, and never more than the blocks there are. Those 240
+come from the same peers, so a step is never taken under a quarter of one block
+at the anchor: two lying peers cannot make cheap blocks count as an hour. The last
 two blocks are read a round later: a tip every 15 seconds would otherwise keep
 asking a peer for a block it has not got.
 
