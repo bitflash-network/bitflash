@@ -2070,6 +2070,8 @@ static json rpc_vaultcreate(const json& p)
     return j;
 }
 
+static bool FindUnvault(const string& strVault, json& rec);
+
 // vaultunvault <vault address>: the one way out, fixed in advance; no key.
 static json rpc_vaultunvault(const json& p)
 {
