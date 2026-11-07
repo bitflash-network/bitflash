@@ -298,6 +298,14 @@ def load_explorer_module():
     return mod
 
 
+def run_explorer_scripts():
+    mod = load_explorer_module()
+    p2sh = mod.spk_info("a914" + "11" * 20 + "87")
+    assert_true(p2sh["type"] == "p2sh" and p2sh["address"][0] in "CD", "a script address: " + str(p2sh))
+    assert_true(mod.spk_info("6a0401020304") == {"type": "data"}, "an OP_RETURN output")
+    assert_true(mod.spk_info("51")["type"] == "other", "an unknown script")
+
+
 def run_testnet_explorer():
     """The test chain's own genesis, read by the same tools, under its own name."""
     saved = dict(vars(chain))
@@ -374,6 +382,7 @@ def main():
     run_genesis_smoke()
     run_hashrate_estimate()
     run_testnet_explorer()
+    run_explorer_scripts()
     run_golden_fixture(update)
     print("Bitflash script tool regressions passed")
     return 0

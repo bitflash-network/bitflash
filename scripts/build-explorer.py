@@ -13,11 +13,12 @@ import bitflash_chain as chain
 
 
 ADDRESS_VERSION = 25
+SCRIPT_ADDRESS_VERSION = 28
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def b58check(payload):
-    v = bytes([ADDRESS_VERSION]) + payload
+def b58check(payload, version=ADDRESS_VERSION):
+    v = bytes([version]) + payload
     v += chain.sha256d(v)[:4]
     n = int.from_bytes(v, "big")
     s = ""
@@ -54,6 +55,11 @@ def spk_info(script_hex):
         and spk[2] == 0x14 and spk[23] == 0x88 and spk[24] == 0xAC
     ):
         return {"type": "p2pkh", "address": b58check(spk[3:23])}
+    # A swap's contract, on this chain, is one of these.
+    if len(spk) == 23 and spk[0] == 0xA9 and spk[1] == 0x14 and spk[22] == 0x87:
+        return {"type": "p2sh", "address": b58check(spk[2:22], SCRIPT_ADDRESS_VERSION)}
+    if spk[:1] == b"\x6a":
+        return {"type": "data"}
     if len(spk) >= 35 and spk[-1] == 0xAC:
         if spk[0] == 0x41 and len(spk) == 67:
             pk = spk[1:66]
