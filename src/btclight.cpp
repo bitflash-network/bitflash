@@ -117,18 +117,23 @@ Integer DgbWorkFloor(const Net& net, const Headers& headers, int64 now)
 }
 // A count of blocks says nothing of what they cost. A private chain that claims
 // time has passed eases as it grows: 160 blocks can hold the work of 40. So on
-// DigiByte the blocks over a contract count by their work, in the steps of the
-// blocks before it.
+// the chains that ease from one block to the next, the blocks over a contract
+// count by their work, in the steps of the blocks before it. Not on a test
+// network, where any block twenty minutes late may cost nothing at all.
+bool CountsByWork(const Net& net)
+{
+    return (net.multiAlgo || net.kawpow || net.digishield || net.asertHeight) && !net.regtest && !net.minDifficulty;
+}
 int WorkConfirmations(const Integer& workSince, const Integer& step, int counted)
 {
     if (step <= 0) return counted;
     Integer steps = workSince/step+1;
     return steps < counted ? steps.convert_to<int>() : counted;
 }
-static int DgbConfirmations(const Net& net, const Headers& headers, int funded)
+static int ConfirmationsByWork(const Net& net, const Headers& headers, int funded)
 {
     const int counted = headers.Tip().height-funded+1;
-    if (net.regtest || net.anchor.empty() || funded <= net.anchorHeight || headers.ActiveHeight(headers.At(funded).hash) < 0) return counted;
+    if (net.anchor.empty() || funded <= net.anchorHeight || headers.ActiveHeight(headers.At(funded).hash) < 0) return counted;
     const int from = std::max(net.anchorHeight, funded-240);
     const Integer step = (headers.At(funded).work-headers.At(from).work)/(funded-from);
     return WorkConfirmations(headers.Tip().work-headers.At(funded).work, step, counted);
@@ -1783,7 +1788,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     json j = {{"contractTxid",txid.GetHex()},{"vout",output},{"unspent",false},{"confirmations",0},{"amount",nullptr},{"spent",false},{"found",false}};
     if (funding == txs.end() || output < 0) return j;
     if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
-    j["confirmations"] = s.net.multiAlgo || s.net.kawpow ? DgbConfirmations(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
+    j["confirmations"] = CountsByWork(s.net) ? ConfirmationsByWork(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
     j["unspent"] = true;
     j["amount"] = (double)funding->second.tx.vout[output].nValue/CoinUnit(s.net.coin);
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
@@ -1965,6 +1970,7 @@ int SelfTestCash()
     printf("cash-light self-test\n");
     const Net* bch = FindNet("bch","main"); const Net* bchTest = FindNet("bch","test4"); const Net* bchReg = FindNet("bch","regtest");
     const Net* xec = FindNet("xec","main"); const Net* xecTest = FindNet("xec","test"); const Net* xecReg = FindNet("xec","regtest");
+    check(CountsByWork(*bch) && CountsByWork(*xec) && !CountsByWork(*bchTest) && !CountsByWork(*xecTest),"ASERT counts by work, on the main networks");
     check(bch && bchTest && bchReg && xec && xecTest && xecReg,"Bitcoin Cash and eCash networks");
     if (!bch || !bchTest || !bchReg || !xec || !xecTest || !xecReg) { printf("cash-light: %d failure(s)\n",failures+1); return 1; }
     // Genesis fields of the two nodes (chainparams.cpp asserts these hashes).
@@ -2144,6 +2150,7 @@ int SelfTestDigiByte()
         check(DgbWorkFloor(*mainNet,h,(int64)a.time+10) == a.work,"no floor at the anchor");
         check(DgbWorkFloor(*mainNet,h,month) == a.work+(a.work-b.work)*(30*86400/15)/16,"a month on");
     }
+    check(CountsByWork(*mainNet) && CountsByWork(*testNet) && !CountsByWork(*regNet),"DigiByte counts by work, but on regtest");
     check(WorkConfirmations(Integer(1000),Integer(10),160) == 101 && WorkConfirmations(Integer(10000),Integer(10),160) == 160,"blocks count for their work, at most for themselves");
     check(WorkConfirmations(Integer(400),Integer(10),160) == 41,"160 blocks with the work of 40");
     check(mainNet->maxHeaders == 20000 && mainNet->scanBatch == 200,"a peer's 20000 headers, 200 blocks at a time");
@@ -2231,6 +2238,8 @@ int SelfTestDogecoin()
     printf("doge-light self-test\n");
     const Net* mainNet = FindNet("doge","main"); const Net* testNet = FindNet("doge","test"); const Net* regNet = FindNet("doge","regtest");
     check(mainNet && testNet && regNet,"Dogecoin networks: main, test, regtest");
+    check(CountsByWork(*mainNet) && !CountsByWork(*testNet) && !CountsByWork(*regNet),"DigiShield counts by work, on the main network");
+    check(!CountsByWork(*FindNet("btc","main")) && !CountsByWork(*FindNet("ltc","main")),"a two-week retarget does not ease, and counts blocks");
     if (!mainNet || !testNet || !regNet) { printf("doge-light: %d failure(s)\n",failures+1); return 1; }
     // dogecoin v1.14.9's chainparams.cpp asserts these hashes.
     check(Decode(mainNet->genesis).hash.GetHex() == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691","main genesis hash");
