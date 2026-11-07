@@ -27,11 +27,10 @@ shielded pool instead (see the privacy roadmap). That choice shapes CTV below.
 
 | network | block time | UTC |
 |---|---|---|
-| testnet | `1798200000` | 2026-12-25 12:00:00 (at the latest; earlier if ready) |
-| mainnet | `0` (never) | to be fixed, planned for May 2027 |
+| testnet | `1795176000` | 2026-11-20 12:00:00 |
+| mainnet | `1798200000` | 2026-12-25 12:00:00 |
 
-`RULES_V4_TIME_MAINNET = 0` means "never" in the code until the date is
-decided. As with rules v2 and v3, every rule is checked against the time of
+As with rules v2 and v3, every rule is checked against the time of
 the block being connected (median time past for lock times), and everything on
 either chain before the switch keeps its validity.
 
