@@ -2,7 +2,8 @@ Bitflash for macOS (Apple silicon: M1 and later)
 ================================================
 
 Terminal only, no app to install. Everything it needs is in this folder:
-the Bitflash node, btfchat, Tor, and the libraries they use.
+the Bitflash node, btfchat, Tor, and the libraries they use. It needs
+macOS 15 (Sequoia) or newer.
 
 Once, after unpacking
 ---------------------
