@@ -30,6 +30,7 @@
 #include "btfchatwallet.h"
 #include "chatdir.h"
 #include "community.h"
+#include "explorer.h"
 #include "jsonrpc.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
@@ -222,6 +223,142 @@ static bool Check(bool condition, const char* message)
     }
     printf("  FAIL %s\n", message);
     return false;
+}
+
+// A fresh chain, which is the genesis block alone, and a transaction waiting.
+// With EXPLORER_DATADIR it reads that node's files instead and prints what it
+// finds for each of EXPLORER_QUERIES, for comparing with a real chain.
+static int RunExplorerSelfTest()
+{
+    printf("explorer self-test\n");
+    int nFail = 0;
+    const char* pszDataDir = getenv("EXPLORER_DATADIR");
+    std::string tmp;
+    if (pszDataDir)
+        strSetDataDir = pszDataDir;
+    else
+    {
+        if (!MakeTempDir(tmp))
+        {
+            printf("  FAIL could not create a temporary data directory\n");
+            return 1;
+        }
+        strSetDataDir = tmp;
+    }
+    try
+    {
+        if (!LoadBlockIndex())
+            throw std::runtime_error("LoadBlockIndex failed");
+        const char* pszQueries = getenv("EXPLORER_QUERIES");
+        if (pszDataDir)
+        {
+            std::stringstream queries(pszQueries ? pszQueries : "");
+            std::string query;
+            while (queries >> query)
+            {
+                uint256 hash;
+                explorer::Result result = explorer::Find(query, hash);
+                if (result == explorer::IS_BLOCK)
+                {
+                    explorer::BlockView view;
+                    nFail += explorer::ReadBlock(hash, view) == explorer::FOUND ? 0 : 1;
+                    printf("block %d %s txs=%d size=%u main=%d\n", view.height, view.hash.GetHex().c_str(),
+                           (int)view.txs.size(), view.nSize, (int)view.fMainChain);
+                }
+                else if (result == explorer::IS_TX)
+                {
+                    explorer::TxView view;
+                    nFail += explorer::ReadTx(hash, view) == explorer::FOUND ? 0 : 1;
+                    printf("tx %s height=%d size=%u fee=%s\n", view.txid.GetHex().c_str(), view.height, view.nSize,
+                           view.fFeeKnown ? explorer::Money(view.fee).c_str() : "?");
+                    for (size_t i = 0; i < view.in.size(); i++)
+                        printf("  in %s:%u %s %s\n", view.in[i].prev.GetHex().c_str(), view.in[i].n,
+                               explorer::Money(view.in[i].value).c_str(), view.in[i].from.c_str());
+                    for (size_t i = 0; i < view.out.size(); i++)
+                        printf("  out %s %s spentby=%s\n", explorer::Money(view.out[i].value).c_str(),
+                               view.out[i].to.c_str(), view.out[i].spentBy.GetHex().c_str());
+                }
+                else
+                {
+                    printf("  FAIL nothing found for %s\n", query.c_str());
+                    nFail++;
+                }
+            }
+            return nFail ? 1 : 0;
+        }
+
+        uint256 genesis = hashGenesisBlock;
+        uint256 hash;
+        nFail += Check(explorer::Find(" 0 ", hash) == explorer::IS_BLOCK && hash == genesis, "a height names its block") ? 0 : 1;
+        nFail += Check(explorer::Find(genesis.GetHex(), hash) == explorer::IS_BLOCK, "a block hash names its block") ? 0 : 1;
+        nFail += Check(explorer::Find("1", hash) == explorer::NOT_FOUND, "a height past the tip is not found") ? 0 : 1;
+        nFail += Check(explorer::Find("xyz", hash) == explorer::BAD_QUERY, "a word is not a query") ? 0 : 1;
+        nFail += Check(explorer::Find("", hash) == explorer::BAD_QUERY, "nor is nothing") ? 0 : 1;
+        nFail += Check(explorer::Find(std::string(64, 'a'), hash) == explorer::NOT_FOUND, "an unknown hash is not found") ? 0 : 1;
+
+        explorer::BlockView block;
+        nFail += Check(explorer::ReadBlock(genesis, block) == explorer::FOUND, "the genesis block reads") ? 0 : 1;
+        nFail += Check(block.height == 0 && block.fMainChain && block.next == uint256(0) && block.txs.size() == 1 &&
+                       block.txs[0].fCoinBase && block.txs[0].value == 50 * COIN, "and says what it is") ? 0 : 1;
+        explorer::BlockView none;
+        nFail += Check(explorer::ReadBlock(uint256(7), none) == explorer::NOT_FOUND, "an unknown block does not") ? 0 : 1;
+
+        std::vector<explorer::BlockRow> rows;
+        int nTip = -1;
+        nFail += Check(explorer::Recent(-1, 25, rows, nTip) == explorer::FOUND && rows.size() == 1 && nTip == 0 &&
+                       rows[0].hash == genesis && rows[0].reward == 50 * COIN && !rows[0].to.empty(),
+                       "the list starts at the tip") ? 0 : 1;
+
+        nFail += Check(explorer::Find(block.txs[0].txid.GetHex(), hash) == explorer::IS_TX, "a txid names its transaction") ? 0 : 1;
+        explorer::TxView coinbase;
+        nFail += Check(explorer::ReadTx(block.txs[0].txid, coinbase) == explorer::FOUND && coinbase.fInChain &&
+                       coinbase.fCoinBase && coinbase.in.empty() && !coinbase.fFeeKnown && coinbase.height == 0 &&
+                       coinbase.nConfirmations == 1 && coinbase.block == genesis && coinbase.out.size() == 1 &&
+                       coinbase.out[0].spentBy == uint256(0), "a coinbase reads, unspent") ? 0 : 1;
+
+        // Waiting: spends what no node has, so its value and its fee stay unknown.
+        CTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(uint256(9), 0);
+        tx.vout.resize(1);
+        tx.vout[0].nValue = COIN;
+        CScript p2sh;
+        p2sh << OP_HASH160 << uint160(3) << OP_EQUAL;
+        tx.vout[0].scriptPubKey = p2sh;
+        uint256 txid = tx.GetHash();
+        CRITICAL_BLOCK(cs_mapTransactions)
+            mapTransactions[txid] = tx;
+        explorer::TxView waiting;
+        nFail += Check(explorer::Find(txid.GetHex(), hash) == explorer::IS_TX, "a waiting transaction is found") ? 0 : 1;
+        nFail += Check(explorer::ReadTx(txid, waiting) == explorer::FOUND && !waiting.fInChain && !waiting.fFeeKnown &&
+                       waiting.in.size() == 1 && !waiting.in[0].fKnown, "and reads, its fee unknown") ? 0 : 1;
+        uint160 three(3);
+        nFail += Check(waiting.out[0].to == Hash160ToScriptAddress(three), "a script address is an address") ? 0 : 1;
+        CRITICAL_BLOCK(cs_mapTransactions)
+            mapTransactions.erase(txid);
+
+        nFail += Check(explorer::Money(23966227) == "0.23966227" && explorer::Money(3 * COIN) == "3.00" &&
+                       explorer::Money(-COIN / 2) == "-0.50" && explorer::Money(1) == "0.00000001", "amounts keep every digit") ? 0 : 1;
+
+        CScript data;
+        data << OP_RETURN << 1;
+        nFail += Check(explorer::DescribeScript(data) == "data", "an OP_RETURN is data") ? 0 : 1;
+        CScript unknown;
+        unknown << OP_1;
+        nFail += Check(explorer::DescribeScript(unknown) == "script", "the rest is a script") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL %s\n", e.what());
+        nFail++;
+    }
+    if (!tmp.empty())
+    {
+        DBFlush(true);
+        RemoveTree(tmp);
+    }
+    printf("explorer: %d failure(s)\n", nFail);
+    return nFail ? 1 : 0;
 }
 
 static int RunWalletKeyPoolSelfTest()
@@ -8715,6 +8852,8 @@ int RunSelfTest(const std::string& name)
         return btclight::SelfTestDigiByte();
     if (name == "rvn-chain")
         return btclight::SelfTestRavencoin();
+    if (name == "explorer")
+        return RunExplorerSelfTest();
     if (name == "btc-swap")
         return RunBtcSwapSelfTest();
     if (name == "chat-swap")

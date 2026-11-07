@@ -193,7 +193,7 @@ static void PrintUsage()
     // reading the source. Kept in step now; a suite that cannot be discovered is
     // a suite that stops being run.
     printf("            wallet-sqlite-encrypt, wallet-backend-default, wallet-convert,\n");
-    printf("            managed-tor, treasury, chat-link, chat-identity, chat-relay,\n");
+    printf("            managed-tor, treasury, explorer, chat-link, chat-identity, chat-relay,\n");
     printf("            or chat-live (needs Tor and the network; not run by `make tests`)\n");
     printf("\n");
     printf("Mining mode:\n");
