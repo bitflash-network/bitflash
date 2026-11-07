@@ -6339,18 +6339,21 @@ static int RunRulesV4SelfTest()
     // ---- the switch
     bool fWasTestNet = IsTestNet();
     SelectNetworkParams(false);
-    nFail += Check(RulesV4Time() == 0 && !RulesV4Active(0xffffffffU),
-                   "mainnet: rules v4 are never on until a date is set") ? 0 : 1;
-    SelectNetworkParams(true);
     nFail += Check(RulesV4Time() == 1798200000 && !RulesV4Active(1798200000 - 1) &&
                    RulesV4Active(1798200000),
-                   "testnet: rules v4 from 2026-12-25 12:00 UTC, not a second before") ? 0 : 1;
+                   "mainnet: rules v4 from 2026-12-25 12:00 UTC, not a second before") ? 0 : 1;
+    nFail += Check(RulesV4Time() >= RulesV3Time() && RulesV4Time() >= SwapsOpenTimeFor(false),
+                   "after rules v3, and not ahead of the swaps") ? 0 : 1;
+    SelectNetworkParams(true);
+    nFail += Check(RulesV4Time() == 1795176000 && !RulesV4Active(1795176000 - 1) &&
+                   RulesV4Active(1795176000),
+                   "testnet: rules v4 from 2026-11-20 12:00 UTC, not a second before") ? 0 : 1;
     nFail += Check(RulesV4Time() >= RulesV3Time(), "and never ahead of rules v3") ? 0 : 1;
     nBenchRulesV4Time = 1792500000;
     nFail += Check(RulesV4Time() == 1792500000 && RulesV4Active(1792500000),
                    "an isolated testnet bench can move the switch (-benchrulesv4)") ? 0 : 1;
     SelectNetworkParams(false);
-    nFail += Check(RulesV4Time() == 0 && !RulesV4Active(0xffffffffU),
+    nFail += Check(RulesV4Time() == 1798200000 && !RulesV4Active(1792500000),
                    "and that never reaches mainnet") ? 0 : 1;
     nBenchRulesV4Time = 0;
     SelectNetworkParams(fWasTestNet);

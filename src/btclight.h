@@ -121,6 +121,7 @@ unsigned int LitecoinRetarget(unsigned int bits, int64 elapsed, unsigned int lim
 unsigned int DigiShield(unsigned int bits, int64 elapsed, unsigned int limit);
 bool CheckAuxPow(const btcswap::AuxPow& aux, const uint256& block, int chainId, bool strict, std::string& err);
 Integer AnchorWorkFloor(const Net& net, const Header& anchor, int64 now);
+bool CountsByWork(const Net& net);
 bool RefusesTx(const Bytes& reject);
 unsigned int Asert(unsigned int anchorBits, int64 timeDiff, int64 heightDiff, int64 spacing, int64 halfLife, unsigned int limit);
 Bytes EncodeFilter(const uint256& block, const std::vector<Bytes>& scripts);
