@@ -24,6 +24,17 @@ GENESIS_NONCE = 3141
 GENESIS_TEXT = "Bitflash 24/Jul/2026 Fair launch: one CPU one vote, no premine"
 
 
+def use_testnet():
+    """Have this module read the public test chain instead of the main one."""
+    global MAGIC, GENESIS_HASH, GENESIS_MERKLE, GENESIS_TIME, GENESIS_NONCE, GENESIS_TEXT
+    MAGIC = bytes([0xCE, 0xE2, 0xC0, 0xFF])
+    GENESIS_HASH = "a9d11c6d697bcb7aea0653bc088b12dcf9f44e732df205162cf085fd9d9963eb"
+    GENESIS_MERKLE = "510b293105e3ff85b8d4c3920e357f85d1a86bf199eb4e7d11f04f380030ec5c"
+    GENESIS_TIME = 1_787_184_000
+    GENESIS_NONCE = 3199
+    GENESIS_TEXT = "Bitflash testnet 20/Aug/2026: resettable public test chain"
+
+
 class ParseError(Exception):
     pass
 

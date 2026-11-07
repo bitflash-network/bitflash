@@ -281,6 +281,9 @@ def run_golden_fixture(update):
         # the chunking landed, and had been failing ever since.
         chunk = json.loads((explorer_dir / "block" / "0.json").read_text(encoding="ascii"))
         assert_true("1" in chunk, "explorer chunk is missing height 1")
+        spend = chunk["1"]["txs"][1]["txid"]
+        heights = json.loads((explorer_dir / "tx" / (spend[:2] + ".json")).read_text(encoding="ascii"))
+        assert_true(heights[spend] == 1, "the explorer's txid index does not find a transaction")
         assert_true(len(chunk["1"]["txs"]) == 2,
                     "explorer fixture block did not include the normal transaction")
 
@@ -293,6 +296,38 @@ def load_explorer_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def run_explorer_scripts():
+    mod = load_explorer_module()
+    p2sh = mod.spk_info("a914" + "11" * 20 + "87")
+    assert_true(p2sh["type"] == "p2sh" and p2sh["address"][0] in "CD", "a script address: " + str(p2sh))
+    assert_true(mod.spk_info("6a0401020304") == {"type": "data"}, "an OP_RETURN output")
+    assert_true(mod.spk_info("51")["type"] == "other", "an unknown script")
+
+
+def run_testnet_explorer():
+    """The test chain's own genesis, read by the same tools, under its own name."""
+    saved = dict(vars(chain))
+    try:
+        chain.use_testnet()
+        genesis = chain.reconstructed_genesis()
+        assert_true(genesis["hash"] == chain.GENESIS_HASH, "testnet genesis hash")
+        assert_true(genesis["merkle_root"] == chain.GENESIS_MERKLE, "testnet genesis merkle root")
+        with tempfile.TemporaryDirectory() as td:
+            blk = Path(td) / "blk0001.dat"
+            write_block_file(blk, [genesis])
+            out = Path(td) / "explorer"
+            run([SCRIPTS / "build-explorer.py", "--testnet", blk, out])
+            blocks = json.loads((out / "blocks.json").read_text(encoding="ascii"))
+            assert_true(blocks["network"] == "bitflash-testnet" and blocks["count"] == 1,
+                        "the explorer did not read the test chain")
+            assert_true("tBTF has no value" in (out / "index.html").read_text(encoding="utf-8"),
+                        "the testnet explorer does not say what chain it shows")
+            assert_true('" tBTF"' in (out / "explorer.js").read_text(encoding="utf-8"),
+                        "the testnet explorer counts in BTF")
+    finally:
+        vars(chain).update(saved)
 
 
 def run_hashrate_estimate():
@@ -346,6 +381,8 @@ def main():
     update = "--update-goldens" in sys.argv[1:]
     run_genesis_smoke()
     run_hashrate_estimate()
+    run_testnet_explorer()
+    run_explorer_scripts()
     run_golden_fixture(update)
     print("Bitflash script tool regressions passed")
     return 0
