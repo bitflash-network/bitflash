@@ -56,8 +56,11 @@ linux-node: deps-linux
 
 deps-linux: deps-apt deps-secp256k1 deps-randomx
 
+# The package list goes stale on a long-lived image: a version it names can
+# be gone from the mirror, and the install then stops on a 404.
 deps-apt:
 	@if command -v apt-get >/dev/null 2>&1; then \
+	  $(SUDO) apt-get update && \
 	  $(SUDO) apt-get install -y build-essential cmake git pkg-config autoconf \
 	    libtool libssl-dev libdb5.3++-dev libsodium-dev nlohmann-json3-dev \
 	    libboost-system-dev libglfw3-dev libgl-dev libsqlite3-dev \
