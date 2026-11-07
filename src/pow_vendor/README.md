@@ -8,7 +8,9 @@ Pinned source archives (no build-time downloads):
   `7864c39c2bbc85eadcc36cdf5b789d5f551ede7d`.
 
 `UPSTREAM.json` records every upstream path, local path and SHA256. The 40 source
-and header copies occupy about 440 KiB. The original C files retain `.c` and
+and header copies for DigiByte and KAWPOW occupy about 440 KiB. `x16/` holds 26
+more, byte for byte Ravencoin v4.6.1's `src/algo/` (sphlib, `LICENSE.sphlib`),
+for X16R/X16RV2, which only a Ravencoin regtest reaches. The original C files retain `.c` and
 compile as C99. DigiByte's `aes_helper.cpp` is included by its hash sources;
 it is not a separate translation unit. Ravencoin's `managed.cpp` (global locking
 cache) is deliberately omitted. The wrappers use a bounded two-entry memo.
