@@ -122,7 +122,7 @@ jobs:
     # Terminal only, no .app: the headless node (wallet, solo mining, the
     # chat's wallet) and btfchat, with Tor and the libraries they use inside
     # the folder. Built and tried on GitHub's Apple silicon machines.
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
       TOR_VERSION: 15.0.19
@@ -182,6 +182,10 @@ jobs:
           echo "--- what the binaries load (nothing from Homebrew may remain):"
           otool -L $D/bitflash-node $D/btfchat | grep -v ":$"
           ! otool -L $D/bitflash-node $D/btfchat | grep -q /opt/homebrew
+          echo "--- the oldest macOS each file runs on (README-macOS.txt names it):"
+          for f in $D/bitflash-node $D/btfchat $D/lib/*.dylib; do
+            echo "$(otool -l "$f" | awk '/minos/ {print $2; exit}') $(basename "$f")"
+          done
           python3 scripts/reproducible-archive.py tar.gz $D.tar.gz $D
           echo "D=$D" >> $GITHUB_ENV
       - name: The folder works without Homebrew
@@ -242,7 +246,7 @@ jobs:
 
   macos-miner:
     name: Bitflash Miner for macOS (Apple silicon)
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       XMRIG_MAC_SHA256: 6ae4eb4216e99a201ae9a3d2c3a7c275207c5165cfc25da1f3d735d6c4829c18
       XMRIG_LICENSE_SHA256: 589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2
