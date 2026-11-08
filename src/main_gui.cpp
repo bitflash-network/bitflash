@@ -601,22 +601,6 @@ static void ParseStartupArguments(int argc, char* argv[])
             StartupRefuse("could not read -rpcpassword file: " + strErr, "");
         strRpcPassword = strFromFile;
     }
-    // The onion publishes the P2P port and the one above it (the pool's,
-    // tor.cpp), each forwarded to the same port on 127.0.0.1. An RPC server
-    // bound to either is reachable by anybody over Tor; a bench ran so with
-    // -port=18491 -rpcport=18492 before anyone noticed.
-    {
-        string strRpcPort = argval2(argc, argv, "/rpcport", "-rpcport");
-        int nP2P = (int)ntohs(nListenPort);
-        // Unset is the default port, which a -port next to it publishes too
-        // (-port=8431 puts 8432 on the onion).
-        int nRpc = strRpcPort.empty() ? (IsTestNet() ? 18432 : 8432) : atoi(strRpcPort.c_str());
-        if (nRpc == nP2P || nRpc == nP2P + 1)
-            StartupRefuse(strprintf("%s %d is a port this node publishes on its onion",
-                                    strRpcPort.empty() ? "the default RPC port" : "-rpcport", nRpc),
-                          strprintf("Ports %d and %d are reachable by anybody over Tor; pick another for the RPC server.",
-                                    nP2P, nP2P + 1));
-    }
     fJsonRpc = JsonRpcConfigure(argval2(argc, argv, "/rpcuser", "-rpcuser"),
                                 strRpcPassword,
                                 argval2(argc, argv, "/rpcport", "-rpcport"));
@@ -630,6 +614,26 @@ static void ParseStartupArguments(int argc, char* argv[])
         if (fJsonRpc)
             fprintf(stderr, "-chatwallet: btfchat on this machine can use this wallet (cookie in the data directory)\n");
     }
+#endif
+    // The onion publishes the P2P port and the one above it (the pool's,
+    // tor.cpp), each forwarded to the same port on 127.0.0.1. An RPC server
+    // bound to either is reachable by anybody over Tor; a bench ran so with
+    // -port=18491 -rpcport=18492 before anyone noticed. Checked only when
+    // there is an RPC server to start (it starts further down).
+    if (fJsonRpc)
+    {
+        string strRpcPort = argval2(argc, argv, "/rpcport", "-rpcport");
+        int nP2P = (int)ntohs(nListenPort);
+        // Unset is the default port, which a -port next to it publishes too
+        // (-port=8431 puts 8432 on the onion).
+        int nRpc = strRpcPort.empty() ? (IsTestNet() ? 18432 : 8432) : atoi(strRpcPort.c_str());
+        if (nRpc == nP2P || nRpc == nP2P + 1)
+            StartupRefuse(strprintf("%s %d is a port this node publishes on its onion",
+                                    strRpcPort.empty() ? "the default RPC port" : "-rpcport", nRpc),
+                          strprintf("Ports %d and %d are reachable by anybody over Tor; pick another for the RPC server.",
+                                    nP2P, nP2P + 1));
+    }
+#ifndef BITFLASH_CHAT_APP
     // The Bitcoin half of a swap: where this machine's Bitcoin Core is. Read
     // only when a btc* call is made; nothing connects to Core before that.
     btcswap::Configure(argval2(argc, argv, "/btcchain", "-btcchain"),
