@@ -3447,8 +3447,19 @@ bool ProcessMessages(CNode* pfrom)
         try
         {
             CheckForShutdown(2);
-            CRITICAL_BLOCK(cs_main)
-                fRet = ProcessMessage(pfrom, strCommand, vMsg);
+            // The share chain's messages read no chain state, and a history
+            // costs a RandomX hash a share: under cs_main, a few thousand of
+            // them held up blocks, RPC and mining for minutes. They take
+            // cs_p2pool alone. Before the version, ProcessMessage refuses them.
+            bool fDone = false;
+            if (strCommand.compare(0, 3, "p2p") == 0 && pfrom->nVersion != 0)
+            {
+                CDataStream vCopy(vMsg);
+                fDone = fRet = P2PoolProcessMessage(pfrom, strCommand, vCopy);
+            }
+            if (!fDone)
+                CRITICAL_BLOCK(cs_main)
+                    fRet = ProcessMessage(pfrom, strCommand, vMsg);
             CheckForShutdown(2);
         }
         CATCH_PRINT_EXCEPTION("ProcessMessage()")

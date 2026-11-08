@@ -179,7 +179,10 @@ int SwapEngine::MinConfirmations(const std::string& coin) const
     // five algorithms include SHA-256 and scrypt, as rentable: 40 min, at 15 s.
     // KAWPOW's hash rate can be rented too, and honest nodes and this wallet's
     // light client stay on their tip against a fork 60 blocks deep: 60, an hour.
-    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "RVN" ? 60 : coin == "BCH" ? 4 : coin == "XEC" ? 6 : 2;
+    // Bitflash runs RandomX, which anyone can rent by the hour, on a chain far
+    // smaller than any of these: 30 of its two-minute blocks, an hour too.
+    return coin == "LTC" ? 8 : coin == "DOGE" ? 20 : coin == "DGB" ? 160 : coin == "RVN" ? 60 : coin == "BCH" ? 4 : coin == "XEC" ? 6 :
+           coin == "BTF" ? 30 : 2;
 }
 
 bool SwapEngine::Wallet(const char* method, const json& params, json& r, std::string& err)
@@ -487,8 +490,30 @@ void SwapEngine::TryRefund(ChatSwap& s)
     std::string secret, err2;
     if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err2) && fSpent)
     {
-        s.stage = fRefunded ? SW_REFUNDED : SW_DONE;
-        s.status = fRefunded ? "refunded" : "they took ours with the secret";
+        if (fRefunded)
+        {
+            s.stage = SW_REFUNDED;
+            s.status = "refunded";
+        }
+        else if (!secret.empty() && !s.fMaker)
+        {
+            // The maker took ours at the last moment: the secret is ours too.
+            s.secret = secret;
+            s.stage = SW_REDEEMING;
+            s.status = "they took ours; taking theirs with the secret";
+        }
+        else if (!secret.empty())
+        {
+            s.stage = SW_DONE;
+            s.status = "they took ours with the secret";
+        }
+        else
+        {
+            // Spent where the node cannot read it yet: a memory pool its RPC
+            // does not search (only Bitcoin Core 25 and later do). Never over
+            // until the spend is in a block and says which it was.
+            s.status = "ours was spent; waiting for a block to show the secret";
+        }
         return;
     }
     s.lastError = err;
@@ -747,7 +772,8 @@ void SwapEngine::Tick(ChatSwap& s)
             // a redeem that sits is sent again with twice the fee.
             bool fSpent = false, fRefunded = false;
             std::string secret, e2;
-            if (FindSecret(s.want, s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), fSpent, secret, fRefunded, e2) && fSpent)
+            if (FindSecret(s.want, s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), fSpent, secret, fRefunded, e2) && fSpent &&
+                (fRefunded || !secret.empty()))
             {
                 s.redeemSince = 0;
                 s.stage = fRefunded ? SW_FAILED : SW_DONE;
@@ -762,7 +788,10 @@ void SwapEngine::Tick(ChatSwap& s)
                 s.status = "redeemed; waiting for " + CoinName(s.want) + " to confirm it";
                 return;
             }
-            int64_t nRate = std::min<int64_t>(std::max<int64_t>(s.redeemFeeRate, 1000) * 2, 1000000);
+            // Dogecoin's and Ravencoin's floor is COIN/100 a kvB already: their
+            // ceiling is the one the wallet's spends allow, a whole coin.
+            int64_t nMaxRate = s.want == "DOGE" || s.want == "DGB" || s.want == "RVN" ? COIN : 1000000;
+            int64_t nRate = std::min<int64_t>(std::max<int64_t>(s.redeemFeeRate, 1000) * 2, nMaxRate);
             json r;
             json bumpParams = json::array({s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), s.secret,
                                            s.btcDestination, AmountText(s.want, nRate)});
@@ -837,7 +866,10 @@ void SwapEngine::Tick(ChatSwap& s)
         // Already ours from an earlier round, or gone?
         bool fSpent = false, fRefunded = false;
         std::string secret, e2;
-        if (FindSecret(s.want, s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), fSpent, secret, fRefunded, e2) && fSpent)
+        // Spent with the secret is our redeem; spent with neither the secret
+        // nor a refund to show is a spend not yet in a block: wait for it.
+        if (FindSecret(s.want, s.theirContract, Ref(s.want, s.theirTxid, s.theirVout), fSpent, secret, fRefunded, e2) && fSpent &&
+            (fRefunded || !secret.empty()))
         {
             s.stage = fRefunded ? SW_FAILED : SW_DONE;
             s.status = fRefunded ? "they refunded theirs before we could take it" : "done";

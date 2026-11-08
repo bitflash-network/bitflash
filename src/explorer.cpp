@@ -7,7 +7,8 @@
 namespace explorer {
 
 // A transaction can have thousands of inputs and each is a read under cs_main.
-// Past this many the fee goes unknown instead of the window going grey.
+// Past this many the fee goes unknown instead of the window going grey; the
+// same for outputs, whose spends past it are not looked up.
 static const size_t MAX_INPUTS_READ = 1000;
 
 string Money(int64 n)
@@ -109,6 +110,10 @@ Result Find(const string& strQuery, uint256& hashRet)
     return NOT_FOUND;
 }
 
+// A block's row never changes, and the window asks for the same 25 every few
+// seconds: read once, not a whole block each time under cs_main. Under cs_main.
+static map<uint256, BlockRow> mapRowCache;
+
 Result Recent(int nTop, int nCount, vector<BlockRow>& rowsRet, int& nTipRet)
 {
     CRITICAL_BLOCK(cs_main)
@@ -117,9 +122,17 @@ Result Recent(int nTop, int nCount, vector<BlockRow>& rowsRet, int& nTipRet)
             return NOT_FOUND;
         rowsRet.clear();
         nTipRet = nBestHeight;
+        if (mapRowCache.size() > 1000)
+            mapRowCache.clear();
         CBlockIndex* pindex = nTop < 0 ? pindexBest : MainChainAt(nTop);
         for (; pindex && (int)rowsRet.size() < nCount; pindex = pindex->pprev)
         {
+            map<uint256, BlockRow>::iterator mi = mapRowCache.find(pindex->GetBlockHash());
+            if (mi != mapRowCache.end())
+            {
+                rowsRet.push_back(mi->second);
+                continue;
+            }
             CBlock block;
             if (!block.ReadFromDisk(pindex, true))
                 return NOT_FOUND;
@@ -132,6 +145,7 @@ Result Recent(int nTop, int nCount, vector<BlockRow>& rowsRet, int& nTipRet)
             row.reward = block.vtx.empty() ? 0 : block.vtx[0].GetValueOut();
             if (!block.vtx.empty() && !block.vtx[0].vout.empty())
                 row.to = DescribeScript(block.vtx[0].vout[0].scriptPubKey);
+            mapRowCache[row.hash] = row;
             rowsRet.push_back(row);
         }
         return FOUND;
@@ -254,7 +268,7 @@ Result ReadTx(const uint256& txid, TxView& viewRet)
             // The index keeps where each output was spent, which is what lets a
             // reader walk from a swap's contract to the transaction that took it.
             CTransaction txSpend;
-            if (viewRet.fInChain && i < txindex.vSpent.size() && !txindex.vSpent[i].IsNull() &&
+            if (viewRet.fInChain && i < MAX_INPUTS_READ && i < txindex.vSpent.size() && !txindex.vSpent[i].IsNull() &&
                 txSpend.ReadFromDisk(txindex.vSpent[i]))
                 out.spentBy = txSpend.GetHash();
             viewRet.out.push_back(out);

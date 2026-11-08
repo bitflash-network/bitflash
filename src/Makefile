@@ -82,7 +82,8 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
           btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h coinunit.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
-          proxy.h tor.h treasury.h gui_chat.h gui_explorer.h explorer.h font_roboto.h
+          proxy.h tor.h treasury.h gui_chat.h gui_explorer.h explorer.h font_roboto.h \
+          dgb_anchors.h rvn_anchors.h x16rv2.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o

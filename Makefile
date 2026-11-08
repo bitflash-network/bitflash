@@ -142,8 +142,9 @@ appimage: gui appimage-tools
 	@mkdir -p /tmp/bitflash.AppDir/usr/bin \
 	          /tmp/bitflash.AppDir/usr/lib \
 	          /tmp/bitflash.AppDir/usr/share/applications \
-	          /tmp/bitflash.AppDir/usr/share/icons/hicolor/256x256/apps
+	          /tmp/bitflash.AppDir/usr/share/icons/hicolor/256x256/apps 	          /tmp/bitflash.AppDir/usr/share/doc/bitflash
 	@cp src/bitflash /tmp/bitflash.AppDir/usr/bin/bitflash
+	@cp THIRD-PARTY-NOTICES.txt /tmp/bitflash.AppDir/usr/share/doc/bitflash/
 	@printf '#!/bin/sh\nHERE="$$(dirname "$$(readlink -f "$$0")")"\nexport LD_LIBRARY_PATH="$$HERE/usr/lib:$$LD_LIBRARY_PATH"\nexec "$$HERE/usr/bin/bitflash" "$$@"\n' \
 	  > /tmp/bitflash.AppDir/AppRun && chmod +x /tmp/bitflash.AppDir/AppRun
 	@printf '[Desktop Entry]\nName=Bitflash\nExec=bitflash\nIcon=bitflash\nType=Application\nCategories=Finance;\n' \
@@ -193,8 +194,9 @@ btfchat-appimage: btfchat-linux appimage-tools
 	@mkdir -p /tmp/btfchat.AppDir/usr/bin \
 	          /tmp/btfchat.AppDir/usr/lib \
 	          /tmp/btfchat.AppDir/usr/share/applications \
-	          /tmp/btfchat.AppDir/usr/share/icons/hicolor/256x256/apps
+	          /tmp/btfchat.AppDir/usr/share/icons/hicolor/256x256/apps 	          /tmp/btfchat.AppDir/usr/share/doc/btfchat
 	@cp src/btfchat /tmp/btfchat.AppDir/usr/bin/btfchat
+	@cp THIRD-PARTY-NOTICES.txt /tmp/btfchat.AppDir/usr/share/doc/btfchat/
 	@printf '#!/bin/sh\nHERE="$$(dirname "$$(readlink -f "$$0")")"\nexport LD_LIBRARY_PATH="$$HERE/usr/lib:$$LD_LIBRARY_PATH"\nexec "$$HERE/usr/bin/btfchat" "$$@"\n' \
 	  > /tmp/btfchat.AppDir/AppRun && chmod +x /tmp/btfchat.AppDir/AppRun
 	@printf '[Desktop Entry]\nName=btfchat\nExec=btfchat\nIcon=btfchat\nType=Application\nCategories=Network;InstantMessaging;\n' \
@@ -282,6 +284,7 @@ windows: deps-windows
 	@mkdir -p Bitflash-$(VERSION)-windows
 	@cp src/bitflash.exe Bitflash-$(VERSION)-windows/Bitflash.exe
 	@cp src/btfchat.exe Bitflash-$(VERSION)-windows/BtfChat.exe
+	@cp THIRD-PARTY-NOTICES.txt Bitflash-$(VERSION)-windows/
 	@ldd src/bitflash.exe | grep ucrt64 | awk '{print $$3}' | \
 	  xargs -I{} cp {} Bitflash-$(VERSION)-windows/ 2>/dev/null || true
 	@ldd src/btfchat.exe | grep ucrt64 | awk '{print $$3}' | \

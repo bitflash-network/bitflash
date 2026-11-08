@@ -33,6 +33,16 @@ jobs:
         shell: bash -eo pipefail {0}
     steps:
       - uses: actions/checkout@v5
+      - name: One version everywhere, and the tag's
+        # The packages are named from the Makefile, the binaries say
+        # headers_core.h, and the draft is titled from the tag. Nothing stopped
+        # a tag on a tree that still said the version before.
+        run: |
+          V=$(sed -n 's/^VERSION[[:space:]]*:= *//p' Makefile)
+          H=$(sed -n 's/^#define BITFLASH_VERSION_STRING "\(.*\)"/\1/p' src/headers_core.h)
+          echo "Makefile $V, headers_core.h $H, ref $GITHUB_REF_NAME"
+          [ -n "$V" ] && [ "$V" = "$H" ]
+          if [ "$GITHUB_REF_TYPE" = tag ]; then [ "$GITHUB_REF_NAME" = "v$V" ]; fi
       - name: Dependencies
         run: make deps-linux
       - name: Wallet AppImage with Tor
@@ -54,6 +64,7 @@ jobs:
             Bitflash-*-x86_64.AppImage
             BtfChat-*-x86_64.AppImage
             bitflash-node-*-x86_64
+            THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
 
   linux-distros:
@@ -174,7 +185,7 @@ jobs:
           cp -R torx/tor $D/tor
           cp -R torx/docs $D/tor/docs        # Tor's licenses and its libraries'
           [ -d torx/data ] && mkdir -p $D/tor/data-defaults && cp -R torx/data/. $D/tor/data-defaults/
-          cp packaging/macos/README-macOS.txt $D/
+          cp packaging/macos/README-macOS.txt THIRD-PARTY-NOTICES.txt $D/
           # Apple silicon runs only signed code; ours had their library paths
           # just rewritten, so they are signed again (ad hoc: no Apple account).
           # Tor keeps the Tor Project's own signature.

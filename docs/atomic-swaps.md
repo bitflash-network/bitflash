@@ -139,7 +139,10 @@ Bitcoin side, the embedded light client above or Bitcoin Core on the same machin
   0.001 BTC**. Two presses.
 - **Then nobody presses anything.** The maker's chat checks the taker's
   contract the same way (paying the maker, under the maker's secret hash, at
-  least 6 hours left) and takes it, which shows the secret on that chain. The
+  least 6 hours left) and takes it, which shows the secret on that chain.
+  On mainnet a Bitflash contract counts once 30 blocks (an hour) are over it:
+  RandomX can be rented by the hour, and a shorter wait would let a taker
+  undo their own lock after the secret is out. The
   taker's chat reads the secret **off the chain** -- not from a message -- and
   takes the maker's.
 - **If it does not finish**, each side's coins come back by themselves when
@@ -478,7 +481,9 @@ inside it.
 Blocks count for what they cost. MultiShield eases for a chain that claims time
 has passed, and a private chain of 160 blocks can hold the work of about 40. So
 the light client reports a contract's confirmations by the work over it, in steps
-of the 240 blocks before it, and never more than the blocks there are. The last
+of the 240 blocks before it, and never more than the blocks there are. Those 240
+come from the same peers, so a step is never taken under a quarter of one block
+at the anchor: two lying peers cannot make cheap blocks count as an hour. The last
 two blocks are read a round later: a tip every 15 seconds would otherwise keep
 asking a peer for a block it has not got.
 

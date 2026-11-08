@@ -213,6 +213,136 @@
       "upstream": "src/crypto/ethash/include/ethash/version.h",
       "path": "src/pow_vendor/rvn/crypto/ethash/include/ethash/version.h",
       "sha256": "e1da4319d0da24b4920b33f0e30e59c175832d9d0dba6a0c8263d3dd7dd6d862"
+    },
+    {
+      "upstream": "src/algo/blake.c",
+      "path": "src/pow_vendor/x16/blake.c",
+      "sha256": "5de8dd4c81f13ac62994d22e737e3c214edb4c52b072314705e5422c04ed412a"
+    },
+    {
+      "upstream": "src/algo/bmw.c",
+      "path": "src/pow_vendor/x16/bmw.c",
+      "sha256": "9a034709867e42e266d1682d54d4e791fb45038bac54a330558fb1715e352178"
+    },
+    {
+      "upstream": "src/algo/fugue.c",
+      "path": "src/pow_vendor/x16/fugue.c",
+      "sha256": "71524e3b098258c1f2538b347f84850b84d60fed0902a16885b93e8e742ce064"
+    },
+    {
+      "upstream": "src/algo/groestl.c",
+      "path": "src/pow_vendor/x16/groestl.c",
+      "sha256": "cbf1d71462a045065739dddd6c52c2ec9ceec88afb925d2d1228937f6da34ff1"
+    },
+    {
+      "upstream": "src/algo/hamsi.c",
+      "path": "src/pow_vendor/x16/hamsi.c",
+      "sha256": "f48a32c1f37bf064c940d8633b019636ed095a87426452ce5c14bea741208c69"
+    },
+    {
+      "upstream": "src/algo/hamsi_helper.c",
+      "path": "src/pow_vendor/x16/hamsi_helper.c",
+      "sha256": "97aba695450e23255400c2ff44a22912608b6adb7cf797f5a49b39c24c78f188"
+    },
+    {
+      "upstream": "src/algo/jh.c",
+      "path": "src/pow_vendor/x16/jh.c",
+      "sha256": "0aa91c01f7c6cc91b6bfbd4768f3c6b03d4ae122fe5e01167b6b67740cd29d16"
+    },
+    {
+      "upstream": "src/algo/keccak.c",
+      "path": "src/pow_vendor/x16/keccak.c",
+      "sha256": "6730c3e4a2ffba1d44864804a415b349da6265f2320021be1cfb487acd60fbda"
+    },
+    {
+      "upstream": "src/algo/md_helper.c",
+      "path": "src/pow_vendor/x16/md_helper.c",
+      "sha256": "37998ec56b3f21e3614b83cf906517c462848286a3fc116265703043d02b2366"
+    },
+    {
+      "upstream": "src/algo/shabal.c",
+      "path": "src/pow_vendor/x16/shabal.c",
+      "sha256": "4e21031b06a53f7ad7711af557decad815ba63601889c49730c37d33ecfc4757"
+    },
+    {
+      "upstream": "src/algo/sph_blake.h",
+      "path": "src/pow_vendor/x16/sph_blake.h",
+      "sha256": "c4519791ce589245e52bf807ef15bebc32f16bec2bca3b947ee5afab4b6e37d6"
+    },
+    {
+      "upstream": "src/algo/sph_bmw.h",
+      "path": "src/pow_vendor/x16/sph_bmw.h",
+      "sha256": "62d9155dbaf4fd91a72a677489ca0d6188dfb6f4e733d40d6310104375d29a5a"
+    },
+    {
+      "upstream": "src/algo/sph_fugue.h",
+      "path": "src/pow_vendor/x16/sph_fugue.h",
+      "sha256": "b32dc9dcc176bc248cc892412b11c1a44a7a102c21431d874acd5577d51e82fb"
+    },
+    {
+      "upstream": "src/algo/sph_groestl.h",
+      "path": "src/pow_vendor/x16/sph_groestl.h",
+      "sha256": "24a4033ef219638e1e244955dec6bbda3207ba7476c4ed3425ebf0c84792ccfc"
+    },
+    {
+      "upstream": "src/algo/sph_hamsi.h",
+      "path": "src/pow_vendor/x16/sph_hamsi.h",
+      "sha256": "7cca65f792bf2e08340ebbade2dfe2225d1d76b73750d8fae1ecf985faf45fab"
+    },
+    {
+      "upstream": "src/algo/sph_jh.h",
+      "path": "src/pow_vendor/x16/sph_jh.h",
+      "sha256": "da69369bc074a765c7d7440e99034183330d019a2c29749d25a9906b54857fbf"
+    },
+    {
+      "upstream": "src/algo/sph_keccak.h",
+      "path": "src/pow_vendor/x16/sph_keccak.h",
+      "sha256": "de793b6b6b8588b318fd6210272829aefa542b9369ffa4f2e419b4f5508e2128"
+    },
+    {
+      "upstream": "src/algo/sph_md_helper.c",
+      "path": "src/pow_vendor/x16/sph_md_helper.c",
+      "sha256": "0da3e505017cce7d9d04e6865afc29857f6797b757b8204ab699d32ecece0ab7"
+    },
+    {
+      "upstream": "src/algo/sph_sha2.h",
+      "path": "src/pow_vendor/x16/sph_sha2.h",
+      "sha256": "4ac003436576ae8c7050f24ba7d88ab6b2777c2b5b76c3b4e7b56eb44bb5dbb4"
+    },
+    {
+      "upstream": "src/algo/sph_sha2big.c",
+      "path": "src/pow_vendor/x16/sph_sha2big.c",
+      "sha256": "f5c62304869b688a67f644e31182f94a87994471c44bfbbbe61189bb60e84b77"
+    },
+    {
+      "upstream": "src/algo/sph_shabal.h",
+      "path": "src/pow_vendor/x16/sph_shabal.h",
+      "sha256": "c21e1bee0f4de724ae0c2fff3f2d9b156e05e423006072c868c48e2b629b084f"
+    },
+    {
+      "upstream": "src/algo/sph_tiger.h",
+      "path": "src/pow_vendor/x16/sph_tiger.h",
+      "sha256": "6c923708c1643c46215d3f3a989dc697114dd4404bb9e565f46bfb11bc0b70e7"
+    },
+    {
+      "upstream": "src/algo/sph_types.h",
+      "path": "src/pow_vendor/x16/sph_types.h",
+      "sha256": "0a87bd456362fef5f39f1b3541e9e7ecfc0305be2ea89d804fd4e65585b19db9"
+    },
+    {
+      "upstream": "src/algo/sph_whirlpool.h",
+      "path": "src/pow_vendor/x16/sph_whirlpool.h",
+      "sha256": "cb01bef2c81f2238454388e5c014127a2aa6f0b493a255df9c813e558a81ad8d"
+    },
+    {
+      "upstream": "src/algo/tiger.cpp",
+      "path": "src/pow_vendor/x16/tiger.cpp",
+      "sha256": "334c4e49cdb4ccae40042f2df8e08e9c7f7810cb58947a6c559fc9adb435efaa"
+    },
+    {
+      "upstream": "src/algo/whirlpool.c",
+      "path": "src/pow_vendor/x16/whirlpool.c",
+      "sha256": "1f3a66911585dc1475237ea37ec1968a9910e5430812a506a019a0f2ea3718fc"
     }
   ]
 }

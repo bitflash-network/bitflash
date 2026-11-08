@@ -135,7 +135,15 @@ static int ConfirmationsByWork(const Net& net, const Headers& headers, int funde
     const int counted = headers.Tip().height-funded+1;
     if (net.anchor.empty() || funded <= net.anchorHeight || headers.ActiveHeight(headers.At(funded).hash) < 0) return counted;
     const int from = std::max(net.anchorHeight, funded-240);
-    const Integer step = (headers.At(funded).work-headers.At(from).work)/(funded-from);
+    Integer step = (headers.At(funded).work-headers.At(from).work)/(funded-from);
+    // Those blocks are the peer's word too: two lying peers mine the 240
+    // before a contract as cheaply as the ones over it, and a step of almost
+    // nothing counts almost nothing as an hour. The anchor is ours, so a step
+    // is never under a quarter of one block there, the floor's own measure.
+    const Header& anchor = headers.At(net.anchorHeight);
+    const Integer anchorStep = net.multiAlgo ? anchor.work-headers.At(net.anchorHeight-1).work
+                                             : (Integer(1)<<256)/(Target(anchor.bits)+1);
+    if (step < anchorStep/4) step = anchorStep/4;
     return WorkConfirmations(headers.Tip().work-headers.At(funded).work, step, counted);
 }
 // Peers that still send "reject" (Dogecoin Core 1.14) send it for a broadcast
@@ -850,6 +858,20 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
         if (net->bip94 && (p.height+1)%net->Interval() == 0 && (int64)h.time < (int64)p.time-600)
             throw std::runtime_error("testnet4 timewarp");
         h.height = p.height+1; h.work = p.work+step;
+        // A branch that does not overtake is kept only while it could: within
+        // a day's work of the tip (144 blocks of it), and while side branches
+        // hold fewer than 20000 headers. Without this a peer streamed valid
+        // headers of a weak fork -- from 2009 on Bitcoin, or past a few eased
+        // blocks on Dogecoin -- until the wallet ran out of memory.
+        if (!storedHeaders && h.work <= Tip().work)
+        {
+            const int back = std::min(144, Tip().height-base);
+            const Integer day = back > 0 ? Tip().work-At(Tip().height-back).work : Integer(0);
+            if (h.work+day < Tip().work)
+                throw std::runtime_error(net->label+" header on a branch far behind the tip");
+            if (nodes.size() > (size_t)(Tip().height-base+1)+20000)
+                throw std::runtime_error(net->label+" holds too many headers off its chain");
+        }
         nodes[h.hash] = h;
         if (h.work > Tip().work)
         {
@@ -1076,7 +1098,14 @@ struct Peer
                 else if (ended || header[i] < 32 || header[i] > 126) throw std::runtime_error("invalid "+net.label+" command");
                 else command += (char)header[i];
             }
-            Bytes payload(length); if (length) Transfer(&payload[0], length, false);
+            // Grown as it arrives, not allocated as declared: a header that
+            // claims 256 MB and sends nothing more costs no more than it sends.
+            Bytes payload;
+            for (size_t got = 0; got < length; )
+            {
+                size_t chunk = std::min<size_t>(length-got, 1024*1024);
+                payload.resize(got+chunk); Transfer(&payload[got], chunk, false); got += chunk;
+            }
             uint256 hash = Digest(payload);
             if (!std::equal(hash.begin(), hash.begin()+4, header.begin()+20)) throw std::runtime_error(net.label+" checksum mismatch");
             if (command == wanted) return payload;
@@ -1306,8 +1335,14 @@ static void Load(State& s)
         }
         s.birthday = j.value("birthday", (int64)0);
         s.scan = j.at("scan").get<int>(); if (s.scan < 0) throw std::runtime_error("invalid saved filter cursor");
-        s.peers = j.value("peers", std::vector<std::string>());
-        if (s.peers.size() > 256) s.peers.resize(256);
+        // A table saved before the cap per /16 keeps two of each group.
+        std::vector<std::string> saved = j.value("peers", std::vector<std::string>());
+        std::map<std::string,int> groups;
+        for (size_t i = 0; i < saved.size() && s.peers.size() < 256; ++i)
+        {
+            size_t dot = saved[i].find('.'); dot = dot == std::string::npos ? dot : saved[i].find('.',dot+1);
+            if (dot == std::string::npos || ++groups[saved[i].substr(0,dot+1)] <= 2) s.peers.push_back(saved[i]);
+        }
     }
     s.savedFilters = s.filters.size();
     s.savedFilterTail = s.filters.empty() ? uint256(0) : s.filters.back().block;
@@ -1323,7 +1358,11 @@ static void Discover(State& s, Peer& p, std::unique_lock<std::recursive_mutex>& 
 {
     Bytes b = Fetch(p,"getaddr",Bytes(),"addr",lock); size_t pos = 0; uint64_t n = Count(b,pos,1000);
     if (b.size()-pos != n*30) throw std::runtime_error("invalid Bitcoin addr size");
-    for (uint64_t i = 0; i < n && s.peers.size() < 256; ++i, pos += 30)
+    // One answer filled all 256 places once, for good: a peer naming 256 of
+    // its own nodes was then almost every pick, and both of the two peers
+    // whose answers are compared. A few from each answer, two per /16.
+    int added = 0;
+    for (uint64_t i = 0; i < n && s.peers.size() < 256 && added < 8; ++i, pos += 30)
     {
         if ((LE(b,pos+4,8)&s.net.services) != s.net.services) continue;
         bool ipv4 = true;
@@ -1333,7 +1372,11 @@ static void Discover(State& s, Peer& p, std::unique_lock<std::recursive_mutex>& 
         if (!a || a == 10 || a == 127 || a >= 224 || (a == 169 && c == 254) || (a == 172 && c >= 16 && c <= 31) || (a == 192 && c == 168)) continue;
         unsigned int port = b[pos+28]*256+b[pos+29]; if (!port) continue;
         std::string peer = strprintf("%u.%u.%u.%u:%u",a,c,b[pos+26],b[pos+27],port);
-        if (std::find(s.peers.begin(),s.peers.end(),peer) == s.peers.end()) s.peers.push_back(peer);
+        std::string group = strprintf("%u.%u.",a,c);
+        int inGroup = 0;
+        for (size_t k = 0; k < s.peers.size(); ++k) if (s.peers[k].compare(0,group.size(),group) == 0) ++inGroup;
+        if (inGroup >= 2) continue;
+        if (std::find(s.peers.begin(),s.peers.end(),peer) == s.peers.end()) { s.peers.push_back(peer); ++added; }
     }
 }
 static std::vector<Bytes> ActiveScripts(State& s);
@@ -1475,6 +1518,10 @@ static void Round(State& s, Peer& primary, Peer* second)
     catch (...) { lock.lock(); throw; }
     s.peersCompared = 1;
     if (!s.net.filters) { ScanBlocks(s,primary,lock); Save(s); return; }
+    // On the main chain a filter is taken from two peers or not at all: one
+    // alone could leave out the block that spends a contract, and the scan
+    // cursor would pass it for good.
+    if (!second && s.net.name == "main" && !s.net.regtest) { Save(s); return; }
     int start = (int)s.filters.size();
     if (start <= s.headers.Tip().height)
     {
@@ -1629,12 +1676,23 @@ static void Worker(State* s)
                 }
             }
             if (choices.empty()) throw std::runtime_error("regtest needs -"+net.coin+"peer=host:port");
-            Peer primary(net); primary.Connect(choices[rotation++%choices.size()],port);
+            const std::string primaryName = choices[rotation++%choices.size()];
+            Peer primary(net); primary.Connect(primaryName,port);
+            // One of the two compared is always a seed when the first is a
+            // saved address: saved addresses are what other peers told us.
+            std::vector<std::string> seconds = choices;
+            size_t secondFrom = rotation;
+            if (configured.empty() && !net.seeds.empty() &&
+                std::find(net.seeds.begin(),net.seeds.end(),primaryName) == net.seeds.end())
+            {
+                seconds = net.seeds;
+                secondFrom = rotation/2;
+            }
             std::unique_ptr<Peer> second;
-            for (size_t i = 0; i < std::min<size_t>(choices.size(),4); ++i)
+            for (size_t i = 0; i < std::min<size_t>(seconds.size(),4); ++i)
             {
                 std::unique_ptr<Peer> candidate(new Peer(net));
-                try { candidate->Connect(choices[(rotation+i)%choices.size()],port); }
+                try { candidate->Connect(seconds[(secondFrom+i)%seconds.size()],port); }
                 catch (...) { continue; }
                 if (candidate->identity != primary.identity) { second = std::move(candidate); break; }
             }
@@ -1765,6 +1823,8 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     if (!s.error.empty()) throw std::runtime_error(s.error);
     if (!s.synced || s.scan < s.headers.Tip().height+1-ScanLag(s.net))
         throw std::runtime_error(s.net.label+(s.net.filters ? " light is synchronizing headers and contract filters" : " light is synchronizing headers and scanning blocks"));
+    if (s.net.filters && s.net.name == "main" && !s.net.regtest && s.peersCompared < 2)
+        throw std::runtime_error(s.net.label+" light is waiting for a second peer to compare filters with");
     CScript script; script.SetPayToScriptHash(contract);
     auto txs = Transactions(s); uint256 txid(0); int output = -1;
     size_t colon = ref.find(':');

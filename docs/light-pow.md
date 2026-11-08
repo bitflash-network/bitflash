@@ -1,8 +1,8 @@
 # Foreign-chain header proof modules
 
-These are mainnet proof/difficulty helpers for a future light-client adapter.
-They perform no I/O, networking or synchronization and do not change Bitflash
-consensus, swaps or the existing Bitcoin light client. Hash/work byte arrays are
+These are the mainnet proof/difficulty helpers the DigiByte and Ravencoin light
+clients use (`btclight.cpp`; docs/atomic-swaps.md). They perform no I/O,
+networking or synchronization themselves and do not change Bitflash consensus. Hash/work byte arrays are
 little endian; `DisplayHash` returns the conventional reversed hexadecimal form.
 
 ## The entry point
@@ -166,8 +166,10 @@ not establish a native build/run of the complete Linux wallet or any macOS
 execution. The UCRT64 Clang distribution still lacks a usable Windows ASan/fuzzer
 runtime; the sanitizer runtime executions were performed on Linux.
 
-Earlier DigiByte algorithms/retarget regimes, X16R/X16RV2, other networks,
-transaction/block validity, filters, peer discovery, networking, reorg storage,
-wallet integration and swap execution are outside this change. Future consensus
+Earlier DigiByte algorithms/retarget regimes, other networks and
+transaction/block validity are outside these modules. Peer discovery,
+networking, reorg storage, wallet integration and swap execution are the light
+client's (`btclight.cpp`), and X16R/X16RV2 (`x16rv2.cpp`, Ravencoin regtest only)
+came later with it. Future consensus
 changes require an explicit source/rule update; these helpers are not a promise
 to accept future forks without review.
