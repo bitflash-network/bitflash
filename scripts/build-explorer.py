@@ -284,14 +284,19 @@ def build_explorer(raw_blocks, out_dir):
         }, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
-    # The front page of bitflash.network shows the height and the hashrate.
-    # blocks.json has both but is megabytes; this is the few bytes it needs.
+    # The front page of bitflash.network shows the height, the hashrate and
+    # the newest few blocks. blocks.json has all of it but is megabytes; this
+    # is the few hundred bytes it needs.
     (out / "tip.json").write_text(
         json.dumps({
             "network": network,
             "height": len(blocks) - 1,
             "time": blocks[-1]["time"] if blocks else None,
             "hashrate": (estimate or {}).get("hashrate"),
+            "recent": [
+                {k: s[k] for k in ("height", "hash", "time", "nTx", "size", "cbValue", "cbAddr")}
+                for s in summaries[:6]
+            ],
         }, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
