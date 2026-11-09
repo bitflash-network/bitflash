@@ -345,11 +345,12 @@ def testnet_page():
         ('alt="">Bitflash</a>', 'alt="">Bitflash testnet</a>'),
         ('<a href="https://explorer.bitflash.network/" aria-current="page">', '<a href="https://explorer.bitflash.network/">'),
         ('<a href="https://testnet-explorer.bitflash.network/">', '<a href="https://testnet-explorer.bitflash.network/" aria-current="page">'),
-        ('<h1>Block explorer ', '<h1>Testnet explorer '),
+        ('<h1>Block explorer</h1>', '<h1>Testnet explorer</h1>'),
+        ('<span id="chainname">Main chain</span>', '<span id="chainname">Test chain</span>'),
         ('Read-only view of the main chain:', 'Read-only view of the test chain:'),
     ):
         assert old in page, old
-        page = page.replace(old, new)
+        page = page.replace(old, new, 1)
     script = EXPLORER_JS.replace('+" BTF"; }', '+" tBTF"; }')
     assert script != EXPLORER_JS
     return page, script
@@ -377,89 +378,165 @@ INDEX_HTML = r"""<!doctype html>
 <script src="explorer.js" defer></script>
 </head>
 <body>
-<p class="notice">First exchange listing: the community campaign on NonKYC is open until 2027-02-04. It needs 100 backers, and $5 counts as one. Pledges are donations, refunded if the listing is not completed. <a href="https://nonkyc.io/listing/campaign/BTF">Back the campaign &rarr;</a></p>
+<p class="notice">First exchange listing: the NonKYC campaign needs 100 backers by 2027-02-04, and $5 counts as one. Pledges are donations, refunded if the listing does not happen. <a href="https://nonkyc.io/listing/campaign/BTF">Back the campaign &rarr;</a></p>
 <header class="topbar">
-  <a class="brand" href="https://bitflash.network/"><img src="logo.png" width="22" height="22" alt="">Bitflash</a>
+  <a class="brand" href="https://bitflash.network/"><img src="logo.png" width="28" height="28" alt="">Bitflash</a>
   <nav aria-label="Bitflash sites">
-    <a href="https://bitflash.network/">home</a>
-    <a href="https://github.com/bitflash-network/bitflash">code</a>
-    <a href="https://docs.bitflash.network/">docs</a>
-    <a href="https://releases.bitflash.network/">downloads</a>
-    <a href="https://explorer.bitflash.network/" aria-current="page">explorer</a>
-    <a href="https://testnet-explorer.bitflash.network/">testnet</a>
-    <a href="https://faucet.bitflash.network/">faucet</a>
+    <a href="https://docs.bitflash.network/">Docs</a>
+    <a href="https://releases.bitflash.network/">Downloads</a>
+    <a href="https://explorer.bitflash.network/" aria-current="page">Explorer</a>
+    <a href="https://testnet-explorer.bitflash.network/">Testnet</a>
+    <a href="https://faucet.bitflash.network/">Faucet</a>
+    <a href="https://github.com/bitflash-network/bitflash">Source</a>
   </nav>
-  <span class="meta" id="tip"></span>
-  <span class="meta" id="net"></span>
+  <span class="action"><a class="button" href="https://releases.bitflash.network/">Download</a></span>
 </header>
-<div class="wrap">
-  <h1>Block explorer <button class="link" id="home" hidden>back to blocks</button></h1>
-  <p class="note">Read-only view of the main chain: blocks, their transactions, and the coinbase payout. There is no mempool and no per-address history here.</p>
+<main>
+  <p class="crumb">Explorer &middot; <span id="chainname">Main chain</span></p>
+  <h1>Block explorer</h1>
+  <p class="lede">Read-only view of the main chain: blocks, their transactions and the coinbase payout, rebuilt from a node's own block files at every block. There is no mempool and no per-address history here.</p>
+  <div class="metrics">
+    <div class="metric"><b id="m-height">&hellip;</b><span>Block height</span></div>
+    <div class="metric"><b id="m-hash">&hellip;</b><span>Network hashrate, estimated</span></div>
+    <div class="metric"><b id="m-interval">&hellip;</b><span>Average time between blocks</span></div>
+    <div class="metric"><b id="m-count">&hellip;</b><span>Blocks in the chain</span></div>
+  </div>
   <p class="note" id="netnote" hidden></p>
   <div id="listview">
-    <input id="q" placeholder="Search by height, block hash or txid">
+    <input id="q" type="search" placeholder="Search by height, block hash or txid" aria-label="Search by height, block hash or txid" autocomplete="off" spellcheck="false">
     <div class="scroll"><table>
-      <thead><tr><th>Height</th><th>Time (UTC)</th><th>Txs</th><th>Size</th><th>Coinbase</th><th>To</th></tr></thead>
-      <tbody id="rows"></tbody>
+      <thead><tr><th>Height</th><th>Time (UTC)</th><th class="num">Txs</th><th class="num">Size</th><th class="num">Reward</th><th>To</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="6" class="mut">Reading the chain&hellip;</td></tr></tbody>
     </table></div>
-    <p class="mut" id="more"></p>
+    <p class="note" id="more"></p>
   </div>
   <div id="detail" hidden></div>
-</div>
+  <p><button class="back" id="home" hidden>&larr; Back to the newest blocks</button></p>
+</main>
+<footer>
+  <div class="foot-cols">
+    <div><h2>Software</h2><ul>
+      <li><a href="https://releases.bitflash.network/">Downloads</a></li>
+      <li><a href="https://docs.bitflash.network/">Documentation</a></li>
+      <li><a href="https://github.com/bitflash-network/bitflash">Source code</a></li>
+    </ul></div>
+    <div><h2>Network</h2><ul>
+      <li><a href="https://explorer.bitflash.network/">Block explorer</a></li>
+      <li><a href="https://testnet-explorer.bitflash.network/">Testnet explorer</a></li>
+      <li><a href="https://faucet.bitflash.network/">Testnet faucet</a></li>
+      <li><a href="https://bitflash.network/treasury">Treasury</a></li>
+    </ul></div>
+    <div><h2>Community</h2><ul>
+      <li><a href="https://discord.gg/kcgeg696YE">Discord</a></li>
+      <li><a href="https://x.com/BTFBitflash">X</a></li>
+    </ul></div>
+    <div><h2>This page</h2><ul>
+      <li>No cookies and no trackers</li>
+      <li>Static files built from blk*.dat</li>
+    </ul></div>
+  </div>
+  <span class="wordmark" aria-hidden="true">Bitflash</span>
+  <p class="legal">MIT licensed, built on Bitcoin 0.1.0 (Satoshi Nakamoto, 2009). The wallet has the same explorer built in, reading only your own node.</p>
+</footer>
 </body>
 </html>
 """
 
 
-STYLE_CSS = r""":root{
+STYLE_CSS = r"""/* The explorer in the bitflash.network look: one sans-serif face, monospace
+   only for hashes and addresses, surfaces told apart by tone, lines only in
+   the table. Self-contained: nothing is loaded from another host. */
+:root{
   color-scheme: light dark;
-  --bg:#fff; --bg-2:#f6f6f6; --fg:#111; --dim:#6b6b6b; --line:#d7d7d7; --line-hard:#111;
-  --accent:#0b7a34; --accent-2:#12a047; --bar:3rem;
-  --mono: ui-monospace,"Cascadia Mono","Segoe UI Mono",Consolas,"DejaVu Sans Mono","Liberation Mono","Courier New",monospace;
+  --bg:#ffffff; --bg-2:#eff3f0; --bg-3:#e2e9e4; --fg:#0b100d; --soft:#4b554f; --line:#d9e0db;
+  --accent:#0e7339; --accent-2:#0a5c2d; --on-accent:#ffffff; --field:#1f9d57;
+  --night:#0b100d; --night-ink:#e8ede9;
+  --sans:"Inter","Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"DejaVu Sans Mono","Liberation Mono",monospace;
+  --gutter:clamp(1rem,3vw,2.5rem);
 }
 @media (prefers-color-scheme: dark){:root{
-  --bg:#000; --bg-2:#0b0b0b; --fg:#dcdcdc; --dim:#8a8a8a; --line:#242424; --line-hard:#4a4a4a;
-  --accent:#2ee06a; --accent-2:#6bff9f;
+  --bg:#0b100d; --bg-2:#131a16; --bg-3:#1b241f; --fg:#e8ede9; --soft:#a2ada6; --line:#26302a;
+  --accent:#4fd88c; --accent-2:#7be6aa; --on-accent:#03200e; --night:#030504;
 }}
-*{box-sizing:border-box;}
-html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--mono);-webkit-text-size-adjust:100%;}
-a{color:var(--accent);}
-.notice{margin:0;padding:.55rem clamp(.9rem,2.5vw,3rem);background:var(--accent);color:var(--bg);font-size:.86rem;line-height:1.5;}
-.notice a,.notice a:visited{color:var(--bg);font-weight:bold;white-space:nowrap;}
-.topbar{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;min-height:var(--bar);
-        padding:.5rem clamp(.9rem,2.5vw,3rem);border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5;}
-.brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--fg);font-weight:bold;}
-.brand img{width:22px;height:22px;display:block;}
-.topbar nav{display:flex;flex-wrap:wrap;gap:.15rem 1.4rem;font-size:.86rem;}
-.topbar nav a{text-decoration:none;color:var(--dim);}
-.topbar nav a::before{content:"/";color:var(--line-hard);margin-right:.3rem;}
-.topbar nav a:hover{color:var(--fg);text-decoration:underline;}
-.topbar nav a[aria-current="page"]{color:var(--accent);font-weight:bold;}
-.topbar nav a[aria-current="page"]::before{color:var(--accent);}
-.topbar .meta{margin-left:auto;font-size:.76rem;color:var(--dim);letter-spacing:.06em;}
-.wrap{padding:1.4rem clamp(.9rem,2.5vw,3rem) 4rem;}
-h1{font-size:1rem;margin:0 0 .3rem;letter-spacing:.02em;}
-h2{font-size:.95rem;margin:1.2rem 0 .4rem;}
-.mut{color:var(--dim);}
-.note{color:var(--dim);font-size:.82rem;max-width:60rem;margin:.2rem 0 1rem;}
-input{width:100%;max-width:28rem;padding:.5rem .7rem;border:1px solid var(--line);background:var(--bg-2);color:var(--fg);font:inherit;font-size:.86rem;}
-input:focus{outline:none;border-color:var(--accent);}
+*,*::before,*::after{box-sizing:border-box;}
+html{background:var(--bg);color:var(--fg);font:17px/1.55 var(--sans);-webkit-text-size-adjust:100%;-webkit-font-smoothing:antialiased;}
+body{margin:0;background:var(--bg);}
+:focus-visible{outline:3px solid var(--field);outline-offset:3px;}
+a{color:var(--accent);text-underline-offset:3px;}
+a:hover{color:var(--accent-2);}
+
+.notice{margin:0;padding:.7rem var(--gutter);background:var(--night);color:var(--night-ink);font-size:.88rem;line-height:1.5;}
+.notice a,.notice a:visited{color:var(--night-ink);font-weight:650;white-space:nowrap;}
+.notice a:hover{color:var(--field);}
+
+.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:.6rem 2.2rem;min-height:4rem;padding:.6rem var(--gutter);background:var(--bg);}
+.brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:var(--fg);font-weight:750;font-size:1.15rem;letter-spacing:-.02em;white-space:nowrap;}
+.brand:visited,.brand:hover{color:var(--fg);}
+.brand img{width:28px;height:28px;display:block;}
+.topbar nav{display:flex;flex-wrap:wrap;gap:.2rem 1.6rem;font-size:1rem;}
+.topbar nav a,.topbar nav a:visited{text-decoration:none;color:var(--soft);}
+.topbar nav a:hover{color:var(--fg);}
+.topbar nav a[aria-current="page"]{color:var(--fg);font-weight:650;}
+.topbar .action{margin-left:auto;}
+a.button,a.button:visited{display:inline-flex;align-items:center;min-height:40px;padding:0 1rem;font:650 .93rem/1 var(--sans);text-decoration:none;background:var(--accent);color:var(--on-accent);transition:background-color .15s;}
+a.button:hover{background:var(--accent-2);color:var(--on-accent);}
+@media (max-width:720px){.topbar{flex-wrap:wrap;gap:.4rem 1.2rem;}.topbar nav{order:3;width:100%;gap:.2rem 1.1rem;font-size:.88rem;}}
+
+main{padding:2.4rem var(--gutter) 6rem;min-width:0;max-width:110rem;}
+.crumb{font-size:.88rem;color:var(--soft);margin:0 0 1.2rem;}
+h1{font-size:clamp(2.1rem,4vw,3.4rem);font-weight:750;letter-spacing:-.03em;line-height:1.05;margin:0 0 1rem;}
+h2{font-size:clamp(1.5rem,2.2vw,2rem);font-weight:700;letter-spacing:-.02em;line-height:1.15;margin:0 0 1rem;}
+.lede{font-size:1.3rem;line-height:1.45;max-width:52ch;margin:0 0 2rem;}
+.note{color:var(--soft);font-size:.88rem;max-width:70ch;margin:.4rem 0 1.4rem;}
+.mut{color:var(--soft);}
+
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:clamp(1.5rem,3vw,3rem);margin:clamp(2rem,4vw,3rem) 0 1rem;}
+.metric{min-width:0;}
+.metric b{display:block;font-size:clamp(2rem,3.6vw,3.4rem);font-weight:750;letter-spacing:-.03em;line-height:1;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+.metric span{display:block;margin-top:.6rem;font-size:.88rem;color:var(--soft);}
+
+input{display:block;width:min(100%,48rem);height:3.2rem;margin:2rem 0 .6rem;padding:0 .9rem;border:0;border-radius:0;background:var(--bg-2);color:var(--fg);font:500 1.15rem/1 var(--sans);-webkit-appearance:none;appearance:none;}
+input::placeholder{color:var(--soft);opacity:1;}
+
 .scroll{overflow-x:auto;}
-table{width:100%;border-collapse:collapse;margin-top:.8rem;font-size:.86rem;}
-th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums;}
-th{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);font-weight:normal;}
-tr.blk{cursor:pointer;}
-tr.blk:hover td{background:var(--bg-2);}
-code{font-size:.8rem;word-break:break-all;color:var(--fg);}
-.card{border:1px solid var(--line);background:var(--bg-2);padding:.9rem 1rem;margin-top:.8rem;}
-.kv{display:grid;grid-template-columns:11rem 1fr;gap:.25rem .8rem;font-size:.82rem;}
-.kv div:nth-child(odd){color:var(--dim);}
-.tx{border-top:1px solid var(--line);padding:.7rem 0;}
-.tx.hit{border-left:3px solid var(--accent);padding-left:.8rem;}
-.io{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
-@media (max-width:640px){.io{grid-template-columns:1fr;}.kv{grid-template-columns:7rem 1fr;}.topbar .meta{margin-left:0;width:100%;}}
-.pill{display:inline-block;font-size:.68rem;padding:.05rem .5rem;border:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:.05em;}
-button.link{background:none;border:none;color:var(--accent);cursor:pointer;font:inherit;padding:0;text-decoration:underline;}
+table{width:100%;border-collapse:collapse;margin-top:1rem;font-size:.93rem;}
+th,td{text-align:left;padding:.7rem 1.4rem .7rem 0;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums;white-space:nowrap;}
+th{font-weight:650;color:var(--soft);}
+th.num,td.num{text-align:right;}
+td:first-child{font-weight:650;color:var(--accent);}
+tr.blk{cursor:pointer;transition:background-color .12s;}
+tr.blk:hover{background:var(--bg-2);}
+code{font-family:var(--mono);font-size:.84rem;word-break:break-all;color:inherit;}
+td code{color:var(--soft);}
+
+#detail h2{margin-top:1rem;}
+#detail,.tx{scroll-margin-top:5rem;}
+.card{background:var(--bg-2);padding:clamp(1.1rem,2.5vw,1.8rem);margin:1rem 0 2.4rem;max-width:72rem;}
+.kv{display:grid;grid-template-columns:11rem minmax(0,1fr);gap:.5rem 1.2rem;font-size:.93rem;}
+.kv > div:nth-child(odd){color:var(--soft);}
+.tx{padding:1.2rem 0;border-top:1px solid var(--line);max-width:72rem;}
+.tx.hit{background:var(--bg-2);padding-left:1rem;padding-right:1rem;}
+.tx > div:first-child{display:flex;flex-wrap:wrap;gap:.4rem .8rem;align-items:baseline;margin-bottom:.8rem;}
+.io{display:grid;grid-template-columns:1fr 1fr;gap:1.4rem;font-size:.93rem;}
+.io > div > div{margin:.3rem 0;}
+.io .mut{font-weight:650;color:var(--soft);}
+.pill{display:inline-block;font-size:.8rem;padding:.1rem .55rem;background:var(--bg-3);color:var(--fg);}
+button.link{background:none;border:0;color:var(--accent);cursor:pointer;font:inherit;padding:0;text-decoration:underline;text-underline-offset:3px;}
+button.back{min-height:44px;padding:0 1.1rem;border:0;background:var(--bg-2);color:var(--fg);font:600 1rem/1 var(--sans);cursor:pointer;}
+button.back:hover{background:var(--bg-3);}
+@media (max-width:640px){.metrics{grid-template-columns:1fr 1fr;}.lede{font-size:1.1rem;}.io{grid-template-columns:1fr;}.kv{grid-template-columns:7rem minmax(0,1fr);}th:nth-child(4),td:nth-child(4){display:none;}}
+
+footer{background:var(--night);color:var(--night-ink);padding:clamp(2.5rem,5vw,4rem) var(--gutter) 1.4rem;font-size:1rem;}
+footer a,footer a:visited{color:var(--night-ink);text-decoration:none;}
+footer a:hover{color:var(--field);text-decoration:underline;}
+.foot-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:2rem;}
+.foot-cols h2{font-size:1rem;font-weight:650;letter-spacing:0;margin:0 0 .8rem;color:var(--night-ink);}
+.foot-cols ul{list-style:none;margin:0;padding:0;}
+.foot-cols li{margin:0 0 .45rem;opacity:.72;}
+.wordmark{display:block;margin:clamp(3rem,8vw,7rem) 0 0 -.04em;padding-bottom:.08em;font-size:clamp(4.4rem,27vw,30rem);font-weight:800;letter-spacing:-.055em;line-height:.8;white-space:nowrap;overflow:hidden;color:var(--night-ink);}
+.legal{margin:1.6rem 0 0;font-size:.88rem;opacity:.72;}
+@media (prefers-reduced-motion: reduce){*{transition:none !important;}}
 """
 
 
@@ -492,19 +569,20 @@ function renderList(filter){
   if(!list.length && /^[0-9a-f]{64}$/.test(q)){ openTx(q); return; }
   if(!list.length){
     var empty = E('tr');
-    var td = E('td', 'mut', 'no match');
+    var td = E('td', 'mut', 'No block matches that.');
     td.colSpan = 6;
     append(empty, td); append(rows, empty);
   }
   list.forEach(function(b){
     var tr = row([String(b.height), ts(b.time), String(b.nTx), b.size+' B', btf(b.cbValue), ''], 'blk');
+    tr.children[2].className = tr.children[3].className = tr.children[4].className = 'num';
     tr.dataset.h = b.height;
     clear(tr.children[5]);
     append(tr.children[5], code(b.cbAddr || '-'));
     tr.onclick = function(){ openBlock(tr.dataset.h); };
     append(rows, tr);
   });
-  document.getElementById('more').textContent = (!q && SUM.length>SHOWN) ? ("showing latest "+SHOWN+" of "+SUM.length+" blocks; search to find any") : "";
+  document.getElementById('more').textContent = (!q && SUM.length>SHOWN) ? ("Showing the newest "+SHOWN+" of "+group(SUM.length)+" blocks. Search to find any other.") : "";
 }
 function kv(parent, key, value, isCode){
   append(parent, E('div', '', key));
@@ -574,7 +652,7 @@ function openBlock(h, txid){
       append(io, ioSide('Outputs', t.vout, function(o){
         var d = E('div');
         var to = o.address ? o.address : (o.pubkey ? 'pubkey '+o.pubkey.slice(0,16)+'...' : o.type);
-        append(d, document.createTextNode(btf(o.value)+' -> '), code(to));
+        append(d, document.createTextNode(btf(o.value)+' to '), code(to));
         return d;
       }));
       append(tx, head, io); append(detail, tx);
@@ -583,7 +661,7 @@ function openBlock(h, txid){
     document.getElementById('listview').hidden = true;
     detail.hidden = false;
     document.getElementById('home').hidden = false;
-    if(hit) hit.scrollIntoView(); else window.scrollTo(0,0);
+    if(hit) hit.scrollIntoView(); else detail.scrollIntoView();
   });
 }
 document.getElementById('home').onclick=function(){
@@ -600,6 +678,8 @@ function openFromHash(){
 }
 window.addEventListener('hashchange', openFromHash);
 document.getElementById('q').oninput=function(){ renderList(this.value); };
+function group(n){ return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function put(id, text){ var e = document.getElementById(id); if(e) e.textContent = text; }
 function fmtHashrate(h){
   var u=['H/s','kH/s','MH/s','GH/s','TH/s','PH/s'], i=0;
   while(h>=1000 && i<u.length-1){ h/=1000; i++; }
@@ -608,8 +688,8 @@ function fmtHashrate(h){
 function showEstimate(e){
   if(!e || !e.hashrate) return;
   var mins = e.intervalSec/60;
-  document.getElementById('net').textContent =
-    '~' + fmtHashrate(e.hashrate) + ' - a block every ' + mins.toFixed(1) + ' min';
+  put('m-hash', fmtHashrate(e.hashrate));
+  put('m-interval', mins.toFixed(1) + ' min');
   var note = document.getElementById('netnote');
   note.textContent =
     'Network hashrate is estimated, not measured: expected hashes per block is 2^256/(target+1), ' +
@@ -619,7 +699,7 @@ function showEstimate(e){
   note.hidden = false;
 }
 fetch('blocks.json').then(function(r){return r.json();}).then(function(d){
-  SUM=d.blocks; document.getElementById('tip').textContent='tip height '+d.tipHeight+' - '+d.count+' blocks';
+  SUM=d.blocks; put('m-height', group(d.tipHeight)); put('m-count', group(d.count));
   showEstimate(d.estimate);
   renderList('');
   openFromHash();
