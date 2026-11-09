@@ -2,666 +2,314 @@
 
 <img src="docs/social.png" width="820" alt="Bitflash"/>
 
-# Bitflash `BTF`
+# Bitflash
 
-CPU-only cryptocurrency. A revival of Bitcoin 0.1.0 with RandomX proof of work and anonymous `.btf` addressing over Tor onion services.
+**Bitcoin 0.1.0, revived for the CPU.**<br>
+RandomX proof of work, nodes reached only through Tor onion services, no premine.
 
-![PoW](https://img.shields.io/badge/PoW-RandomX%20(CPU)-2ea44f?style=for-the-badge)
-![Privacy](https://img.shields.io/badge/addresses-.btf%20anonymous-2ea44f?style=for-the-badge)
-![Tor](https://img.shields.io/badge/tor-onion%20service-7d4698?style=for-the-badge)
-![Fair Launch](https://img.shields.io/badge/premine-none-2ea44f?style=for-the-badge)
-[![Discord](https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge)](https://discord.gg/kcgeg696YE)
-[![X](https://img.shields.io/badge/x-@BTFBitflash-000000?style=for-the-badge)](https://x.com/BTFBitflash)
-
-**[Download](https://releases.bitflash.network/)** · **[Testnet faucet](https://faucet.bitflash.network/)** · **[Discord](https://discord.gg/kcgeg696YE)**
-
-**First exchange listing:** the community campaign on NonKYC is open until 2027-02-04. It needs 100 backers, and $5 counts as one. Pledges are donations, refunded if the listing is not completed. **[Back the campaign →](https://nonkyc.io/listing/campaign/BTF)**
+[Download](https://releases.bitflash.network/) &nbsp;·&nbsp;
+[Documentation](https://docs.bitflash.network/) &nbsp;·&nbsp;
+[Explorer](https://explorer.bitflash.network/) &nbsp;·&nbsp;
+[Testnet faucet](https://faucet.bitflash.network/) &nbsp;·&nbsp;
+[Discord](https://discord.gg/kcgeg696YE) &nbsp;·&nbsp;
+[X](https://x.com/BTFBitflash)
 
 </div>
 
----
+> [!IMPORTANT]
+> **Every node must run 1.2.32 or newer before 2026-12-25 12:00 UTC**, when rules v4 activate on
+> mainnet (testnet: 2026-11-20 12:00 UTC). This applies to wallets, explorers and exchanges as
+> well as miners. A node on 1.2.31 or older stops following the chain at the first block that
+> uses the new opcodes. See [Network upgrades](#network-upgrades).
 
-## What it is
+> [!NOTE]
+> The first exchange listing is being crowdfunded on NonKYC until 2027-02-04: 100 backers are
+> needed, and $5 counts as one. Pledges are donations, refunded if the listing does not happen.
+> [Campaign page](https://nonkyc.io/listing/campaign/BTF).
 
-Bitflash keeps Satoshi's original consensus rules and replaces two things:
+## Overview
 
-**RandomX proof of work.** Memory-hard algorithm used by Monero. A laptop competes equally with a server. ASICs and GPUs have no advantage.
+Bitflash starts from the first release of Bitcoin and keeps its model: a fixed supply of
+21 million, a block reward that halves on schedule, and no company, premine or founder
+allocation. Two parts are replaced.
 
-**Anonymous addressing.** Every node has a `.btf` address derived from its public key, similar to a Tor `.onion`. Nodes reach each other only through Tor hidden services: a peer is dialled at the `.onion` its own signed descriptor names, and the address it decodes to is what authenticates it. There is no clearnet transport to fall back to.
+- **Proof of work is RandomX**, the memory-hard algorithm Monero uses. It is designed for
+  general-purpose processors, so ordinary computers can mine and ASICs and GPUs gain little.
+- **Nodes are addressed by key and reached over Tor.** Each node has a `.btf` address derived
+  from its public key and publishes a signed descriptor naming the onion service where it can be
+  reached. There is no clearnet transport: peers never learn each other's IP address, and a node
+  behind NAT or CGNAT needs no port forwarding.
 
-No premine. No ICO. 50 BTF per block, halving on schedule, 21M cap, ~2 minute blocks.
+On top of that base the node carries the consensus rules Bitcoin adopted after 0.1.0 (strict
+signatures, BIP34, pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`) and, from rules v4, relative
+lock times, `OP_CHECKTEMPLATEVERIFY` and `OP_CHECKSIGFROMSTACK`. These make possible what the
+wallet ships today: vaults, inheritance, atomic swaps with seven other chains, and pooled
+mining without a pool operator.
 
-### What `.btf` does and does not hide
+## Download
 
-Worth being precise, because the difference matters if you are relying on it.
+Packages for every release are at [releases.bitflash.network](https://releases.bitflash.network/)
+and on the [GitHub releases page](https://github.com/bitflash-network/bitflash/releases). Tor
+is included in every package; nothing else needs to be installed.
 
-**A peer you reach over `.btf` does not learn your IP.** Every dial goes out through Tor to the peer's hidden service, and every inbound connection arrives through your own. Neither side sees the other's clearnet address, and there is no third party in the middle: the relays that used to pair nodes are gone from the code.
+| Platform | Package | How to start |
+|---|---|---|
+| Windows, 64-bit | `Bitflash-<version>-windows-with-tor.zip` | Extract, run `Bitflash.exe` |
+| Linux x86_64 | `Bitflash-<version>-x86_64.AppImage` | `chmod +x`, then run it |
+| Linux server | `bitflash-node-<version>-x86_64` | `./bitflash-node -nogui -managedtor` |
+| macOS 15+, Apple silicon | `Bitflash-<version>-macos-arm64.tar.gz` | From Terminal, see below |
+| Mining only | `Bitflash-Miner-<version>-*` | `mine.cmd` or `./mine.sh` |
 
-**Nothing terminates your connection but the peer.** Earlier versions routed through a rendezvous relay, which by construction saw your IP unless you also used Tor. That transport was removed, not merely discouraged.
-
-**Your listener no longer gives you away.** It used to bind every interface, so anything that could reach the plain port completed a handshake and was handed your signed descriptor — onion included. Under managed Tor it binds loopback only, which is all the hidden service needs. If your Tor runs on another machine and has to reach this one over the network, `-bindaddr=IP` says so explicitly.
-
-This is unlinkability between peers, not anonymity against a network observer.
-For Tor routing and direct onion peer endpoints, start the node with `-tor`;
-see [Tor mode](docs/tor.md).
-For a plain SOCKS5 proxy without Tor-specific defaults, use
-`-socks=HOST:PORT`.
-
-### Trade, talk and get paid, with nobody in the middle
-
-**Atomic swaps, BTF for BTC.** Either both sides get paid or both get their
-coins back; no exchange, no escrow, no server. The Bitcoin side runs on your
-own Bitcoin Core, or on a Bitcoin light client built into the wallet, over its
-own Tor. Swaps open on mainnet on **2026-12-25 12:00 UTC**, on top of rules
-v3, a soft fork on mainnet at 2026-11-21 12:00 UTC. See
-[atomic swaps](docs/atomic-swaps.md).
-
-**btfchat.** Messages, money and swaps between `.btf` addresses. Offline
-messages wait in the Bitflash nodes themselves, sealed for the recipient; no
-relay and no account. Public communities are listed on the chain, and swap
-offers are posted in them. With a window, or `btfchat -terminal`. See
-[btfchat](docs/btfchat.md).
-
-**Payments.** Payment links and QR codes (BIP21), fees per size with a
-"speed up" for a stuck payment (BIP125), and invoices for a shop that are only
-its own node: a fresh address, the link, the QR and a signed webhook when it
-is paid. See [invoices](docs/invoices.md).
-
----
-
-## Quick start
-
-Download the [latest release](https://releases.bitflash.network/) and run. No
-install, no configuration — it connects automatically and starts syncing.
-
-**Linux:** make the `.AppImage` executable and run it.
-
-**Windows:** extract the `-windows-with-tor.zip` and run `Bitflash.exe`. Tor is
-bundled and a managed Tor instance starts automatically, so onion transport
-works with no separate install. Pass `-nomanagedtor` to turn it off.
-
-**macOS (Apple silicon, M1 and later):** from Terminal, no app to install.
-Unpack `-macos-arm64.tar.gz`, then, once:
+On macOS the package runs from Terminal:
 
 ```bash
 xattr -dr com.apple.quarantine Bitflash-*-macos-arm64
 cd Bitflash-*-macos-arm64 && ./bitflash-node -managedtor
 ```
 
-`README-macOS.txt` in the folder covers mining and btfchat.
+The headless Linux node needs Debian 13, Ubuntu 24.04 or later
+(`sudo apt install libsodium23 libdb5.3++ libsqlite3-0 libssl3t64`). On other distributions,
+use the AppImage.
 
-**btfchat** is its own program beside the wallet: `BtfChat.exe` on Windows, the
-`BtfChat-*.AppImage` on Linux, `./btfchat` on macOS. It needs a recovery phrase
-of its own once (`btfchat -newphrase`) and the wallet started with
-`-chatwallet` for paying and being paid.
+Where the download sites are blocked, the same files are served over Tor at
+`http://rqzruhh4sm2s3fl6b4mpselkqsaaxebnyptpqhdpt236g57lof7j7sid.onion/`.
 
-Every release ships a `SHA256SUMS` covering the assets. Verifying takes a second
-and is worth doing:
+### Verifying a download
 
-```bash
-sha256sum -c SHA256SUMS
-```
-
-For newer signed releases, verify the checksum file itself first:
+Each release publishes `SHA256SUMS` and a detached signature, `SHA256SUMS.asc`, made with the
+release key `910A 2B4C CA87 9E81 FB4B 2AEA 1D4A 53D3 B78A A4B8`.
 
 ```bash
 gpg --verify SHA256SUMS.asc SHA256SUMS
-sha256sum -c SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-The helper below downloads the release assets, verifies `SHA256SUMS.asc` when it
-is present, then checks the hashes:
+Release builds are reproducible: the same commit produces the same files byte for byte.
+[docs/release-verification.md](docs/release-verification.md) describes how to check the key,
+and how to rebuild a release and compare it.
+
+## Wallet
+
+The wallet starts with a twelve-word recovery phrase (BIP39 and BIP32, BIP44 coin type
+4346950, registered in [SLIP-0044](https://github.com/satoshilabs/slips/blob/master/slip-0044.md)).
+The words are printed once, to the terminal or the window, and never written to `debug.log`.
 
 ```bash
-scripts/verify-release.sh latest
+bitflash -newphrase                          # create a phrase and show it once
+bitflash -restorephrase="twelve words ..."   # rebuild a wallet from the phrase
+bitflash -backupwallet=/path/to/backup       # write a backup file that opens on its own
 ```
 
-See [release verification](docs/release-verification.md) for the full release
-audit flow and the maintainer signing step.
+Keep both the phrase and a file backup. Keys created before a phrase existed, and keys imported
+later, are not derived from the words and are restored only from a file. The derivation is
+specified in [docs/derivation.md](docs/derivation.md), with test vectors and a standalone
+script, so the phrase stays recoverable without this software.
 
-Public mirrors should make the latest checksum files available both under the
-versioned release directory and at the release root:
+New wallets are stored as a single `wallet.sqlite`. Older Berkeley DB `wallet.dat` files keep
+working and can be converted from the window. A `wallet.dat` copied on its own will not open
+elsewhere; use `-backupwallet`, or copy the whole data directory with the node stopped. See
+[docs/storage.md](docs/storage.md).
 
-```text
-https://releases.bitflash.network/v1.2.20/SHA256SUMS
-https://releases.bitflash.network/SHA256SUMS        # alias to latest
-```
+Wallet and chain data live in `%APPDATA%\Bitflash` on Windows and `~/.bitflash` on Linux and
+macOS. Upgrading replaces only the program; never delete the data directory without a backup.
 
-Bitflash also ships a deterministic UTXO-set commitment tool:
+### Contracts
 
-```bash
-python3 scripts/verify-utxo-set.py --out utxo-report.json --json
-```
+From the rules v4 activation the wallet can lock coins under conditions enforced by consensus.
+Contracts are recorded in `v4contracts.json` beside the wallet; back it up together with the
+wallet.
 
-It reconstructs the best chain from local block files, computes the current
-UTXO root and supply, and writes canonical JSON that independent auditors can
-compare or timestamp externally with OpenTimestamps. See
-[UTXO-set commitments](docs/utxo-commitment.md).
-
-The same root can prove one unspent output without sharing the full UTXO set:
-
-```bash
-python3 scripts/prove-utxo.py TXID:VOUT --out utxo-proof.json --json
-python3 scripts/verify-utxo-proof.py utxo-proof.json
-```
-
-See [UTXO inclusion proofs](docs/utxo-proofs.md).
-
-Bitflash also ships a deterministic fair-launch verifier:
-
-```bash
-python3 scripts/verify-fair-launch.py --max-blocks 1000 --out bitflash-fair-launch-report.json --json
-```
-
-The report reads the local chain directly, checks the genesis launch baseline,
-and produces canonical JSON whose hash can be compared by independent auditors
-or timestamped externally with OpenTimestamps. See
-[fair-launch verification](docs/fair-launch.md).
-
-For a static local block explorer, generate HTML and JSON from either a data
-directory or explicit block files:
-
-```bash
-python3 scripts/build-explorer.py --datadir ~/.bitflash ./explorer-out
-python3 scripts/build-explorer.py ~/.bitflash/blk0001.dat ~/.bitflash/blk0002.dat ./explorer-out
-```
-
-The generated explorer is static and self-contained: `index.html`,
-`style.css`, `explorer.js`, `blocks.json`, `block/*.json`, and `logo.png`. It is
-safe to host behind a strict policy such as `default-src 'none'; img-src 'self';
-style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none';
-form-action 'none'`.
-
-**Keep your node current.** Consensus rules have changed since the first
-releases — 1.2.1 fixed a bug that let anyone spend anyone's coins, and 1.2.2
-added a per-block signature-operation cap. A node on an older build will accept
-blocks that current nodes reject, which puts it on a different chain without any
-warning.
-
-Two more reasons, both measured rather than theorised:
-
-- **Before 1.2.13** a node closed a disconnected peer's socket twice and left the
-  closed handle in its `select()` set, where it made `select()` fail on every
-  iteration. The node then spent its socket loop in an error path instead of
-  reading its peers — the deaf-node behaviour reported since 1.2.7. Two nodes
-  side by side on one machine, same network: the one without the fix held 11
-  peers and logged 741 spurious disconnections; the one with it held 21 and
-  logged none. On 1.2.13 in production, two mining nodes hold 13 and 18 peers
-  with zero.
-- **Before 1.2.11** a long-running Windows node accumulated sockets it never
-  released — 1262 of them in 26 hours on one machine, each holding an ephemeral
-  port. Restarting returned them; upgrading stops them accumulating.
-
-Your wallet and chain data live in `%APPDATA%\Bitflash` (Windows) or
-`~/.bitflash` (Linux) and are shared by every version, so upgrading is just
-replacing the binary. Never delete that directory to "fix" something without a
-backup — it holds your keys.
-
----
-
-## Your wallet: the phrase and the file
-
-Since 1.2.12 a wallet can hold twelve words that rebuild it. Since 1.2.13 those
-words also cover the address the window shows you. **Both still matter** — the
-phrase and the file back up different things, and the difference is where people
-lose money.
-
-Since 1.2.20 the file is a single self-contained `wallet.sqlite` by default. A
-fresh data directory starts on it; an existing Berkeley DB `wallet.dat` keeps
-working and the desktop app converts it in one click on first run, never
-touching the original, which stays as a fallback. Choose a backend explicitly
-with `-walletbackend=sqlite` or `-walletbackend=bdb`, recorded in a
-`wallet-backend` marker in the data directory. See
-[wallet storage](docs/storage.md).
-
-The derivation is written down in [docs/derivation.md](docs/derivation.md), with
-test vectors and a script that reproduces them from scratch. It is there so the
-twelve words keep working even if this software does not: paths, address format
-and encoding, enough to recover the keys with ordinary tools and no Bitflash
-code at all.
-
-### The recovery phrase
-
-```
-bitflash -newphrase                          # create it, show it once, exit
-bitflash -restorephrase="twelve words here"  # rebuild a wallet from it
-```
-
-`-newphrase` installs a BIP39/BIP32 seed and derives the wallet as a BIP44 tree
-along `m/44'/4346950'/0'/…` — coin type **4346950** is `0x425446`, the ASCII
-bytes `BTF`, registered in [SLIP-0044](https://github.com/satoshilabs/slips/blob/master/slip-0044.md).
-It builds the key pool and default receiving address from the seed, and prints
-the words once. It refuses if a phrase
-already exists: replacing one silently would strand every coin on addresses the
-written-down words no longer describe.
-
-`-restorephrase` installs the seed and walks forward in batches of a hundred
-addresses, rescanning the chain after each and stopping when a whole batch turns
-up nothing. `-restoredepth=N` looks further. `-showderived=N` lists the addresses
-a phrase produces, so you can check one before trusting it.
-
-The same two operations are in the window, under **Wallet Safety**.
-
-**The words are printed to the terminal and nowhere else** — never to
-`debug.log`, which is the file people are routinely asked to attach to an issue.
-
-**What the phrase does not cover.** Keys that existed *before* the seed was
-installed are random. They are not derived from it and they do not come back
-from the words. The wallet names such an address `Your Address (created before
-the recovery phrase)` so you can tell them apart. This is why file backups still
-matter.
-
-> **If you created a phrase on 1.2.12, run `-restorephrase` with the same twelve
-> words.** That release installed the seed but left the visible address and the
-> key pool random, so the wallet went on handing out addresses the words cannot
-> reproduce while the window said a phrase existed. Restoring repairs it.
-
-### The file
-
-Under the SQLite default the wallet is one self-contained `wallet.sqlite`, and
-`-backupwallet` writes a matching `.sqlite` copy that opens on its own — no
-sidecar directory. The Berkeley DB notes below apply to a legacy `wallet.dat`.
-
-**Copying `wallet.dat` on its own is not a backup.** Berkeley DB ties the file
-to the environment in the `database/` subdirectory beside it, so a lone
-`wallet.dat` will not open elsewhere — the keys are all still in there, and the
-file is refused anyway. Use the built-in command, which writes a copy that
-stands on its own:
-
-```
-bitflash -backupwallet=/path/to/wallet-backup.dat
-```
-
-It loads the wallet, writes the copy, and exits without starting the node. If
-you would rather copy by hand, shut the node down first and take the **whole**
-data directory, not just `wallet.dat`.
-
-A file backup covers what a phrase cannot: keys from before the seed, and any
-key the wallet acquired by import. It also has a margin of its own — the wallet
-keeps a pool of 100 pre-generated keys, so a backup covers the next 100 mining
-rewards or receive addresses. Take a fresh one after mining for a while, after
-creating many receive addresses, and before moving the wallet to another machine.
-
-The GUI has a **Backup Wallet** button and a **Wallet Safety** view, which fills
-the key pool before writing the backup.
-
-### Finding coins the wallet never recorded
-
-```
-bitflash -rescan
-```
-
-Walks the chain for coins a key of yours owns but the wallet has no record of —
-after importing keys, or after restoring a file from another machine.
-`-importwallet` runs this automatically. A scan asked for with no chain data
-loaded is refused rather than reported as "no transactions found", which reads
-as a verdict to somebody who has just lost a wallet.
-
-### When wallet.dat itself will not open
-
-A legacy `wallet.dat` runs on Berkeley DB. If that database is the thing
-that is broken — a build that will not read it, a file truncated by a bad copy,
-an environment beyond recovery — the keys are usually still fine, and you can
-take them out as text:
-
-```
-bitflash -dumpwallet=/path/to/keys.txt
-bitflash -importwallet=/path/to/keys.txt   # into any wallet, on any machine
-```
-
-One key per line with its address and label, no database and no environment.
-Importing skips keys the wallet already holds, so running it twice is safe, and
-an unreadable line is reported and stepped over rather than abandoning the rest.
-Restart the node afterwards so it scans the chain for transactions belonging to
-the new keys.
-
-**The dump is your private keys in the clear.** Anyone who reads that file can
-spend those coins. It is written owner-only on Linux and macOS; on Windows it
-inherits whatever the containing folder allows, so choose the folder carefully.
-Move it somewhere safe and delete the copy. `-dumpwallet` will not overwrite an
-existing file.
-
----
+- **Vaults.** Coins can leave only through an unvault transaction that is visible on the chain.
+  The spending key can complete the withdrawal after a delay you choose; the recovery key can
+  take the coins back at any time before that. See [docs/rules-v4.md](docs/rules-v4.md).
+- **Inheritance.** Coins pass to an heir once the owner has been inactive for a chosen period.
+  The owner's wallet renews automatically; the heir's package holds no key until it is needed.
+  See [docs/inheritance.md](docs/inheritance.md).
+- **Batches.** One output now that expands later into a fixed set of payments.
 
 ## Mining
 
-Open **Options** from the menu bar. Under Mining Mode:
+| Mode | How |
+|---|---|
+| Solo | `bitflash -nogui -gen`, or *Options > Mining Mode* in the window |
+| P2Pool | `bitflash -nogui -p2pool`, then point XMRig at `127.0.0.1:3333` |
+| Bitflash Miner | `mine.cmd YOUR_ADDRESS` on Windows, `./mine.sh YOUR_ADDRESS` on Linux and macOS |
+| Your own XMRig | through Tor to the pool onion, see below |
 
-**Solo** — mine directly to your wallet. Default.
+**P2Pool** runs inside the node. Participating nodes keep a share chain, and every block's
+coinbase pays the miners of the last 2160 shares in proportion to their work. There is no
+operator, no custody and no fee. See [docs/p2pool.md](docs/p2pool.md).
 
-**Operator** — run a pool. The pool listens on a second port on the same hidden service, so workers reach it over Tor like any other peer. The window shows the pool's `.btf` address, discovered pools, and owed payouts. A worker announces which chain it is mining when it subscribes, and a pool on the other network refuses it rather than handing out work whose shares could never be paid.
+**Bitflash Miner** is the official XMRig release packaged with a Tor client and a launcher. It
+mines to the network pool over Tor, with a 1% fee, or to a local P2Pool node with
+`mine.cmd p2pool`. Antivirus products commonly flag XMRig; the binary is unmodified, and
+[docs/windows-defender.md](docs/windows-defender.md) explains what is reported and why.
 
-Pool announcements are published on Nostr with live status fields, so external tools can query the latest pool state by `.btf` address.
-
-Pool operators also write a local `pool_status.json` every ten seconds and a
-`pool_rounds.json` proof ledger whenever they find blocks or pay miners. By
-default both are created in the data directory; use `-poolstatusfile=PATH` and
-`-poolroundsfile=PATH` to write them somewhere a dashboard or web sync can read.
-The files are informational only: nodes still discover pools through Nostr and
-`.btf`, not through any web domain.
-See [public pool directory](docs/pool-directory.md) for the website/API shape.
-
-**Participant** — mine to someone else's pool. Enter or select the pool's `.btf` address and enable Start Mining.
-
-### Mining with ordinary software
-
-From **PoW v2** — mainnet at block time 1789992000 (2026-09-21 12:00 UTC),
-testnet at 1789419600 (2026-09-14 21:00 UTC) — you do not need Bitflash
-installed to mine it. Download **Bitflash Miner** from the releases page
-(`Bitflash-Miner-*-windows.zip` or `-linux.tar.gz`): it is the official XMRig
-build plus a Tor client and a launcher.
-
-```
-mine.cmd YOUR_BTF_ADDRESS        Windows
-./mine.sh YOUR_BTF_ADDRESS       Linux, macOS (Apple silicon)
-```
-
-It starts a private Tor and runs XMRig through it to the pool's onion; Ctrl+C
-stops both. Double-clicked, it asks for the address. Antivirus products flag
-XMRig everywhere — the binary is unchanged, and its hash matches the one on
-XMRig's release page. See [Windows Defender](docs/windows-defender.md) for what
-is flagged, why, and how false positives are reported.
-
-Or bring your own XMRig, which has spoken Tor on its own since 5.7.0: run Tor
-(the Tor Browser, open, is enough — its SOCKS port is 9150; a `tor` daemon
-listens on 9050) and point the miner at the pool's onion through it:
+To use your own XMRig (5.7.0 or later), run Tor and connect through its SOCKS port:
 
 ```bash
-xmrig -a rx/0 -x 127.0.0.1:9150 -o mddjuyuctouv62eqdaofvwf4timxxmp72d2ghmc6qp5mdey6f5au56id.onion:8436 -u YOUR_BTF_ADDRESS -p x
+xmrig -a rx/0 -x 127.0.0.1:9050 \
+  -o mddjuyuctouv62eqdaofvwf4timxxmp72d2ghmc6qp5mdey6f5au56id.onion:8436 \
+  -u YOUR_ADDRESS -p x
 ```
 
-The pool lives behind a Tor hidden service like every node on this network,
-and nothing in either path touches the clear net; there is no public IP
-anywhere in it to switch off. `YOUR_BTF_ADDRESS` is a Bitflash payment
-address, the kind `-newaddress` prints — not a `.btf` node address. The pool
-pays out to it. Fee 1%. To try PoW v2 before mainnet switches, the testnet
-pool is `vocwzaqll3vzuvs4nkva5fxh6q5odlokkqvfc2uvhcjtmjlygae5l4id.onion:18438`
-(`testnet` as the launcher's second word) and pays a testnet address.
+`YOUR_ADDRESS` is a Bitflash payment address, as printed by `-newaddress`, not a `.btf` node
+address. Use port 9150 instead of 9050 if Tor Browser provides the proxy.
 
-Before the switch the pool refuses these miners with a message that names the
-activation time. Until then, and for anyone who prefers the node's own miner,
-Bitflash mines to the same pool over its own Tor:
+The node can also run a pool of its own (`-operator`), serving workers on a second port of its
+onion service. See [docs/pool-directory.md](docs/pool-directory.md) and
+[docs/pow-v2.md](docs/pow-v2.md).
+
+## Trading, messaging and payments
+
+- **Atomic swaps.** BTF for BTC, LTC, BCH, XEC, DOGE, DGB or RVN, without an exchange or an
+  intermediary: either both sides are paid or both are refunded. The other chain is reached
+  through your own node for that chain, or through a light client built into the wallet that
+  verifies every header's proof of work over Tor. Swaps open on mainnet on
+  **2026-12-25 12:00 UTC**. See [docs/atomic-swaps.md](docs/atomic-swaps.md).
+- **btfchat.** Messages, payments and swap offers between `.btf` addresses. Messages for an
+  offline recipient are held, encrypted, by the Bitflash nodes themselves; there is no account
+  and no relay. See [docs/btfchat.md](docs/btfchat.md).
+- **Payments.** BIP21 payment links and QR codes, replace-by-fee for a stuck payment, and
+  invoices for merchants with a signed webhook on payment. See [docs/invoices.md](docs/invoices.md).
+- **Block explorer.** *Explorer* in the wallet menu looks up blocks and transactions from the
+  node's own files, so no website learns what was looked up.
+
+## Running a node
+
+The desktop app starts its own Tor and creates an onion service on first run. For a server:
 
 ```bash
-./bitflash -participant=ygnbd2zwq5wllaafopxa7ccnvnwuen75qt6rqco3x4bx3mfiorbaxei.btf
+bitflash-node -nogui -managedtor            # node only
+bitflash-node -nogui -managedtor -gen       # node and solo miner
+bitflash-node -nogui -managedtor -p2pool    # node and P2Pool
 ```
 
-Why a switch was needed, and what a pool has to send, is in
-[docs/pow-v2.md](docs/pow-v2.md). The 1.2.23 release and earlier could not be
-mined by XMRig at all — the README of that release said otherwise, and it was
-wrong.
+| Option | Purpose |
+|---|---|
+| `-datadir=PATH` | Use another data directory |
+| `-testnet` | Join the test network (port 18433, separate genesis and data) |
+| `-port=N` | P2P port, default 8433 |
+| `-managedtor[=PATH]` | Start a Tor process and an onion service for this node |
+| `-tor[=HOST:PORT]` | Use an existing Tor SOCKS proxy, default `127.0.0.1:9050` |
+| `-torbridges` | Reach Tor through the built-in Snowflake bridges |
+| `-torbridge=LINE` | Add an obfs4 or Snowflake bridge of your own |
+| `-btfseed=ADDRESS:KEY` | Add a `.btf` bootstrap peer |
+| `-help` | List every option |
 
-The same switch brings the consensus rules Bitcoin adopted after 0.1.0 —
-strict DER and low-S signatures, the height in every coinbase, the retarget
-window that measures what it divides by — see [docs/rules-v2.md](docs/rules-v2.md).
-
-A node can also act as a local stratum bridge for a pool, for miners that
-cannot be given a proxy:
-
-```bash
-./bitflash -nogui -stratumbridge=POOL_BTF_ADDRESS -stratumbridgeport=3333
-xmrig -a rx/0 -o 127.0.0.1:3333 -u YOUR_BTF_ADDRESS -p x
-```
-
-`-stratumbridgebind=0.0.0.0` opens it to the network; it stays on loopback
-unless asked. Bitflash itself runs no public bridge.
-
-Estimate rewards and electricity cost locally:
-
-```bash
-python3 scripts/bitflash-mining-calculator.py \
-  --hashrate 21 --hashrate-unit kh/s \
-  --network-hashrate 1.56 --network-hashrate-unit mh/s \
-  --watts 140 --kwh-cost 0.10 \
-  --price 0.001 --pool-fee 1
-```
-
-See [mining calculator](docs/mining-calculator.md). Price is manual until
-Bitflash has a reliable public market.
-
----
-
-## Headless / server mode
-
-```bash
-./bitflash -nogui                     # node only
-./bitflash -nogui -gen                # node + solo mining
-./bitflash -nogui -gen -operator      # pool operator
-./bitflash -nogui -gen -operator \
-  -poolstatusfile=/var/www/pool_status.json \
-  -poolroundsfile=/var/www/pool_rounds.json
-./bitflash -nogui -gen -participant=POOL_BTF_ADDRESS  # mine to pool
-./bitflash -nogui -stratumbridge=POOL_BTF_ADDRESS      # local bridge for XMRig/SRBMiner
-```
-
-Every option takes `-` or `/`. **Under MSYS2 use the `-` form** — the shell
-rewrites a leading slash into a path before the node ever sees it.
-
-**The mining mode is remembered between restarts** since 1.2.11, so a node that
-was mining comes back mining. A `-gen`, `-operator` or `-participant` flag always
-wins over what was stored, and the log says on every start which of the two
-decided. Passing the flag anyway is the safe habit: it survives a wallet that
-came from an older build.
-
-Other options worth knowing:
-
-```bash
--datadir=PATH    # wallet and chain data elsewhere
--testnet         # isolated test network genesis, datadir, port 18433, and magic
--port=N          # P2P listen port, default 8433; testnet default 18433
--socks=HOST:PORT # SOCKS5 for outbound Nostr and onion peer dials
--bindaddr=IP     # listen here instead of loopback (only for Tor on another machine)
--tor[=HOST:PORT] # Tor mode; default local Tor SOCKS5 proxy is 127.0.0.1:9050
--managedtor[=PATH] # start Tor, create a hidden service, advertise its onion
--nomanagedtor    # disable the automatic bundled-Tor startup
--onionservice=HOST.onion:PORT # advertise this node's Tor hidden service
--debug           # verbose log; without it debug.log is nearly silent
--help            # full list
-```
-
-`-port` plus `-datadir` is what lets two nodes share one machine. Both are
-needed — the data directory takes an exclusive lock, so a second node pointed at
-the same one will refuse to start.
-
-`-socks=127.0.0.1:9050` routes outbound Nostr discovery and `.onion` peer
-dials through a local SOCKS5 proxy such as Tor.
-When it is set, the node skips
-plain HTTP external-IP probes instead of leaking a direct request outside the
-proxy. IPv6 proxy endpoints use brackets, for example `-socks=[::1]:9050`.
-
-`-tor` is a privacy shorthand for the usual local Tor SOCKS5 listener at
-`127.0.0.1:9050`. It routes outbound Nostr discovery and signed `.onion` peer
-dials through Tor, and keeps external-IP probes disabled. Use `-tor=HOST:PORT`
-when Tor listens somewhere else.
-
-Bridges are for networks that block Tor itself: `-torbridges` uses the built-in
-Snowflake set, `-torbridge=LINE` adds an obfs4 or snowflake bridge of your own.
-If you ask for bridges and the pluggable-transport binary is missing, the node
-refuses to start rather than quietly reaching Tor directly — that fallback would
-be the exact thing you were avoiding. With no bridges asked for, a managed Tor
-that reaches no peer in four minutes climbs a ladder on its own -- Snowflake,
-obfs4, webtunnel, meek, from Tor Browser's bundled list -- and remembers what
-worked (`-notorfallback` turns that off; `bridges.txt` in the data directory,
-or *Options* in the app, takes bridges of your own). Where the download sites
-are blocked too, the releases are served over Tor at
-`http://rqzruhh4sm2s3fl6b4mpselkqsaaxebnyptpqhdpt236g57lof7j7sid.onion/`; see
+If a managed Tor reaches no peer within four minutes, the node tries Snowflake, obfs4,
+webtunnel and meek bridges in turn and remembers the one that worked (`-notorfallback`
+disables this). See [docs/tor.md](docs/tor.md) and
 [docs/censored-networks.md](docs/censored-networks.md).
 
-The desktop app starts a managed Tor automatically when no other Tor option is
-set, so onion transport works out of the box; `-nomanagedtor` turns that off.
-For a headless node, ask for it explicitly:
+*Menu > Diagnostics* shows peers, sockets, block arrival and mining state, and the same report
+is written to `debug.log` every ten minutes. Please include it when reporting a problem.
 
-`-managedtor[=PATH]` starts a Tor process for this node, writes a local `torrc`,
-creates a v3 hidden service for port `8433`, routes outbound discovery through
-that Tor instance, and signs the generated `.onion:8433` endpoint into the
-node's `.btf` descriptor. Without `PATH`, Bitflash looks for `tor/tor.exe`,
-`tor.exe`, or `tor` beside the binary and then on `PATH`. The hidden-service key
-is stored under the Bitflash data directory in `managed-tor/onion-service/`.
-
-### When something looks wrong
-
-**Menu > Diagnostics**, and the same report in `debug.log` every ten minutes:
-peers held against peers the socket loop is actually watching, blocks received and how
-many arrived without a parent, the proof-of-work mode with the live miner thread
-count, sockets by the part of the program that opened them, and per peer how long
-since the last message each way. There is a copy button — if you open an issue,
-paste that.
-
-It exists because every hard problem in this project so far was found from
-*outside* the node: sockets read over WMI from another machine, memory compared
-against a number in a README, a `grep` over somebody's log. In each case the node
-knew and had no way to say so.
-
-As a systemd service:
+A minimal systemd unit:
 
 ```ini
 [Unit]
 Description=Bitflash node
-After=network.target
+After=network-online.target
 
 [Service]
-ExecStart=/opt/bitflash/bitflash -nogui -gen -operator
+ExecStart=/opt/bitflash/bitflash-node -nogui -managedtor
 Restart=always
-User=bitcoin
-WorkingDirectory=/opt/bitflash
+User=bitflash
 
 [Install]
 WantedBy=multi-user.target
 ```
 
----
+### Peer discovery
 
-## How nodes find each other
+A node's descriptor (its `.btf` address, an encryption key and its current onion) is signed
+with the key the address is derived from, so no one can publish a descriptor for an address
+they do not control. Nodes find each other through seeds compiled into the binary, a cache of
+peers that answered before (`btfpeers.json`) and descriptors exchanged between connected peers.
+Nostr is consulted only when none of these has the address. Any node with a stable onion can
+serve as a bootstrap seed; it holds no funds and is trusted for nothing.
 
-A node publishes a **self-certifying descriptor**: its `.btf` address, an
-encryption key, and the `.onion` where it is currently reachable, signed with the
-key the address decodes to. Nobody can publish a descriptor for an address they
-do not own, so whoever passes one on is trusted for nothing — forging an entry
-would need somebody else's secret key.
-
-Discovery runs on three layers, and none of them is required for the others to
-work:
-
-| | |
-|---|---|
-| **Baked seed** | a pinned `.onion` compiled into the binary, dialled directly, so a cold start needs no relay to answer |
-| **Peer cache** | peers that answered before, kept in `btfpeers.json` |
-| **Peer exchange** | connected nodes hand each other signed descriptors, so the network grows and heals on its own |
-
-Nostr is used to look up a descriptor when nothing else has one, and that is all
-it is used for. Tor frequently has no exit to reach the Nostr relays, so nothing
-load-bearing may depend on it.
-
-A single connection scheduler works through all three, re-reading the cache each
-round — which is what puts peer exchange to use — with exponential backoff and
-jitter per address. A dead peer costs one dial and then goes quiet; a peer that
-was merely unreachable for a moment gets tried again. Seeds are retried whenever
-the peer count is on the floor, not only on the first run.
-
----
-
-## Running a bootstrap seed
-
-Relays are gone. A node behind NAT needs nothing forwarded, because its hidden
-service is its address. What still helps a stranger is somebody answering the
-very first dial, and any node with a stable onion can be that:
+### Testnet
 
 ```bash
-./bitflash-node -nogui -managedtor -port=8433
+bitflash-node -nogui -managedtor -testnet -datadir=/path/to/testnet
 ```
 
-Publish the `.btf` address it prints and people can pass it with `-btfseed=`. A
-seed holds no balance, does not mine, and is trusted for nothing: it serves the
-same signed descriptors any peer does.
+Give the testnet node its own data directory, so the two networks do not share an onion
+service. Test coins are available from the [faucet](https://faucet.bitflash.network/) (10 BTF
+per address every six hours), or by mining with `-gen`. Testnet and mainnet addresses look the
+same; coins sent to the wrong network cannot be recovered.
 
----
+## Network upgrades
 
-## Testnet
+| Upgrade | Contents | Mainnet activation |
+|---|---|---|
+| PoW v2 and rules v2 | XMRig-compatible RandomX, strict DER and low-S signatures, BIP34 and BIP30, corrected retarget | Active since 2026-09-21 |
+| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, median-time lock-time finality | 2026-11-21 12:00 UTC |
+| Rules v4 | BIP68 and `OP_CHECKSEQUENCEVERIFY`, `OP_CHECKTEMPLATEVERIFY`, `OP_CHECKSIGFROMSTACK` | 2026-12-25 12:00 UTC |
 
-There is a test network with its own genesis, magic bytes, port and data
-directory, so a testnet node and a mainnet node cannot see or corrupt each
-other. It is where to try a wallet change, a pool, or a patch before it touches
-coins that matter.
+Rules v4 activate on testnet on 2026-11-20 12:00 UTC. Each upgrade is specified in
+[docs/pow-v2.md](docs/pow-v2.md), [docs/rules-v2.md](docs/rules-v2.md) and
+[docs/rules-v4.md](docs/rules-v4.md). A node that has not upgraded before an activation
+follows a different chain without warning, so keep every node current.
 
-```bash
-./bitflash-node -nogui -testnet -datadir=<a folder of its own>
-```
-
-Pass `-datadir` explicitly. Without it both networks land in the same
-application directory and fight over the same hidden service, which fails in
-ways that look like a network problem.
-
-Coins are free from the faucet at **<https://faucet.bitflash.network>**, 10 BTF
-at a time, one per address and per IP every six hours. Get an address to give it
-with `-newaddress`. You can also just mine: the difficulty floor makes the first
-blocks trivial, so `-testnet -gen` fills a wallet quickly.
-
-Testnet and mainnet addresses are indistinguishable — same version byte — so
-nothing can tell them apart for you. Coins sent to a mainnet address on testnet
-land on an output nobody can ever spend on mainnet.
-
----
-
-## Build from source
-
-**Linux:**
-```bash
-make linux
-```
-Installs deps via apt, builds libsecp256k1 and RandomX, produces `Bitflash-*.AppImage`.
-
-**Windows (MSYS2 UCRT64):**
-```bash
-make windows
-```
-Installs deps via pacman, produces `Bitflash-*-windows.zip`.
-
-To build the Windows package that also carries the Tor Expert Bundle:
-
-```bash
-make windows-tor
-```
-
-That produces `Bitflash-*-windows-with-tor.zip`. The release script downloads
-the Tor Expert Bundle from the official Tor archive, verifies its pinned SHA256,
-optionally verifies the Tor Project GPG signature when `gpg` is available, and
-places `tor/tor.exe` beside `Bitflash.exe` so `-managedtor` works without a
-separate Tor install. For release builds, use `TOR_VERIFY_GPG=required make
-windows-tor` to require the extra signature check.
-
----
-
-## At a glance
+## Parameters
 
 | | |
 |---|---|
 | Ticker | BTF |
-| Proof of work | RandomX (CPU, memory-hard) |
-| Block time | ~2 minutes |
-| Difficulty retarget | every 30 blocks (~1 hour) |
-| Block reward | 50 BTF, halving every 210,000 blocks |
-| Halving interval | **~292 days** at target block time |
-| Max supply | 21,000,000 BTF |
-| Coinbase maturity | 120 blocks (~4 hours) before mined coins can be spent |
-| Max signature ops | 20,000 per block |
+| Proof of work | RandomX |
+| Block time | 2 minutes (target) |
+| Difficulty retarget | Every 30 blocks |
+| Block reward | 50 BTF, halving every 210,000 blocks (about 292 days) |
+| Maximum supply | 21,000,000 BTF |
+| Coinbase maturity | 120 blocks |
 | P2P port | 8433 (testnet 18433) |
-| Addressing | `.btf` over Tor onion services — see the caveats above |
 | Premine | None |
-| Treasury | A 2-of-3 multisig on the chain that pays for the first exchange listing; opt-in only (`donate`, `-treasuryshare`, `-poolfeeto=treasury`); balance and every movement at [bitflash.network/treasury](https://bitflash.network/treasury) — see [docs/treasury.md](docs/treasury.md) |
-| Pool server | Built-in — second port on the node's own onion |
-| Wallet recovery | Twelve-word phrase (BIP39 + BIP32 + BIP44, coin type 4346950), plus file backup |
-| Wallet storage | SQLite `wallet.sqlite` by default, or Berkeley DB `wallet.dat` |
-| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, lock-time finality by median time, `OP_VER`/`OP_VERIF`/`OP_VERNOTIF` invalid; soft fork on mainnet at 2026-11-21 12:00 UTC |
-| Rules v4 | Relative lock times (`OP_CHECKSEQUENCEVERIFY`, BIP68/112), `OP_CHECKTEMPLATEVERIFY` and `OP_CHECKSIGFROMSTACK`; on testnet from 2026-11-20 12:00 UTC and on mainnet from 2026-12-25 12:00 UTC. Every node must upgrade before then: one on 1.2.31 or older leaves the chain at its first v4 spend. See [docs/rules-v4.md](docs/rules-v4.md) |
-| Platforms | Windows, Linux (x86_64), macOS (Apple silicon, Terminal only) |
+| Treasury | Opt-in 2-of-3 multisig that funds exchange listings, public at [bitflash.network/treasury](https://bitflash.network/treasury) ([docs/treasury.md](docs/treasury.md)) |
 
-The halving interval is the number most people get wrong coming from Bitcoin.
-Same 210,000 blocks, but at two minutes instead of ten, so it arrives in about
-ten months rather than four years.
+The halving interval is the same 210,000 blocks as Bitcoin, but at two-minute blocks it comes
+roughly every ten months rather than every four years.
 
----
+## Building from source
 
-Young network. Keep your node current and don't put in more than you are willing to lose.
+```bash
+make linux          # Linux: installs dependencies with apt, builds the AppImage
+make windows        # Windows, MSYS2 UCRT64: installs dependencies with pacman
+make windows-tor    # Windows package with the Tor Expert Bundle
+make tests          # unit tests
+```
 
-MIT. Built on Bitcoin 0.1.0 (Satoshi Nakamoto, 2009). The license covers the code; the name,
-logo and domain are not licensed. See [TRADEMARK.md](TRADEMARK.md).
+The build fetches and verifies pinned versions of libsecp256k1, RandomX and Tor. Third-party
+licenses are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) and the full set of
+dependencies in [docs/dependencies.md](docs/dependencies.md).
+
+## Documentation
+
+| Topic | Documents |
+|---|---|
+| Using the wallet | [storage](docs/storage.md), [derivation](docs/derivation.md), [multisig](docs/multisig.md), [inheritance](docs/inheritance.md), [invoices](docs/invoices.md), [RPC reference](docs/rpc.md) |
+| Network and privacy | [Tor](docs/tor.md), [censored networks](docs/censored-networks.md), [network hardening](docs/net-hardening.md) |
+| Mining | [PoW v2](docs/pow-v2.md), [P2Pool](docs/p2pool.md), [pool directory](docs/pool-directory.md), [mining calculator](docs/mining-calculator.md), [Windows Defender](docs/windows-defender.md) |
+| Swaps and chat | [atomic swaps](docs/atomic-swaps.md), [other chains](docs/swaps-multicoin.md), [light clients](docs/light-pow.md), [btfchat](docs/btfchat.md) |
+| Consensus | [rules v2](docs/rules-v2.md), [rules v4](docs/rules-v4.md) |
+| Auditing | [release verification](docs/release-verification.md), [fair launch](docs/fair-launch.md), [UTXO commitments](docs/utxo-commitment.md), [UTXO proofs](docs/utxo-proofs.md), [treasury](docs/treasury.md) |
+
+The same documents are published at [docs.bitflash.network](https://docs.bitflash.network/).
+
+## Contributing and security
+
+Bug reports and pull requests are welcome on GitHub. Consensus and wallet changes are expected
+to come with tests, and are proven on testnet before release. Please report security issues
+privately to the maintainers on [Discord](https://discord.gg/kcgeg696YE) rather than in a
+public issue.
+
+Bitflash is a young network. Keep your node up to date and do not put in more than you can
+afford to lose.
+
+## License
+
+Released under the MIT license, see [LICENSE](LICENSE). Based on Bitcoin 0.1.0 by Satoshi
+Nakamoto (2009). The license covers the code; the Bitflash name, logo and domain are not
+licensed, see [TRADEMARK.md](TRADEMARK.md).
