@@ -3690,6 +3690,136 @@ static int RunRulesV2SelfTest()
 // scriptPubKey it is supposed to satisfy. scriptSig and scriptPubKey run as
 // one concatenated script (0.1.0), so anything in the scriptSig that changes
 // control flow reaches the output's own checks.
+// The legacy signature hash as it was written before it stopped copying the
+// transaction, kept verbatim as the reference the rewrite must match.
+static uint256 SignatureHashReference(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType)
+{
+    if (nIn >= txTo.vin.size())
+        return 1;
+    CTransaction txTmp(txTo);
+    scriptCode.FindAndDelete(CScript(OP_CODESEPARATOR));
+    for (int i = 0; i < txTmp.vin.size(); i++)
+        txTmp.vin[i].scriptSig = CScript();
+    txTmp.vin[nIn].scriptSig = scriptCode;
+    if ((nHashType & 0x1f) == SIGHASH_NONE)
+    {
+        txTmp.vout.clear();
+        for (int i = 0; i < txTmp.vin.size(); i++)
+            if (i != nIn)
+                txTmp.vin[i].nSequence = 0;
+    }
+    else if ((nHashType & 0x1f) == SIGHASH_SINGLE)
+    {
+        unsigned int nOut = nIn;
+        if (nOut >= txTmp.vout.size())
+            return 1;
+        txTmp.vout.resize(nOut+1);
+        for (int i = 0; i < nOut; i++)
+            txTmp.vout[i].SetNull();
+        for (int i = 0; i < txTmp.vin.size(); i++)
+            if (i != nIn)
+                txTmp.vin[i].nSequence = 0;
+    }
+    if (nHashType & SIGHASH_ANYONECANPAY)
+    {
+        txTmp.vin[0] = txTmp.vin[nIn];
+        txTmp.vin.resize(1);
+    }
+    CDataStream ss(SER_GETHASH);
+    ss.reserve(10000);
+    ss << txTmp << nHashType;
+    return Hash(ss.begin(), ss.end());
+}
+
+// -selftest=sighash-reference -- SignatureHash() against the reference, on
+// random transactions, every hash type byte, every input index and one past
+// the end, and the three wider compact-size encodings.
+static int RunSigHashReferenceSelfTest()
+{
+    printf("sighash-reference self-test\n");
+    int nFail = 0;
+    uint64 nSeed = 0x9e3779b97f4a7c15ULL;
+    auto rnd = [&nSeed]() -> uint32_t {
+        nSeed ^= nSeed << 13; nSeed ^= nSeed >> 7; nSeed ^= nSeed << 17;
+        return (uint32_t)(nSeed >> 16);
+    };
+    auto script = [&rnd](unsigned int nMax) {
+        CScript s;
+        unsigned int n = rnd() % (nMax + 1);
+        for (unsigned int i = 0; i < n; i++)
+            s.push_back((rnd() % 7 == 0) ? (unsigned char)OP_CODESEPARATOR : (unsigned char)rnd());
+        return s;
+    };
+    auto randomTx = [&](unsigned int nIns, unsigned int nOuts, unsigned int nScript) {
+        CTransaction tx;
+        tx.nVersion = (int)rnd();
+        tx.vin.resize(nIns);
+        for (unsigned int i = 0; i < nIns; i++)
+        {
+            for (int k = 0; k < 8; k++)
+                ((uint32_t*)tx.vin[i].prevout.hash.begin())[k] = rnd();
+            tx.vin[i].prevout.n = rnd() % 4 == 0 ? (unsigned int)-1 : rnd();
+            tx.vin[i].scriptSig = script(nScript);
+            tx.vin[i].nSequence = rnd() % 3 == 0 ? UINT_MAX : rnd();
+        }
+        tx.vout.resize(nOuts);
+        for (unsigned int i = 0; i < nOuts; i++)
+        {
+            tx.vout[i].nValue = ((int64)rnd() << 32) | rnd();
+            tx.vout[i].scriptPubKey = script(nScript);
+        }
+        tx.nLockTime = (int)rnd();
+        return tx;
+    };
+
+    unsigned int nCompared = 0, nMismatch = 0;
+    auto compare = [&](const CTransaction& tx, const CScript& code, unsigned int nIn, int nHashType) {
+        nCompared++;
+        if (SignatureHash(code, tx, nIn, nHashType) != SignatureHashReference(code, tx, nIn, nHashType))
+        {
+            if (nMismatch++ < 5)
+                printf("  mismatch: %u in, %u out, nIn %u, hash type 0x%x\n",
+                       (unsigned int)tx.vin.size(), (unsigned int)tx.vout.size(), nIn, nHashType);
+        }
+    };
+
+    for (int t = 0; t < 300; t++)
+    {
+        CTransaction tx = randomTx(1 + rnd() % 6, rnd() % 7, 60);
+        CScript code = script(80);
+        for (unsigned int nIn = 0; nIn <= tx.vin.size(); nIn++)
+        {
+            for (int h = 0; h < 256; h++)
+                compare(tx, code, nIn, h);
+            for (int r = 0; r < 4; r++)
+                compare(tx, code, nIn, (int)rnd());
+        }
+    }
+    nFail += Check(nMismatch == 0, strprintf("%u random cases match the reference", nCompared).c_str()) ? 0 : 1;
+
+    // 0xfd, 0xfe: 300 inputs and outputs, and a 70000-byte script.
+    {
+        unsigned int nBefore = nMismatch;
+        CTransaction tx = randomTx(300, 300, 4);
+        tx.vout[5].scriptPubKey.insert(tx.vout[5].scriptPubKey.end(), 70000, (unsigned char)OP_NOP);
+        CScript code = script(80);
+        code.insert(code.end(), 70000, (unsigned char)OP_NOP);
+        int types[] = { SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE,
+                        SIGHASH_ALL | SIGHASH_ANYONECANPAY, SIGHASH_NONE | SIGHASH_ANYONECANPAY,
+                        SIGHASH_SINGLE | SIGHASH_ANYONECANPAY };
+        for (unsigned int k = 0; k < 6; k++)
+            for (unsigned int nIn = 0; nIn < 300; nIn += 37)
+                compare(tx, code, nIn, types[k]);
+        compare(tx, code, 5, SIGHASH_SINGLE);
+        nFail += Check(nMismatch == nBefore, "wide compact sizes match the reference") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunScriptEvalSelfTest()
 {
     printf("script-eval self-test\n");
@@ -8888,6 +9018,8 @@ int RunSelfTest(const std::string& name)
         return RunSigpipeSelfTest();
     if (name == "script-eval")
         return RunScriptEvalSelfTest();
+    if (name == "sighash-reference")
+        return RunSigHashReferenceSelfTest();
     if (name == "rules-v2")
         return RunRulesV2SelfTest();
     if (name == "net-hardening")

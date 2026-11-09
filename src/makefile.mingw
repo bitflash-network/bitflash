@@ -357,6 +357,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=rvn-kawpow
 	./bitflash.exe -selftest=sigpipe
 	./bitflash.exe -selftest=script-eval
+	./bitflash.exe -selftest=sighash-reference
 	./bitflash.exe -selftest=rules-v2
 	./bitflash.exe -selftest=rules-v3
 	./bitflash.exe -selftest=rules-v4

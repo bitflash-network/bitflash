@@ -752,8 +752,16 @@ uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache
 bool IsStrictDERSignature(const vector<unsigned char>& vchSig);
 bool IsLowSSignature(const vector<unsigned char>& vchSig);
 uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType);
+// Signature hashes already computed in one script run, by script code and hash
+// type: a CHECKMULTISIG tries one signature against up to twenty keys, and
+// every try used to hash the whole transaction again.
+struct SigHashCache
+{
+    map<pair<int, vector<unsigned char> >, uint256> m;
+};
 bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CScript scriptCode,
-              const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs);
+              const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs,
+              SigHashCache* pCache = NULL);
 // What VerifySignature() will require from rules v3 on, usable today for "is
 // this transaction complete": the scriptSig is push-only and satisfies the
 // scriptPubKey; if the scriptPubKey is pay-to-script-hash, the last push is
