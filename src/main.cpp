@@ -5,6 +5,7 @@
 #pragma push_macro("snprintf")
 #undef snprintf
 #include <nlohmann/json.hpp>
+#include <chrono>
 #pragma pop_macro("snprintf")
 #ifdef snprintf
 #undef snprintf
@@ -354,6 +355,34 @@ bool DeriveWalletPassphraseKey(const string& strPassphrase,
     OPENSSL_cleanse(chKey, sizeof(chKey));
     OPENSSL_cleanse(chIV, sizeof(chIV));
     return true;
+}
+
+// Rounds for a new master key. The fixed 25000 is cheap for a GPU guessing
+// passphrases against a stolen wallet file. As Bitcoin Core does, measure
+// this machine and take what costs about a tenth of a second per unlock,
+// never fewer than 25000. The count is stored with the master key, so a
+// wallet encrypted before this keeps opening with its own.
+unsigned int CalibrateWalletDeriveIterations(const string& strPassphrase,
+                                             const vector<unsigned char>& vchSalt)
+{
+    static const unsigned int nFloor = 25000;
+    static const double dCeiling = 50000000.0;
+    static const double dTargetMs = 100.0;
+    unsigned int nRounds = nFloor;
+    // Twice: the first run at the floor only estimates the speed, the second
+    // runs near the target and corrects for what the estimate got wrong.
+    for (int pass = 0; pass < 2; pass++)
+    {
+        CKeyingMaterial vchKey;
+        vector<unsigned char> vchIV;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        if (!DeriveWalletPassphraseKey(strPassphrase, vchSalt, nRounds, vchKey, vchIV))
+            return nFloor;
+        double dMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        double dNext = nRounds * dTargetMs / std::max(dMs, 1.0);
+        nRounds = (unsigned int)std::min(dNext, dCeiling);
+    }
+    return std::max(nRounds, nFloor);
 }
 
 bool EncryptSecret(const CKeyingMaterial& vchKey,

@@ -2580,6 +2580,8 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
         strErrorRet = "could not create a wallet encryption salt";
         return false;
     }
+    kMasterKey.nDeriveIterations = CalibrateWalletDeriveIterations(strPassphrase, kMasterKey.vchSalt);
+    printf("EncryptWallet() : %u key derivation rounds\n", kMasterKey.nDeriveIterations);
 
     CKeyingMaterial vchPassKey;
     vector<unsigned char> vchPassIV;

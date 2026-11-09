@@ -2486,6 +2486,20 @@ static int RunWalletEncryptSelfTest()
         vector<unsigned char> vchPlainHDMaster = vchHDMaster;
         vector<unsigned char> vchPlainHDChainCode = vchHDChainCode;
 
+        // New master keys take as many rounds as cost this machine about a
+        // tenth of a second, never fewer than the old fixed 25000.
+        {
+            vector<unsigned char> vchSalt(8, 0x5a);
+            unsigned int nRounds = CalibrateWalletDeriveIterations("btf-test-passphrase", vchSalt);
+            CKeyingMaterial k1, k2;
+            vector<unsigned char> iv1, iv2;
+            nFail += Check(nRounds >= 25000 &&
+                           DeriveWalletPassphraseKey("btf-test-passphrase", vchSalt, nRounds, k1, iv1) &&
+                           DeriveWalletPassphraseKey("btf-test-passphrase", vchSalt, nRounds, k2, iv2) &&
+                           k1 == k2 && iv1 == iv2,
+                           strprintf("key derivation is calibrated (%u rounds) and stays deterministic", nRounds).c_str()) ? 0 : 1;
+        }
+
         string strBackup;
         nFail += Check(EncryptWallet("btf-test-passphrase", strBackup, strError),
                        "wallet.dat can be rewritten encrypted") ? 0 : 1;
