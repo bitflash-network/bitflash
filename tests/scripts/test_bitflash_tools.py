@@ -273,6 +273,11 @@ def run_golden_fixture(update):
         full = json.loads((explorer_dir / "blocks.json").read_text(encoding="ascii"))
         assert_true(tip["height"] == full["tipHeight"],
                     "tip.json disagrees with blocks.json on the height")
+        assert_true(tip["recent"] and tip["recent"][0]["height"] == full["tipHeight"]
+                    and tip["recent"][0]["hash"] == full["blocks"][0]["hash"],
+                    "tip.json's recent blocks do not start at the tip")
+        assert_true(len(tip["recent"]) == min(6, full["count"]),
+                    "tip.json does not carry the newest six blocks")
         assert_true("Access-Control-Allow-Origin" in
                     (explorer_dir / "_headers").read_text(encoding="ascii"),
                     "explorer _headers does not open tip.json to the site")
