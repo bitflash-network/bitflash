@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/social.png" width="820" alt="Bitflash"/>
+<img src="docs/logo.png" width="112" height="112" alt="Bitflash logo"/>
 
 # Bitflash
 
