@@ -189,6 +189,8 @@ bool DeriveWalletPassphraseKey(const string& strPassphrase,
                                unsigned int nDeriveIterations,
                                CKeyingMaterial& vchKeyRet,
                                vector<unsigned char>& vchIVRet);
+unsigned int CalibrateWalletDeriveIterations(const string& strPassphrase,
+                                             const vector<unsigned char>& vchSalt);
 bool EncryptSecret(const CKeyingMaterial& vchKey,
                    const vector<unsigned char>& vchPlaintext,
                    const vector<unsigned char>& vchIV,
