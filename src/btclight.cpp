@@ -141,8 +141,10 @@ static int ConfirmationsByWork(const Net& net, const Headers& headers, int funde
     // nothing counts almost nothing as an hour. The anchor is ours, so a step
     // is never under a quarter of one block there, the floor's own measure.
     const Header& anchor = headers.At(net.anchorHeight);
-    const Integer anchorStep = net.multiAlgo ? anchor.work-headers.At(net.anchorHeight-1).work
-                                             : (Integer(1)<<256)/(Target(anchor.bits)+1);
+    // Both arms as Integer: left as Boost expression templates they are two
+    // different types, which newer clang refuses in a conditional.
+    const Integer anchorStep = net.multiAlgo ? Integer(anchor.work-headers.At(net.anchorHeight-1).work)
+                                             : Integer((Integer(1)<<256)/(Target(anchor.bits)+1));
     if (step < anchorStep/4) step = anchorStep/4;
     return WorkConfirmations(headers.Tip().work-headers.At(funded).work, step, counted);
 }
@@ -2298,9 +2300,9 @@ int SelfTestDogecoin()
     printf("doge-light self-test\n");
     const Net* mainNet = FindNet("doge","main"); const Net* testNet = FindNet("doge","test"); const Net* regNet = FindNet("doge","regtest");
     check(mainNet && testNet && regNet,"Dogecoin networks: main, test, regtest");
+    if (!mainNet || !testNet || !regNet) { printf("doge-light: %d failure(s)\n",failures+1); return 1; }
     check(CountsByWork(*mainNet) && !CountsByWork(*testNet) && !CountsByWork(*regNet),"DigiShield counts by work, on the main network");
     check(!CountsByWork(*FindNet("btc","main")) && !CountsByWork(*FindNet("ltc","main")),"a two-week retarget does not ease, and counts blocks");
-    if (!mainNet || !testNet || !regNet) { printf("doge-light: %d failure(s)\n",failures+1); return 1; }
     // dogecoin v1.14.9's chainparams.cpp asserts these hashes.
     check(Decode(mainNet->genesis).hash.GetHex() == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691","main genesis hash");
     check(Decode(testNet->genesis).hash.GetHex() == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e","test genesis hash");

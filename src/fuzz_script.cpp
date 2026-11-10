@@ -6,6 +6,7 @@
 // parser, standard-script extractors and EvalScript all see that same input.
 
 #include "headers_core.h"
+#include "fuzz_datadir.h"
 
 #include <stdint.h>
 #include <stddef.h>

@@ -6,6 +6,7 @@
 // opening sockets or starting node threads.
 
 #include "headers_core.h"
+#include "fuzz_datadir.h"
 
 #include <stdint.h>
 #include <stddef.h>

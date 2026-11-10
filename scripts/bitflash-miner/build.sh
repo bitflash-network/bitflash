@@ -33,7 +33,7 @@ mkdir -p $D/xmrig $D/tor $D/licenses
 (cd stage && tar xzf ../dl/xmrig-6.26.0-linux-static-x64.tar.gz)
 cp stage/xmrig-6.26.0/xmrig $D/xmrig/
 cp dl/xmrig-LICENSE $D/licenses/XMRIG-LICENSE.txt
-mkdir -p stage/lintor && tar xzf /root/rel16/.cache/tor-expert-bundle-linux-x86_64-15.0.19.tar.gz -C stage/lintor
+mkdir -p stage/lintor && tar xzf /root/rel16/.cache/tor-expert-bundle-linux-x86_64-16.0.tar.gz -C stage/lintor
 cp stage/lintor/tor/tor $D/tor/
 cp stage/lintor/tor/libevent-2.1.so.7 stage/lintor/tor/libcrypto.so.3 stage/lintor/tor/libssl.so.3 $D/tor/
 cp tor-LICENSE $D/licenses/TOR-LICENSE.txt

@@ -77,7 +77,7 @@ LIBS = -L$(SECP_LIB) -lsecp256k1 \
 # past -- "duplicate section ... has different size". That is one object
 # indexing a struct by the old layout and another by the new one, in the same
 # binary. Nothing crashed here, and nothing would say so if it had.
-HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
+HEADERS = headers_core.h headers.h fuzz_datadir.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
@@ -491,6 +491,8 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=rvn-chain
 	./bitflash-node -selftest=explorer
 	./bitflash-node -selftest=db-locks
+	./bitflash-node -selftest=db-open-failure
+	./bitflash-node -selftest=private-file
 	./bitflash-node -selftest=swap-wait-payment
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice
