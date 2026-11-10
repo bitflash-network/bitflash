@@ -471,6 +471,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=rvn-kawpow
 	./bitflash-node -selftest=sigpipe
 	./bitflash-node -selftest=script-eval
+	./bitflash-node -selftest=sighash-reference
 	./bitflash-node -selftest=rules-v2
 	./bitflash-node -selftest=rules-v3
 	./bitflash-node -selftest=rules-v4

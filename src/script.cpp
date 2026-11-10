@@ -5,7 +5,7 @@
 #include "headers.h"
 #include "sigcheck.h"
 
-bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs);
+bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs, SigHashCache* pCache);
 
 
 
@@ -87,6 +87,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
     vector<valtype> stack;
     vector<valtype> altstack;
     CtvHashCache ctvCache;   // OP_CHECKTEMPLATEVERIFY hashes txTo once per run
+    SigHashCache sighashCache;
     unsigned int nOpCount = 0;
     if (pvStackRet)
         pvStackRet->clear();
@@ -901,7 +902,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 // Drop the signature, since there's no way for a signature to sign itself
                 scriptCode.FindAndDelete(CScript(vchSig));
 
-                bool fSuccess = CheckSig(vchSig, vchPubKey, scriptCode, txTo, nIn, nHashType, fStrictSigs);
+                bool fSuccess = CheckSig(vchSig, vchPubKey, scriptCode, txTo, nIn, nHashType, fStrictSigs, &sighashCache);
 
                 stack.pop_back();
                 stack.pop_back();
@@ -996,7 +997,7 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                     valtype& vchPubKey = stacktop(-ikey);
 
                     // Check signature
-                    if (CheckSig(vchSig, vchPubKey, scriptCode, txTo, nIn, nHashType, fStrictSigs))
+                    if (CheckSig(vchSig, vchPubKey, scriptCode, txTo, nIn, nHashType, fStrictSigs, &sighashCache))
                     {
                         isig++;
                         nSigsCount--;
@@ -1059,6 +1060,51 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
 
 
 
+// Writes the serialization straight into SHA-256, the way CDataStream would
+// lay it out, so nothing is copied.
+namespace {
+class CSigHashWriter
+{
+    SHA256_CTX ctx;
+public:
+    CSigHashWriter() { SHA256_Init(&ctx); }
+    void Write(const void* p, size_t n) { if (n) SHA256_Update(&ctx, p, n); }
+    template<typename T> void Raw(const T& v) { Write(&v, sizeof(v)); }
+    void CompactSize(uint64 n)
+    {
+        if (n < UCHAR_MAX-2)      { unsigned char c = n; Raw(c); }
+        else if (n <= USHRT_MAX)  { unsigned char c = UCHAR_MAX-2; unsigned short x = n; Raw(c); Raw(x); }
+        else if (n <= UINT_MAX)   { unsigned char c = UCHAR_MAX-1; unsigned int x = n; Raw(c); Raw(x); }
+        else                      { unsigned char c = UCHAR_MAX; Raw(c); Raw(n); }
+    }
+    void Bytes(const vector<unsigned char>& v)
+    {
+        CompactSize(v.size());
+        if (!v.empty())
+            Write(&v[0], v.size());
+    }
+    void Input(const CTxIn& txin, const vector<unsigned char>& script, unsigned int nSequence)
+    {
+        Write(&txin.prevout, sizeof(txin.prevout));     // FLATDATA, as COutPoint serializes
+        Bytes(script);
+        Raw(nSequence);
+    }
+    uint256 Final()
+    {
+        uint256 hash1;
+        SHA256_Final((unsigned char*)&hash1, &ctx);
+        uint256 hash2;
+        SHA256((unsigned char*)&hash1, sizeof(hash1), (unsigned char*)&hash2);
+        return hash2;
+    }
+};
+}
+
+// The legacy signature hash. It used to copy the transaction, blank the parts
+// the hash type leaves out and serialize the copy: a whole-transaction copy
+// per signature check, which is most of what a check costs on a large
+// transaction. This writes the same bytes without the copy, and the
+// sighash-reference self-test holds it to the old code byte for byte.
 uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType)
 {
     if (nIn >= txTo.vin.size())
@@ -1066,59 +1112,73 @@ uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int
         printf("ERROR: SignatureHash() : nIn=%d out of range\n", nIn);
         return 1;
     }
-    CTransaction txTmp(txTo);
 
     // In case concatenating two scripts ends up with two codeseparators,
     // or an extra one at the end, this prevents all those possible incompatibilities.
     scriptCode.FindAndDelete(CScript(OP_CODESEPARATOR));
 
-    // Blank out other inputs' signatures
-    for (int i = 0; i < txTmp.vin.size(); i++)
-        txTmp.vin[i].scriptSig = CScript();
-    txTmp.vin[nIn].scriptSig = scriptCode;
-
-    // Blank out some of the outputs
-    if ((nHashType & 0x1f) == SIGHASH_NONE)
+    const bool fNone = (nHashType & 0x1f) == SIGHASH_NONE;
+    const bool fSingle = !fNone && (nHashType & 0x1f) == SIGHASH_SINGLE;
+    const bool fAnyoneCanPay = (nHashType & SIGHASH_ANYONECANPAY) != 0;
+    if (fSingle && nIn >= txTo.vout.size())
     {
-        // Wildcard payee
-        txTmp.vout.clear();
-
-        // Let the others update at will
-        for (int i = 0; i < txTmp.vin.size(); i++)
-            if (i != nIn)
-                txTmp.vin[i].nSequence = 0;
+        printf("ERROR: SignatureHash() : nOut=%d out of range\n", nIn);
+        return 1;
     }
-    else if ((nHashType & 0x1f) == SIGHASH_SINGLE)
+
+    static const vector<unsigned char> vchEmpty;
+    CSigHashWriter w;
+    w.Raw(txTo.nVersion);
+
+    // Inputs: this one carries the script being signed, the others an empty
+    // one; under NONE and SINGLE the others' sequence numbers are left free.
+    // ANYONECANPAY keeps this input alone.
+    if (fAnyoneCanPay)
     {
-        // Only lockin the txout payee at same index as txin
-        unsigned int nOut = nIn;
-        if (nOut >= txTmp.vout.size())
+        w.CompactSize(1);
+        w.Input(txTo.vin[nIn], scriptCode, txTo.vin[nIn].nSequence);
+    }
+    else
+    {
+        w.CompactSize(txTo.vin.size());
+        for (unsigned int i = 0; i < txTo.vin.size(); i++)
         {
-            printf("ERROR: SignatureHash() : nOut=%d out of range\n", nOut);
-            return 1;
+            if (i == nIn)
+                w.Input(txTo.vin[i], scriptCode, txTo.vin[i].nSequence);
+            else
+                w.Input(txTo.vin[i], vchEmpty, (fNone || fSingle) ? 0 : txTo.vin[i].nSequence);
         }
-        txTmp.vout.resize(nOut+1);
-        for (int i = 0; i < nOut; i++)
-            txTmp.vout[i].SetNull();
-
-        // Let the others update at will
-        for (int i = 0; i < txTmp.vin.size(); i++)
-            if (i != nIn)
-                txTmp.vin[i].nSequence = 0;
     }
 
-    // Blank out other inputs completely, not recommended for open transactions
-    if (nHashType & SIGHASH_ANYONECANPAY)
+    // Outputs: none under NONE; under SINGLE the ones before this index as
+    // null outputs (value -1, empty script), then the one at it.
+    if (fNone)
+        w.CompactSize(0);
+    else if (fSingle)
     {
-        txTmp.vin[0] = txTmp.vin[nIn];
-        txTmp.vin.resize(1);
+        w.CompactSize(nIn + 1);
+        const int64 nNull = -1;
+        for (unsigned int i = 0; i < nIn; i++)
+        {
+            w.Raw(nNull);
+            w.CompactSize(0);
+        }
+        w.Raw(txTo.vout[nIn].nValue);
+        w.Bytes(txTo.vout[nIn].scriptPubKey);
+    }
+    else
+    {
+        w.CompactSize(txTo.vout.size());
+        for (unsigned int i = 0; i < txTo.vout.size(); i++)
+        {
+            w.Raw(txTo.vout[i].nValue);
+            w.Bytes(txTo.vout[i].scriptPubKey);
+        }
     }
 
-    // Serialize and hash
-    CDataStream ss(SER_GETHASH);
-    ss.reserve(10000);
-    ss << txTmp << nHashType;
-    return Hash(ss.begin(), ss.end());
+    w.Raw(txTo.nLockTime);
+    w.Raw(nHashType);
+    return w.Final();
 }
 
 
@@ -1166,7 +1226,8 @@ bool IsLowSSignature(const vector<unsigned char>& sig)
 
 
 bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CScript scriptCode,
-              const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs)
+              const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs,
+              SigHashCache* pCache)
 {
     // Rules v2: one encoding per signature. OpenSSL's parser accepts more
     // than DER -- and how much more has changed between its versions, which
@@ -1189,7 +1250,18 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
     // libsecp256k1, not OpenSSL (sigcheck.h). The key used to be parsed
     // before the hash type was read; both orders refuse the same inputs, and
     // a bad key costs nothing here before the hash is computed.
-    uint256 hash = SignatureHash(scriptCode, txTo, nIn, nHashType);
+    uint256 hash;
+    if (pCache)
+    {
+        pair<int, vector<unsigned char> > key(nHashType, vector<unsigned char>(scriptCode.begin(), scriptCode.end()));
+        map<pair<int, vector<unsigned char> >, uint256>::const_iterator it = pCache->m.find(key);
+        if (it != pCache->m.end())
+            hash = it->second;
+        else
+            hash = pCache->m[key] = SignatureHash(scriptCode, txTo, nIn, nHashType);
+    }
+    else
+        hash = SignatureHash(scriptCode, txTo, nIn, nHashType);
     return SigCheckEcdsa((const unsigned char*)&hash, vchSig, vchPubKey);
 }
 
