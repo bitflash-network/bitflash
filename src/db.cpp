@@ -1234,8 +1234,10 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
     string strLastType;
     try
     {
-    CRITICAL_BLOCK(cs_mapKeys)
+    // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+    // cs_mapKeys): the other order here was a lock-order inversion (TSan).
     CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_mapKeys)
     {
         // Get cursor
         Dbc* pcursor = GetCursor();
@@ -1608,8 +1610,10 @@ bool LoadWalletFromSQLite(const string& strPath)
     CSQLiteWalletRuntimeLoadVisitor visitor;
     try
     {
-        CRITICAL_BLOCK(cs_mapKeys)
+        // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+        // cs_mapKeys): the other order here was a lock-order inversion (TSan).
         CRITICAL_BLOCK(cs_mapWallet)
+        CRITICAL_BLOCK(cs_mapKeys)
         {
             if (!sqlite.ScanRecords(visitor, strError))
             {
@@ -1679,8 +1683,10 @@ bool LoadWalletFromSQLiteRuntime(const string& strPath)
     CSQLiteWalletRuntimeLoadVisitor visitor;
     try
     {
-        CRITICAL_BLOCK(cs_mapKeys)
+        // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+        // cs_mapKeys): the other order here was a lock-order inversion (TSan).
         CRITICAL_BLOCK(cs_mapWallet)
+        CRITICAL_BLOCK(cs_mapKeys)
         {
             if (!pWalletSQLiteRuntime->ScanRecords(visitor, strError))
             {

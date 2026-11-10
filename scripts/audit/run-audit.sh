@@ -169,7 +169,7 @@ phase_asan() {
 
 phase_tsan() {
     d=$(tree tsan)
-    export TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1
+    export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:suppressions=$SRC/scripts/audit/tsan.supp"
     run_selftests "$d" "-fsanitize=thread -g -O1" "" tsan
     unset TSAN_OPTIONS
 }

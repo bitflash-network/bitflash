@@ -1588,6 +1588,7 @@ int main(int argc, char* argv[])
         BtfStopManagedTor();
         return 1;
     }
+    btcswap::StartLightClients();
 #endif
 
     if (nMineMode == MINE_OPERATOR || fP2PoolMode) {

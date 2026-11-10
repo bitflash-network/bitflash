@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for scripts/audit/run-audit.sh.
+#
+# Berkeley DB is not built with ThreadSanitizer. Its own page latches are
+# taken in an order that varies by design (it has its own deadlock detector),
+# and from a single thread TSan reports them as lock-order inversions by the
+# thousand. Everything the node itself does around BDB stays checked.
+deadlock:libdb_cxx-5.3.so
+race:libdb_cxx-5.3.so

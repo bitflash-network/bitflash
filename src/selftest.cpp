@@ -6,6 +6,7 @@
 // and against a temporary data directory.
 
 #include "headers_core.h"
+#include <atomic>
 #include "btfaddr.h"
 #include "bip32.h"
 #include "proxy.h"
@@ -7108,7 +7109,7 @@ static int RunChatLinkSelfTest()
             btfchat::Link*         link;
             btfchat::SocketStream* stream;
             const unsigned char*   sk;
-            bool                   fOk;
+            std::atomic<bool>      fOk;   // the main thread polls it (ThreadSanitizer)
             std::string            err;
         };
         Arg arg;

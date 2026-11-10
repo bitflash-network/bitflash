@@ -37,7 +37,8 @@ static std::string Base64(const std::string& in)
 {
     static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
-    int val = 0, bits = -6;
+    unsigned int val = 0;   // wraps (defined); only the low bits are read
+    int bits = -6;
     for (size_t i = 0; i < in.size(); i++)
     {
         val = (val << 8) + (unsigned char)in[i];

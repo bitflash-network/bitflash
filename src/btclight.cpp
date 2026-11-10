@@ -12,6 +12,8 @@
 #include "swap.h"
 #include <fstream>
 #include <thread>
+#include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -583,8 +585,12 @@ static std::vector<Net> MakeNets()
 }
 static const std::vector<Net>& Nets()
 {
-    static const std::vector<Net> nets = MakeNets();
-    return nets;
+    // Never destroyed. Each light client's worker thread is detached and holds
+    // a reference into this table (State::net); at exit the static destructors
+    // ran while a worker could still be in its loop, and it read freed memory
+    // (AddressSanitizer, heap-use-after-free in Worker).
+    static const std::vector<Net>* nets = new std::vector<Net>(MakeNets());
+    return *nets;
 }
 const Net* FindNet(const std::string& coin, const std::string& network)
 {
@@ -1645,8 +1651,30 @@ static std::vector<std::string> ConfiguredPeers(const std::string& coin)
     return peers;
 }
 
+// Workers are detached, and the process can end while one is in its loop:
+// the static destructors then ran under it (the locks and tables it reads),
+// which ThreadSanitizer and AddressSanitizer both caught. The first worker
+// registers an exit handler; registered after every global was built, it
+// runs before their destructors, raises fShutdown and gives the workers a
+// bounded time to leave (each checks fShutdown at least every 100 ms between
+// network calls, which have their own timeouts).
+static std::atomic<int> nWorkersRunning(0);
+static void WaitForWorkersAtExit()
+{
+    fShutdown = true;
+    for (int i = 0; i < 300 && nWorkersRunning.load() > 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+// Counted up before the thread exists (so the handler cannot miss one),
+// down when its loop ends.
+struct WorkerDone
+{
+    ~WorkerDone() { --nWorkersRunning; }
+};
+
 static void Worker(State* s)
 {
+    WorkerDone done;
     const Net& net = s->net;
     unsigned short port = net.port;
     size_t rotation = 0;
@@ -1736,7 +1764,12 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
             if (it == states.end())
             {
                 std::unique_ptr<State> initial(new State(*net)); Load(*initial);
-                state = initial.release(); states[coin+"/"+network] = state; std::thread(Worker,state).detach();
+                static bool fExitHandler = (std::atexit(WaitForWorkersAtExit), true);
+                (void)fExitHandler;
+                state = initial.release(); states[coin+"/"+network] = state;
+                ++nWorkersRunning;
+                try { std::thread(Worker,state).detach(); }
+                catch (...) { --nWorkersRunning; throw; }
             }
             else state = it->second;
         }
