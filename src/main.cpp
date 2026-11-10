@@ -199,7 +199,10 @@ uint256 GetBlockWork(unsigned int nBits)
     bnTarget.SetCompact(nBits);
     if (bnTarget <= 0)
         return 0;
-    return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
+    // A named value: the operators return const CBigNum, and getuint256() is
+    // not const (GCC let -fpermissive pass that; clang does not).
+    CBigNum bnWork = (CBigNum(1) << 256) / (bnTarget + 1);
+    return bnWork.getuint256();
 }
 
 // Fill in what is not stored for a block whose pprev, nHeight and nBits are
