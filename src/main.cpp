@@ -146,6 +146,19 @@ static std::atomic<uint64> gParticipantHashRateX1000{0};
 static std::mutex gParticipantStatusMutex;
 static std::string gParticipantStatus;
 
+MapCheckpoints mapCheckpoints;
+
+// Mainnet checkpoints. Each was more than a week under the tip on the day it
+// went in, and was read from the block files of three nodes that agreed.
+// Testnet has none: it is reset and re-mined on purpose.
+static void SelectCheckpoints(bool fTestNetIn)
+{
+    mapCheckpoints.clear();
+    if (fTestNetIn)
+        return;
+    mapCheckpoints[68000] = uint256("0xda46bdcfe661ddb61b8d27a1adc5c0fc30f6ad6a8f18f03fc9dc07a7e003bfc6");
+}
+
 void SelectGenesisParams(bool fTestNetIn)
 {
     static bool fGenesisParamsSelected = false;
@@ -168,12 +181,176 @@ void SelectGenesisParams(bool fTestNetIn)
         hashGenesisBlock = uint256(MAINNET_GENESIS_HASH);
         hashGenesisMerkleRoot = uint256(MAINNET_GENESIS_MERKLE);
     }
+    SelectCheckpoints(fTestNetIn);
 }
 
 void SelectChainParams(bool fTestNetIn)
 {
     SelectNetworkParams(fTestNetIn);
     SelectGenesisParams(fTestNetIn);
+}
+
+// The work one block stands for: how many hashes it takes, on average, to find
+// one at or under its target, which is 2^256 / (target + 1). A block at the
+// floor (0x1f0fffff) counts 4096; one at four times the difficulty, 16384.
+uint256 GetBlockWork(unsigned int nBits)
+{
+    CBigNum bnTarget;
+    bnTarget.SetCompact(nBits);
+    if (bnTarget <= 0)
+        return 0;
+    return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
+}
+
+// Fill in what is not stored for a block whose pprev, nHeight and nBits are
+// set and whose parent has been through here already.
+void SetChainWork(CBlockIndex* pindex)
+{
+    pindex->nChainWork = GetBlockWork(pindex->nBits);
+    pindex->fOffCheckpoint = false;
+    if (pindex->pprev)
+    {
+        pindex->nChainWork += pindex->pprev->nChainWork;
+        pindex->fOffCheckpoint = pindex->pprev->fOffCheckpoint;
+    }
+    MapCheckpoints::const_iterator mi = mapCheckpoints.find(pindex->nHeight);
+    if (mi != mapCheckpoints.end() && pindex->phashBlock && (*mi).second != pindex->GetBlockHash())
+        pindex->fOffCheckpoint = true;
+}
+
+std::string ChainWorkToString(const uint256& nWork)
+{
+    std::string str = nWork.GetHex();
+    size_t nFirst = str.find_first_not_of('0');
+    return nFirst == std::string::npos ? "0" : str.substr(nFirst);
+}
+
+// Whether pindexNew should replace pindexOld as the best chain.
+bool IsBetterChain(const CBlockIndex* pindexNew, const CBlockIndex* pindexOld)
+{
+    if (pindexNew == NULL || pindexNew->fOffCheckpoint)
+        return false;
+    if (pindexOld == NULL || pindexOld->fOffCheckpoint)
+        return true;
+    return pindexNew->nChainWork > pindexOld->nChainWork;
+}
+
+// The highest checkpoint whose block this node has.
+const CBlockIndex* LastCheckpointInIndex()
+{
+    for (MapCheckpoints::const_reverse_iterator it = mapCheckpoints.rbegin(); it != mapCheckpoints.rend(); ++it)
+    {
+        map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find((*it).second);
+        if (mi != mapBlockIndex.end() && (*mi).second->nHeight == (*it).first && !(*mi).second->fOffCheckpoint)
+            return (*mi).second;
+    }
+    return NULL;
+}
+
+// Whether a block with this hash may go on top of pindexPrev.
+bool CheckpointsAllow(const CBlockIndex* pindexPrev, const uint256& hash, const char** ppszWhy, int* pnScore)
+{
+    const char* pszWhy = NULL;
+    int nScore = 0;
+    if (pindexPrev && !mapCheckpoints.empty())
+    {
+        int nHeight = pindexPrev->nHeight + 1;
+        MapCheckpoints::const_iterator mi = mapCheckpoints.find(nHeight);
+        const CBlockIndex* pcheckpoint = LastCheckpointInIndex();
+        if (pindexPrev->fOffCheckpoint)
+        {
+            pszWhy = "builds on a chain that contradicts a checkpoint";
+            nScore = CHECKPOINT_SCORE_CONTRADICTS;
+        }
+        else if (mi != mapCheckpoints.end() && (*mi).second != hash)
+        {
+            pszWhy = "is not the checkpoint block of its height";
+            nScore = CHECKPOINT_SCORE_CONTRADICTS;
+        }
+        else if (pcheckpoint && nHeight < pcheckpoint->nHeight)
+        {
+            pszWhy = "forks off below the last checkpoint";
+            nScore = CHECKPOINT_SCORE_OLD_FORK;
+        }
+    }
+    if (ppszWhy)
+        *ppszWhy = pszWhy;
+    if (pnScore)
+        *pnScore = nScore;
+    return pszWhy == NULL;
+}
+
+CBlockIndex* BackToCheckpoints(CBlockIndex* pindex)
+{
+    while (pindex && pindex->fOffCheckpoint)
+        pindex = pindex->pprev;
+    return pindex;
+}
+
+bool fCheckpointWalkBack = false;
+bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew);
+
+// Only after a checkpoint walk back: a walk back for a tail that failed
+// verification leaves those blocks in the index, and they must come back
+// from peers, not from here. Every block in the index is on disk (AcceptBlock
+// writes it first), and Reorganize connects each one, so a candidate that
+// does not connect is dropped by Reorganize and the next one is tried.
+bool ActivateBestKnownChain()
+{
+    if (!fCheckpointWalkBack)
+        return true;
+    fCheckpointWalkBack = false;
+    bool fRet = true;
+    CRITICAL_BLOCK(cs_main)
+    {
+        for (int nTry = 0; nTry < 8; nTry++)
+        {
+            CBlockIndex* pindexBestKnown = pindexBest;
+            for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+                if (IsBetterChain((*mi).second, pindexBestKnown))
+                    pindexBestKnown = (*mi).second;
+            if (pindexBestKnown == pindexBest)
+                break;
+            printf("ActivateBestKnownChain() : the index already has a better chain, height %d work %s\n",
+                   pindexBestKnown->nHeight, ChainWorkToString(pindexBestKnown->nChainWork).c_str());
+            size_t nIndexBefore = mapBlockIndex.size();
+            CTxDB txdb;
+            txdb.TxnBegin();
+            if (!Reorganize(txdb, pindexBestKnown))
+            {
+                txdb.TxnAbort();
+                fRet = error("ActivateBestKnownChain() : Reorganize failed");
+                if (mapBlockIndex.size() == nIndexBefore)
+                    break;   // nothing was dropped, so the same candidate would come back
+                continue;
+            }
+            hashBestChain = pindexBestKnown->GetBlockHash();
+            pindexBest = pindexBestKnown;
+            nBestHeight = pindexBest->nHeight;
+            nTransactionsUpdated++;
+            printf("ActivateBestKnownChain() : new best=%s  height=%d  work=%s\n", hashBestChain.ToString().substr(0,14).c_str(),
+                   nBestHeight, ChainWorkToString(pindexBest->nChainWork).c_str());
+            fRet = true;
+            break;
+        }
+    }
+    return fRet;
+}
+
+// "HEIGHT:HASH", for -benchcheckpoint.
+bool AddBenchCheckpoint(const std::string& strArg)
+{
+    size_t nColon = strArg.find(':');
+    if (nColon == std::string::npos)
+        return false;
+    std::string strHeight = strArg.substr(0, nColon);
+    std::string strHash = strArg.substr(nColon + 1);
+    if (strHeight.empty() || strHeight.size() > 9 || strHeight.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    if (strHash.size() != 64 || strHash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+        return false;
+    mapCheckpoints[atoi(strHeight.c_str())] = uint256(strHash);
+    return true;
 }
 
 static CBlock BuildGenesisBlock()
@@ -2625,13 +2802,15 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
         pindexNew->pprev = (*miPrev).second;
         pindexNew->nHeight = pindexNew->pprev->nHeight + 1;
     }
+    SetChainWork(pindexNew);
 
     CTxDB txdb;
     txdb.TxnBegin();
     txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
 
-    // New best
-    if (pindexNew->nHeight > nBestHeight)
+    // New best: more accumulated work than the chain this node is on, not
+    // more blocks (see GetBlockWork in main.h).
+    if (IsBetterChain(pindexNew, pindexBest))
     {
         if (pindexGenesisBlock == NULL && hash == hashGenesisBlock)
         {
@@ -2671,7 +2850,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
         pindexBest = pindexNew;
         nBestHeight = pindexBest->nHeight;
         nTransactionsUpdated++;
-        printf("AddToBlockIndex: new best=%s  height=%d\n", hashBestChain.ToString().substr(0,14).c_str(), nBestHeight);
+        printf("AddToBlockIndex: new best=%s  height=%d  work=%s\n", hashBestChain.ToString().substr(0,14).c_str(), nBestHeight,
+               ChainWorkToString(pindexBest->nChainWork).c_str());
     }
 
     txdb.TxnCommit();
@@ -2783,6 +2963,14 @@ bool CBlock::AcceptBlock(int* pnDoS)
     if (mi == mapBlockIndex.end())
         return error("AcceptBlock() : prev block not found");
     CBlockIndex* pindexPrev = (*mi).second;
+
+    // Checkpoints (see main.h): not on a chain that contradicts one, and not
+    // a fork from below the newest one this node has.
+    const char* pszCheckpoint = NULL;
+    int nCheckpointScore = 0;
+    if (!CheckpointsAllow(pindexPrev, hash, &pszCheckpoint, &nCheckpointScore))
+        return DoS(pnDoS, nCheckpointScore, error("AcceptBlock() : block %s at height %d %s",
+                                     hash.ToString().substr(0,14).c_str(), pindexPrev->nHeight + 1, pszCheckpoint));
 
     // Check timestamp against prev
     if (nTime <= pindexPrev->GetMedianTimePast())

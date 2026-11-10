@@ -74,6 +74,55 @@ static const unsigned int MAX_REPLACED_TXS = 100;
 // (21 million, halving every 210,000 blocks). Tunable.
 static const CBigNum bnProofOfWorkLimit(~uint256(0) >> 12);
 
+// Which chain is the best one.
+//
+// 0.1.0 took the chain with the most blocks. Blocks are not all worth the
+// same: difficulty moves every 30 blocks here, by up to four times, so a chain
+// can be longer and still hold less proof of work than the one it replaces.
+// Bitcoin changed this in 0.3.3 and so does this tree: the best chain is the
+// one with the most accumulated work, and of two with the same work the one
+// seen first stays. For every reorganization this network has had (one or two
+// blocks at one difficulty) the two rules pick the same chain.
+//
+// The work is not stored. It is rebuilt from nBits when the index is loaded,
+// so nothing on disk changes and an older build opens the same files.
+class CBlockIndex;
+uint256 GetBlockWork(unsigned int nBits);
+void SetChainWork(CBlockIndex* pindex);
+bool IsBetterChain(const CBlockIndex* pindexNew, const CBlockIndex* pindexOld);
+// Hex without the leading zeros, for the log.
+std::string ChainWorkToString(const uint256& nWork);
+
+// Checkpoints: the hash of a block far enough back that no honest
+// reorganization reaches it, fixed in the program. A chain that has another
+// block at that height is refused whatever work it shows, and once the
+// checkpoint block is here nothing may fork off below it. A node that was
+// already following such a chain leaves it when it loads its index.
+// Mainnet only; filled by SelectChainParams.
+typedef std::map<int, uint256> MapCheckpoints;
+extern MapCheckpoints mapCheckpoints;
+// pnScore gets what a refusal counts against the peer that sent the block:
+// CHECKPOINT_SCORE_CONTRADICTS for a chain with another block at a checkpoint
+// height, which no honest node offers, and CHECKPOINT_SCORE_OLD_FORK for a
+// fork from below the newest checkpoint. A node back from more than a week
+// away whose last block was orphaned offers exactly that, once, to the peer
+// that asks what it has; it is kept unless it goes on.
+static const int CHECKPOINT_SCORE_CONTRADICTS = 100;
+static const int CHECKPOINT_SCORE_OLD_FORK = 20;
+bool CheckpointsAllow(const CBlockIndex* pindexPrev, const uint256& hash, const char** ppszWhy = NULL, int* pnScore = NULL);
+const CBlockIndex* LastCheckpointInIndex();
+// The nearest block, pindex or one before it, that contradicts no checkpoint.
+CBlockIndex* BackToCheckpoints(CBlockIndex* pindex);
+// -benchcheckpoint=HEIGHT:HASH on an isolated testnet bench.
+bool AddBenchCheckpoint(const std::string& strArg);
+// Set at load when the best chain was walked back to the checkpoints. The
+// index may already hold the chain that agrees with them (the checkpoint
+// block itself, kept on a side branch), and no peer announces it again:
+// every inv for it answers "have". ActivateBestKnownChain() switches to it
+// once the wallet is loaded, the way a new block would have.
+extern bool fCheckpointWalkBack;
+bool ActivateBestKnownChain();
+
 
 
 
@@ -1566,6 +1615,12 @@ public:
     unsigned int nBits;
     unsigned int nNonce;
 
+    // In memory only (see GetBlockWork above): the work in this block and in
+    // every block before it, and whether this block or one before it
+    // contradicts a checkpoint.
+    uint256 nChainWork;
+    bool fOffCheckpoint;
+
 
     CBlockIndex()
     {
@@ -1581,6 +1636,8 @@ public:
         nTime          = 0;
         nBits          = 0;
         nNonce         = 0;
+        nChainWork     = 0;
+        fOffCheckpoint = false;
     }
 
     CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn, CBlock& block)
@@ -1597,6 +1654,8 @@ public:
         nTime          = block.nTime;
         nBits          = block.nBits;
         nNonce         = block.nNonce;
+        nChainWork     = 0;
+        fOffCheckpoint = false;
     }
 
     uint256 GetBlockHash() const
