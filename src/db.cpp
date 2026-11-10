@@ -742,6 +742,18 @@ bool CTxDB::LoadBlockIndex()
         }
     }
 
+    // Accumulated work and the checkpoint mark are not on disk (see
+    // GetBlockWork in main.h): work them out again, parents first.
+    {
+        vector<pair<int, CBlockIndex*> > vByHeight;
+        vByHeight.reserve(mapBlockIndex.size());
+        for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+            vByHeight.push_back(make_pair((*mi).second->nHeight, (*mi).second));
+        sort(vByHeight.begin(), vByHeight.end());
+        for (unsigned int i = 0; i < vByHeight.size(); i++)
+            SetChainWork(vByHeight[i].second);
+    }
+
     if (!ReadHashBestChain(hashBestChain))
     {
         if (pindexGenesisBlock == NULL)
@@ -753,7 +765,8 @@ bool CTxDB::LoadBlockIndex()
         return error("CTxDB::LoadBlockIndex() : blockindex for hashBestChain not found\n");
     pindexBest = mapBlockIndex[hashBestChain];
     nBestHeight = pindexBest->nHeight;
-    printf("LoadBlockIndex(): hashBestChain=%s  height=%d\n", hashBestChain.ToString().substr(0,14).c_str(), nBestHeight);
+    printf("LoadBlockIndex(): hashBestChain=%s  height=%d  work=%s\n", hashBestChain.ToString().substr(0,14).c_str(), nBestHeight,
+           ChainWorkToString(pindexBest->nChainWork).c_str());
 
     // Verify the tail of the best chain, and fall back to the last good block
     // if any of it fails.
@@ -789,6 +802,20 @@ bool CTxDB::LoadBlockIndex()
         }
     }
     printf("LoadBlockIndex(): verified %d block(s)\n", nChecked);
+
+    // A best chain that contradicts a checkpoint comes off the same way, back
+    // to the last block that does not. Whichever of the two reaches further
+    // back wins: both are on the best chain, so the lower one covers the other.
+    if (pindexBest->fOffCheckpoint)
+    {
+        CBlockIndex* pindexOk = BackToCheckpoints(pindexBest);
+        if (pindexOk && (pindexFork == NULL || pindexOk->nHeight <= pindexFork->nHeight))
+        {
+            printf("LoadBlockIndex() : *** the best chain contradicts a checkpoint after height %d\n", pindexOk->nHeight);
+            pindexFork = pindexOk;
+            fCheckpointWalkBack = true;
+        }
+    }
 
     // The repair itself happens in the caller, after this handle is closed.
     // The cursor above is still open and holds read locks, so a write

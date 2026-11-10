@@ -186,7 +186,7 @@ static void PrintUsage()
     printf("            db-env-reopen, db-locks, wallet-sqlite, wallet-sqlite-migration,\n");
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
-    printf("            consensus-limits, pool-stratum,\n");
+    printf("            consensus-limits, chain-work, pool-stratum,\n");
     printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, network-params, socks5-proxy,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
     // suites that exist were not named here, so nobody could find them without
@@ -245,7 +245,8 @@ static void PrintUsage()
     printf("  /ltc... /doge... /bch... /xec... /dgb... /rvn...  (the same options for the other\n");
     printf("                              chains: /ltcchain, /ltcdatadir, /ltcrpcport, -ltcpeer...)\n");
     printf("  /isolate                   (test bench: dial nothing but /connectbtf and the /XXXpeer\n");
-    printf("                              peers; /benchrulesv4=TIME moves rules v4 there, testnet only)\n");
+    printf("                              peers; /benchrulesv4=TIME moves rules v4 there, testnet only;\n");
+    printf("                              /benchcheckpoint=HEIGHT:HASH gives that bench a checkpoint)\n");
     printf("  /invoicewebhook=URL        (invoices: POST each status change to http://host[:port]/path)\n");
     printf("  /invoicewebhooksecret=S    (sign those POSTs: X-Bitflash-Signature: sha256=HMAC(S, body))\n");
     printf("  /invoicenotify=CMD         (invoices: run CMD on each status change, %%s = invoice id)\n");
@@ -516,6 +517,19 @@ static void ParseStartupArguments(int argc, char* argv[])
             StartupRefuse(strprintf("-benchrulesv4=%s is not a unix time", strBenchV4.c_str()), "");
         nBenchRulesV4Time = (unsigned int)n;
         fprintf(stderr, "bench: rules v4 from block time %u on this isolated testnet\n", nBenchRulesV4Time);
+    }
+
+    // -benchcheckpoint=HEIGHT:HASH gives the same bench a checkpoint (testnet
+    // has none), so what a node does with a chain that contradicts one can be
+    // seen with blocks. Same fence as -benchrulesv4, for the same reason.
+    string strBenchCheckpoint = argval2(argc, argv, "/benchcheckpoint", "-benchcheckpoint");
+    if (!strBenchCheckpoint.empty())
+    {
+        if (!fUseTestNet || !fIsolate)
+            StartupRefuse("-benchcheckpoint is for an isolated testnet bench only", "add -testnet and -isolate, or leave it out");
+        if (!AddBenchCheckpoint(strBenchCheckpoint))
+            StartupRefuse(strprintf("-benchcheckpoint=%s is not HEIGHT:HASH", strBenchCheckpoint.c_str()), "");
+        fprintf(stderr, "bench: checkpoint %s on this isolated testnet\n", strBenchCheckpoint.c_str());
     }
 
     // net.cpp has described nListenPort as "tunable via /port" since it was
@@ -1337,6 +1351,8 @@ int main(int argc, char* argv[])
         // backend: RescanSpentFlags writes corrected flags through CWalletDB,
         // which routes to SQLite when that backend is active.
         RescanSpentFlags();
+        // With the wallet loaded, so the blocks it connects are seen by it.
+        ActivateBestKnownChain();
 #endif
     }
     catch (const std::exception& e)

@@ -8964,6 +8964,185 @@ static int RunSwapWaitPaymentSelfTest()
 
 #include "test_light_pow.h"
 
+// One block of a made-up index, registered in mapBlockIndex under a hash that
+// is just its number, with the work and checkpoint mark filled in the way
+// AddToBlockIndex and the index load do it.
+static CBlockIndex* ChainWorkTestBlock(CBlockIndex* pprev, unsigned int nBits, unsigned int nNumber,
+                                       std::vector<CBlockIndex*>& vMade)
+{
+    CBlockIndex* pindex = new CBlockIndex();
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.insert(make_pair(uint256(nNumber), pindex)).first;
+    pindex->phashBlock = &((*mi).first);
+    pindex->pprev = pprev;
+    pindex->nHeight = pprev ? pprev->nHeight + 1 : 0;
+    pindex->nBits = nBits;
+    SetChainWork(pindex);
+    vMade.push_back(pindex);
+    return pindex;
+}
+
+static int RunChainWorkSelfTest()
+{
+    fflush(stdout);
+    printf("chain-work self-test\n");
+
+    int nFail = 0;
+    const unsigned int nFloor = 0x1f0fffff;   // the proof-of-work limit
+    const unsigned int nHard  = 0x1f03ffff;   // four times as hard: one retarget up
+    std::vector<CBlockIndex*> vMade;
+    MapCheckpoints mapSaved;
+    try
+    {
+        // The real tables first, before the test puts its own in their place.
+        SelectChainParams(true);
+        nFail += Check(mapCheckpoints.empty(), "testnet has no checkpoints") ? 0 : 1;
+        SelectChainParams(false);
+        nFail += Check(mapCheckpoints.size() == 1 && mapCheckpoints.count(68000) &&
+                       mapCheckpoints[68000] == uint256("0xda46bdcfe661ddb61b8d27a1adc5c0fc30f6ad6a8f18f03fc9dc07a7e003bfc6"),
+                       "mainnet checkpoint at height 68000 is pinned") ? 0 : 1;
+        nFail += Check(mapCheckpoints.begin()->first > 0 && mapCheckpoints.count(0) == 0,
+                       "no checkpoint sits on the genesis block") ? 0 : 1;
+        mapSaved = mapCheckpoints;
+        mapCheckpoints.clear();
+
+        // Work of one block.
+        nFail += Check(GetBlockWork(nFloor) == uint256(4096), "a block at the floor is worth 4096 hashes") ? 0 : 1;
+        nFail += Check(GetBlockWork(nHard) == uint256(16384), "a block four times as hard is worth 16384") ? 0 : 1;
+        nFail += Check(GetBlockWork(0x1d00ffff) == uint256((uint64)0x100010001ULL),
+                       "Bitcoin's difficulty 1 is worth 0x100010001, as in Bitcoin") ? 0 : 1;
+        nFail += Check(GetBlockWork(0) == uint256(0) && GetBlockWork(0x1f8fffff) == uint256(0),
+                       "a zero or negative target is worth nothing") ? 0 : 1;
+        nFail += Check(GetBlockWork(0x01010000) > GetBlockWork(0x02010000) && GetBlockWork(0x01010000) > uint256(0),
+                       "the smallest target does not overflow") ? 0 : 1;
+        nFail += Check(ChainWorkToString(uint256(4096)) == "1000" && ChainWorkToString(uint256(0)) == "0",
+                       "work prints as hex without leading zeros") ? 0 : 1;
+
+        // Two branches off one block. A is longer. B is shorter and went
+        // through a retarget, so it holds more work.
+        CBlockIndex* proot = ChainWorkTestBlock(NULL, nFloor, 1000, vMade);
+        CBlockIndex* pa = proot;
+        for (int i = 1; i <= 40; i++)
+            pa = ChainWorkTestBlock(pa, nFloor, 1000 + i, vMade);
+        CBlockIndex* pb = proot;
+        for (int i = 1; i <= 30; i++)
+            pb = ChainWorkTestBlock(pb, nFloor, 2000 + i, vMade);
+        for (int i = 31; i <= 35; i++)
+            pb = ChainWorkTestBlock(pb, nHard, 2000 + i, vMade);
+        // A second branch with exactly A's work, seen after it.
+        CBlockIndex* pc = proot;
+        for (int i = 1; i <= 40; i++)
+            pc = ChainWorkTestBlock(pc, nFloor, 3000 + i, vMade);
+
+        nFail += Check(proot->nChainWork == uint256(4096) && pa->nChainWork == uint256(41 * 4096) &&
+                       pb->nChainWork == uint256(31 * 4096 + 5 * 16384),
+                       "work adds up along a branch") ? 0 : 1;
+        nFail += Check(pa->nHeight == 40 && pb->nHeight == 35 && pb->nChainWork > pa->nChainWork,
+                       "the test has a shorter branch with more work") ? 0 : 1;
+        nFail += Check(IsBetterChain(pb, pa), "the shorter branch with more work is the better chain") ? 0 : 1;
+        nFail += Check(!IsBetterChain(pa, pb), "the longer branch with less work is not") ? 0 : 1;
+        nFail += Check(!IsBetterChain(pc, pa) && !IsBetterChain(pa, pc),
+                       "equal work does not replace the chain seen first") ? 0 : 1;
+        nFail += Check(IsBetterChain(proot, NULL) && !IsBetterChain(NULL, proot) && !IsBetterChain(pa, pa),
+                       "anything beats no chain, and a chain does not beat itself") ? 0 : 1;
+        CBlockIndex* pa41 = ChainWorkTestBlock(pa, nFloor, 1041, vMade);
+        nFail += Check(IsBetterChain(pa41, pa) && !IsBetterChain(pa41, pb),
+                       "one more block wins over its parent, not over a heavier branch") ? 0 : 1;
+
+        // Checkpoints. The main branch M is blocks 101..110 at heights 1..10
+        // on top of a new root; the checkpoint is its block at height 5.
+        mapCheckpoints[5] = uint256(105);
+        CBlockIndex* pm = ChainWorkTestBlock(NULL, nFloor, 100, vMade);
+        CBlockIndex* pm2 = NULL;
+        CBlockIndex* pm4 = NULL;
+        for (int i = 1; i <= 4; i++)
+        {
+            pm = ChainWorkTestBlock(pm, nFloor, 100 + i, vMade);
+            if (i == 2) pm2 = pm;
+            if (i == 4) pm4 = pm;
+        }
+        const char* pszWhy = NULL;
+        int nScore = -1;
+        nFail += Check(LastCheckpointInIndex() == NULL, "the checkpoint block is not here yet") ? 0 : 1;
+        nFail += Check(CheckpointsAllow(pm4, uint256(105), &pszWhy, &nScore) && pszWhy == NULL && nScore == 0,
+                       "the checkpoint block is allowed at its height") ? 0 : 1;
+        nFail += Check(!CheckpointsAllow(pm4, uint256(905), &pszWhy, &nScore) && pszWhy != NULL && nScore == 100,
+                       "another block at the checkpoint height is refused, and its sender dropped") ? 0 : 1;
+        nFail += Check(CheckpointsAllow(pm2, uint256(903)),
+                       "a fork below a checkpoint this node does not have yet is still allowed") ? 0 : 1;
+
+        CBlockIndex* pm5 = NULL;
+        for (int i = 5; i <= 10; i++)
+        {
+            pm = ChainWorkTestBlock(pm, nFloor, 100 + i, vMade);
+            if (i == 5) pm5 = pm;
+        }
+        nFail += Check(!pm->fOffCheckpoint && !pm5->fOffCheckpoint, "the branch through the checkpoint is not marked") ? 0 : 1;
+        nFail += Check(LastCheckpointInIndex() == pm5, "the checkpoint block is found once it is here") ? 0 : 1;
+        nFail += Check(CheckpointsAllow(pm, uint256(111)), "the next block of the best chain is allowed") ? 0 : 1;
+        nFail += Check(CheckpointsAllow(pm5, uint256(906)), "a fork right above the checkpoint is allowed") ? 0 : 1;
+        nFail += Check(!CheckpointsAllow(pm2, uint256(903), &pszWhy, &nScore) && pszWhy != NULL,
+                       "a fork from below the checkpoint is refused now") ? 0 : 1;
+        nFail += Check(nScore == CHECKPOINT_SCORE_OLD_FORK && nScore * 4 < 100 && nScore * 5 >= 100,
+                       "its sender is kept for four such blocks and dropped at the fifth") ? 0 : 1;
+        nFail += Check(!CheckpointsAllow(pm4, uint256(905)), "another block at the checkpoint height is still refused") ? 0 : 1;
+
+        // An index that already holds a branch around the checkpoint, as one
+        // written by an older build could: X leaves M at height 4 and is
+        // heavier than M.
+        CBlockIndex* px = pm4;
+        for (int i = 5; i <= 8; i++)
+            px = ChainWorkTestBlock(px, nHard, 200 + i, vMade);
+        nFail += Check(px->fOffCheckpoint && px->pprev->fOffCheckpoint && !pm4->fOffCheckpoint,
+                       "a branch with another block at the checkpoint height is marked from there on") ? 0 : 1;
+        nFail += Check(px->nChainWork > pm->nChainWork && !IsBetterChain(px, pm),
+                       "more work does not make that branch the better chain") ? 0 : 1;
+        nFail += Check(IsBetterChain(pm, px), "a node on that branch takes the chain through the checkpoint") ? 0 : 1;
+        nFail += Check(!CheckpointsAllow(px, uint256(209), &pszWhy, &nScore) && pszWhy != NULL && nScore == 100,
+                       "nothing may be built on that branch") ? 0 : 1;
+        nFail += Check(BackToCheckpoints(px) == pm4 && BackToCheckpoints(pm) == pm && BackToCheckpoints(NULL) == NULL,
+                       "walking back from that branch stops at the block before it left") ? 0 : 1;
+        nFail += Check(LastCheckpointInIndex() == pm5, "the marked branch does not hide the checkpoint block") ? 0 : 1;
+
+        // No checkpoints, no opinion.
+        mapCheckpoints.clear();
+        nFail += Check(CheckpointsAllow(pm2, uint256(903)) && LastCheckpointInIndex() == NULL,
+                       "with no checkpoints every fork is allowed") ? 0 : 1;
+
+        // -benchcheckpoint=HEIGHT:HASH
+        std::string strHash(64, 'a');
+        nFail += Check(AddBenchCheckpoint("12:" + strHash) && mapCheckpoints.size() == 1 &&
+                       mapCheckpoints[12] == uint256(strHash),
+                       "a bench checkpoint is read as HEIGHT:HASH") ? 0 : 1;
+        nFail += Check(!AddBenchCheckpoint("") && !AddBenchCheckpoint("12") && !AddBenchCheckpoint(":" + strHash) &&
+                       !AddBenchCheckpoint("-1:" + strHash) && !AddBenchCheckpoint("x:" + strHash) &&
+                       !AddBenchCheckpoint("12:abcd") && !AddBenchCheckpoint("12:" + std::string(64, 'g')) &&
+                       mapCheckpoints.size() == 1,
+                       "anything else is refused and adds nothing") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+
+    for (size_t i = 0; i < vMade.size(); i++)
+    {
+        mapBlockIndex.erase(vMade[i]->GetBlockHash());
+        delete vMade[i];
+    }
+    mapCheckpoints = mapSaved;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -9002,6 +9181,8 @@ int RunSelfTest(const std::string& name)
         return RunNetworkParamsSelfTest();
     if (name == "consensus-limits")
         return RunConsensusLimitsSelfTest();
+    if (name == "chain-work")
+        return RunChainWorkSelfTest();
     if (name == "pool-stratum")
         return RunPoolStratumSelfTest();
     if (name == "parse-money")
@@ -9084,6 +9265,6 @@ int RunSelfTest(const std::string& name)
         return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }
