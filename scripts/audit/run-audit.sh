@@ -58,12 +58,12 @@ tree() {
 # The self-test commands `make tests` runs, one per line.
 selftest_cmds() { make -s -n -C "$1" tests RANDOMX_DIR="$RANDOMX_DIR" 2>/dev/null | grep '^\./'; }
 
-# Builds the self-test binaries in $1 with compiler $2, then runs every
+# Builds the self-test binaries in $1 with clang and the flags $2, then runs every
 # self-test with the prefix $3 (a wrapper such as valgrind, or nothing).
 # Each self-test gets its own log; one failing does not stop the rest.
 run_selftests() {
-    dir=$1; cc=$2; wrap=$3; tag=$4
-    (cd "$dir" && make -j "$J" CXX="${cc}++" CC="$cc" RANDOMX_DIR="$RANDOMX_DIR" \
+    dir=$1; flags=$2; wrap=$3; tag=$4
+    (cd "$dir" && make -j "$J" CXX="clang++ $flags" CC="clang $flags" RANDOMX_DIR="$RANDOMX_DIR" \
         bitflash-node btfchat $(selftest_cmds "$dir" | sed -n 's|^\./\(test_[a-z0-9_]*\)$|\1|p' | sort -u) \
         > "$OUT/$tag-build.log" 2>&1)
     rc=$?
@@ -163,21 +163,21 @@ phase_asan() {
     d=$(tree asan)
     export ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0
     export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0
-    run_selftests "$d" "clang -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" "" asan
+    run_selftests "$d" "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" "" asan
     unset ASAN_OPTIONS UBSAN_OPTIONS
 }
 
 phase_tsan() {
     d=$(tree tsan)
     export TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1
-    run_selftests "$d" "clang -fsanitize=thread -g -O1" "" tsan
+    run_selftests "$d" "-fsanitize=thread -g -O1" "" tsan
     unset TSAN_OPTIONS
 }
 
 phase_valgrind() {
     have valgrind || return
     d=$(tree valgrind)
-    run_selftests "$d" "clang -g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite" valgrind
+    run_selftests "$d" "-g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite" valgrind
 }
 
 phase_heap() {
@@ -187,7 +187,7 @@ phase_heap() {
     mkdir -p "$OUT/heap"
     for t in p2pool-chain btc-light rules-v4 explorer; do
         (cd "$OUT/heap" && heaptrack -o "$OUT/heap/$t" "$d/bitflash-node" -selftest=$t > "$OUT/heap/$t.run.log" 2>&1)
-        heaptrack_print -f "$OUT/heap/$t".*.zst 2>/dev/null | grep -E '^(peak heap memory|total memory leaked|calls to allocation)' > "$OUT/heap/$t.txt"
+        heaptrack_print -f "$OUT/heap/$t".zst 2>/dev/null | grep -E '^(peak heap memory|total memory leaked|calls to allocation)' > "$OUT/heap/$t.txt"
         say "heaptrack $t: $(tr '\n' ';' < "$OUT/heap/$t.txt")"
     done
 }
@@ -276,7 +276,7 @@ phase_cov() {
     d=$(tree cov)
     export LLVM_PROFILE_FILE="$OUT/cov-raw/selftest-%p.profraw"
     mkdir -p "$OUT/cov-raw"
-    run_selftests "$d" "clang -fprofile-instr-generate -fcoverage-mapping -O0" "" cov-selftests
+    run_selftests "$d" "-fprofile-instr-generate -fcoverage-mapping -O0" "" cov-selftests
     unset LLVM_PROFILE_FILE
     $PD merge -sparse "$OUT"/cov-raw/selftest-*.profraw -o "$OUT/cov-selftests.profdata"
     $LC report "$d/bitflash-node" -instr-profile="$OUT/cov-selftests.profdata" \

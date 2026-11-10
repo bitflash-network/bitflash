@@ -4,6 +4,9 @@
 
 #include "headers.h"
 #include "wallet_sqlite.h"
+#ifndef WIN32
+#include <fcntl.h>
+#endif
 
 
 
@@ -315,8 +318,16 @@ CDB::CDB(const char* pszFile, const char* pszMode, bool fTxn) : pdb(NULL)
             env.set_lk_max_locks(537000);
             env.set_lk_max_objects(537000);
             // Beside the environment, not in whatever directory the process
-            // happened to start in.
-            pdbErrFile = fopen((strAppDir + "/db.log").c_str(), "a");
+            // happened to start in, and owner-only like everything else there.
+            string strDbLog = strAppDir + "/db.log";
+#ifdef WIN32
+            pdbErrFile = fopen(strDbLog.c_str(), "a");
+#else
+            int fdDbLog = open(strDbLog.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+            pdbErrFile = fdDbLog >= 0 ? fdopen(fdDbLog, "a") : NULL;
+            if (fdDbLog >= 0 && !pdbErrFile)
+                close(fdDbLog);
+#endif
             if (pdbErrFile)
                 env.set_errfile(pdbErrFile);
             ///env.log_set_config(DB_LOG_AUTO_REMOVE, 1); /// causes corruption

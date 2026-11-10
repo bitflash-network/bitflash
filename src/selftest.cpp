@@ -1322,6 +1322,11 @@ static int RunDbOpenFailureSelfTest()
                        "a failed open leaves no use count behind") ? 0 : 1;
         nFail += Check(FileExists((tmp + "/db.log").c_str()),
                        "the Berkeley DB error log is in the data directory") ? 0 : 1;
+#ifndef _WIN32
+        struct stat stLog;
+        nFail += Check(stat((tmp + "/db.log").c_str(), &stLog) == 0 && (stLog.st_mode & 0777) == 0600,
+                       "and only its owner can read it") ? 0 : 1;
+#endif
         {
             CTxDB txdb("cr+");
             nFail += Check(DbFileUseCount("blkindex.dat") == 1, "an open file counts once") ? 0 : 1;
@@ -1377,8 +1382,12 @@ static int RunPrivateFileSelfTest()
     if (f)
         fclose(f);
 #ifndef _WIN32
+    // Someone who opened the old file (left readable on purpose) keeps that
+    // handle; it must never see what is written next. Holding it open also
+    // keeps the old inode number from being reused for the new file.
     chmod(path.c_str(), 0644);
     ino_t inoOld = st.st_ino;
+    FILE* fReader = fopen(path.c_str(), "r");
 #endif
     f = OpenPrivateFile(path.c_str(), false);
     nFail += Check(f != NULL, "non-exclusive replaces an existing file") ? 0 : 1;
@@ -1390,6 +1399,15 @@ static int RunPrivateFileSelfTest()
 #ifndef _WIN32
     nFail += Check(stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600 && st.st_ino != inoOld,
                    "with a new owner-only file, not the old one reopened") ? 0 : 1;
+    char bufOld[16] = {0};
+    if (fReader)
+    {
+        if (!fgets(bufOld, sizeof(bufOld), fReader))
+            bufOld[0] = 0;
+        fclose(fReader);
+    }
+    nFail += Check(fReader != NULL && std::string(bufOld) == "first\n",
+                   "a handle on the old file never sees the new contents") ? 0 : 1;
     std::string target = tmp + "/target";
     std::string link = tmp + "/link";
     FILE* t = fopen(target.c_str(), "w");
