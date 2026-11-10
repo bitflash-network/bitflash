@@ -1411,7 +1411,7 @@ static int RunPrivateFileSelfTest()
                    "a handle on the old file never sees the new contents") ? 0 : 1;
     std::string target = tmp + "/target";
     std::string link = tmp + "/link";
-    FILE* t = fopen(target.c_str(), "w");
+    FILE* t = OpenPrivateFile(target.c_str(), true);
     if (t)
     {
         fputs("keep\n", t);
