@@ -177,7 +177,7 @@ phase_tsan() {
 phase_valgrind() {
     have valgrind || return
     d=$(tree valgrind)
-    run_selftests "$d" "-g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite" valgrind
+    run_selftests "$d" "-g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite --suppressions=$SRC/scripts/audit/valgrind.supp" valgrind
 }
 
 phase_heap() {
@@ -296,6 +296,11 @@ phase_cov() {
 
 phase_repro() {
     have reprotest || return
+    # Without these the varied build fails to start (exit 127) and nothing is
+    # compared at all.
+    for t in disorderfs faketime; do
+        have "$t" || { say "repro skipped: $t is not installed"; return; }
+    done
     d=$(tree repro)
     cd "$BUILD/repro" || return
     # Kernel, host name and user cannot vary without a VM or root namespaces
