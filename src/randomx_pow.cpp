@@ -74,6 +74,30 @@ bool RulesV4Active(unsigned int nBlockTime)
     return t != 0 && nBlockTime >= t && RulesV3Active(nBlockTime);
 }
 
+unsigned int nBenchRulesV5Time = 0;
+
+unsigned int RulesV5Time()
+{
+    if (IsTestNet() && nBenchRulesV5Time)
+        return nBenchRulesV5Time;
+    return IsTestNet() ? RULES_V5_TIME_TESTNET : RULES_V5_TIME_MAINNET;
+}
+
+bool RulesV5ActiveAtMedianTime(int64 nMedianTimePast)
+{
+    // Never ahead of rules v4. The block itself is timed after this median,
+    // and v4 only ever switches on as time goes forward, so v4 holds for the
+    // block too.
+    unsigned int t = RulesV5Time();
+    return t != 0 && nMedianTimePast >= (int64)t && nMedianTimePast <= (int64)0xffffffffU &&
+           RulesV4Active((unsigned int)nMedianTimePast);
+}
+
+bool RulesV5Active(const CBlockIndex* pindexPrev)
+{
+    return pindexPrev != NULL && RulesV5ActiveAtMedianTime(pindexPrev->GetMedianTimePast());
+}
+
 unsigned int SwapsOpenTimeFor(bool fTestNetwork)
 {
     unsigned int t = fTestNetwork ? RULES_V3_TIME_TESTNET : RULES_V3_TIME_MAINNET;

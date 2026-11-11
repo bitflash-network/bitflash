@@ -374,6 +374,18 @@ bool ProcessMessages(CNode* pfrom);
 // them can produce a block that AcceptBlock would refuse.
 class CTransaction;
 bool IsFinalForNextBlock(const CTransaction& tx);
+// Rules v3 finality for the block after pindexPrev: its height, the median
+// time past of pindexPrev, and from rules v5 nLockTime read unsigned. What
+// AcceptBlock checks; IsFinalForNextBlock asks it of the tip.
+bool IsFinalAfter(const CTransaction& tx, const CBlockIndex* pindexPrev);
+// Rules v5: the earliest nTime the block after pindexPrev may carry. Above
+// the median time past always; and when that block closes a retarget window,
+// not before the window's first block, so the retarget's timespan cannot go
+// negative. Every block builder starts its time here. 0 for no parent.
+int64 BlockTimeFloor(const CBlockIndex* pindexPrev);
+// Rules v5, as AcceptBlock applies it: is nTime allowed, by the retarget
+// rule above, for the block after pindexPrev? Always true before rules v5.
+bool RetargetTimeAllowed(const CBlockIndex* pindexPrev, unsigned int nTime);
 // Rules v4 (BIP68): whether one input's relative lock is over in the block
 // after pindexPrev. fUnmined: the coin it spends is not in a block yet.
 class CTxIndex;
@@ -836,12 +848,20 @@ public:
     // nLockTime meant nothing to the chain. That is harmless until a script
     // relies on it -- OP_CHECKLOCKTIMEVERIFY checks nLockTime, and without
     // this rule a "refund after block N" could be mined at block 1.
-    bool IsFinalAt(int nBlockHeight, int64 nBlockTime) const
+    //
+    // fRulesV5: nLockTime is read as the unsigned 32-bit number it is on the
+    // wire, as Bitcoin reads it. Before, the comparison below sign-extended
+    // it, so a lock time of 2^31 or more (a time in 2038-2106) came out
+    // negative, below any median time, and the transaction counted as final
+    // at once. The first comparison was already unsigned (LOCKTIME_THRESHOLD
+    // is unsigned int), so only the second one changes.
+    bool IsFinalAt(int nBlockHeight, int64 nBlockTime, bool fRulesV5 = false) const
     {
         if (nLockTime == 0)
             return true;
         int64 nCutoff = nLockTime < LOCKTIME_THRESHOLD ? (int64)nBlockHeight : nBlockTime;
-        if ((int64)nLockTime < nCutoff)
+        int64 nLock = fRulesV5 ? (int64)(unsigned int)nLockTime : (int64)nLockTime;
+        if (nLock < nCutoff)
             return true;
         foreach(const CTxIn& txin, vin)
             if (!txin.IsFinal())
