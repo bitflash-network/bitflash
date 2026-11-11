@@ -50,16 +50,18 @@ if ! make -j "$J" RANDOMX_DIR="$RANDOMX_DIR" FUZZ_CXX="$fcxx" \
 fi
 bin=$SRC/src/$t
 
-# An empty corpus gets a starting point: the payload, deserializer, decoder,
-# script and v4-templates harnesses write structured seeds of their own, the
-# others start from one byte.
-if [ -z "$(ls -A "$CORPUS")" ]; then
-    if [ "$t" = fuzz-p2p-payload ] || [ "$t" = fuzz-deserialize ] || [ "$t" = fuzz-decoders ] ||
-       [ "$t" = fuzz-script ] || [ "$t" = fuzz-v4-templates ]; then
-        BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true
-    fi
-    [ -n "$(ls -A "$CORPUS")" ] || printf '\000' > "$CORPUS/seed0"
+# The payload, deserializer, decoder, script and v4-templates harnesses write
+# structured seeds of their own; they join the corpus (a kept one too:
+# fuzz-script's predates its structured spends) without replacing anything.
+# The others start from one byte.
+if [ "$t" = fuzz-p2p-payload ] || [ "$t" = fuzz-deserialize ] || [ "$t" = fuzz-decoders ] ||
+   [ "$t" = fuzz-script ] || [ "$t" = fuzz-v4-templates ]; then
+    sd=$OUT/seeds-$t
+    rm -rf "$sd"; mkdir -p "$sd"
+    BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true
+    cp -n "$sd"/* "$CORPUS/" 2>/dev/null || true
 fi
+[ -n "$(ls -A "$CORPUS")" ] || printf '\000' > "$CORPUS/seed0"
 
 w=$OUT/work-$engine-$t
 rm -rf "$w"; mkdir -p "$w"
