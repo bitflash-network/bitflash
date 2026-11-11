@@ -3060,6 +3060,17 @@ bool CBlock::CheckBlock(int* pnDoS) const
     return true;
 }
 
+bool RulesV3LockedIn()
+{
+    // A block's rules follow its own timestamp, which only has to be above
+    // its parent's median time past. So for the first few blocks after the
+    // switch time a block may still be dated before it, and run the old
+    // rules. Once the tip's median time past has reached the switch, every
+    // valid next block is dated after it.
+    unsigned int t = RulesV3Time();
+    return t != 0 && pindexBest && (unsigned int)pindexBest->GetMedianTimePast() >= t;
+}
+
 bool IsFinalForNextBlock(const CTransaction& tx)
 {
     if (!pindexBest || !RulesV3Active((unsigned int)GetAdjustedTime()))

@@ -386,6 +386,12 @@ int64 BlockTimeFloor(const CBlockIndex* pindexPrev);
 // Rules v5, as AcceptBlock applies it: is nTime allowed, by the retarget
 // rule above, for the block after pindexPrev? Always true before rules v5.
 bool RetargetTimeAllowed(const CBlockIndex* pindexPrev, unsigned int nTime);
+// True once no valid next block can be dated before the rules v3 switch: the
+// tip's median time past is at or past it. Until then a miner may still date
+// a block just before the switch, and in that block a pay-to-script-hash
+// output is spent by its script alone, without signatures. The wallet and
+// relay go by this, not by the clock (see main.cpp).
+bool RulesV3LockedIn();
 // Rules v4 (BIP68): whether one input's relative lock is over in the block
 // after pindexPrev. fUnmined: the coin it spends is not in a block yet.
 class CTxIndex;
@@ -971,7 +977,7 @@ public:
             // From rules v3 on, a script hash is spent by its redeem script,
             // so paying to one is safe and relayed. That is what an atomic
             // swap and a 2-of-3 escrow pay to.
-            if (s.IsPayToScriptHash() && RulesV3Active((unsigned int)GetAdjustedTime()))
+            if (s.IsPayToScriptHash() && RulesV3LockedIn())
                 continue;
             return false;
         }

@@ -181,11 +181,13 @@ static CScript ScriptForAddress(const string& strAddr)
     {
         // Until the rules v3 switch a pay-to-script-hash output is spendable
         // by anyone who presents the script, signatures or not. Paying to one
-        // before then is giving the money away.
-        if (!RulesV3Active(GetAdjustedTime()))
+        // before then is giving the money away. And not by the clock: for a
+        // few blocks after the switch time a block may still be dated before
+        // it (see RulesV3LockedIn).
+        if (!RulesV3LockedIn())
             throw runtime_error(RulesV3Time() == 0
                 ? "pay-to-script-hash addresses (C...) are not active on this network yet: the rules v3 switch is not scheduled"
-                : strprintf("pay-to-script-hash addresses (C...) activate at block time %u; not before", RulesV3Time()));
+                : strprintf("pay-to-script-hash addresses (C...) activate once the chain's median block time passes %u, a few blocks after the switch; not before", RulesV3Time()));
         s << OP_HASH160 << hash160 << OP_EQUAL;
         return s;
     }
@@ -501,7 +503,7 @@ static json rpc_validateaddress(const json& p)
                 if (sub.contains("addresses")) j["addresses"] = sub["addresses"];
                 if (sub.contains("reqSigs")) j["sigsrequired"] = sub["reqSigs"];
             }
-            j["active"] = RulesV3Active(GetAdjustedTime());
+            j["active"] = RulesV3LockedIn();
         }
         else
         {
@@ -993,7 +995,7 @@ static json rpc_createrawtransaction(const json& p)
                 throw runtime_error("script: must be followed by hex");
             vector<unsigned char> vch = ParseHex(strHex);
             scriptPubKey = CScript(vch.begin(), vch.end());
-            if (scriptPubKey.IsPayToScriptHash() && !RulesV3Active(GetAdjustedTime()))
+            if (scriptPubKey.IsPayToScriptHash() && !RulesV3LockedIn())
                 throw runtime_error("pay-to-script-hash outputs are not active on this network yet");
         }
         else
@@ -1379,6 +1381,11 @@ static int LockBlocksParam(const json& p, size_t nIndex, int nDefault)
 // Fund a contract from this wallet and say where it went.
 static json FundContract(const swap::Contract& c, int64 nValue, const char* pszComment)
 {
+    // The contract output is pay-to-script-hash, which only protects coins
+    // once rules v3 are locked in; swaps open later than that, but the
+    // contract must not depend on the two dates staying in that order.
+    if (!RulesV3LockedIn())
+        throw runtime_error("swap contracts need rules v3 locked in on this chain (pay-to-script-hash)");
     CScript contract = swap::BuildContract(c);
     CScript scriptPubKey;
     scriptPubKey.SetPayToScriptHash(contract);

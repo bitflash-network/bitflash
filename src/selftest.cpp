@@ -6592,6 +6592,50 @@ static int RunRulesV3SelfTest()
                        "while rules v3 are not active, paying to a script hash is not relayed") ? 0 : 1;
     }
 
+    // ---- lock-in follows the chain's median time, not the clock or the tip's
+    // own time: just after the switch a block may still be dated before it
+    {
+        CBlockIndex* pindexBestSaved = pindexBest;
+        const unsigned int t = RulesV3Time();
+        std::vector<CBlockIndex> chain(11);
+        // Eleven blocks two minutes apart, the newest five after the switch: the
+        // median (the sixth newest) is still before it.
+        for (int i = 0; i < 11; i++)
+        {
+            chain[i].nHeight = 1000 + i;
+            chain[i].nTime = t - 700 + 120 * i;
+            chain[i].pprev = i ? &chain[i - 1] : NULL;
+        }
+        pindexBest = &chain[10];
+        bool fTipPast = chain[10].nTime > t;
+        bool fLockedEarly = RulesV3LockedIn();
+        CTransaction pay;
+        pay.vin.resize(1);
+        pay.vin[0].scriptSig = CScript() << std::vector<unsigned char>(72, 1);
+        pay.vout.push_back(CTxOut(COIN, p2shLock));
+        bool fRelayedEarly = pay.IsStandard();
+        nFail += Check(fTipPast && !fLockedEarly && !fRelayedEarly,
+                       "tip past the switch, median not yet: not locked in (the wallet refuses C addresses), not relayed") ? 0 : 1;
+
+        // Six more blocks after it: now the median is past the switch too.
+        chain.resize(17);
+        for (int i = 0; i < 17; i++)
+        {
+            chain[i].nHeight = 1000 + i;
+            chain[i].nTime = t - 700 + 120 * i;
+            chain[i].pprev = i ? &chain[i - 1] : NULL;
+        }
+        pindexBest = &chain[16];
+        bool fLocked = RulesV3LockedIn();
+        bool fRelayed = pay.IsStandard();
+        nFail += Check(chain[16].GetMedianTimePast() >= (int64)t && fLocked && fRelayed,
+                       "median past the switch: locked in (the wallet pays C addresses), relayed") ? 0 : 1;
+
+        pindexBest = NULL;
+        nFail += Check(!RulesV3LockedIn(), "no chain: not locked in") ? 0 : 1;
+        pindexBest = pindexBestSaved;
+    }
+
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
