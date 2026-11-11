@@ -410,6 +410,8 @@ static json BlockToJson(CBlockIndex* pindex)
 
 typedef json (*RpcMethod)(const json& params);
 
+static int64 BtfMedianTimePast();
+
 static json rpc_getinfo(const json&)
 {
     json j;
@@ -425,6 +427,9 @@ static json rpc_getinfo(const json&)
     j["walletlocked"]    = IsWalletLocked();
     // When /walletunlocktimeout locks the wallet again (unix time; 0: never).
     j["unlocked_until"]  = IsWalletLocked() ? (int64)0 : GetWalletRelockTime();
+    // What time locks are judged by; btfchat reads it to see the chain is
+    // not crawling before a taker locks BTF.
+    j["mediantime"]      = BtfMedianTimePast();
     return j;
 }
 
@@ -1403,6 +1408,16 @@ static void RequireSwapsOpen()
     }
 }
 
+// The Bitflash tip's median time past: what a time lock is judged by.
+static int64 BtfMedianTimePast()
+{
+    int64 n = 0;
+    CRITICAL_BLOCK(cs_main)
+        if (pindexBest)
+            n = pindexBest->GetMedianTimePast();
+    return n;
+}
+
 static json ContractJson(const swap::Contract& c, const CScript& contract)
 {
     json j;
@@ -1413,118 +1428,284 @@ static json ContractJson(const swap::Contract& c, const CScript& contract)
     j["secretHash"]      = HexStr(c.secretHash.begin(), c.secretHash.end(), false);
     j["lockTime"]        = c.nLockTime;
     if (c.nLockTime < (int64)LOCKTIME_THRESHOLD)
+    {
+        // A height lock: what this wallet made before 1.2.33. Read, refunded,
+        // never made again, and refused from the other side of a chat swap.
+        j["lockIsHeight"] = true;
         j["blocksUntilRefund"] = std::max<int64>(0, c.nLockTime - nBestHeight);
+    }
+    else
+    {
+        int64 nMedian = BtfMedianTimePast();
+        j["medianTimePast"] = nMedian;
+        j["secondsUntilRefund"] = swap::SecondsUntilRefund(c.nLockTime, nMedian);
+    }
     return j;
 }
 
-// The lock, in blocks from now: the standard one, or on testnet only a shorter
-// one given as the last parameter -- so a refund can be tried in minutes, not a
-// day. On mainnet a short lock is how a participant loses their coins (the
+// The lock, in seconds from now: the standard one, or on testnet only a
+// shorter one given as a parameter -- so a refund can be tried in minutes, not
+// a day. On mainnet a short lock is how a participant loses their coins (the
 // initiator waits it out, refunds, and redeems the other side), so there it
-// is not even accepted.
-static int LockBlocksParam(const json& p, size_t nIndex, int nDefault)
+// is not even accepted. null is the standard one, so a tag can follow.
+static int64 BtfLockSecsParam(const json& p, size_t nIndex, int64 nDefault)
 {
-    if (p.size() <= nIndex)
+    if (p.size() <= nIndex || p[nIndex].is_null())
         return nDefault;
     if (!IsTestNet())
         throw runtime_error("the lock length is fixed on mainnet");
-    if (!p[nIndex].is_number_integer() || p[nIndex].get<int>() < 1 || p[nIndex].get<int>() > nDefault)
-        throw runtime_error(strprintf("lock blocks: 1 to %d", nDefault));
-    return p[nIndex].get<int>();
+    if (!p[nIndex].is_number_integer() || p[nIndex].get<int64>() < 60 || p[nIndex].get<int64>() > nDefault)
+        throw runtime_error(strprintf("lock seconds: 60 to %lld", (long long)nDefault));
+    return p[nIndex].get<int64>();
 }
 
-// Fund a contract from this wallet and say where it went.
-static json FundContract(const swap::Contract& c, int64 nValue, const char* pszComment)
+// The name a caller gives a lock (btfchat: the swap's id), or "".
+static string SwapTagParam(const json& p, size_t nIndex)
 {
-    // The contract output is pay-to-script-hash, which only protects coins
-    // once rules v3 are locked in; swaps open later than that, but the
-    // contract must not depend on the two dates staying in that order.
-    if (!RulesV3LockedIn())
-        throw runtime_error("swap contracts need rules v3 locked in on this chain (pay-to-script-hash)");
+    if (p.size() <= nIndex || p[nIndex].is_null())
+        return string();
+    if (!p[nIndex].is_string() || !swap::JournalTagOk(p[nIndex].get<string>()))
+        throw runtime_error("the tag is 1 to 64 letters, digits, '_', ':' or '-'");
+    return p[nIndex].get<string>();
+}
+
+// A journal line that is a record, not a promise (a redeem, a refund): a
+// failure to write it is reported in debug.log and the answer, not fatal.
+static void LogSwap(const json& j)
+{
+    string err;
+    if (!swap::JournalAppend(j, err))
+        printf("swaps.log: %s\n", err.c_str());
+}
+
+// The journal line that has to be on the disk before a lock is paid. Its
+// failure stops the lock: coins sent to a contract whose secret is gone are
+// gone too.
+static void JournalIntent(const json& j)
+{
+    json line = j;
+    line["state"] = "intent";
+    string err;
+    if (!swap::JournalAppend(line, err))
+        throw runtime_error("swaps.log could not be written, so nothing was sent: " + err);
+}
+
+// Everything already known under a tag, or null.
+static json JournalPrior(const string& tag)
+{
+    json prior;
+    string err;
+    if (!tag.empty() && !swap::JournalLookup(tag, prior, err))
+        throw runtime_error("swaps.log cannot be read, so nothing was sent: " + err);
+    return prior;
+}
+
+// Asked again under a tag already used: the same lock, or a refusal -- never
+// a second lock with other terms under one name.
+static void CheckPriorTerms(const json& prior, const string& chain, const string& role, const string& recipient,
+                            const string& amount, const string& hash)
+{
+    if (prior.value("chain", string()) != chain || prior.value("role", string()) != role ||
+        prior.value("recipient", string()) != recipient || prior.value("amountText", string()) != amount ||
+        (!hash.empty() && prior.value("secretHash", string()) != hash))
+        throw runtime_error("that tag already names a different swap lock in swaps.log");
+}
+
+// Did this wallet pay the contract? A wallet transaction with an output to it.
+static bool BtfWalletPaid(const CScript& contract, int64 nValue, uint256& txidOut)
+{
+    CScript p2sh;
+    p2sh.SetPayToScriptHash(contract);
+    CRITICAL_BLOCK(cs_mapWallet)
+        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            for (size_t i = 0; i < it->second.vout.size(); i++)
+                if (it->second.vout[i].scriptPubKey == p2sh && it->second.vout[i].nValue == nValue)
+                {
+                    txidOut = it->first;
+                    return true;
+                }
+    return false;
+}
+
+// A lock from the journal, as swapinitiate answers it.
+static json BtfLockFromJournal(const json& prior)
+{
+    CScript contract;
+    vector<unsigned char> vch = ParseHex(prior.value("contract", string()));
+    contract = CScript(vch.begin(), vch.end());
+    swap::Contract c;
+    if (!swap::ParseContract(contract, c))
+        throw runtime_error("swaps.log holds a contract under that tag that does not parse");
+    json j = ContractJson(c, contract);
+    j["contractTxid"] = prior.value("contractTxid", string());
+    j["amount"] = prior.contains("amount") ? prior["amount"] : json(nullptr);
+    j["role"] = prior.value("role", string());
+    j["tag"] = prior.value("tag", string());
+    if (prior.contains("secret"))
+        j["secret"] = prior["secret"];
+    j["recovered"] = true;
+    return j;
+}
+
+// swapinitiate and swapparticipate: a Bitflash lock, written to swaps.log
+// before it is paid. With a tag, asking again -- after a timeout, a crash, a
+// restart -- answers with the lock already made instead of making a second.
+static json BtfLock(const json& p, bool fInitiator)
+{
+    size_t iLock = fInitiator ? 2 : 3;
+    RequireSwapsOpen();
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+
+    swap::Contract c;
+    c.recipientPkh = PkhOfAddress(p[0].get<string>());
+    int64 nValue = AmountFromValue(p[1]);
+    string strHash;
+    if (!fInitiator)
+    {
+        strHash = p[2].get<string>();
+        if (strHash.size() != 64 || !IsHex(strHash))
+            throw runtime_error("the secret hash is 64 hex characters");
+    }
+    int64 nLockSecs = BtfLockSecsParam(p, iLock, fInitiator ? swap::BTF_INITIATOR_LOCK_SECS : swap::BTF_PARTICIPANT_LOCK_SECS);
+    string tag = SwapTagParam(p, iLock + 1);
+    string role = fInitiator ? "initiator" : "participant";
+    string recipient = Hash160ToAddress(uint160(c.recipientPkh));
+
+    json prior = JournalPrior(tag);
+    if (!prior.is_null())
+    {
+        CheckPriorTerms(prior, "btf", role, recipient, FormatMoney(nValue), strHash);
+        string state = prior.value("state", string());
+        if (state == "funded")
+            return BtfLockFromJournal(prior);
+        if (state == "intent")
+        {
+            // Wallet calls run one at a time, so a lock that only got as far
+            // as its intent was paid (the wallet holds the transaction) or
+            // never will be.
+            vector<unsigned char> vch = ParseHex(prior.value("contract", string()));
+            uint256 txid;
+            if (BtfWalletPaid(CScript(vch.begin(), vch.end()), nValue, txid))
+            {
+                LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
+                             {"contractTxid", txid.GetHex()}, {"recovered", true}});
+                prior["contractTxid"] = txid.GetHex();
+                return BtfLockFromJournal(prior);
+            }
+            LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", prior.value("contractAddress", string())},
+                         {"error", "never paid"}});
+        }
+        // "failed": nothing paid that contract. A new one below.
+    }
+
+    vector<unsigned char> vchRefund = GetKeyFromPool();
+    if (vchRefund.empty())
+        throw runtime_error("could not draw a key from the wallet");
+    uint160 hRefund = Hash160(vchRefund);
+    c.refundPkh.assign(hRefund.begin(), hRefund.end());
+    vector<unsigned char> secret;
+    if (fInitiator)
+    {
+        if (!swap::NewSecret(secret, c.secretHash))
+            throw runtime_error("the system's random number generator failed; no secret was made and nothing was sent");
+    }
+    else
+        c.secretHash = ParseHex(strHash);
+    c.nLockTime = GetAdjustedTime() + nLockSecs;
+
     CScript contract = swap::BuildContract(c);
+    json j = ContractJson(c, contract);
+    j["amount"] = ValueFromAmount(nValue);
+    j["role"] = role;
+    j["chain"] = "btf";
+    if (!tag.empty())
+        j["tag"] = tag;
+    if (fInitiator)
+        j["secret"] = HexStr(secret.begin(), secret.end(), false);
+    {
+        json intent = j;
+        intent["amountText"] = FormatMoney(nValue);
+        intent.erase("secondsUntilRefund");
+        intent.erase("medianTimePast");
+        JournalIntent(intent);
+    }
+    if (!secret.empty())
+        OPENSSL_cleanse(&secret[0], secret.size());
+
     CScript scriptPubKey;
     scriptPubKey.SetPayToScriptHash(contract);
     CWalletTx wtx;
-    wtx.mapValue["comment"] = pszComment;
+    wtx.mapValue["comment"] = fInitiator ? "Atomic swap: initiated" : "Atomic swap: participated";
     if (!SendMoney(scriptPubKey, nValue, wtx))
+    {
+        LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", j["contractAddress"]}, {"error", "send failed"}});
         throw runtime_error("send failed: insufficient balance once the fee is counted");
-    json j = ContractJson(c, contract);
+    }
     j["contractTxid"] = wtx.GetHash().GetHex();
-    j["amount"] = ValueFromAmount(nValue);
+    string err;
+    if (!swap::JournalAppend(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", j["contractAddress"]},
+                                  {"contractTxid", j["contractTxid"]}}, err))
+        j["journalWarning"] = "the lock is paid, but swaps.log could not record its transaction: " + err;
     return j;
 }
 
-// A line per swap in the data directory: the secret is the one thing that,
-// lost, cannot be recovered -- and an RPC answer scrolls away.
-static void LogSwap(const json& j)
-{
-    string path = GetAppDir() + "/swaps.log";
-    FILE* f = fopen(path.c_str(), "a");
-    if (!f)
-        return;
-    json line = j;
-    line["time"] = (int64)GetTime();
-    fprintf(f, "%s\n", line.dump().c_str());
-    fclose(f);
-}
-
-// swapinitiate <participant address> <amount>
+// swapinitiate <participant address> <amount> [lock seconds, testnet only | null] [tag]
 static json rpc_swapinitiate(const json& p)
 {
     if (p.size() < 2 || !p[0].is_string())
-        throw runtime_error("swapinitiate <participant address> <amount> [lock blocks, testnet only]");
-    RequireSwapsOpen();
-    if (IsWalletLocked())
-        throw runtime_error("wallet is locked");
-
-    swap::Contract c;
-    c.recipientPkh = PkhOfAddress(p[0].get<string>());
-    vector<unsigned char> vchRefund = GetKeyFromPool();
-    if (vchRefund.empty())
-        throw runtime_error("could not draw a key from the wallet");
-    uint160 hRefund = Hash160(vchRefund);
-    c.refundPkh.assign(hRefund.begin(), hRefund.end());
-
-    vector<unsigned char> secret(swap::SECRET_BYTES);
-    RAND_bytes(&secret[0], (int)secret.size());
-    c.secretHash.resize(32);
-    SHA256(&secret[0], secret.size(), &c.secretHash[0]);
-    c.nLockTime = nBestHeight + LockBlocksParam(p, 2, swap::INITIATOR_LOCK_BLOCKS);
-
-    json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: initiated");
-    j["secret"] = HexStr(secret.begin(), secret.end(), false);
-    j["role"] = "initiator";
-    LogSwap(j);
-    OPENSSL_cleanse(&secret[0], secret.size());
-    return j;
+        throw runtime_error("swapinitiate <participant address> <amount> [lock seconds, testnet only | null] [tag]");
+    return BtfLock(p, true);
 }
 
-// swapparticipate <initiator address> <amount> <secret hash>
+// swapparticipate <initiator address> <amount> <secret hash> [lock seconds, testnet only | null] [tag]
 static json rpc_swapparticipate(const json& p)
 {
     if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
-        throw runtime_error("swapparticipate <initiator address> <amount> <secret hash> [lock blocks, testnet only]");
-    RequireSwapsOpen();
-    if (IsWalletLocked())
-        throw runtime_error("wallet is locked");
+        throw runtime_error("swapparticipate <initiator address> <amount> <secret hash> [lock seconds, testnet only | null] [tag]");
+    return BtfLock(p, false);
+}
 
-    swap::Contract c;
-    c.recipientPkh = PkhOfAddress(p[0].get<string>());
-    string strHash = p[2].get<string>();
-    if (strHash.size() != 64 || !IsHex(strHash))
-        throw runtime_error("the secret hash is 64 hex characters");
-    c.secretHash = ParseHex(strHash);
-    vector<unsigned char> vchRefund = GetKeyFromPool();
-    if (vchRefund.empty())
-        throw runtime_error("could not draw a key from the wallet");
-    uint160 hRefund = Hash160(vchRefund);
-    c.refundPkh.assign(hRefund.begin(), hRefund.end());
-    c.nLockTime = nBestHeight + LockBlocksParam(p, 3, swap::PARTICIPANT_LOCK_BLOCKS);
-
-    json j = FundContract(c, AmountFromValue(p[1]), "Atomic swap: participated");
-    j["role"] = "participant";
-    LogSwap(j);
-    return j;
+// On start: a Bitflash lock whose intent is in the journal but whose payment
+// is not -- the node stopped between the two -- is looked for in the wallet,
+// and recorded with its transaction when it was paid, so whoever reads
+// swaps.log to recover it finds where it is.
+static void RecoverSwapJournal()
+{
+    vector<json> lines;
+    string err;
+    if (!swap::JournalRead(lines, err))
+    {
+        printf("swaps.log: %s\n", err.c_str());
+        return;
+    }
+    map<string, json> open;   // contractAddress -> intent, for Bitflash locks not yet settled
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        string addr = lines[i].value("contractAddress", string());
+        string state = lines[i].value("state", string());
+        if (addr.empty())
+            continue;
+        if (state == "intent" && lines[i].value("chain", string()) == "btf")
+            open[addr] = lines[i];
+        else if (state == "funded" || state == "failed")
+            open.erase(addr);
+    }
+    for (map<string, json>::iterator it = open.begin(); it != open.end(); ++it)
+    {
+        vector<unsigned char> vch = ParseHex(it->second.value("contract", string()));
+        int64 nValue = 0;
+        if (!ParseMoney(it->second.value("amountText", string()).c_str(), nValue))
+            continue;
+        uint256 txid;
+        if (BtfWalletPaid(CScript(vch.begin(), vch.end()), nValue, txid))
+        {
+            LogSwap(json{{"tag", it->second.value("tag", string())}, {"state", "funded"}, {"contractAddress", it->first},
+                         {"contractTxid", txid.GetHex()}, {"recovered", true}});
+            printf("swaps.log: the swap contract %s was paid by %s before the node stopped; its secret and "
+                   "contract are in swaps.log\n", it->first.c_str(), txid.GetHex().c_str());
+        }
+    }
 }
 
 static swap::Contract ContractFromParam(const json& v, CScript& contractOut)
@@ -1593,6 +1774,9 @@ static json rpc_swapauditcontract(const json& p)
     CTxIndex txindex;
     j["unspent"] = CTxDB("r").ReadTxIndex(tx.GetHash(), txindex) && n < txindex.vSpent.size() &&
                    txindex.vSpent[n].IsNull();
+    // A coinbase cannot be spent until it matures, and vanishes for good if
+    // its block is orphaned: no swap should count on one.
+    j["coinbase"] = tx.IsCoinBase();
     // What a participant must check before locking anything of theirs: that
     // the coins are to THEIR address and that the lock leaves them time.
     j["recipientIsMine"] = IsMineAddress(Hash160ToAddress(uint160(c.recipientPkh)));
@@ -3252,27 +3436,31 @@ static json rpc_swapfindsecret(const json& p)
     COutPoint outpoint(txFrom.GetHash(), n);
 
     CTransaction spend;
-    bool fFound = false;
-    CRITICAL_BLOCK(cs_mapTransactions)
-    {
-        map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(outpoint);
-        if (mi != mapNextTx.end() && mi->second.ptx)
-        {
-            spend = *mi->second.ptx;
-            fFound = true;
-        }
-    }
-    if (!fFound)
+    bool fFound = false, fConfirmed = false;
+    // The chain first: a spend in a block is the one that counts, and says so.
     {
         CTxIndex txindex;
         if (CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && n < txindex.vSpent.size() &&
             !txindex.vSpent[n].IsNull() && spend.ReadFromDisk(txindex.vSpent[n]))
-            fFound = true;
+            fFound = fConfirmed = true;
     }
+    if (!fFound)
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(outpoint);
+            if (mi != mapNextTx.end() && mi->second.ptx)
+            {
+                spend = *mi->second.ptx;
+                fFound = true;
+            }
+        }
     json j;
     j["spent"] = fFound;
     if (!fFound)
         return j;
+    // In a block of the chain, or only in the memory pool (where a redeem
+    // paying more could still take its place).
+    j["confirmed"] = fConfirmed;
     j["txid"] = spend.GetHash().GetHex();
     for (size_t k = 0; k < spend.vin.size(); k++)
     {
@@ -3372,7 +3560,7 @@ static string UtcText(int64 t)
 // shorter one as the last parameter (a refund tried in minutes, not a day).
 static int64 LockSecsParam(const json& p, size_t nIndex, int64 nDefault, const btcswap::Chain& chain)
 {
-    if (p.size() <= nIndex)
+    if (p.size() <= nIndex || p[nIndex].is_null())
         return nDefault;
     if (chain.fMain)
         throw runtime_error("the lock length is fixed on " + btclight::Label(chain.coin) + "'s main chain");
@@ -3393,70 +3581,6 @@ static json BtcContractJson(const btcswap::Chain& chain, const swap::Contract& c
     j["lockTime"]        = c.nLockTime;
     j["refundOpens"]     = UtcText(c.nLockTime);
     return j;
-}
-
-// Lock coins from the chain's own node (Bitcoin Core, Litecoin Core) in a
-// contract whose keys are ours; with the light client, say what to pay.
-static json BtcFundContract(const btcswap::Chain& chain, const swap::Contract& c, int64 nValue)
-{
-    // What is left after the spend's fee has to clear Dogecoin's dust limit.
-    if (chain.coin == "doge" && nValue < COIN / 50)
-        throw runtime_error("the least Dogecoin a contract can hold is 0.02 DOGE");
-    // Its wallets pay 0.1 DGB per 1000 bytes: the estimate lands near that.
-    if (chain.coin == "dgb" && nValue < COIN / 10)
-        throw runtime_error("the least DigiByte a contract can hold is 0.1 DGB");
-    if (chain.coin == "rvn" && nValue < COIN / 10)
-        throw runtime_error("the least Ravencoin a contract can hold is 0.1 RVN");
-    CScript contract = swap::BuildContract(c);
-    string strAddr = btcswap::ScriptAddress(chain, contract);
-    if (btcswap::UsingLight(chain.coin))
-    {
-        btclight::Watch(chain, contract);
-        json j = BtcContractJson(chain, c, contract);
-        j["contractTxid"] = ""; j["vout"] = -1;
-        j["amount"] = CoinValueFromAmount(chain.coin, nValue);
-        j["awaitingPayment"] = true;
-        j["paymentInstructions"] = "pay exactly " + CoinAmountText(chain.coin, nValue) + " " + Ticker(chain.coin) + " to " + strAddr;
-        return j;
-    }
-    string who = btcswap::BackendName(chain.coin);
-    json txid = CoinCall(chain.coin, "sendtoaddress", json::array({ strAddr, CoinAmountText(chain.coin, nValue) }));
-    if (!txid.is_string())
-        throw runtime_error(who + " did not return a transaction id");
-    json wtx = CoinCall(chain.coin, "gettransaction", json::array({ txid }));
-    if (!wtx.is_object() || !wtx.contains("hex") || !wtx["hex"].is_string())
-        throw runtime_error(who + " did not return the contract transaction");
-    CTransaction tx;
-    if (!btcswap::ParseTx(ParseHex(wtx["hex"].get<string>()), tx))
-        throw runtime_error("the contract transaction does not decode");
-    CScript p2sh;
-    p2sh.SetPayToScriptHash(contract);
-    int nOut = -1;
-    for (unsigned int i = 0; i < tx.vout.size(); i++)
-        if (tx.vout[i].scriptPubKey == p2sh && tx.vout[i].nValue == nValue)
-            nOut = (int)i;
-    if (nOut < 0)
-        throw runtime_error(who + "'s transaction does not pay the contract");
-    json j = BtcContractJson(chain, c, contract);
-    j["contractTxid"] = txid;
-    j["contractTx"] = wtx["hex"];
-    j["vout"] = nOut;
-    j["amount"] = CoinValueFromAmount(chain.coin, nValue);
-    return j;
-}
-
-static swap::Contract BtcNewContract(const btcswap::Chain& chain, const string& strTheirAddr)
-{
-    swap::Contract c;
-    string err;
-    if (!btcswap::AddressToPkh(chain, strTheirAddr, c.recipientPkh, err))
-        throw runtime_error(err);
-    vector<unsigned char> vchRefund = GetKeyFromPool();
-    if (vchRefund.empty())
-        throw runtime_error("could not draw a key from the wallet");
-    uint160 h = Hash160(vchRefund);
-    c.refundPkh.assign(h.begin(), h.end());
-    return c;
 }
 
 // btcswapinfo -- is Bitcoin Core there, on which chain, and what it holds.
@@ -3509,48 +3633,259 @@ static json CoinNewAddress(const string& coin, const json&)
     return btcswap::PkhToAddress(chain, vector<unsigned char>(h.begin(), h.end()));
 }
 
-// btcinitiate <their BTC address> <amount> [lock seconds, test chains only]
-static json CoinInitiate(const string& coin, const json& p)
+// The least a contract on that chain may hold: what is left after the spend's
+// fee has to clear the chain's dust limit.
+static void CheckCoinContractFloor(const string& coin, int64 nValue)
 {
-    if (p.size() < 2 || !p[0].is_string())
-        throw runtime_error("initiate <participant's " + btclight::Label(coin) + " address> <amount> [lock seconds, test chains only]");
-    RequireSwapsOpen();
-    btcswap::Chain chain = RequireChain(coin);
-    if (IsWalletLocked())
-        throw runtime_error("wallet is locked");
-    swap::Contract c = BtcNewContract(chain, p[0].get<string>());
-    vector<unsigned char> secret(swap::SECRET_BYTES);
-    RAND_bytes(&secret[0], (int)secret.size());
-    c.secretHash.resize(32);
-    SHA256(&secret[0], secret.size(), &c.secretHash[0]);
-    c.nLockTime = GetTime() + LockSecsParam(p, 2, btcswap::INITIATOR_LOCK_SECS, chain);
-    json j = BtcFundContract(chain, c, CoinAmountFromValue(coin, p[1]));
-    j["secret"] = HexStr(secret.begin(), secret.end(), false);
-    j["role"] = "initiator";
-    LogSwap(j);
-    OPENSSL_cleanse(&secret[0], secret.size());
+    if (coin == "doge" && nValue < COIN / 50)
+        throw runtime_error("the least Dogecoin a contract can hold is 0.02 DOGE");
+    // Its wallets pay 0.1 DGB per 1000 bytes: the estimate lands near that.
+    if (coin == "dgb" && nValue < COIN / 10)
+        throw runtime_error("the least DigiByte a contract can hold is 0.1 DGB");
+    if (coin == "rvn" && nValue < COIN / 10)
+        throw runtime_error("the least Ravencoin a contract can hold is 0.1 RVN");
+}
+
+// Did the chain's own node pay this contract address? Its wallet's sends.
+static bool CoreWalletPaid(const btcswap::Chain& chain, const string& strAddr, string& txidOut, int& voutOut)
+{
+    json r;
+    string err;
+    // "*": every label, or every account on Dogecoin Core 1.14.
+    if (!btcswap::Call(chain.coin, "listtransactions", json::array({ "*", 1000 }), r, err) || !r.is_array())
+        return false;
+    for (size_t i = 0; i < r.size(); i++)
+    {
+        const json& e = r[i];
+        if (e.is_object() && e.value("category", string()) == "send" && e.value("address", string()) == strAddr &&
+            e.contains("txid") && e["txid"].is_string())
+        {
+            txidOut = e["txid"].get<string>();
+            voutOut = e.contains("vout") && e["vout"].is_number_integer() ? e["vout"].get<int>() : -1;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A lock from the journal, as coininitiate answers it.
+static json CoinLockFromJournal(const btcswap::Chain& chain, const json& prior)
+{
+    vector<unsigned char> vch = ParseHex(prior.value("contract", string()));
+    CScript contract(vch.begin(), vch.end());
+    swap::Contract c;
+    if (!swap::ParseContract(contract, c))
+        throw runtime_error("swaps.log holds a contract under that tag that does not parse");
+    json j = BtcContractJson(chain, c, contract);
+    j["contractTxid"] = prior.value("contractTxid", string());
+    j["vout"] = prior.contains("vout") && prior["vout"].is_number_integer() ? prior["vout"].get<int>() : -1;
+    j["amount"] = prior.contains("amount") ? prior["amount"] : json(nullptr);
+    j["role"] = prior.value("role", string());
+    j["tag"] = prior.value("tag", string());
+    if (prior.contains("secret"))
+        j["secret"] = prior["secret"];
+    if (prior.value("state", string()) == "made")
+    {
+        btclight::Watch(chain, contract);
+        j["awaitingPayment"] = true;
+        j["paymentInstructions"] = "pay exactly " + prior.value("amountText", string()) + " " + Ticker(chain.coin) +
+                                   " to " + j["contractAddress"].get<string>();
+    }
+    if (prior.contains("fundingUnverified"))
+        j["fundingUnverified"] = prior["fundingUnverified"];
+    j["recovered"] = true;
     return j;
 }
 
-// btcparticipate <their BTC address> <amount> <secret hash> [lock seconds, test chains only]
-static json CoinParticipate(const string& coin, const json& p)
+// coininitiate and coinparticipate: a lock on another chain, written to
+// swaps.log before it is paid, as BtfLock does here. From the chain's own node
+// (Bitcoin Core, Litecoin Core...) the node pays it; with the light client the
+// answer says what to pay, and the person's own wallet does.
+//
+// Once the node has accepted the payment nothing here throws: a step after it
+// that fails (the node slow to answer, a transaction this wallet cannot read)
+// says so in "fundingUnverified" beside the transaction id. Throwing then would
+// have lost the only copy of the secret with coins already in the contract.
+static json CoinLock(const string& coin, const json& p, bool fInitiator)
 {
-    if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
-        throw runtime_error("participate <initiator's " + btclight::Label(coin) + " address> <amount> <secret hash> [lock seconds, test chains only]");
+    size_t iLock = fInitiator ? 2 : 3;
     RequireSwapsOpen();
     btcswap::Chain chain = RequireChain(coin);
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
-    string strHash = p[2].get<string>();
-    if (strHash.size() != 64 || !IsHex(strHash))
-        throw runtime_error("the secret hash is 64 hex characters");
-    swap::Contract c = BtcNewContract(chain, p[0].get<string>());
-    c.secretHash = ParseHex(strHash);
-    c.nLockTime = GetTime() + LockSecsParam(p, 3, btcswap::PARTICIPANT_LOCK_SECS, chain);
-    json j = BtcFundContract(chain, c, CoinAmountFromValue(coin, p[1]));
-    j["role"] = "participant";
-    LogSwap(j);
+    string strHash;
+    if (!fInitiator)
+    {
+        strHash = p[2].get<string>();
+        if (strHash.size() != 64 || !IsHex(strHash))
+            throw runtime_error("the secret hash is 64 hex characters");
+    }
+    int64 nValue = CoinAmountFromValue(coin, p[1]);
+    CheckCoinContractFloor(coin, nValue);
+    int64 nLockSecs = LockSecsParam(p, iLock, fInitiator ? btcswap::INITIATOR_LOCK_SECS : btcswap::PARTICIPANT_LOCK_SECS, chain);
+    string tag = SwapTagParam(p, iLock + 1);
+    string role = fInitiator ? "initiator" : "participant";
+
+    swap::Contract c;
+    string err;
+    if (!btcswap::AddressToPkh(chain, p[0].get<string>(), c.recipientPkh, err))
+        throw runtime_error(err);
+    string chainLabel = ChainLogName(coin) + "-" + chain.name;
+    string recipient = btcswap::PkhToAddress(chain, c.recipientPkh);
+    string amountText = CoinAmountText(coin, nValue);
+
+    json prior = JournalPrior(tag);
+    bool fReuse = false;
+    vector<unsigned char> secret;
+    if (!prior.is_null())
+    {
+        CheckPriorTerms(prior, chainLabel, role, recipient, amountText, strHash);
+        string state = prior.value("state", string());
+        if (state == "funded" || state == "made")
+            return CoinLockFromJournal(chain, prior);
+        if (state == "intent")
+        {
+            // Written, and maybe paid: the node may have taken the payment and
+            // then not answered in time, or this node stopped in between.
+            string txid;
+            int vout = -1;
+            if (!btcswap::UsingLight(coin) && CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout))
+            {
+                LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
+                             {"contractTxid", txid}, {"vout", vout}, {"recovered", true}});
+                prior["contractTxid"] = txid;
+                prior["vout"] = vout;
+                prior["state"] = "funded";
+                return CoinLockFromJournal(chain, prior);
+            }
+            // Not seen paid. Paid again, it is the same contract, under the
+            // same secret: a second payment is one more output this wallet
+            // can refund, never one nobody can.
+            vector<unsigned char> vch = ParseHex(prior.value("contract", string()));
+            swap::Contract back;
+            if (!swap::ParseContract(CScript(vch.begin(), vch.end()), back))
+                throw runtime_error("swaps.log holds a contract under that tag that does not parse");
+            c = back;
+            if (fInitiator)
+            {
+                string strSecret = prior.value("secret", string());
+                if (strSecret.size() != 64 || !IsHex(strSecret))
+                    throw runtime_error("swaps.log holds no secret for that tag");
+                secret = ParseHex(strSecret);
+            }
+            fReuse = true;
+        }
+        // "failed": the node refused that payment. A new contract below.
+    }
+    if (!fReuse)
+    {
+        vector<unsigned char> vchRefund = GetKeyFromPool();
+        if (vchRefund.empty())
+            throw runtime_error("could not draw a key from the wallet");
+        uint160 h = Hash160(vchRefund);
+        c.refundPkh.assign(h.begin(), h.end());
+        if (fInitiator)
+        {
+            if (!swap::NewSecret(secret, c.secretHash))
+                throw runtime_error("the system's random number generator failed; no secret was made and nothing was sent");
+        }
+        else
+            c.secretHash = ParseHex(strHash);
+        c.nLockTime = GetTime() + nLockSecs;
+    }
+
+    CScript contract = swap::BuildContract(c);
+    string strAddr = btcswap::ScriptAddress(chain, contract);
+    json j = BtcContractJson(chain, c, contract);
+    j["amount"] = CoinValueFromAmount(coin, nValue);
+    j["role"] = role;
+    if (!tag.empty())
+        j["tag"] = tag;
+    if (fInitiator)
+        j["secret"] = HexStr(secret.begin(), secret.end(), false);
+    if (!secret.empty())
+        OPENSSL_cleanse(&secret[0], secret.size());
+    if (!fReuse)
+    {
+        json intent = j;
+        intent["amountText"] = amountText;
+        JournalIntent(intent);
+    }
+
+    if (btcswap::UsingLight(coin))
+    {
+        btclight::Watch(chain, contract);
+        j["contractTxid"] = ""; j["vout"] = -1;
+        j["awaitingPayment"] = true;
+        j["paymentInstructions"] = "pay exactly " + amountText + " " + Ticker(coin) + " to " + strAddr;
+        LogSwap(json{{"tag", tag}, {"state", "made"}, {"contractAddress", strAddr}});
+        return j;
+    }
+
+    string who = btcswap::BackendName(coin);
+    json txid;
+    int nCode = 0;
+    if (!btcswap::Call(coin, "sendtoaddress", json::array({ strAddr, amountText }), txid, err, 4 * 1024 * 1024, &nCode) ||
+        !txid.is_string())
+    {
+        // An error the node answered with: it refused, nothing went out.
+        if (nCode != 0)
+        {
+            LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", strAddr}, {"error", err}});
+            throw runtime_error(who + ": " + err);
+        }
+        // No answer at all: the payment may still have gone out.
+        throw runtime_error(who + " gave no clear answer to the payment (" + (err.empty() ? string("no transaction id") : err) +
+                            "): the contract " + strAddr + " may be paid. Its secret and contract are in swaps.log; "
+                            "ask again with the same tag to find out, or audit that address");
+    }
+    j["contractTxid"] = txid;
+    j["vout"] = -1;
+    try
+    {
+        json wtx = CoinCall(coin, "gettransaction", json::array({ txid }));
+        if (!wtx.is_object() || !wtx.contains("hex") || !wtx["hex"].is_string())
+            throw runtime_error(who + " did not return the contract transaction");
+        CTransaction tx;
+        if (!btcswap::ParseTx(ParseHex(wtx["hex"].get<string>()), tx))
+            throw runtime_error("the contract transaction does not decode");
+        CScript p2sh;
+        p2sh.SetPayToScriptHash(contract);
+        int nOut = -1;
+        for (unsigned int i = 0; i < tx.vout.size(); i++)
+            if (tx.vout[i].scriptPubKey == p2sh && tx.vout[i].nValue == nValue)
+                nOut = (int)i;
+        if (nOut < 0)
+            throw runtime_error(who + "'s transaction does not pay the contract in an output this wallet can read");
+        j["contractTx"] = wtx["hex"];
+        j["vout"] = nOut;
+    }
+    catch (std::exception& e)
+    {
+        j["fundingUnverified"] = string(e.what());
+    }
+    json funded = {{"tag", tag}, {"state", "funded"}, {"contractAddress", strAddr}, {"contractTxid", txid}, {"vout", j["vout"]}};
+    if (j.contains("fundingUnverified"))
+        funded["fundingUnverified"] = j["fundingUnverified"];
+    if (!swap::JournalAppend(funded, err))
+        j["journalWarning"] = "the lock is paid, but swaps.log could not record its transaction: " + err;
     return j;
+}
+
+// btcinitiate <their BTC address> <amount> [lock seconds, test chains only | null] [tag]
+static json CoinInitiate(const string& coin, const json& p)
+{
+    if (p.size() < 2 || !p[0].is_string())
+        throw runtime_error("initiate <participant's " + btclight::Label(coin) + " address> <amount> [lock seconds, test chains only | null] [tag]");
+    return CoinLock(coin, p, true);
+}
+
+// btcparticipate <their BTC address> <amount> <secret hash> [lock seconds, test chains only | null] [tag]
+static json CoinParticipate(const string& coin, const json& p)
+{
+    if (p.size() < 3 || !p[0].is_string() || !p[2].is_string())
+        throw runtime_error("participate <initiator's " + btclight::Label(coin) + " address> <amount> <secret hash> [lock seconds, test chains only | null] [tag]");
+    return CoinLock(coin, p, false);
 }
 
 // A contract transaction given as raw hex, or as a txid Bitcoin Core can
@@ -3600,6 +3935,7 @@ struct BtcContractOut
     int64 nValue = -1;
     bool fUnspent = false;
     int nConfirmations = 0;
+    bool fCoinbase = false;
 };
 
 static BtcContractOut BtcResolveContract(const btcswap::Chain& chain, const json& v, const CScript& contract)
@@ -3613,6 +3949,7 @@ static BtcContractOut BtcResolveContract(const btcswap::Chain& chain, const json
         o.n = found["vout"].get<int>() < 0 ? 0 : found["vout"].get<unsigned int>();
         o.fUnspent = found["unspent"].get<bool>();
         o.nConfirmations = found["confirmations"].get<int>();
+        o.fCoinbase = found.value("coinbase", false);
         if (o.fUnspent) o.nValue = CoinAmountFromValue(coin, found["amount"]);
         return o;
     }
@@ -3650,6 +3987,7 @@ static BtcContractOut BtcResolveContract(const btcswap::Chain& chain, const json
         o.nValue = CoinAmountFromValue(coin, out["value"]);
         o.nConfirmations = out.contains("confirmations") && out["confirmations"].is_number_integer()
                                ? out["confirmations"].get<int>() : 0;
+        o.fCoinbase = out.contains("coinbase") && out["coinbase"].is_boolean() && out["coinbase"].get<bool>();
     }
     else if (nFromTx >= 0)
         o.nValue = -1;     // the transaction says how much, but Core does not see it unspent
@@ -3676,6 +4014,9 @@ static json CoinAuditContract(const string& coin, const json& p)
     j["amount"] = o.fUnspent ? json(CoinValueFromAmount(coin, o.nValue)) : json(nullptr);
     j["unspent"] = o.fUnspent;
     j["confirmations"] = o.nConfirmations;
+    // Paid by a coinbase: unspendable until it matures, and gone for good if
+    // its block is orphaned. A swap refuses to count on it.
+    j["coinbase"] = o.fCoinbase;
     j["secondsUntilRefund"] = std::max<int64>(0, c.nLockTime - chain.nMedianTime);
     j["recipientIsMine"] = IsMineAddress(Hash160ToAddress(uint160(c.recipientPkh)));
     return j;
@@ -3868,6 +4209,7 @@ static json CoinFindSecret(const string& coin, const json& p)
                     if (!in.is_object() || in.value("txid", string()) != strTxid || in.value("vout", -1) != (int)n)
                         continue;
                     j["found"] = true;
+                    j["confirmed"] = true;
                     j["height"] = h;
                     j["txid"] = tx.value("txid", string());
                     vector<unsigned char> secret, vchSig;
@@ -3929,6 +4271,8 @@ static json CoinFindSecret(const string& coin, const json& p)
     }
     const CTransaction& spend = vCandidates[0];
     j["found"] = true;
+    // From a block (it has a height), or only from the memory pool.
+    j["confirmed"] = j.contains("height");
     j["txid"] = spend.GetHash().GetHex();
     for (size_t k = 0; k < spend.vin.size(); k++)
     {
@@ -3940,6 +4284,102 @@ static json CoinFindSecret(const string& coin, const json& p)
         }
     }
     j["refunded"] = true;     // spent without the secret: the refund path
+    return j;
+}
+
+// The chain code of a journal line's "chain" ("litecoin-main" -> "ltc").
+static string CoinOfChainLabel(const string& label)
+{
+    static const char* names[][2] = { { "bitcoin-", "btc" }, { "litecoin-", "ltc" }, { "dogecoin-", "doge" },
+                                      { "digibyte-", "dgb" }, { "ravencoin-", "rvn" }, { "bitcoincash-", "bch" },
+                                      { "ecash-", "xec" } };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (label.compare(0, strlen(names[i][0]), names[i][0]) == 0)
+            return names[i][1];
+    return string();
+}
+
+// swaplookup <tag> -- what swaps.log knows of the lock named <tag>, on any
+// chain: "none", "failed" (nothing was paid), "unpaid" (the contract exists,
+// nothing of ours paid it), "intent" (written, not known yet whether paid),
+// "funded", or "made" (an outside wallet pays it). btfchat asks this when a
+// lock call gave no answer, before it lets the swap be locked again or called off.
+static json rpc_swaplookup(const json& p)
+{
+    if (p.size() < 1)
+        throw runtime_error("swaplookup <tag>");
+    string tag = SwapTagParam(p, 0);
+    if (tag.empty())
+        throw runtime_error("swaplookup <tag>");
+    json prior = JournalPrior(tag);
+    json j;
+    if (prior.is_null())
+    {
+        j["state"] = "none";
+        return j;
+    }
+    j = prior;
+    j.erase("time");
+    if (j.value("state", string()) == "made")
+        j["awaitingPayment"] = true;
+    if (j.value("state", string()) != "intent")
+        return j;
+    string chainLabel = j.value("chain", string());
+    vector<unsigned char> vch = ParseHex(prior.value("contract", string()));
+    CScript contract(vch.begin(), vch.end());
+    if (chainLabel == "btf")
+    {
+        // Wallet calls run one at a time: a Bitflash lock that is still only
+        // an intent was paid (the wallet has the transaction) or never will be.
+        int64 nValue = 0;
+        uint256 txid;
+        if (ParseMoney(prior.value("amountText", string()).c_str(), nValue) && BtfWalletPaid(contract, nValue, txid))
+        {
+            LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
+                         {"contractTxid", txid.GetHex()}, {"recovered", true}});
+            j["state"] = "funded";
+            j["contractTxid"] = txid.GetHex();
+        }
+        else
+        {
+            LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", prior.value("contractAddress", string())},
+                         {"error", "never paid"}});
+            j["state"] = "failed";
+        }
+        return j;
+    }
+    string coin = CoinOfChainLabel(chainLabel);
+    if (coin.empty())
+        return j;
+    // "unpaid": the contract exists (and asked again under the tag, the same
+    // one is made), but nothing of this wallet's paid it. With the light
+    // client nothing is ever sent from here; with a node, its wallet has had
+    // ten minutes to show a payment it made.
+    if (btcswap::UsingLight(coin))
+    {
+        j["state"] = "unpaid";
+        return j;
+    }
+    try
+    {
+        btcswap::Chain chain = RequireChain(coin);
+        string txid;
+        int vout = -1;
+        if (CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout))
+        {
+            LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
+                         {"contractTxid", txid}, {"vout", vout}, {"recovered", true}});
+            j["state"] = "funded";
+            j["contractTxid"] = txid;
+            j["vout"] = vout;
+        }
+        else if (GetTime() - prior.value("time", (int64)0) > 600)
+            j["state"] = "unpaid";
+    }
+    catch (std::exception& e)
+    {
+        j["checkError"] = string(e.what());
+    }
     return j;
 }
 
@@ -3983,7 +4423,7 @@ static json rpc_help(const json&)
            "gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
-           "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret "
+           "swapinitiate swapparticipate swapauditcontract swapredeem swaprefund swapextractsecret swapfindsecret swaplookup "
            "btcswapinfo btcnewaddress btcvalidatedestination btcinitiate btcparticipate btcauditcontract btcredeem btcrefund btcfindsecret "
            "coinswapinfo coinnewaddress coinvalidatedestination coininitiate coinparticipate coinauditcontract coinredeem coinrefund coinfindsecret "
            "templatehash spendscript vaultcreate vaultunvault vaultwithdraw vaultrecover ctvbatch ctvexpand listv4contracts "
@@ -4049,6 +4489,7 @@ static const RpcEntry kMethods[] = {
     { "swaprefund",       rpc_swaprefund },
     { "swapextractsecret", rpc_swapextractsecret },
     { "swapfindsecret",   rpc_swapfindsecret },
+    { "swaplookup",       rpc_swaplookup },
     { "btcswapinfo",      rpc_btcswapinfo },
     { "btcvalidatedestination", rpc_btcvalidatedestination },
     { "btcnewaddress",    rpc_btcnewaddress },
@@ -4268,6 +4709,9 @@ void ThreadJsonRpcServer(void* parg)
         return;
     }
     printf("JSON-RPC listening on 127.0.0.1:%d\n", g_rpcPort);
+    // A swap lock the node stopped in the middle of, found again.
+    try { RecoverSwapJournal(); }
+    catch (std::exception& e) { printf("swaps.log: %s\n", e.what()); }
 
     while (!fShutdown)
     {

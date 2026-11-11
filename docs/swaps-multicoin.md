@@ -11,8 +11,10 @@ The contract is the one every swap here uses (docs/atomic-swaps.md), byte for
 byte Decred's atomicswap contract: SHA-256 hash lock, `OP_CHECKLOCKTIMEVERIFY`
 refund, P2PKH both ways. All six chains run Bitcoin's script with P2SH and
 CLTV, so the same contract, the same redeem and the same refund work on each.
-The Bitflash side does not change at all. The initiator's lock is 48 hours and
-the participant's 24, in median time past, on every chain.
+The Bitflash side is the same contract. The initiator's lock is 48 hours and
+the participant's 24, in median time past, on every chain; on Bitflash, also
+locked by median time since 1.2.33, a participant's lock is 18 hours
+(docs/atomic-swaps.md, "The timing").
 
 The key the other chain's contract pays is a key of this wallet, as it is for
 Bitcoin (btcswap.h): the same curve and the same Hash160 serve all of them.

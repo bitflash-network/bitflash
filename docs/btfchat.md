@@ -130,9 +130,11 @@ did not, or locked less, or to another address, or under another secret.
 *Stops it:* nothing is locked or redeemed on the strength of a step. The
 taker's app looks the maker's contract up on the taker's own Bitflash node or
 Bitcoin Core and needs it unspent, confirmed, paying the taker's address the
-agreed amount, with 36 hours left; the maker's app checks the taker's the
-same way, under the maker's own hash, with 6 hours left, before showing the
-secret. A raw transaction in a message is never trusted: Bitcoin is checked
+agreed amount, with 36 hours left, locked by time and not paid by a
+coinbase; the maker's app checks the taker's the same way, under the maker's
+own hash, with 6 hours left, before showing the secret. A contract's lock is
+read from the contract before any chain is asked about it, so a lock chosen to
+send a light client back over months of blocks is refused first. A raw transaction in a message is never trusted: Bitcoin is checked
 by `gettxout` on the person's own node.
 
 **Fake coins.** Paying real BTF with Bitcoin from regtest or a test chain,

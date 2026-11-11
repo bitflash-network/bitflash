@@ -42,9 +42,57 @@ The contract is **byte for byte the one Decred's
 they support, so a Bitflash user and a `btcatomicswap` user can swap with each
 other.
 
-The initiator's lock is 48 hours and the participant's 24, so that the
-participant always has a day to redeem after the initiator has shown the
-secret.
+The initiator's lock is 48 hours and the participant's 24 (18 when the
+participant gives BTF), so that the participant always has the time to redeem
+after the initiator has shown the secret.
+
+### The timing, and why Bitflash locks by time
+
+Every lock is a unix time judged by the chain's median time past, the
+Bitflash contract included: rules v3 let a refund into a block only once the
+median time of the eleven blocks before it has passed the lock
+(`OP_CHECKLOCKTIMEVERIFY` plus BIP113, `CTransaction::IsFinalAt`). Until
+1.2.33 the Bitflash contract was locked by height, 48 * 30 or 24 * 30 blocks
+of two minutes. A height lock is a promise about the chain's speed, and
+Bitflash retargets every 30 blocks by at most four times: difficulty pushed up
+for a few windows and then left to the honest miners makes the next blocks
+come hours apart. A taker who gave BTF against a coin locked by time could
+then still be waiting for its 720th block when the maker's lock had
+run out, and the maker could take its own coins back and the taker's too.
+
+The swap needs three things, with both locks in time:
+
+1. the maker, who shows the secret by redeeming the taker's contract, gets
+   that redeem into a block before the taker's refund opens;
+2. the taker, who reads the secret off the chain, gets its redeem in before
+   the maker's refund opens;
+3. the taker's refund is in a block before the maker's refund opens.
+
+For (1) and (2), a redeem is valid at once and is sent hours before the lock,
+while a refund needs the median time past the lock: six blocks stamped after
+it and one more to carry it. Slowing a chain delays the refund at least as
+much as the redeem. Speeding one up is bounded by the two hours a block's time
+may run ahead and by the retarget, far inside the margins (the maker redeems
+only with 6 hours left; the taker has at least 12).
+
+(3) is the case a slowed Bitflash chain can attack, and only when the taker
+gives BTF: its refund then needs those seven Bitflash blocks between its own
+lock and the maker's. The taker locks only while the maker's contract has at
+least 36 hours left, and a taker's BTF lock is 18 hours, so seven blocks have
+at least 18 hours: about 150 minutes a block, more than 64 times the two-minute
+target, three of the largest retarget steps in a row. Driving the difficulty
+that high takes far more work than reversing the 30 Bitflash confirmations
+both sides already wait for before acting, so the margin is not the weakest
+point of the swap. Before it locks, a taker giving BTF also waits while the
+Bitflash tip's median time is more than an hour behind the clock (normally
+about 12 minutes), which is where such a slowdown would have to begin.
+Dogecoin judges a lock by the next block's own time (BIP113 never activated
+there), which costs up to about two of those hours; the margin covers it.
+
+Both peers must agree on this: offers and takes carry `"v":2`. An offer or a
+take from a version that still locks Bitflash by height is refused before
+anybody locks anything, and a counterparty contract on Bitflash locked by
+height is refused too.
 
 ## Embedded Bitcoin light client (no Bitcoin Core)
 
@@ -104,11 +152,16 @@ agreed swap amount. Keep the chat open through completion or refund.
   twice the fee rate (the redeem signals BIP125), up to 0.01 BTC per 1000
   vbytes. With no fee estimate in light mode the first rate is `-btcfeerate`,
   10 sat/vB when unset; set it higher when Bitcoin's fees are high.
-- **A taker's refund is watched to the end.** The maker holds the secret and
-  could still redeem the taker's contract after the taker's refund was sent,
-  outbidding its fee. Until the maker's own lock opens, the taker's chat keeps
-  looking for that redeem, and if it appears it takes the maker's coins with
-  the secret it shows. This holds with Bitcoin Core too.
+- **A refund is done only when it is in a block.** The maker holds the secret
+  and could still redeem the taker's contract after the taker's refund was
+  sent, outbidding its fee. Until a block has the refund, the chat keeps
+  looking at its own contract: if a redeem appears instead, it takes the
+  maker's coins with the secret it shows. A light-mode refund still in no
+  block after an hour goes out again at twice the fee rate. This holds with
+  Bitcoin Core too, where a refund only in the memory pool is not the end.
+- **A maker whose redeem lost the race refunds its own.** If the taker's
+  refund confirms before the maker's redeem, the maker's swap goes on to
+  refund the maker's contract at its lock instead of stopping.
 
 State lives under `GetAppDir()` in `btc-light-<network>.headers`, `.filters`
 and `.json`. Contracts, scan cursor, matched blocks and pending broadcasts
@@ -134,9 +187,11 @@ Bitcoin side, the embedded light client above or Bitcoin Core on the same machin
 - **Maker**: the chat shows **accept: lock 100 BTF**. Two presses: the coins go
   into the contract.
 - **Taker**: the chat checks the maker's contract on the taker's own node --
-  on the chain, unspent, confirmed, paying the taker's address the agreed
-  amount, with at least 36 hours left -- and only then shows **go on: lock
-  0.001 BTC**. Two presses.
+  on the chain, unspent, confirmed, not paid by a coinbase, locked by time,
+  paying the taker's address the agreed amount, with at least 36 hours left --
+  and only then shows **go on: lock 0.001 BTC**. Two presses. A taker giving
+  BTF also waits while Bitflash blocks are coming slowly (see the timing
+  above).
 - **Then nobody presses anything.** The maker's chat checks the taker's
   contract the same way (paying the maker, under the maker's secret hash, at
   least 6 hours left) and takes it, which shows the secret on that chain.
@@ -149,7 +204,14 @@ Bitcoin side, the embedded light client above or Bitcoin Core on the same machin
   their lock runs out, as long as the chat is open at some point after that.
 
 A step from the other side is a claim; nothing is locked or redeemed on the
-strength of a message alone. **Keep the chat open while a swap is running.**
+strength of a message alone. An offer has floors, so no contract costs more
+to spend than it holds: 0.1 BTF, 0.0002 BTC, 0.001 LTC, 0.0001 BCH, 100 XEC,
+0.02 DOGE, 0.1 DGB, 0.1 RVN. The chat store (`btfchat.dat`, with every
+running swap's secret) is replaced in one step and flushed to the disk, only
+its owner can read it, and while it cannot be saved the chat makes no new
+lock and says so. A lock whose call gave no answer is looked up in the
+wallet's journal before the swap can be locked again or called off.
+**Keep the chat open while a swap is running.**
 The one way to lose is to be the taker and stay away for the whole day after
 the maker has taken your side: then the maker can refund too.
 
@@ -187,7 +249,7 @@ Alice has BTF and wants BTC; Bob has BTC and wants BTF, both with this wallet:
 | 1 | gives Bob a BTF address (`getnewaddress`) | gives Alice a Bitcoin address of **his Bitflash wallet** (`btcnewaddress`) |
 | 2 | | `btcinitiate <Alice's btcnewaddress> 0.001` -- Core pays the contract; prints the contract, txid, vout, the **secret** and its **hash** |
 | 3 | `btcauditcontract <contract> <txid:vout>` -- on **her own** Core: unspent, confirmations, pays her, hash, time left | |
-| 4 | `swapparticipate <Bob's BTF address> 100 <hash>` -- locks BTF for 24 h | |
+| 4 | `swapparticipate <Bob's BTF address> 100 <hash>` -- locks BTF for 18 h | |
 | 5 | | `swapauditcontract <contract> <txid>`, then `swapredeem ... <secret>` -- takes the BTF, showing the secret |
 | 6 | `swapfindsecret <her contract> <txid>` -- the secret, off the chain | |
 | 7 | `btcredeem <Bob's contract> <txid:vout> <secret>` -- the BTC lands in her Core's wallet | |
@@ -217,15 +279,31 @@ against his Core; Alice uses the Bitflash wallet:
   contract output unspent, confirmed, paying YOUR address the agreed amount,
   with time left. `btcauditcontract` asks your Bitcoin Core (`unspent`,
   `confirmations`); `swapauditcontract` your Bitflash node.
-- **The lock times are fixed on mainnet** (48 h / 24 h). A short lock is how a
-  participant loses their coins: the initiator waits it out, refunds, and
-  still redeems the other side. Test chains accept a shorter one as a last
-  parameter, to try a refund in minutes.
-- **The secret is written to `swaps.log`** in the data directory by
-  `swapinitiate` and `btcinitiate`, because it is the one thing that cannot be
-  recovered and an RPC answer scrolls away. Keep that file as private as the
-  wallet. The keys a Bitcoin contract pays to are this wallet's keys: back the
-  wallet up as you would for BTF.
+- **The lock times are fixed on mainnet** (48 h for an initiator, 24 h for a
+  participant, 18 h for a participant giving BTF; all in median time). A short
+  lock is how a participant loses their coins: the initiator waits it out,
+  refunds, and still redeems the other side. Test chains accept a shorter one,
+  in seconds, as the parameter after the amount (or the hash), to try a refund
+  in minutes; `null` there is the standard one.
+- **The secret is written to `swaps.log` before anything is sent.** Every lock
+  (`swapinitiate`, `swapparticipate`, `btcinitiate`, `coin...`) first writes its
+  contract, lock time and, for an initiator, the secret, as a line with
+  `"state":"intent"`, and only then pays; then it adds `"funded"` with the
+  transaction (`"made"` for a contract an outside wallet pays, `"failed"` when
+  nothing went out). The file is rewritten whole beside itself, flushed to the
+  disk and renamed into place, and only this user can read it (0600 on
+  POSIX). If it cannot be written, nothing is sent. Keep it as private as the
+  wallet; the keys a Bitcoin contract pays to are this wallet's keys, so back
+  the wallet up as you would for BTF.
+- **A lock can be named.** The last parameter of each lock call is an optional
+  tag (btfchat uses the swap's id). Asked again under the same tag -- after a
+  timeout, a crash, a restart -- the wallet answers with the lock it already
+  made instead of making a second; a Bitcoin Core that took the payment and
+  then did not answer is asked whether it paid. `swaplookup <tag>` says what
+  the journal knows. Once the node has accepted the payment the call no
+  longer throws: a step after it that fails comes back as `fundingUnverified`
+  beside the transaction id. On start the node looks for Bitflash locks the
+  journal left as intents and records the ones its wallet paid.
 - **Before rules v3 every swap command refuses.** Until then a script-hash
   output is anyone-can-spend: a funded contract could be taken by whoever read
   it off the chain. On mainnet they keep refusing until the launch on
@@ -236,18 +314,19 @@ against his Core; Alice uses the Bitflash wallet:
 
 | call | does |
 |---|---|
-| `swapinitiate addr amount` | new secret; Bitflash contract paying `addr` with the secret, refundable to us after 48 h; funds it |
-| `swapparticipate addr amount hash` | contract paying `addr` under `hash`, refundable to us after 24 h; funds it |
-| `swapauditcontract contract txid` | terms, amount, `recipientIsMine`, `confirmations`, `unspent`, `blocksUntilRefund` |
+| `swapinitiate addr amount [lock] [tag]` | new secret; Bitflash contract paying `addr` with the secret, refundable to us 48 h on (median time); written to `swaps.log`, then funded |
+| `swapparticipate addr amount hash [lock] [tag]` | contract paying `addr` under `hash`, refundable to us 18 h on; written, then funded |
+| `swapauditcontract contract txid` | terms, amount, `recipientIsMine`, `confirmations`, `unspent`, `coinbase`, `medianTimePast`, `secondsUntilRefund` (a contract locked by height, from before 1.2.33: `lockIsHeight`, `blocksUntilRefund`) |
+| `swaplookup tag` | what `swaps.log` knows of the lock named `tag`: `none`, `intent`, `failed`, `unpaid`, `funded` or `made`, with its contract |
 | `swapredeem contract txid secret` | takes the coins with the secret, to a fresh address of ours |
 | `swaprefund contract txid` | takes them back after the lock |
-| `swapfindsecret contract txid` | was our contract spent, and with which secret (memory pool and chain) |
+| `swapfindsecret contract txid` | was our contract spent, and with which secret (chain, then memory pool; `confirmed` says which) |
 | `swapextractsecret txid\|hex hash` | the secret, from a redeem on this chain (txid) or Bitcoin's (raw hex, witness or not) |
 | `btcswapinfo` | is Bitcoin Core reachable, which chain, balance, fee rate |
 | `btcnewaddress` | a Bitcoin address whose key is in this wallet: where to be paid BTC in a swap |
-| `btcinitiate addr amount` | new secret; Bitcoin contract paying `addr`, refundable to us after 48 h; Core funds it |
-| `btcparticipate addr amount hash` | the same under `hash`, 24 h |
-| `btcauditcontract contract ref` | as Core sees it: `unspent`, `confirmations`, amount, `recipientIsMine`, `secondsUntilRefund` |
+| `btcinitiate addr amount [lock] [tag]` | new secret; Bitcoin contract paying `addr`, refundable to us after 48 h; written to `swaps.log`, then Core funds it |
+| `btcparticipate addr amount hash [lock] [tag]` | the same under `hash`, 24 h |
+| `btcauditcontract contract ref` | as Core sees it: `unspent`, `confirmations`, amount, `coinbase`, `recipientIsMine`, `secondsUntilRefund` |
 | `btcredeem contract ref secret` | takes the BTC with the secret, into a fresh address of Core's wallet |
 | `btcrefund contract ref` | takes it back once Bitcoin's median time passes the lock |
 | `btcfindsecret contract ref [height]` | was it spent, and with which secret |

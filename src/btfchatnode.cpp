@@ -91,6 +91,7 @@ bool UnlockIdentity(const std::string& password, Identity& out, std::string& err
 static CCriticalSection cs_chat;
 
 static bool               g_fUnlocked = false;
+static std::string        g_strStoreError;      // why the last save failed; "" once one succeeds
 static Identity           g_id;
 static Roster             g_roster;
 static ReplayGuard        g_replay;
@@ -192,6 +193,14 @@ static bool EnsureSecp()
 static bool LoadStore(std::string& errOut)
 {
     FILE* f = fopen(ChatStorePath().c_str(), "rb");
+    // Versions before 1.2.33 removed the store before renaming the new one
+    // into place: stopped between the two, only btfchat.dat.new was left.
+    if (!f && errno == ENOENT)
+    {
+        f = fopen((ChatStorePath() + ".new").c_str(), "rb");
+        if (f)
+            printf("btfchat: btfchat.dat is missing; reading btfchat.dat.new, left by an interrupted save\n");
+    }
     if (!f)
         return true;   // nothing saved yet is not a failure
 
@@ -306,22 +315,22 @@ static bool SaveStore()
         return false;
     sodium_memzero(&plain[0], plain.size());
 
-    std::string strTmp = ChatStorePath() + ".new";
-    FILE* f = fopen(strTmp.c_str(), "wb");
-    if (!f)
-        return false;
-    bool fOk = fwrite(&sealed[0], 1, sealed.size(), f) == sealed.size();
-    fflush(f);
-    fclose(f);
-    if (!fOk)
+    // Written beside, flushed to the disk and renamed over the old one in a
+    // single step (only this user can read it): a crash or a full disk leaves
+    // the store as it was or as it is now, never truncated and never gone.
+    // It holds every running swap's secret and contracts.
+    std::string err;
+    if (!WriteFileAtomicPrivate(ChatStorePath(), std::string(sealed.begin(), sealed.end()), err))
     {
-        unlink(strTmp.c_str());
+        if (g_strStoreError != err)
+            printf("btfchat: the chat store could not be saved: %s\n", err.c_str());
+        g_strStoreError = err;
         return false;
     }
-    // Write beside and rename, so an interrupted save cannot leave a truncated
-    // store where a good one was.
-    unlink(ChatStorePath().c_str());
-    return rename(strTmp.c_str(), ChatStorePath().c_str()) == 0;
+    if (!g_strStoreError.empty())
+        printf("btfchat: the chat store is saved again\n");
+    g_strStoreError.clear();
+    return true;
 }
 
 bool ChatUnlock(const std::string& password, std::string& errOut)
@@ -1221,10 +1230,17 @@ bool ChatSendSwapStep(const std::string& peerAddr, const std::string& stepText,
     return SendInConversation(peerAddr, f, stepText, fLeftInMailboxOut, errOut);
 }
 
-void ChatSaveStore()
+bool ChatSaveStore(std::string* pErrOut)
 {
+    bool fOk = false;
     CRITICAL_BLOCK(cs_chat)
-        SaveStore();
+    {
+        fOk = SaveStore();
+        if (!fOk && pErrOut)
+            *pErrOut = g_fUnlocked ? (g_strStoreError.empty() ? std::string("the store could not be sealed") : g_strStoreError)
+                                   : std::string("the chat is locked");
+    }
+    return fOk;
 }
 
 std::string ChatMailboxPublicHex()
@@ -1598,7 +1614,10 @@ static int DeliverCommunityPosts(const std::vector<unsigned char>& key,
             continue;
         Frame f;
         std::string err;
-        if (!OpenFrame(g_secp, js, f, err))
+        bool fOpened = false;
+        try { fOpened = OpenFrame(g_secp, js, f, err); }
+        catch (...) { fOpened = false; }
+        if (!fOpened)
             continue;
         if ((f.kind != MSG_GROUP_TEXT && f.kind != MSG_SWAP_OFFER) || f.group != id)
             continue;
@@ -1787,9 +1806,14 @@ int ChatPollMailboxes(std::string& errOut)
 static void ThreadChatMailbox(void* parg)
 {
     IMPLEMENT_RANDOMIZE_STACK(ThreadChatMailbox(parg));
-    try
+    // The try is inside the loop: one round that throws (a malformed message
+    // from anybody, a store that failed) is logged and the next round runs.
+    // Around the loop, the first such message ended mailbox polling, outbox
+    // flushing and key publishing until the app was restarted -- and then it
+    // was fetched again.
+    while (!fShutdown)
     {
-        while (!fShutdown)
+        try
         {
             if (ChatUnlocked())
             {
@@ -1863,7 +1887,12 @@ static void ThreadChatMailbox(void* parg)
                 if (nOut > 0)
                     printf("btfchat: %d message(s) sent from the outbox\n", nOut);
             }
+        }
+        catch (std::exception& e) { PrintException(&e, "ThreadChatMailbox()"); }
+        catch (...)               { PrintException(NULL, "ThreadChatMailbox()"); }
 
+        try
+        {
             // Two minutes between full rounds. Polling harder buys latency for
             // somebody who is offline anyway, and every poll is a Tor circuit to
             // a node -- which is traffic a watcher can count.
@@ -1885,9 +1914,9 @@ static void ThreadChatMailbox(void* parg)
                 }
             }
         }
+        catch (std::exception& e) { PrintException(&e, "ThreadChatMailbox()"); Sleep(5000); }
+        catch (...)               { PrintException(NULL, "ThreadChatMailbox()"); Sleep(5000); }
     }
-    catch (std::exception& e) { PrintException(&e, "ThreadChatMailbox()"); }
-    catch (...)               { PrintException(NULL, "ThreadChatMailbox()"); }
 }
 
 // Publishes the chat's descriptor on the Bitflash network and keeps it fresh.

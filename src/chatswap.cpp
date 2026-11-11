@@ -86,11 +86,46 @@ static bool AmountOk(const json& j, const char* key, int64_t& out)
     return out > 0 && out <= MAX_SWAP_AMOUNT;
 }
 
+// A string field: absent reads as "", anything but a string is refused. A
+// stranger writes these, and nlohmann's value() throws on a wrong type.
+static bool StrField(const json& j, const char* key, std::string& out)
+{
+    out.clear();
+    if (!j.contains(key))
+        return true;
+    if (!j[key].is_string())
+        return false;
+    out = j[key].get<std::string>();
+    return true;
+}
+
+int64_t SwapMinAmount(const std::string& coin)
+{
+    // Bitflash's own spend of a contract pays at least 0.01 BTF.
+    if (coin == "BTF")  return 10000000;     // 0.1 BTF
+    if (coin == "BTC")  return 20000;        // 0.0002 BTC
+    if (coin == "LTC")  return 100000;       // 0.001 LTC
+    if (coin == "BCH")  return 10000;        // 0.0001 BCH
+    if (coin == "XEC")  return 10000;        // 100 XEC (two places)
+    if (coin == "DOGE") return 2000000;      // 0.02 DOGE
+    if (coin == "DGB")  return 10000000;     // 0.1 DGB
+    if (coin == "RVN")  return 10000000;     // 0.1 RVN
+    return 0;
+}
+
 static bool OfferFromJson(const json& j, SwapOffer& o, std::string& errOut)
 {
     if (!j.is_object())                    { errOut = "an offer is an object"; return false; }
-    o.give = j.value("give", std::string());
-    o.want = j.value("want", std::string());
+    if (!j.contains("v") || !j["v"].is_number_integer() || j["v"].get<int64_t>() != SWAP_PROTOCOL_VERSION)
+    {
+        errOut = "this offer is from an older Bitflash, which locks BTF by block height; it cannot be taken";
+        return false;
+    }
+    if (!StrField(j, "give", o.give) || !StrField(j, "want", o.want))
+    {
+        errOut = "an offer names its coins as text";
+        return false;
+    }
     if (!SwapCoinOk(o.give) || !SwapCoinOk(o.want) || o.give == o.want || (o.give != "BTF" && o.want != "BTF"))
     {
         errOut = "an offer trades BTF for BTC or LTC, or either of them for BTF";
@@ -101,24 +136,16 @@ static bool OfferFromJson(const json& j, SwapOffer& o, std::string& errOut)
         errOut = "an offer needs two amounts, more than zero and at most 21 million";
         return false;
     }
-    // Under this a contract's redeem would leave dust (the RPC refuses it too):
-    // a taker could lock coins for a contract it could never spend.
-    if ((o.give == "DOGE" && o.giveAmount < 2000000) || (o.want == "DOGE" && o.wantAmount < 2000000))
+    // Under this a contract's redeem would leave dust or nothing (the RPC
+    // refuses it too): a taker could lock coins for a contract it could never
+    // spend.
+    if (o.giveAmount < SwapMinAmount(o.give) || o.wantAmount < SwapMinAmount(o.want))
     {
-        errOut = "the least Dogecoin a contract can hold is 0.02 DOGE";
+        const std::string& coin = o.giveAmount < SwapMinAmount(o.give) ? o.give : o.want;
+        errOut = "the least " + coin + " a swap contract can hold is " + FormatSwapAmount(coin, SwapMinAmount(coin)) + " " + coin;
         return false;
     }
-    if ((o.give == "DGB" && o.giveAmount < 10000000) || (o.want == "DGB" && o.wantAmount < 10000000))
-    {
-        errOut = "the least DigiByte a contract can hold is 0.1 DGB";
-        return false;
-    }
-    if ((o.give == "RVN" && o.giveAmount < 10000000) || (o.want == "RVN" && o.wantAmount < 10000000))
-    {
-        errOut = "the least Ravencoin a contract can hold is 0.1 RVN";
-        return false;
-    }
-    o.note = j.contains("note") && j["note"].is_string() ? j["note"].get<std::string>() : std::string();
+    if (!StrField(j, "note", o.note))    { errOut = "the offer's note is text"; return false; }
     if (o.note.size() > MAX_SWAP_NOTE)     { errOut = "the offer's note is too long"; return false; }
     return true;
 }
@@ -126,6 +153,7 @@ static bool OfferFromJson(const json& j, SwapOffer& o, std::string& errOut)
 static json OfferToJson(const SwapOffer& o)
 {
     json j;
+    j["v"] = SWAP_PROTOCOL_VERSION;
     j["give"] = o.give;
     j["ga"] = o.giveAmount;
     j["want"] = o.want;
@@ -141,7 +169,10 @@ bool ParseSwapOffer(const std::string& text, SwapOffer& out, std::string& errOut
     json j;
     try { j = json::parse(text); }
     catch (...) { errOut = "the offer is not JSON"; return false; }
-    return OfferFromJson(j, out, errOut);
+    // Every read above checks its type first; this is the backstop, so that
+    // no offer anybody can post makes the thread reading it throw.
+    try { return OfferFromJson(j, out, errOut); }
+    catch (...) { out = SwapOffer(); errOut = "the offer has a field of the wrong type"; return false; }
 }
 
 std::string FormatSwapOffer(const SwapOffer& o)
@@ -154,49 +185,58 @@ std::string DescribeSwapOffer(const SwapOffer& o)
     return FormatSwapAmount(o.give, o.giveAmount) + " " + o.give + " for " + FormatSwapAmount(o.want, o.wantAmount) + " " + o.want;
 }
 
-bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
+static bool StepFromJson(const json& j, SwapStep& s, std::string& errOut)
 {
-    s = SwapStep();
-    json j;
-    try { j = json::parse(text); }
-    catch (...) { errOut = "the swap step is not JSON"; return false; }
     if (!j.is_object())                    { errOut = "a swap step is an object"; return false; }
-    s.swap = j.value("s", std::string());
-    s.step = j.value("step", std::string());
+    if (!StrField(j, "s", s.swap) || !StrField(j, "step", s.step))
+    {
+        errOut = "a swap step names its swap and step as text";
+        return false;
+    }
     if (s.swap.size() != 32 || !IsHexString(s.swap)) { errOut = "the swap id is 32 hex characters"; return false; }
 
     if (s.step == "take")
     {
-        s.offer = j.value("offer", std::string());
-        if (s.offer.size() != 32 || !IsHexString(s.offer)) { errOut = "a take names the offer's frame id"; return false; }
+        if (!StrField(j, "offer", s.offer) || s.offer.size() != 32 || !IsHexString(s.offer))
+        {
+            errOut = "a take names the offer's frame id";
+            return false;
+        }
         if (!j.contains("terms") || !OfferFromJson(j["terms"], s.terms, errOut))
             return false;
-        s.to = j.value("to", std::string());
         // The taker is paid in the coin the maker gives.
-        if (!SwapAddressShapeOk(s.terms.give, s.to)) { errOut = "a take needs an address for the coin it receives"; return false; }
+        if (!StrField(j, "to", s.to) || !SwapAddressShapeOk(s.terms.give, s.to))
+        {
+            errOut = "a take needs an address for the coin it receives";
+            return false;
+        }
         return true;
     }
     if (s.step == "lock1" || s.step == "lock2")
     {
-        s.chain = j.value("chain", std::string());
-        s.contract = j.value("c", std::string());
-        s.txid = j.value("tx", std::string());
+        if (!StrField(j, "chain", s.chain) || !StrField(j, "c", s.contract) || !StrField(j, "tx", s.txid))
+        {
+            errOut = "a lock names its chain, contract and transaction as text";
+            return false;
+        }
         if (!SwapCoinOk(s.chain))           { errOut = "a lock names its chain"; return false; }
         // Decred's contract is 97 bytes; a little room, no more.
         if (!IsHexString(s.contract) || s.contract.size() > 300) { errOut = "the contract is hex, at most 150 bytes"; return false; }
         if (s.txid.size() != 64 || !IsHexString(s.txid)) { errOut = "the contract's txid is 64 hex characters"; return false; }
         if (s.chain != "BTF")
         {
-            if (!j.contains("n") || !j["n"].is_number_integer() || j["n"].get<int>() < 0 || j["n"].get<int>() > 100000)
+            // Read whole before it is bounded: a number past 2^31 narrowed to
+            // an int first could land inside the bound.
+            if (!j.contains("n") || !j["n"].is_number_integer() || j["n"].get<int64_t>() < 0 || j["n"].get<int64_t>() > 100000)
             {
                 errOut = "a contract off Bitflash names its output";
                 return false;
             }
-            s.vout = j["n"].get<int>();
+            s.vout = (int)j["n"].get<int64_t>();
         }
         if (s.step == "lock1")
         {
-            s.to = j.value("to", std::string());
+            if (!StrField(j, "to", s.to))   { errOut = "lock1 needs an address for the coin it receives"; return false; }
             // The maker wants the other coin. From a Bitflash lock this cannot
             // tell which, so any of them will do here; the contract built on
             // that chain refuses an address of the wrong network.
@@ -210,18 +250,33 @@ bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
     }
     if (s.step == "redeemed")
     {
-        s.txid = j.value("tx", std::string());
-        if (s.txid.size() != 64 || !IsHexString(s.txid)) { errOut = "the redeem's txid is 64 hex characters"; return false; }
+        if (!StrField(j, "tx", s.txid) || s.txid.size() != 64 || !IsHexString(s.txid))
+        {
+            errOut = "the redeem's txid is 64 hex characters";
+            return false;
+        }
         return true;
     }
     if (s.step == "cancel")
     {
-        s.why = j.contains("why") && j["why"].is_string() ? j["why"].get<std::string>() : std::string();
+        // A reason of the wrong type is no reason; the cancel still stands.
+        if (!StrField(j, "why", s.why))
+            s.why.clear();
         if (s.why.size() > MAX_SWAP_NOTE)   { errOut = "the reason is too long"; return false; }
         return true;
     }
     errOut = "unknown swap step";
     return false;
+}
+
+bool ParseSwapStep(const std::string& text, SwapStep& s, std::string& errOut)
+{
+    s = SwapStep();
+    json j;
+    try { j = json::parse(text); }
+    catch (...) { errOut = "the swap step is not JSON"; return false; }
+    try { return StepFromJson(j, s, errOut); }
+    catch (...) { s = SwapStep(); errOut = "the swap step has a field of the wrong type"; return false; }
 }
 
 std::string FormatSwapStep(const SwapStep& s)

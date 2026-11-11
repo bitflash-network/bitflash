@@ -5,6 +5,8 @@
 #include "headers.h"
 #ifndef WIN32
 #include <fcntl.h>
+#else
+#include <io.h>
 #endif
 
 
@@ -460,6 +462,69 @@ void GetStrongRandBytes(unsigned char* pbuf, int nSize)
         fflush(stderr);
         abort();
     }
+}
+
+bool WriteFileAtomicPrivate(const std::string& path, const std::string& data, std::string& errOut)
+{
+    errOut.clear();
+    std::string tmp = path + ".new";
+    FILE* f = OpenPrivateFile(tmp.c_str(), false);
+    if (!f)
+    {
+        errOut = strprintf("cannot create %s (%s)", tmp.c_str(), strerror(errno));
+        return false;
+    }
+    bool fOk = data.empty() || fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (fflush(f) != 0)
+        fOk = false;
+#ifdef WIN32
+    if (_commit(_fileno(f)) != 0)
+        fOk = false;
+#else
+    if (fsync(fileno(f)) != 0)
+        fOk = false;
+#endif
+    if (fclose(f) != 0)
+        fOk = false;
+    if (!fOk)
+    {
+        remove(tmp.c_str());
+        errOut = strprintf("cannot write %s (disk full?)", tmp.c_str());
+        return false;
+    }
+#ifdef WIN32
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        errOut = strprintf("cannot replace %s (error %lu)", path.c_str(), (unsigned long)GetLastError());
+        remove(tmp.c_str());
+        return false;
+    }
+#else
+    if (rename(tmp.c_str(), path.c_str()) != 0)
+    {
+        errOut = strprintf("cannot replace %s (%s)", path.c_str(), strerror(errno));
+        remove(tmp.c_str());
+        return false;
+    }
+    // The rename is an entry in the directory: until the directory is on the
+    // disk too, a power cut can bring back the old file, or none.
+    std::string dir = path.find('/') == std::string::npos ? std::string(".") : path.substr(0, path.rfind('/'));
+    if (dir.empty())
+        dir = "/";
+    int fd = open(dir.c_str(), O_RDONLY);
+    if (fd >= 0)
+    {
+        if (fsync(fd) != 0)
+            fOk = false;
+        close(fd);
+    }
+    if (!fOk)
+    {
+        errOut = strprintf("cannot flush the directory of %s", path.c_str());
+        return false;
+    }
+#endif
+    return true;
 }
 
 int GetFilesize(FILE* file)
