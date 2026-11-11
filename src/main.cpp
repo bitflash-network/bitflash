@@ -4616,8 +4616,6 @@ static void ProcessGetData(CNode* pfrom)
 {
     CRITICAL_BLOCK(cs_main)
     {
-        bool fServedBlock = false;
-        uint256 hashLastServed = 0;
         while (!pfrom->vRecvGetData.empty() && !fShutdown)
         {
             unsigned int nQueued;
@@ -4640,8 +4638,7 @@ static void ProcessGetData(CNode* pfrom)
                     CBlock block;
                     block.ReadFromDisk((*mi).second, !pfrom->fClient);
                     pfrom->PushMessage("block", block);
-                    fServedBlock = true;
-                    hashLastServed = inv.hash;
+                    pfrom->hashBatchLastBlock = inv.hash;
                 }
             }
             else if (inv.type == MSG_CHATREC)
@@ -4672,10 +4669,16 @@ static void ProcessGetData(CNode* pfrom)
         // after the peer has the batch, so the getblocks it answers with is a
         // new question (a repeat is dropped by the peer itself). A peer in
         // step asks for our tip, which is the last block, and gets no inv.
-        if (fServedBlock && pfrom->vRecvGetData.empty() && hashLastServed != hashBestChain)
+        // The batch is over when the queue is empty, which may be in a later
+        // call than the one that served its last block.
+        if (pfrom->vRecvGetData.empty() && pfrom->hashBatchLastBlock != 0)
         {
-            vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
-            pfrom->PushMessage("inv", vTip);
+            if (pfrom->hashBatchLastBlock != hashBestChain)
+            {
+                vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
+                pfrom->PushMessage("inv", vTip);
+            }
+            pfrom->hashBatchLastBlock = 0;
         }
     }
 }
@@ -4960,6 +4963,19 @@ bool ProcessMessages(CNode* pfrom)
 
 
 
+// Version-time getblocks: whether we have asked anybody yet, and when we last
+// asked a peer only because it said it was ahead of us.
+static bool fAskedForBlocks = false;
+static int64 nLastAheadGetBlocks = 0;
+static const int AHEAD_GETBLOCKS_MIN_GAP = 3;          // blocks: relay lag is not "ahead"
+static const int64 AHEAD_GETBLOCKS_INTERVAL = 5 * 60;  // seconds
+
+void VersionGetBlocksResetForTest()
+{
+    fAskedForBlocks = true;
+    nLastAheadGetBlocks = 0;
+}
+
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
     static map<unsigned int, vector<unsigned char> > mapReuseKey;
@@ -5024,15 +5040,21 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Ask the first connected node for block updates, and ask again when
         // a node is the only one there is: the first may be long gone, and
         // nothing else would ask before the next block is announced.
-        static bool fAskedForBlocks;
         bool fOnlyPeer = false;
         CRITICAL_BLOCK(cs_vNodes)
             fOnlyPeer = (vNodes.size() <= 1);
-        // Also ask a peer that says it is ahead of us, whoever else we
-        // have: a node behind its peers used to wait for the next block to
-        // be announced before it asked anybody.
-        if ((!fAskedForBlocks || fOnlyPeer || pfrom->nStartingHeight > nBestHeight) && !pfrom->fClient)
+        // Also ask a peer that says it is clearly ahead of us, whoever else
+        // we have: a node behind its peers used to wait for the next block to
+        // be announced before it asked anybody. At most one such extra
+        // request per AHEAD_GETBLOCKS_INTERVAL: a 1.2.x peer answers with an
+        // inv of its whole chain, and a fresh node meeting many of them must
+        // not download that once per peer.
+        bool fAhead = pfrom->nStartingHeight > nBestHeight + AHEAD_GETBLOCKS_MIN_GAP &&
+                      GetTime() - nLastAheadGetBlocks >= AHEAD_GETBLOCKS_INTERVAL;
+        if ((!fAskedForBlocks || fOnlyPeer || fAhead) && !pfrom->fClient)
         {
+            if (fAskedForBlocks && !fOnlyPeer)
+                nLastAheadGetBlocks = GetTime();
             fAskedForBlocks = true;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
         }

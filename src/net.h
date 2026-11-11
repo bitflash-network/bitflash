@@ -841,6 +841,10 @@ public:
     // from the front as it drains (ProcessGetData in main.cpp). Message thread
     // only, under cs_vRecv.
     deque<CInv> vRecvGetData;
+    // The last block served from the current getdata batch (0: none yet).
+    // The batch may finish in a later call that serves only transactions,
+    // so it is kept here rather than per call. Same thread and lock.
+    uint256 hashBatchLastBlock;
     // A getblocks that arrived while the send buffer was full, answered once it
     // has room. Only the latest is kept: a newer locator supersedes the older.
     bool fGetBlocksPending;
@@ -923,6 +927,7 @@ public:
     {
         fGetBlocksPending = false;
         hashGetBlocksStop = 0;
+        hashBatchLastBlock = 0;
         fRecvMorePending = false;
         hashInvContinue = 0;
         nTxInvTokens = TX_INV_LOOKUPS_MAX;

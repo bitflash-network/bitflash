@@ -499,6 +499,9 @@ bool IsInitialBlockDownload();
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast);
 extern CCriticalSection cs_mapTransactions;
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
+// Self-test only: the version-time getblocks state (already asked; no extra
+// request to a peer ahead of us yet).
+void VersionGetBlocksResetForTest();
 bool SendMessages(CNode* pto);
 int64 GetBalance();
 struct WalletRecoveryAudit

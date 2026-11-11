@@ -12912,6 +12912,34 @@ static int RunP2PDoSSelfTest()
                 nFail += Check(vCmd.size() == 1 && vCmd[0] == "block",
                                "a peer that asks for our tip gets the block and no inv") ? 0 : 1;
                 delete t;
+
+                // The block is served, the send buffer fills, and the batch
+                // ends in a later call that serves only a transaction.
+                hashBestChain = uint256(0xbe57);
+                CInv invTx(MSG_TX, uint256(0xd07));
+                CDataStream ssTx(SER_NETWORK);
+                ssTx << std::vector<unsigned char>(50, 2);
+                CRITICAL_BLOCK(cs_mapRelay)
+                    mapRelay[invTx] = ssTx;
+                CNode* u = P2PDoSPeer();
+                u->vSend.resize(SendBufferSize() - 10);
+                std::vector<CInv> vMixed;
+                vMixed.push_back(CInv(MSG_BLOCK, hashGenesisBlock));
+                vMixed.push_back(invTx);
+                CDataStream ssMixed(SER_NETWORK);
+                ssMixed << vMixed;
+                P2PDoSProcess(u, "getdata", ssMixed);
+                bool fWaits = u->vRecvGetData.size() == 1;
+                u->vSend.clear();
+                ProcessMessages(u);
+                vCmd = P2PDoSSent(*u);
+                nFail += Check(fWaits && vCmd.size() == 2 && vCmd[0] == "tx" && vCmd[1] == "inv" &&
+                               u->hashBatchLastBlock == 0,
+                               "a batch that ends in a later call serving only a transaction still ends with the tip inv") ? 0 : 1;
+                delete u;
+                CRITICAL_BLOCK(cs_mapRelay)
+                    mapRelay.erase(invTx);
+                hashBestChain = hashBestSaved;
             }
 
             // At version time: a peer behind us is told our tip, and a peer
@@ -12929,9 +12957,11 @@ static int RunP2PDoSSelfTest()
                 }
                 int nBestHeightSaved = nBestHeight;
                 nBestHeight = 100;
-                int nHeights[3] = { 40, 100, 200 };
-                bool fTipInv[3], fGetBlocks[3];
-                for (int i = 0; i < 3; i++)
+                VersionGetBlocksResetForTest();
+                // behind, level, ahead, ahead again (rate-limited), barely ahead
+                int nHeights[5] = { 40, 100, 200, 300, 102 };
+                bool fTipInv[5], fGetBlocks[5];
+                for (int i = 0; i < 5; i++)
                 {
                     CNode* v = new CNode(INVALID_SOCKET, CAddress("127.0.0.1"), true);
                     v->vSend.clear();
@@ -12954,6 +12984,9 @@ static int RunP2PDoSSelfTest()
                                "at version time a peer behind us, and only that peer, is sent an inv of our tip") ? 0 : 1;
                 nFail += Check(fGetBlocks[2] && !fGetBlocks[1],
                                "a peer ahead of us is asked for blocks though we have other peers") ? 0 : 1;
+                nFail += Check(!fGetBlocks[3] && !fGetBlocks[4] && !fGetBlocks[0],
+                               "but only one such request per five minutes, and not for a peer a few blocks ahead") ? 0 : 1;
+                VersionGetBlocksResetForTest();
             }
         }
 
