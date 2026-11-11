@@ -1991,6 +1991,15 @@ public:
             Set((*mi).second);
     }
 
+    // A locator a peer sent, kept as its hashes while the answer waits for
+    // room in that peer's send buffer (CNode cannot hold this type: net.h
+    // comes before main.h).
+    explicit CBlockLocator(const vector<uint256>& vHaveIn) : vHave(vHaveIn)
+    {
+    }
+
+    const vector<uint256>& Have() const { return vHave; }
+
     IMPLEMENT_SERIALIZE
     (
         if (!(nType & SER_GETHASH))

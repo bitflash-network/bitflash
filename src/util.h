@@ -108,6 +108,25 @@ bool LogAcceptsCategory(const char* category);
 void LogPrintDedup(const char* category, const char* file, int line, const std::string& msg);
 #define LogPrint(category, ...) \
     do { if (LogAcceptsCategory(category)) LogPrintDedup((category), __FILE__, __LINE__, strprintf(__VA_ARGS__)); } while (0)
+// Written whatever the category settings, but burst-collapsed the same way:
+// for lines a remote peer can cause, which used to be plain printf() calls and
+// let anyone write to debug.log as fast as they could send.
+#define LogPrintAlways(category, ...) \
+    LogPrintDedup((category), __FILE__, __LINE__, strprintf(__VA_ARGS__))
+// Lines the dedup swallowed since start, for the self-test and diagnostics.
+extern int64 nLogLinesSuppressed;
+
+// debug.log is moved to debug.log.1 (replacing it) once it passes this size, so
+// the two together never hold much more than twice it. A variable so the
+// self-test can shrink it.
+extern long nDebugLogMaxBytes;
+// Rotate strPath when nSize (its size after the last write) is over nMax, or
+// unknown (negative). True when it rotated.
+bool DebugLogRotateIfOver(const std::string& strPath, long nSize, long nMax);
+// The debug.log every line goes to, fixed by the first line written.
+const std::string& DebugLogPath();
+// Write the summary lines of bursts whose window has closed (util.cpp).
+void LogDedupFlush();
 
 // Every format string in this project goes through one of the four functions
 // below -- `printf` itself is remapped to OutputDebugStringF just above, and
@@ -419,20 +438,7 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
     static CCriticalSection cs_debugFile;
     CRITICAL_BLOCK(cs_debugFile)
     {
-        static string strDebugFile;
-        if (strDebugFile.empty()) {
-            string dir = GetAppDir();
-            if (!dir.empty())
-                strDebugFile = dir +
-#ifdef _WIN32
-                    "\\"
-#else
-                    "/"
-#endif
-                    + "debug.log";
-            else
-                strDebugFile = "debug.log";
-        }
+        const string& strDebugFile = DebugLogPath();
         FILE* fileout = fopen(strDebugFile.c_str(), "a");
         if (fileout)
         {
@@ -440,7 +446,11 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
             va_start(arg_ptr, pszFormat);
             vfprintf(fileout, pszFormat, arg_ptr);
             va_end(arg_ptr);
+            // In append mode this is the file's size. There was no cap at
+            // all, and lines a peer can cause filled the disk.
+            long nSize = ftell(fileout);
             fclose(fileout);
+            DebugLogRotateIfOver(strDebugFile, nSize, nDebugLogMaxBytes);
         }
     }
 

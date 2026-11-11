@@ -80,6 +80,218 @@ string strBtfConnect; // .btf peer to keep connected to (from /connectbtf)
 bool fBtfIsolated = false;
 static const int BTF_ONION_CONNECT_TIMEOUT_SECS = 120;
 
+// Bitcoin 0.8's defaults: 1 MB queued before a peer's requests wait, 5 MB
+// received and unprocessed before its socket waits.
+unsigned int nSendBufferSize   = 1000 * 1000;
+unsigned int nReceiveFloodSize = 5 * 1000 * 1000;
+
+// mapAlreadyAskedFor holds, per item, the earliest time it may next be asked
+// of a peer: each further peer that announces it is asked two minutes after
+// the last. An entry more than two minutes in the past says nothing any more:
+// AskFor would compute max(that + 2 minutes, now) = now, exactly as for an
+// item it never saw. Those go first, for free; past nTarget, the oldest.
+void PruneAlreadyAskedFor(int64 nNowMicros, size_t nTarget)
+{
+    const int64 nStale = nNowMicros - 2 * 60 * 1000000LL;
+    for (map<CInv, int64>::iterator it = mapAlreadyAskedFor.begin(); it != mapAlreadyAskedFor.end();)
+    {
+        if (it->second < nStale)
+            mapAlreadyAskedFor.erase(it++);
+        else
+            ++it;
+    }
+    if (mapAlreadyAskedFor.size() <= nTarget)
+        return;
+    vector<int64> vTimes;
+    vTimes.reserve(mapAlreadyAskedFor.size());
+    for (map<CInv, int64>::iterator it = mapAlreadyAskedFor.begin(); it != mapAlreadyAskedFor.end(); ++it)
+        vTimes.push_back(it->second);
+    size_t nDrop = mapAlreadyAskedFor.size() - nTarget;
+    nth_element(vTimes.begin(), vTimes.begin() + (nDrop - 1), vTimes.end());
+    int64 nCut = vTimes[nDrop - 1];
+    for (map<CInv, int64>::iterator it = mapAlreadyAskedFor.begin();
+         it != mapAlreadyAskedFor.end() && mapAlreadyAskedFor.size() > nTarget;)
+    {
+        if (it->second <= nCut)
+            mapAlreadyAskedFor.erase(it++);
+        else
+            ++it;
+    }
+}
+
+bool CNode::RecvFloodPaused()
+{
+    if (vRecv.size() <= ReceiveFloodSize())
+        return false;
+    // Keep reading while the message at the front is still arriving, so a
+    // message larger than the bound (the protocol allows MAX_PROTOCOL_MESSAGE_SIZE)
+    // can always complete. ProcessMessages has already dropped anything in
+    // front of the first message start it could find.
+    unsigned int nHeaderSize = CMessageHeader::SizeOnWire(vRecv.GetVersion());
+    CDataStream::iterator pstart = search(vRecv.begin(), vRecv.end(),
+                                          BEGIN(pchMessageStart), END(pchMessageStart));
+    if ((unsigned int)(vRecv.end() - pstart) < nHeaderSize)
+        return true;     // a large backlog with no message in it: wait for the parser
+    unsigned int nMessageSize = 0;
+    memcpy(&nMessageSize, &pstart[0] + offsetof(CMessageHeader, nMessageSize), sizeof(nMessageSize));
+    if (nMessageSize > MAX_PROTOCOL_MESSAGE_SIZE)
+        return true;     // the parser will refuse it; nothing worth reading for
+    return (unsigned int)(vRecv.end() - pstart) >= nHeaderSize + nMessageSize;
+}
+
+bool NodeReadyToDrop(CNode* pnode, int64 nNow)
+{
+    if (!pnode->ReadyToDisconnect())
+        return false;
+    if (pnode->fDropWithoutDrain)
+        return true;
+    bool fDrained = pnode->vRecv.empty() && pnode->vSend.empty();
+    bool fStuck   = pnode->nDisconnectSince != 0 &&
+                    nNow - pnode->nDisconnectSince > DISCONNECT_DRAIN_SECS;
+    return fDrained || fStuck;
+}
+
+// Bitcoin's AttemptToEvictConnection, without the address groups an onion
+// peer does not have. Protected: the four that most recently gave us a block,
+// the four for a transaction, the four for a P2Pool share, then the older half
+// of whoever is left. Of the rest, a peer that has not finished its handshake
+// goes first, then the youngest. A flood of fresh connections therefore evicts
+// itself, while a peer that has been useful, or simply around, stays.
+static void ProtectMostRecent(vector<int>& vIdx, const vector<NodeEvictionCandidate>& v,
+                              int64 NodeEvictionCandidate::*pField, size_t nProtect)
+{
+    vector<int> vHave;
+    for (size_t i = 0; i < vIdx.size(); i++)
+        if (v[vIdx[i]].*pField > 0)
+            vHave.push_back(vIdx[i]);
+    sort(vHave.begin(), vHave.end(), [&](int a, int b) { return v[a].*pField > v[b].*pField; });
+    if (vHave.size() > nProtect)
+        vHave.resize(nProtect);
+    set<int> setProtect(vHave.begin(), vHave.end());
+    vector<int> vKeep;
+    for (size_t i = 0; i < vIdx.size(); i++)
+        if (!setProtect.count(vIdx[i]))
+            vKeep.push_back(vIdx[i]);
+    vIdx.swap(vKeep);
+}
+
+int SelectNodeToEvict(const vector<NodeEvictionCandidate>& v)
+{
+    vector<int> vIdx;
+    for (size_t i = 0; i < v.size(); i++)
+        vIdx.push_back((int)i);
+    ProtectMostRecent(vIdx, v, &NodeEvictionCandidate::nLastBlockTime, 4);
+    ProtectMostRecent(vIdx, v, &NodeEvictionCandidate::nLastTxTime, 4);
+    ProtectMostRecent(vIdx, v, &NodeEvictionCandidate::nLastShareTime, 4);
+    // The older half of the rest.
+    sort(vIdx.begin(), vIdx.end(), [&](int a, int b) { return v[a].nTimeConnected < v[b].nTimeConnected; });
+    vIdx.erase(vIdx.begin(), vIdx.begin() + vIdx.size() / 2);
+    if (vIdx.empty())
+        return -1;
+    int nPick = -1;
+    for (size_t i = 0; i < vIdx.size(); i++)
+    {
+        int n = vIdx[i];
+        if (nPick < 0)
+        {
+            nPick = n;
+            continue;
+        }
+        const NodeEvictionCandidate& a = v[n];
+        const NodeEvictionCandidate& b = v[nPick];
+        if (a.fHandshakeDone != b.fHandshakeDone)
+        {
+            if (!a.fHandshakeDone)
+                nPick = n;
+        }
+        else if (a.nTimeConnected > b.nTimeConnected)
+            nPick = n;
+    }
+    return nPick;
+}
+
+// Shared by every inbound peer that has not yet given us a block. A bucket:
+// up to INBOUND_BLOCK_BUDGET_MAX checks at once, one more every
+// INBOUND_BLOCK_BUDGET_REFILL_SECS. A new block reaches this node about every
+// two minutes and is asked of one peer, so honest traffic never comes near it.
+static const int   INBOUND_BLOCK_BUDGET_MAX = 32;
+static const int64 INBOUND_BLOCK_BUDGET_REFILL_SECS = 4;
+static CCriticalSection cs_inboundBlockBudget;
+static int   nInboundBlockTokens = INBOUND_BLOCK_BUDGET_MAX;
+static int64 nInboundBlockRefilled = 0;
+
+int64 nInboundBlocksRefused = 0;
+
+// Under cs_inboundBlockBudget.
+static void InboundBlockBudgetRefill()
+{
+    int64 nNow = GetTime();
+    if (nInboundBlockRefilled == 0)
+        nInboundBlockRefilled = nNow;
+    int64 nAdd = (nNow - nInboundBlockRefilled) / INBOUND_BLOCK_BUDGET_REFILL_SECS;
+    if (nAdd > 0)
+    {
+        nInboundBlockTokens = (int)min((int64)INBOUND_BLOCK_BUDGET_MAX, nInboundBlockTokens + nAdd);
+        nInboundBlockRefilled += nAdd * INBOUND_BLOCK_BUDGET_REFILL_SECS;
+    }
+}
+
+bool InboundBlockBudgetTake()
+{
+    CRITICAL_BLOCK(cs_inboundBlockBudget)
+    {
+        InboundBlockBudgetRefill();
+        if (nInboundBlockTokens <= 0)
+            return false;
+        nInboundBlockTokens--;
+        return true;
+    }
+    return false;
+}
+
+bool InboundBlockBudgetAvailable()
+{
+    CRITICAL_BLOCK(cs_inboundBlockBudget)
+    {
+        InboundBlockBudgetRefill();
+        return nInboundBlockTokens > 0;
+    }
+    return false;
+}
+
+bool PeerNeedsBlockBudget(const CNode* pnode)
+{
+    return pnode->fInbound && pnode->nGoodBlocks == 0 &&
+           GetTime() - pnode->nTimeConnected < INBOUND_BLOCK_BUDGET_EXEMPT_SECS;
+}
+
+void InboundBlockBudgetResetForTest(int nTokens)
+{
+    CRITICAL_BLOCK(cs_inboundBlockBudget)
+    {
+        nInboundBlockTokens = nTokens;
+        nInboundBlockRefilled = GetTime();
+    }
+}
+
+int InboundBlockBudgetTokensForTest()
+{
+    CRITICAL_BLOCK(cs_inboundBlockBudget)
+        return nInboundBlockTokens;
+    return 0;
+}
+
+bool SendFloodCheck(CNode* pnode)
+{
+    if (pnode->vSend.size() <= MAX_SEND_BUFFER_HARD || pnode->fDropWithoutDrain)
+        return false;
+    LogPrintAlways("net", "dropping %s: %u bytes queued to it and not read\n",
+                   pnode->addr.ToString().c_str(), (unsigned int)pnode->vSend.size());
+    pnode->fDisconnect = true;
+    pnode->fDropWithoutDrain = true;
+    return true;
+}
+
 int   nPeersWatched        = 0;
 int64 nBlocksReceived      = 0;
 int64 nBlocksWithoutParent = 0;
@@ -814,52 +1026,133 @@ bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut)
 // itself over peer exchange), "" when we only resolved it through Nostr. An
 // empty one never clears a descriptor already on file: dialing a peer we first
 // learned about by exchange must not cost us the ability to pass it on.
+// One peer to remember: what RememberBtfPeers is told about it.
+struct BtfPeerNote
+{
+    string btfAddr;
+    string meeting;
+    string encHex;
+    string desc;
+    string onion;
+    bool fVerified;
+};
+
+// Peers we reached and peers we were only told about have separate room, and
+// the second never takes from the first. The cache used to be one list of 50,
+// newest first, cut from the back: a few "btfpeers" messages full of freshly
+// made keys pushed every peer that had ever answered out of it, and that
+// survived restarts. Most recent first within each kind.
+static const size_t MAX_CACHED_BTF_HEARSAY = 50;
+
+static void TrimBtfPeerCache(vector<CachedBtfPeer>& peers)
+{
+    vector<CachedBtfPeer> keep;
+    size_t nVerified = 0, nHearsay = 0;
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        if (p.fVerified ? nVerified++ < MAX_CACHED_BTF_PEERS
+                        : nHearsay++ < MAX_CACHED_BTF_HEARSAY)
+            keep.push_back(p);
+    }
+    peers.swap(keep);
+}
+
+// Every note in one load and one save. Peer exchange used to read and rewrite
+// the whole file once per descriptor, twenty times a message, under cs_main.
+static void RememberBtfPeers(const vector<BtfPeerNote>& vNotes)
+{
+    if (vNotes.empty())
+        return;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+    {
+        vector<CachedBtfPeer> peers;
+        LoadCachedBtfPeers(peers);
+
+        // Last note first, so the list keeps the order it was given in (a peer
+        // names itself first) at the front of the cache.
+        for (size_t iNote = vNotes.size(); iNote-- > 0;)
+        {
+            const BtfPeerNote& n = vNotes[iNote];
+            string strKeepDesc = n.desc;
+            string strKeepOnion;
+            bool fVerified = n.fVerified;
+            int nKeepP2Pool = P2POOL_UNKNOWN;
+            btf::NormalizeOnionEndpoint(n.onion, strKeepOnion);
+            for (size_t i = 0; i < peers.size(); i++)
+                if (peers[i].btfAddr == n.btfAddr)
+                {
+                    if (strKeepDesc.empty())
+                        strKeepDesc = peers[i].desc;
+                    if (strKeepOnion.empty())
+                        strKeepOnion = peers[i].onion;
+                    // Verified is sticky: a peer that answered once does not become
+                    // hearsay again because somebody mentioned it afterwards.
+                    if (peers[i].fVerified)
+                        fVerified = true;
+                    nKeepP2Pool = peers[i].nP2Pool;
+                    peers.erase(peers.begin() + i);
+                    break;
+                }
+
+            CachedBtfPeer p;
+            p.btfAddr  = n.btfAddr;
+            p.meeting  = n.meeting;
+            p.onion    = strKeepOnion;
+            p.encHex   = n.encHex;
+            p.lastSeen = GetTime();
+            p.desc     = strKeepDesc;
+            p.fVerified = fVerified;
+            p.nP2Pool  = nKeepP2Pool;
+            peers.insert(peers.begin(), p); // most recent first
+        }
+
+        TrimBtfPeerCache(peers);
+        SaveCachedBtfPeers(peers);
+    }
+}
+
 static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
                             const unsigned char enc_pub[32],
                             const string& strDesc = string(),
                             const string& strOnion = string(),
                             bool fVerified = false)
 {
+    BtfPeerNote n;
+    n.btfAddr = strBtfAddr;
+    n.meeting = strMeeting;
+    n.encHex = BytesToHex(enc_pub, 32);
+    n.desc = strDesc;
+    n.onion = strOnion;
+    n.fVerified = fVerified;
+    RememberBtfPeers(vector<BtfPeerNote>(1, n));
+}
+
+// Dial order over the cache: peers that answered before, then hearsay, each
+// most recent first.
+static void OrderForDialling(vector<CachedBtfPeer>& peers)
+{
+    stable_partition(peers.begin(), peers.end(),
+                     [](const CachedBtfPeer& p) { return p.fVerified; });
+}
+
+void BtfRememberPeerForTest(const string& strBtfAddr, const string& strOnion, bool fVerified)
+{
+    unsigned char enc[32] = {0};
+    RememberBtfPeer(strBtfAddr, "", enc, "", strOnion, fVerified);
+}
+
+void BtfPeerCacheStatsForTest(int& nVerified, int& nHearsay, vector<string>& vDialOrder)
+{
+    vector<CachedBtfPeer> peers;
     CRITICAL_BLOCK(cs_btfPeerCache)
-    {
-        vector<CachedBtfPeer> peers;
         LoadCachedBtfPeers(peers);
-
-        string strKeepDesc = strDesc;
-        string strKeepOnion;
-        int nKeepP2Pool = P2POOL_UNKNOWN;
-        btf::NormalizeOnionEndpoint(strOnion, strKeepOnion);
-        for (size_t i = 0; i < peers.size(); i++)
-            if (peers[i].btfAddr == strBtfAddr)
-            {
-                if (strKeepDesc.empty())
-                    strKeepDesc = peers[i].desc;
-                if (strKeepOnion.empty())
-                    strKeepOnion = peers[i].onion;
-                // Verified is sticky: a peer that answered once does not become
-                // hearsay again because somebody mentioned it afterwards.
-                if (peers[i].fVerified)
-                    fVerified = true;
-                nKeepP2Pool = peers[i].nP2Pool;
-                peers.erase(peers.begin() + i);
-                break;
-            }
-
-        CachedBtfPeer p;
-        p.btfAddr  = strBtfAddr;
-        p.meeting  = strMeeting;
-        p.onion    = strKeepOnion;
-        p.encHex   = BytesToHex(enc_pub, 32);
-        p.lastSeen = GetTime();
-        p.desc     = strKeepDesc;
-        p.fVerified = fVerified;
-        p.nP2Pool  = nKeepP2Pool;
-        peers.insert(peers.begin(), p); // most recent first
-
-        if (peers.size() > MAX_CACHED_BTF_PEERS)
-            peers.resize(MAX_CACHED_BTF_PEERS);
-        SaveCachedBtfPeers(peers);
-    }
+    nVerified = nHearsay = 0;
+    foreach(const CachedBtfPeer& p, peers)
+        (p.fVerified ? nVerified : nHearsay)++;
+    OrderForDialling(peers);
+    vDialOrder.clear();
+    foreach(const CachedBtfPeer& p, peers)
+        vDialOrder.push_back(p.btfAddr);
 }
 
 // Under cs_btfPeerCache.
@@ -1196,9 +1489,12 @@ static void BtfNoteDialResult(const string& strBtfAddr, bool fOk)
 static int DialRememberedBtfPeers(int nBudget)
 {
     vector<CachedBtfPeer> peers;
-    LoadCachedBtfPeers(peers);   // re-read every round: this is the PEX path
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);   // re-read every round: this is the PEX path
     if (peers.empty())
         return 0;
+    // Hearsay never spends the round's dials ahead of a peer that answered.
+    OrderForDialling(peers);
 
     int nConnected = 0, nTried = 0;
     foreach(const CachedBtfPeer& p, peers)
@@ -1336,8 +1632,10 @@ void ThreadReconnectCachedBtfPeers(void* parg)
 // the Schnorr signature against the key the `.btf` address decodes to, so the
 // sender is trusted for nothing -- forging an entry would need somebody else's
 // secret key. That leaves flooding: valid descriptors for keys the sender
-// generated itself. The caps below bound one message, and the cache prefers
-// peers that actually answered, so a flood costs a Sybil more than it costs us.
+// generated itself. The caps below bound one message, a connection gets one
+// message, and peers we were only told about have their own room in the cache
+// (TrimBtfPeerCache) and are dialled after the ones that answered, so a flood
+// can churn the hearsay and nothing else.
 //
 
 // Does this endpoint plausibly belong to the network this node is on?
@@ -1411,6 +1709,7 @@ int BtfPexAccept(const vector<string>& vDesc)
     string strSelf = BtfLocalAddress();
     int nKept = 0;
     unsigned int nSeen = 0;
+    vector<BtfPeerNote> vNotes;
 
     foreach(const string& strDesc, vDesc)
     {
@@ -1450,9 +1749,17 @@ int BtfPexAccept(const vector<string>& vDesc)
             continue;
         }
 
-        RememberBtfPeer(strAddr, d.meeting_node, enc, strDesc, d.onion);
+        BtfPeerNote n;
+        n.btfAddr = strAddr;
+        n.meeting = d.meeting_node;
+        n.encHex = BytesToHex(enc, 32);
+        n.desc = strDesc;
+        n.onion = d.onion;
+        n.fVerified = false;
+        vNotes.push_back(n);
         nKept++;
     }
+    RememberBtfPeers(vNotes);
     return nKept;
 }
 
@@ -1579,13 +1886,18 @@ bool CNode::Misbehaving(int nHowMuch)
     {
         CRITICAL_BLOCK(cs_mapBtfBanned)
             mapBtfBanned[strBtfAddr] = GetTime() + BAN_SECONDS;
-        printf("banned %s for %d hours: misbehavior score %d\n",
-               strBtfAddr.c_str(), (int)(BAN_SECONDS / 3600), nMisbehavior);
+        LogPrintAlways("net", "banned %s for %d hours: misbehavior score %d\n",
+                       strBtfAddr.c_str(), (int)(BAN_SECONDS / 3600), nMisbehavior);
     }
     else
-        printf("disconnecting %s: misbehavior score %d (inbound, nothing to ban)\n",
-               addr.ToString().c_str(), nMisbehavior);
+        LogPrintAlways("net", "disconnecting %s: misbehavior score %d (inbound, nothing to ban)\n",
+                       addr.ToString().c_str(), nMisbehavior);
+    // Out now. This used to set fDisconnect alone, and the node then stayed in
+    // vNodes until its buffers drained or DISCONNECT_DRAIN_SECS passed -- with
+    // its socket still read and every message it sent still processed, so a
+    // peer that kept sending never drained and always had the full minute.
     fDisconnect = true;
+    fDropWithoutDrain = true;
     return true;
 }
 
@@ -1724,6 +2036,39 @@ void CNode::Disconnect()
     for (unsigned int nChannel = 0; nChannel < vfSubscribe.size(); nChannel++)
         if (vfSubscribe[nChannel])
             CancelSubscribe(nChannel);
+
+    // The object stays a few minutes for threads that may still point at it;
+    // what it buffered does not have to. Each of these could be megabytes, and
+    // a peer that reconnects in a loop used to leave a copy behind every time.
+    // Try-locks: the socket thread is here with cs_vNodes held, and a thread
+    // holding one of these may be waiting for cs_vNodes.
+    //
+    // What the message thread touches holding only cs_vRecv (ProcessMessages
+    // and ProcessMessage: vRecv, the getdata queue) is cleared with cs_vRecv.
+    // What it touches holding cs_vRecv in ProcessMessage and only cs_vSend in
+    // SendMessages (mapAskFor, the pending getblocks, the refused blocks) is
+    // cleared only with both: clearing the pending getblocks with cs_vRecv
+    // alone raced ServePendingGetBlocks, two swaps of one vector at once.
+    TRY_CRITICAL_BLOCK(cs_vRecv)
+    {
+        vRecv.release();
+        deque<CInv>().swap(vRecvGetData);
+        TRY_CRITICAL_BLOCK(cs_vSend)
+        {
+            if (nPushPos == (unsigned int)-1)
+                vSend.release();
+            mapAskFor.clear();
+            vector<uint256>().swap(vGetBlocksHave);
+            fGetBlocksPending = false;
+            vector<uint256>().swap(vBlocksRefused);
+        }
+    }
+    TRY_CRITICAL_BLOCK(cs_inventory)
+    {
+        setInventoryKnown.clear();
+        set<CInv>().swap(setInventoryKnown2);
+        vector<CInv>().swap(vInventoryToSend);
+    }
 }
 
 
@@ -1737,6 +2082,39 @@ void CNode::Disconnect()
 
 
 
+
+// See net.h.
+bool AttemptToEvictConnection()
+{
+    CRITICAL_BLOCK(cs_vNodes)
+    {
+        vector<CNode*> vPeers;
+        vector<NodeEvictionCandidate> vCandidates;
+        foreach(CNode* pnode, vNodes)
+        {
+            if (!pnode->fInbound || pnode->fDisconnect)
+                continue;
+            NodeEvictionCandidate c;
+            c.nTimeConnected = pnode->nTimeConnected;
+            c.nLastBlockTime = pnode->nLastBlockTime;
+            c.nLastTxTime    = pnode->nLastTxTime;
+            c.nLastShareTime = pnode->nP2PoolLastGood;
+            c.fHandshakeDone = pnode->nVersion != 0;
+            vPeers.push_back(pnode);
+            vCandidates.push_back(c);
+        }
+        int n = SelectNodeToEvict(vCandidates);
+        if (n < 0)
+            return false;
+        LogPrintAlways("net", "evicting inbound peer %s, connected %d s, to make room\n",
+                       vPeers[n]->addr.ToString().c_str(),
+                       (int)(GetTime() - vPeers[n]->nTimeConnected));
+        vPeers[n]->fDisconnect = true;
+        vPeers[n]->fDropWithoutDrain = true;
+        return true;
+    }
+    return false;
+}
 
 void ThreadSocketHandler(void* parg)
 {
@@ -1815,17 +2193,16 @@ void ThreadSocketHandler2(void* parg)
                 else if (pnode->nDisconnectSince == 0)
                     pnode->nDisconnectSince = GetTime();
 
-                bool fDrained = pnode->vRecv.empty() && pnode->vSend.empty();
-                bool fStuck   = pnode->nDisconnectSince != 0 &&
-                                GetTime() - pnode->nDisconnectSince > DISCONNECT_DRAIN_SECS;
-
-                if (pnode->ReadyToDisconnect() && (fDrained || fStuck))
+                // A node dropped for misbehavior, or evicted, gets no drain
+                // grace: see NodeReadyToDrop.
+                if (NodeReadyToDrop(pnode, GetTime()))
                 {
-                    if (!fDrained)
-                        printf("dropping stuck node %s after %d s with %d bytes unsent\n",
-                               pnode->addr.ToString().c_str(),
-                               (int)(GetTime() - pnode->nDisconnectSince),
-                               (int)pnode->vSend.size());
+                    bool fDrained = pnode->vRecv.empty() && pnode->vSend.empty();
+                    if (!fDrained && !pnode->fDropWithoutDrain)
+                        LogPrintAlways("net", "dropping stuck node %s after %d s with %d bytes unsent\n",
+                                       pnode->addr.ToString().c_str(),
+                                       (int)(GetTime() - pnode->nDisconnectSince),
+                                       (int)pnode->vSend.size());
                     // remove from vNodes
                     vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
                     pnode->Disconnect();
@@ -1904,10 +2281,22 @@ void ThreadSocketHandler2(void* parg)
                 BtfPollFd pfd;
                 memset(&pfd, 0, sizeof(pfd));
                 pfd.fd = pnode->hSocket;
-                pfd.events = POLLIN;
+                // Nothing more is read from a node on its way out, nor from one
+                // whose unprocessed backlog is already over ReceiveFloodSize():
+                // TCP then pushes back on the sender, which is the point.
+                bool fWantRecv = !pnode->fDisconnect;
+                if (fWantRecv)
+                    TRY_CRITICAL_BLOCK(pnode->cs_vRecv)
+                        fWantRecv = !pnode->RecvFloodPaused();
+                pfd.events = fWantRecv ? POLLIN : 0;
                 TRY_CRITICAL_BLOCK(pnode->cs_vSend)
+                {
                     if (!pnode->vSend.empty())
                         pfd.events |= POLLOUT;
+                    // Checked here, not where we send: a peer that reads
+                    // nothing never makes its socket writable.
+                    SendFloodCheck(pnode);
+                }
                 vPoll.push_back(pfd);
                 vPollNodes.push_back(NodePollResult(pnode, pnode->hSocket));
             }
@@ -2008,8 +2397,14 @@ void ThreadSocketHandler2(void* parg)
                 // limit sat open and unread, which fed on itself: the deafer
                 // the node got, the more connections it collected.
                 unsigned int nNodes = 0;
+                unsigned int nInbound = 0;
                 CRITICAL_BLOCK(cs_vNodes)
+                {
                     nNodes = (unsigned int)vNodes.size();
+                    foreach(CNode* pnode, vNodes)
+                        if (pnode->fInbound && !pnode->fDisconnect)
+                            nInbound++;
+                }
                 // Also count how many connections this one address already
                 // holds. A single IP that keeps opening sockets -- a broken
                 // node or a deliberate connection-exhaustion flood -- must not
@@ -2033,10 +2428,19 @@ void ThreadSocketHandler2(void* parg)
                             if ((*it)->addr.ip == addr.ip)
                                 nFromThisIP++;
 
-                if (nNodes >= MAX_CONNECTIONS)
+                // Full: make room by evicting the least useful inbound peer
+                // rather than refusing. Every inbound onion peer arrives from
+                // 127.0.0.1, so refusing let whoever opened connections first
+                // keep every slot for as long as it answered pings; now a newer
+                // arrival replaces the youngest peer that has done nothing.
+                bool fFull = (nNodes >= MAX_CONNECTIONS || nInbound >= MAX_INBOUND_CONNECTIONS);
+                bool fEvicted = false;
+                if (fFull && !fBtfIsolated && (fLoopback || nFromThisIP < MAX_CONNECTIONS_PER_IP))
+                    fEvicted = AttemptToEvictConnection();
+                if (fFull && !fEvicted)
                 {
-                    LogPrint("net", "refusing connection from %s, already at %u\n",
-                             addr.ToString().c_str(), nNodes);
+                    LogPrint("net", "refusing connection from %s, already at %u (%u inbound)\n",
+                             addr.ToString().c_str(), nNodes, nInbound);
                     BtfCloseSocket(hSocket);
                 }
                 else if (!fLoopback && nFromThisIP >= MAX_CONNECTIONS_PER_IP)
@@ -2093,9 +2497,10 @@ void ThreadSocketHandler2(void* parg)
             //
             // Receive
             //
-            if (poll.fRecv)
+            if (poll.fRecv && !pnode->fDisconnect)
             {
                 TRY_CRITICAL_BLOCK(pnode->cs_vRecv)
+                if (!pnode->RecvFloodPaused())
                 {
                     CDataStream& vRecv = pnode->vRecv;
                     unsigned int nPos = vRecv.size();
@@ -2310,13 +2715,20 @@ void ThreadMessageHandler2(void* parg)
         vector<CNode*> vNodesCopy;
         CRITICAL_BLOCK(cs_vNodes)
             vNodesCopy = vNodes;
+        bool fMoreWork = false;
         foreach(CNode* pnode, vNodesCopy)
         {
             pnode->AddRef();
 
-            // Receive messages
+            // Receive messages. Each peer gets a bounded share of the pass
+            // (MAX_MESSAGES_PER_PASS, MAX_PEER_PASS_MILLIS); a peer with more
+            // waiting is taken up again on the next pass, after everybody else.
             TRY_CRITICAL_BLOCK(pnode->cs_vRecv)
+            {
                 ProcessMessages(pnode);
+                if (pnode->fRecvMorePending)
+                    fMoreWork = true;
+            }
 
             // Send messages
             TRY_CRITICAL_BLOCK(pnode->cs_vSend)
@@ -2327,9 +2739,19 @@ void ThreadMessageHandler2(void* parg)
 
         WarnIfBehind();
 
-        // Wait and allow messages to bunch up
+        // The counts of collapsed log bursts, once their window closes.
+        {
+            static int64 nLastLogFlush = 0;
+            if (GetTime() != nLastLogFlush)
+            {
+                nLastLogFlush = GetTime();
+                LogDedupFlush();
+            }
+        }
+
+        // Wait and allow messages to bunch up, unless a peer was cut short
         vfThreadRunning[2] = false;
-        Sleep(100);
+        Sleep(fMoreWork ? 5 : 100);
         vfThreadRunning[2] = true;
         CheckForShutdown(2);
     }

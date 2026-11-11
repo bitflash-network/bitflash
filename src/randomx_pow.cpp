@@ -168,6 +168,13 @@ struct RxKeyState
     randomx_dataset* dataset   = NULL;
     randomx_vm*      vmVerify  = NULL;
     CCriticalSection csVerify;
+    // More light VMs on the same cache, made the first time vmVerify is busy.
+    // Block checks (under cs_main), P2Pool shares and pool submits all hash
+    // through RandomXPoWHash; with one VM, a stream of shares or submits from
+    // outside queued ahead of block validation while it held cs_main.
+    randomx_vm*      vmExtra[2] = { NULL, NULL };
+    CCriticalSection csExtra[2];
+    randomx_flags    flagsVerify = RANDOMX_FLAG_DEFAULT;   // what vmVerify was made with
     std::mutex       csDataset;
     bool             fFast     = false;
     bool             fLargeCache   = false;
@@ -302,6 +309,7 @@ static RxKeyState* EnsureKey(int nVersion)
         return NULL;
     }
     k->cache = cache;
+    k->flagsVerify = flags;
     k->vmVerify = vm;
     printf("RandomX: v%d cache ready (256 MB, large pages: %s)\n",
            nVersion, RandomXLargePagesStatus());
@@ -411,15 +419,52 @@ bool RandomXFastReady(int nVersion)
 }
 
 
+// Test hook: hold the first verification VM's lock from another thread, to
+// show a hash still completes on another VM.
+void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold)
+{
+    RxKeyState* k = EnsureKey(nVersion);
+    if (!k)
+        return;
+    if (fHold)
+        k->csVerify.Enter();
+    else
+        k->csVerify.Leave();
+}
+
 uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize)
 {
     uint256 result = 0;
     RxKeyState* k = EnsureKey(nVersion);
     if (!k)
         return result;
+    unsigned char hash[RANDOMX_HASH_SIZE];
+
+    // The first VM if it is free, else one of the extras (made on first use;
+    // the cache is read-only once initialised, so VMs can share it), else wait
+    // for the first. The result is the same whichever VM computes it.
+    TRY_CRITICAL_BLOCK(k->csVerify)
+    {
+        randomx_calculate_hash(k->vmVerify, pData, nSize, hash);
+        memcpy(&result, hash, RANDOMX_HASH_SIZE);
+        return result;
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        TRY_CRITICAL_BLOCK(k->csExtra[i])
+        {
+            if (!k->vmExtra[i])
+                k->vmExtra[i] = randomx_create_vm(k->flagsVerify, k->cache, NULL);
+            if (k->vmExtra[i])
+            {
+                randomx_calculate_hash(k->vmExtra[i], pData, nSize, hash);
+                memcpy(&result, hash, RANDOMX_HASH_SIZE);
+                return result;
+            }
+        }
+    }
     CRITICAL_BLOCK(k->csVerify)
     {
-        unsigned char hash[RANDOMX_HASH_SIZE];
         randomx_calculate_hash(k->vmVerify, pData, nSize, hash);
         memcpy(&result, hash, RANDOMX_HASH_SIZE);
     }
