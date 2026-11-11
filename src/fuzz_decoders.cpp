@@ -716,6 +716,9 @@ static void WriteSeeds(const string& strDir)
     WriteSeed(strDir, "bip21", "bitflash:" + strKeyAddr + "?amount=1.5&label=Shop%20one&message=order+42");
     WriteSeed(strDir, "bip21", "BITFLASH://" + strScriptAddr + "?amount=0.00000001&req-x=1");
     WriteSeed(strDir, "bip21", string("\x01") + strKeyAddr + "?label=a&&message=%zz");
+    // What honggfuzz found: an address, a NUL and more, as the link's address.
+    WriteSeed(strDir, "bip21", "bitflash:" + strKeyAddr + string("\0x ?", 4));
+    WriteSeed(strDir, "address", strKeyAddr + string("\0junk", 5));
     WriteSeed(strDir, "amount", "1.5");
     WriteSeed(strDir, "amount", "1,234,567.12345678");
     WriteSeed(strDir, "amount", " 21000000 ");
