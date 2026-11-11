@@ -237,9 +237,12 @@ static void Descriptor(const string& s)
     // The key and the signature were read as hex: two digits per byte and
     // nothing else, or one descriptor has many spellings.
     nlohmann::json j = nlohmann::json::parse(s);
-    const char* kHex[] = { "pubkey", "sig" };
-    for (int i = 0; i < 2; i++)
+    const char* kHex[] = { "pubkey", "sig", "sig3" };
+    for (int i = 0; i < 3; i++)
     {
+        // sig3 counts only when the onion it signs was taken.
+        if (i == 2 && (d.onion.empty() || !j.contains("sig3")))
+            continue;
         string h = j[kHex[i]].get<string>();
         for (size_t k = 0; k < h.size(); k++)
             if (!isxdigit((unsigned char)h[k]))

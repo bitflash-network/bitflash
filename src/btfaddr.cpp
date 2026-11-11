@@ -232,8 +232,8 @@ static std::string HexEncode(const unsigned char* p, size_t n)
 static bool HexDecode(const std::string& s, unsigned char* out, size_t n)
 {
     // Two hex digits per byte and nothing else. This was sscanf("%2x"), which
-    // also takes white space, a sign and "0x" ("-1" read as ff, " a" as 0a),
-    // so one key or signature had many spellings.
+    // also takes a sign and "0x" ("-1" read as ff, "+d" as 0d) and skips white
+    // space without counting it, so one key or signature had many spellings.
     if (s.size() != n * 2) return false;
     for (size_t i = 0; i < n * 2; i++)
         if (!isxdigit((unsigned char)s[i])) return false;

@@ -347,36 +347,41 @@ bool ParseMoney(const char* pszIn, int64& nRet)
     string strWhole;
     int64 nUnits = 0;                 // fractional part, scaled to COIN (8 decimals)
     const char* p = pszIn;
-    while (isspace(*p))
+    // Every ctype call takes the byte as an unsigned char: a plain char from
+    // 0x80 up is negative, which is undefined (and reads before the table in
+    // some C libraries).
+    #define UC(c) ((unsigned char)(c))
+    while (isspace(UC(*p)))
         p++;
     for (; *p; p++)
     {
-        if (*p == ',' && p > pszIn && isdigit(p[-1]) && isdigit(p[1]) && isdigit(p[2]) && isdigit(p[3]) && !isdigit(p[4]))
+        if (*p == ',' && p > pszIn && isdigit(UC(p[-1])) && isdigit(UC(p[1])) && isdigit(UC(p[2])) && isdigit(UC(p[3])) && !isdigit(UC(p[4])))
             continue;
         if (*p == '.')
         {
             p++;
             int64 nMult = COIN / 10;  // weight of the first decimal digit
-            while (isdigit(*p) && nMult > 0)
+            while (isdigit(UC(*p)) && nMult > 0)
             {
                 nUnits += nMult * (*p - '0');
                 nMult /= 10;
                 p++;
             }
             // reject more than 8 fractional digits rather than silently truncate
-            if (isdigit(*p))
+            if (isdigit(UC(*p)))
                 return false;
             break;
         }
-        if (isspace(*p))
+        if (isspace(UC(*p)))
             break;
-        if (!isdigit(*p))
+        if (!isdigit(UC(*p)))
             return false;
         strWhole.insert(strWhole.end(), *p);
     }
     for (; *p; p++)
-        if (!isspace(*p))
+        if (!isspace(UC(*p)))
             return false;
+    #undef UC
     if (strWhole.size() > 10)         // 10 whole digits * COIN stays within int64
         return false;
     int64 nWhole = atoi64(strWhole);

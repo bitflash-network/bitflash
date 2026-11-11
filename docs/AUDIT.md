@@ -280,8 +280,9 @@ against the code as it was, then against the fixes below.
 | `fuzz-decoders` | `NormalizeOnionEndpoint` kept a port's leading zeros, so `:080` and `:80` were two normal forms of one endpoint. | `btfaddr.cpp`, self-test `decoder-canonical` |
 | the round-trip check written for `fuzz-decoders` (`.btf` names) | A version-1 `.btf` name is 34 bytes in 55 base32 characters; the last character's low three bits are padding, which the decoder dropped whatever they were, so each key answered to eight names. Only the encoder's, with those bits zero, is the address now. | `btfaddr.cpp`, self-test `decoder-canonical` |
 | the hex check written for `fuzz-decoders` (descriptors) | A service descriptor's key and signatures were read with `sscanf("%2x")`, which also takes white space, a sign and `0x`. Plain hex digits only now. | `btfaddr.cpp`, self-test `decoder-canonical` |
-| review while writing `fuzz-decoders` | `EncodeBase58` of an empty vector indexed it; `DecodeBase58` passed a possibly negative `char` to `isspace`. | `base58.h` |
+| review while writing `fuzz-decoders` | `EncodeBase58` of an empty vector indexed it; `DecodeBase58` and `ParseMoney` passed a possibly negative `char` to `isspace`/`isdigit`. | `base58.h`, `util.cpp` |
 | honggfuzz (`fuzz-decoders`, on GitHub), through a payment link | The `std::string` overloads of `DecodeBase58`, `DecodeBase58Check`, `AddressToHash160`, `DecodeAnyAddress` and `IsValidBitcoinAddress` handed `c_str()` on, so an address followed by a NUL and anything else read as the address while the caller kept, and could show, the whole string. They refuse a NUL now. | `base58.h`, self-test `decoder-canonical` |
+| independent review of the length-prefix change | The light client's saved state holds foreign blocks and pending transactions as the bytes that arrived; one that no longer reads under the stricter reader made the state load throw, and swaps in that coin could not start until the file was removed. A saved entry that does not read is now dropped with a line in the log (blocks are a cache the filter scan fetches again). | `btclight.cpp`, self-test `btc-light` |
 
 ### Not canonical, by design
 

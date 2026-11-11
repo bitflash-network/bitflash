@@ -355,8 +355,6 @@ fuzz-p2p-payload: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_p2p_payload.o
 	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: fuzz-p2p-payload"
 
-# Payloads straight into ProcessMessage after the handshake (block, tx, inv,
-# ...); the harness writes its own structured seeds.
 obj-fuzz/fuzz_deserialize.o: fuzz_deserialize.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
@@ -385,6 +383,8 @@ fuzz-decoders-smoke: fuzz-decoders
 	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/decoders ./fuzz-decoders -runs=0
 	./fuzz-decoders -runs=20000 ../work/fuzz-corpus/decoders
 
+# Payloads straight into ProcessMessage after the handshake (block, tx, inv,
+# ...); the harness writes its own structured seeds.
 fuzz-p2p-payload-smoke: fuzz-p2p-payload
 	@rm -rf ../work/fuzz-corpus/p2p-payload && mkdir -p ../work/fuzz-corpus/p2p-payload
 	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/p2p-payload ./fuzz-p2p-payload -runs=0
@@ -573,4 +573,5 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-relay
 	./bitflash-node -selftest=chat-wallet
 
-.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \n        fuzz-deserialize-smoke fuzz-decoders-smoke
+.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
+        fuzz-deserialize-smoke fuzz-decoders-smoke
