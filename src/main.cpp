@@ -4956,9 +4956,16 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (strCommand == "tx")
     {
         vector<uint256> vWorkQueue;
-        CDataStream vMsg(vRecv);
         CTransaction tx;
         vRecv >> tx;
+        // What is relayed, and held if the transaction is an orphan, is the
+        // transaction itself, re-encoded -- not the payload as it arrived.
+        // The payload may carry any number of bytes after the transaction,
+        // which the reader leaves unread; kept, they were stored with every
+        // orphan and served to every peer that asked, bounded by the message
+        // size rather than by the transaction's, which IsStandard limits.
+        CDataStream vMsg(SER_NETWORK, vRecv.nVersion);
+        vMsg << tx;
 
         CInv inv(MSG_TX, tx.GetHash());
         pfrom->AddInventoryKnown(inv);

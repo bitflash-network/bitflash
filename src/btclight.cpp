@@ -1331,15 +1331,27 @@ static void Load(State& s)
             throw std::runtime_error("wrong "+s.net.label+" state network/version");
         if (j.contains("scanHash")) s.scanHash = uint256(j.at("scanHash").get<std::string>());
         for (const auto& text : j.at("watched")) { Bytes b = ParseHex(text.get<std::string>()); if (b.size() != 23) throw std::runtime_error("invalid saved contract script"); s.watched.insert(b); }
+        // A saved block or transaction that no longer reads is dropped, with a
+        // line in the log, rather than stopping the light client for this
+        // coin. Both were stored as the bytes a peer or the user handed over,
+        // and the reader is stricter than it was (lengths in their shortest
+        // form only, since this release): a state file from an older one could
+        // hold one. Blocks are a cache the filter scan fetches again, and a
+        // pending transaction that does not read is no transaction at all.
         for (const auto& text : j.at("blocks"))
         {
-            Bytes b = ParseHex(text.get<std::string>()); Header h = Decode(Bytes(b.begin(), b.begin()+std::min<size_t>(s.net.headerSize,b.size())), &s.net);
-            std::vector<CTransaction> txs; if (!VerifyBlock(b,h,txs,s.net.maxBlock,s.net.auxPow)) throw std::runtime_error("invalid saved Bitcoin block"); s.blocks[h.hash] = b;
+            Bytes b = ParseHex(text.get<std::string>());
+            std::vector<CTransaction> txs;
+            if (b.size() < s.net.headerSize) { printf("%s light: saved block too short, dropped\n",s.net.label.c_str()); continue; }
+            Header h = Decode(Bytes(b.begin(), b.begin()+s.net.headerSize), &s.net);
+            if (!VerifyBlock(b,h,txs,s.net.maxBlock,s.net.auxPow)) { printf("%s light: saved block %s no longer reads, dropped\n",s.net.label.c_str(),h.hash.GetHex().c_str()); continue; }
+            s.blocks[h.hash] = b;
         }
         for (const auto& text : j.at("pending"))
         {
             Bytes b = ParseHex(text.get<std::string>()); CTransaction tx;
-            if (!btcswap::ParseTx(b,tx)) throw std::runtime_error("invalid saved Bitcoin transaction"); s.pending[tx.GetHash()] = b;
+            if (!btcswap::ParseTx(b,tx)) { printf("%s light: a saved pending transaction no longer reads, dropped\n",s.net.label.c_str()); continue; }
+            s.pending[tx.GetHash()] = b;
         }
         s.birthday = j.value("birthday", (int64)0);
         s.scan = j.at("scan").get<int>(); if (s.scan < 0) throw std::runtime_error("invalid saved filter cursor");
@@ -2053,6 +2065,27 @@ int SelfTest()
         }
         saved.scan = (int)saved.filters.size(); SaveFilters(saved); Save(saved);
         State restored("regtest"); restored.path = prefix; Load(restored);
+        {
+            // A state file from a release that stored a longer spelling (or
+            // anything else that no longer reads) still loads: the bad entry
+            // is dropped, the rest kept.
+            State odd("regtest"); odd.path = prefix; Load(odd);
+            Bytes txLong(stream.begin(),stream.end());
+            txLong.insert(txLong.begin()+5, 2, 0); txLong[4] = 0xfd; txLong[5] = 0x01;   // input count as fd 01 00
+            CTransaction unused;
+            check(!btcswap::ParseTx(txLong,unused),"a transaction with a three-byte input count does not read");
+            odd.pending[uint256(77)] = txLong;
+            Bytes blockBad = rawBlock; blockBad.resize(blockBad.size()-1);
+            odd.blocks[uint256(78)] = blockBad;
+            odd.blocks[uint256(79)] = Bytes(10, 0);
+            Save(odd);
+            State again("regtest"); again.path = prefix;
+            bool fLoaded = true;
+            try { Load(again); } catch (const std::exception& e) { printf("  (%s)\n",e.what()); fLoaded = false; }
+            check(fLoaded && again.pending.size() == 1 && again.pending.count(funding.GetHash()) && again.blocks.size() == restored.blocks.size(),
+                  "a saved block or transaction that no longer reads is dropped, and the light client still starts");
+            Save(restored);
+        }
         check(restored.headers.Tip().hash == saved.headers.Tip().hash && restored.scan == saved.scan && restored.watched == saved.watched && restored.pending.size() == 1 && Transactions(restored).count(funding.GetHash()),"restart revalidates headers, filters, matched block, watch and pending transaction");
         Header side = Decode(a);
         for (int i = 0; i < 3; ++i)

@@ -4065,6 +4065,236 @@ static int RunConsensusLimitsSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// Lengths are read in their shortest form only, and never above MAX_SIZE
+// (fuzz-deserialize: a transaction read with a non-canonical input count
+// re-encoded to different bytes; a nine-byte length with its high half set
+// read as its low half). And a "tx" payload is held and relayed as the
+// transaction, not as whatever bytes followed it in the message.
+extern map<uint256, CDataStream*> mapOrphanTransactions;
+
+static bool CompactSizeReads(const std::string& bytes, uint64& nOut)
+{
+    try
+    {
+        CDataStream ss(bytes.data(), bytes.data() + bytes.size(), SER_NETWORK);
+        nOut = ReadCompactSize(ss);
+        return ss.empty();
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+static int RunSerializeCanonicalSelfTest()
+{
+    printf("serialize-canonical self-test\n");
+    int nFail = 0;
+    uint64 n = 0;
+
+    // The shortest form of every width reads; each boundary on both sides.
+    nFail += Check(CompactSizeReads(std::string("\xfc", 1), n) && n == 252, "252 in one byte") ? 0 : 1;
+    nFail += Check(CompactSizeReads(std::string("\xfd\xfd\x00", 3), n) && n == 253, "253 in three bytes") ? 0 : 1;
+    nFail += Check(CompactSizeReads(std::string("\xfd\xff\xff", 3), n) && n == 65535, "65535 in three bytes") ? 0 : 1;
+    nFail += Check(CompactSizeReads(std::string("\xfe\x00\x00\x01\x00", 5), n) && n == 65536, "65536 in five bytes") ? 0 : 1;
+    std::string strMax("\xfe\x00\x00\x00\x02", 5);    // MAX_SIZE, 0x02000000
+    nFail += Check(CompactSizeReads(strMax, n) && n == MAX_SIZE, "MAX_SIZE reads") ? 0 : 1;
+
+    // Longer spellings are refused.
+    nFail += Check(!CompactSizeReads(std::string("\xfd\x05\x00", 3), n), "5 in three bytes is refused") ? 0 : 1;
+    nFail += Check(!CompactSizeReads(std::string("\xfd\xfc\x00", 3), n), "252 in three bytes is refused") ? 0 : 1;
+    nFail += Check(!CompactSizeReads(std::string("\xfe\xff\xff\x00\x00", 5), n), "65535 in five bytes is refused") ? 0 : 1;
+    nFail += Check(!CompactSizeReads(std::string("\xff\x05\x00\x00\x00\x00\x00\x00\x00", 9), n),
+                   "5 in nine bytes is refused") ? 0 : 1;
+    // ... and so is anything above MAX_SIZE, which is where a nine-byte
+    // length with its high half set used to be cut down to its low half.
+    nFail += Check(!CompactSizeReads(std::string("\xfe\x01\x00\x00\x02", 5), n), "MAX_SIZE + 1 is refused") ? 0 : 1;
+    nFail += Check(!CompactSizeReads(std::string("\xff\x05\x00\x00\x00\x01\x00\x00\x00", 9), n),
+                   "2^32 + 5 is refused, not read as 5") ? 0 : 1;
+
+    // A transaction: the canonical bytes read and re-encode to themselves; the
+    // same transaction with its input count spelled fd 01 00 does not read.
+    CTransaction tx;
+    tx.vin.push_back(CTxIn(uint256(1234), 0, CScript() << std::vector<unsigned char>(72, 0x30)));
+    tx.vout.push_back(CTxOut(COIN, CScript() << OP_DUP << OP_HASH160 << uint160(5) << OP_EQUALVERIFY << OP_CHECKSIG));
+    CDataStream ssTx(SER_NETWORK);
+    ssTx << tx;
+    std::string strTx(ssTx.begin(), ssTx.end());
+    {
+        CTransaction tx2;
+        CDataStream ss(strTx.data(), strTx.data() + strTx.size(), SER_NETWORK);
+        ss >> tx2;
+        nFail += Check(ss.empty() && tx2.GetHash() == tx.GetHash() && tx2.GetHash() == Hash(strTx.begin(), strTx.end()),
+                       "a transaction in its own encoding reads back, and its id is the hash of those bytes") ? 0 : 1;
+    }
+    std::string strLong = strTx.substr(0, 4) + std::string("\xfd\x01\x00", 3) + strTx.substr(5);
+    bool fRead = true;
+    try
+    {
+        CTransaction tx3;
+        CDataStream ss(strLong.data(), strLong.data() + strLong.size(), SER_NETWORK);
+        ss >> tx3;
+    }
+    catch (const std::exception&)
+    {
+        fRead = false;
+    }
+    nFail += Check(!fRead, "the same transaction with a three-byte input count is refused") ? 0 : 1;
+
+    // An orphan: held as the transaction's own bytes, not the payload's.
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    try
+    {
+        if (!LoadBlockIndex())
+            throw std::runtime_error("LoadBlockIndex failed");
+        CNode peer(INVALID_SOCKET, CAddress("127.0.0.1"));
+        peer.nVersion = VERSION;
+        CDataStream payload(SER_NETWORK);
+        payload << tx;
+        std::vector<char> vJunk(100000, 'x');
+        payload.write(&vJunk[0], vJunk.size());
+        CRITICAL_BLOCK(cs_main)
+            ProcessMessage(&peer, "tx", payload);
+        uint256 hash = tx.GetHash();
+        std::map<uint256, CDataStream*>::iterator mi = mapOrphanTransactions.find(hash);
+        nFail += Check(mi != mapOrphanTransactions.end(), "a transaction with unknown inputs is held as an orphan") ? 0 : 1;
+        nFail += Check(mi != mapOrphanTransactions.end() && mi->second->size() == strTx.size() &&
+                       std::string(mi->second->begin(), mi->second->end()) == strTx,
+                       "the orphan is held as the transaction's bytes, not the 100 kB that followed it") ? 0 : 1;
+        if (mi != mapOrphanTransactions.end())
+            EraseOrphanTx(hash);
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// What fuzz-decoders found in the text decoders: a .btf name with its
+// padding bits set, hex fields in a descriptor read through sscanf, an onion
+// port with a leading zero, and uint256::SetHex indexing its table with a
+// signed char.
+static int RunDecoderCanonicalSelfTest()
+{
+    printf("decoder-canonical self-test\n");
+    int nFail = 0;
+
+    // .btf: 34 bytes take 55 base32 characters, whose last 3 bits are padding.
+    unsigned char pk[32];
+    for (int i = 0; i < 32; i++)
+        pk[i] = (unsigned char)(3 * i + 1);
+    std::string name = btf::Address(pk);
+    unsigned char pkOut[32];
+    int nVersion = 0;
+    nFail += Check(btf::ParseAddressVersion(name, pkOut, nVersion) && nVersion == 1 && memcmp(pk, pkOut, 32) == 0,
+                   "a .btf name as encoded parses") ? 0 : 1;
+    static const char* B32 = "abcdefghijklmnopqrstuvwxyz234567";
+    std::string label = name.substr(0, name.size() - 4);
+    int nLast = (int)(strchr(B32, label[label.size() - 1]) - B32);
+    int nPaddingTaken = 0;
+    for (int pad = 1; pad < 8; pad++)
+    {
+        std::string other = label.substr(0, label.size() - 1) + B32[nLast | pad] + ".btf";
+        if (btf::ParseAddressVersion(other, pkOut, nVersion))
+            nPaddingTaken++;
+    }
+    nFail += Check(nPaddingTaken == 0, "the same key with any padding bit set is not the address") ? 0 : 1;
+    std::string upper = name;
+    for (size_t i = 0; i < upper.size(); i++)
+        upper[i] = (char)toupper((unsigned char)upper[i]);
+    nFail += Check(btf::ParseAddress(" " + upper + ".\n", pkOut) && memcmp(pk, pkOut, 32) == 0,
+                   "case, white space and a trailing dot are still ignored") ? 0 : 1;
+
+    // Onion endpoints: one normal form per endpoint.
+    std::string host = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion";
+    std::string norm, norm2;
+    nFail += Check(btf::NormalizeOnionEndpoint(host + ":080", norm) && norm == host + ":80" &&
+                   btf::NormalizeOnionEndpoint(host + ":80", norm2) && norm2 == norm,
+                   "an onion port with a leading zero normalizes to the number") ? 0 : 1;
+
+    // Descriptor hex: plain hex only. Sign one, then spell a byte below 0x10
+    // of its signature as " d" and as "+d", which sscanf("%2x") read as 0d.
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    unsigned char seckey[32];
+    for (int i = 0; i < 32; i++)
+        seckey[i] = (unsigned char)(i + 7);
+    secp256k1_keypair kp;
+    secp256k1_xonly_pubkey xpub;
+    unsigned char xonly[32];
+    bool fKey = secp256k1_keypair_create(ctx, &kp, seckey) && secp256k1_keypair_xonly_pub(ctx, &xpub, NULL, &kp) &&
+                secp256k1_xonly_pubkey_serialize(ctx, xonly, &xpub);
+    std::string desc = fKey ? btf::SignDescriptor(ctx, seckey, std::string(64, 'e'), "meet.btf", 1790000000) : "";
+    btf::Descriptor d;
+    nFail += Check(!desc.empty() && btf::VerifyDescriptor(ctx, desc, xonly, d), "a signed descriptor verifies") ? 0 : 1;
+    size_t nSig = desc.find("\"sig\":\"");
+    std::string strUpper = desc;
+    if (nSig != std::string::npos)
+        for (size_t i = nSig + 7; i < nSig + 7 + 128 && i < strUpper.size(); i++)
+            strUpper[i] = (char)toupper((unsigned char)strUpper[i]);
+    nFail += Check(nSig != std::string::npos && btf::VerifyDescriptor(ctx, strUpper, xonly, d),
+                   "upper-case hex is still hex") ? 0 : 1;
+    size_t nByte = std::string::npos;
+    for (size_t i = nSig + 7; nSig != std::string::npos && i + 1 < nSig + 7 + 128; i += 2)
+        if (desc[i] == '0')
+        {
+            nByte = i;
+            break;
+        }
+    if (nByte != std::string::npos)
+    {
+        std::string spaced = desc, plus = desc;
+        spaced[nByte] = ' ';
+        plus[nByte] = '+';
+        nFail += Check(!btf::VerifyDescriptor(ctx, spaced, xonly, d) && !btf::VerifyDescriptor(ctx, plus, xonly, d),
+                       "a signature byte spelled \" d\" or \"+d\" is refused") ? 0 : 1;
+    }
+    else
+        printf("  (no signature byte below 0x10 to respell; skipped)\n");
+    secp256k1_context_destroy(ctx);
+
+    // uint256::SetHex: a byte from 0x80 up ends the digits, wherever the
+    // table sits in memory (it was read at a negative index).
+    uint256 h;
+    h.SetHex(std::string("12\xc8", 3));
+    nFail += Check(h == uint256(0x12), "SetHex stops at a byte above 0x7f") ? 0 : 1;
+    h.SetHex(std::string("\xa0" "34", 3));
+    nFail += Check(h == 0, "SetHex reads nothing from a string that starts with one") ? 0 : 1;
+    h.SetHex(" 0xAbC ");
+    nFail += Check(h == uint256(0xabc), "SetHex still takes white space, 0x and either case") ? 0 : 1;
+
+    // EncodeBase58 of nothing is nothing (it indexed an empty vector).
+    nFail += Check(EncodeBase58(std::vector<unsigned char>()) == "", "base58 of no bytes is the empty string") ? 0 : 1;
+
+    // An address followed by a NUL and more is not that address (the string
+    // overloads read up to the NUL and ignored the rest).
+    std::string strAddr = Hash160ToAddress(uint160(4242));
+    std::string strTail = strAddr + std::string("\0junk", 5);
+    uint160 hAddr;
+    bool fScriptAddr = false;
+    std::vector<unsigned char> vAddr;
+    nFail += Check(AddressToHash160(strAddr, hAddr) && hAddr == uint160(4242), "an address reads") ? 0 : 1;
+    nFail += Check(!AddressToHash160(strTail, hAddr) && !DecodeAnyAddress(strTail, hAddr, fScriptAddr) &&
+                   !IsValidBitcoinAddress(strTail) && !DecodeBase58Check(strTail, vAddr) && !DecodeBase58(strTail, vAddr),
+                   "the same address with a NUL and more after it is refused") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunParseMoneySelfTest()
 {
     printf("parse-money self-test\n");
@@ -12557,6 +12787,10 @@ int RunSelfTest(const std::string& name)
         return RunPoolStratumSelfTest();
     if (name == "parse-money")
         return RunParseMoneySelfTest();
+    if (name == "serialize-canonical")
+        return RunSerializeCanonicalSelfTest();
+    if (name == "decoder-canonical")
+        return RunDecoderCanonicalSelfTest();
     if (name == "debug-log-buffer")
         return RunDebugLogBufferSelfTest();
     if (name == "dgb-pow")
@@ -12675,6 +12909,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
     return 1;
 }

@@ -355,6 +355,34 @@ fuzz-p2p-payload: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_p2p_payload.o
 	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: fuzz-p2p-payload"
 
+obj-fuzz/fuzz_deserialize.o: fuzz_deserialize.cpp $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-deserialize: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_deserialize.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-deserialize"
+
+obj-fuzz/fuzz_decoders.o: fuzz_decoders.cpp $(HEADERS) bip39_english.h
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-decoders: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_decoders.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-decoders"
+
+# Both write their own seeds (a canonical encoding of every type; a sample of
+# every decoder's input) and replay them with a short run on top.
+fuzz-deserialize-smoke: fuzz-deserialize
+	@rm -rf ../work/fuzz-corpus/deserialize && mkdir -p ../work/fuzz-corpus/deserialize
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/deserialize ./fuzz-deserialize -runs=0
+	./fuzz-deserialize -runs=20000 ../work/fuzz-corpus/deserialize
+
+fuzz-decoders-smoke: fuzz-decoders
+	@rm -rf ../work/fuzz-corpus/decoders && mkdir -p ../work/fuzz-corpus/decoders
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/decoders ./fuzz-decoders -runs=0
+	./fuzz-decoders -runs=20000 ../work/fuzz-corpus/decoders
+
 # Payloads straight into ProcessMessage after the handshake (block, tx, inv,
 # ...); the harness writes its own structured seeds.
 fuzz-p2p-payload-smoke: fuzz-p2p-payload
@@ -383,7 +411,7 @@ fuzz-script-smoke: fuzz-script
 	./fuzz-script -runs=128 ../work/fuzz-corpus/script
 
 clean:
-	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -495,6 +523,8 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=reorg-safety
 	./bitflash-node -selftest=pool-stratum
 	./bitflash-node -selftest=parse-money
+	./bitflash-node -selftest=serialize-canonical
+	./bitflash-node -selftest=decoder-canonical
 	./bitflash-node -selftest=debug-log-buffer
 	./bitflash-node -selftest=pow-v2
 	./bitflash-node -selftest=dgb-pow
@@ -543,4 +573,5 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-relay
 	./bitflash-node -selftest=chat-wallet
 
-.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke
+.PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
+        fuzz-deserialize-smoke fuzz-decoders-smoke

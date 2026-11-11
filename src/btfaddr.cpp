@@ -183,6 +183,13 @@ bool ParseAddressVersion(const std::string& addr, unsigned char pubkeyOut[32],
     else
         return false;
 
+    // 34 bytes are 272 bits, and 55 base32 characters carry 275: the last
+    // character's low three bits are padding, which Base32Decode drops
+    // whatever they are. Unchecked, that gave every version-1 key eight
+    // labels; only the one the encoder writes, with those bits zero, is the
+    // address.
+    if (Base32Encode(&raw[0], raw.size()) != label) return false;
+
     unsigned char pk[32];
     memcpy(pk, &raw[0], 32);
     unsigned char sum[2];
@@ -224,7 +231,12 @@ static std::string HexEncode(const unsigned char* p, size_t n)
 
 static bool HexDecode(const std::string& s, unsigned char* out, size_t n)
 {
+    // Two hex digits per byte and nothing else. This was sscanf("%2x"), which
+    // also takes a sign and "0x" ("-1" read as ff, "+d" as 0d) and skips white
+    // space without counting it, so one key or signature had many spellings.
     if (s.size() != n * 2) return false;
+    for (size_t i = 0; i < n * 2; i++)
+        if (!isxdigit((unsigned char)s[i])) return false;
     for (size_t i = 0; i < n; i++)
     {
         unsigned int b;
@@ -267,7 +279,9 @@ bool NormalizeOnionEndpoint(const std::string& in, std::string& out)
     if (errno == ERANGE || end == NULL || *end != '\0' || nPort <= 0 || nPort > 65535)
         return false;
 
-    out = host + ":" + port;
+    // The port as a number is written, so ":080" and ":80" have one normal
+    // form; VerifyDescriptor accepts an onion only in that form.
+    out = host + ":" + std::to_string(nPort);
     return true;
 }
 

@@ -304,6 +304,10 @@ inline vector<unsigned char> ParseHex(const string& str)
 template<typename T>
 string HexStr(const T itbegin, const T itend, bool fSpaces=true)
 {
+    // An empty range has no itbegin[0] to take the address of (a vector's
+    // begin() is a null iterator then).
+    if (itbegin == itend)
+        return string();
     const unsigned char* pbegin = (const unsigned char*)&itbegin[0];
     const unsigned char* pend = pbegin + (itend - itbegin) * sizeof(itbegin[0]);
     string str;
@@ -315,6 +319,8 @@ string HexStr(const T itbegin, const T itend, bool fSpaces=true)
 template<typename T>
 string HexNumStr(const T itbegin, const T itend, bool f0x=true)
 {
+    if (itbegin == itend)
+        return f0x ? "0x" : "";
     const unsigned char* pbegin = (const unsigned char*)&itbegin[0];
     const unsigned char* pend = pbegin + (itend - itbegin) * sizeof(itbegin[0]);
     string str = (f0x ? "0x" : "");

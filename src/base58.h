@@ -56,7 +56,8 @@ inline string EncodeBase58(const unsigned char* pbegin, const unsigned char* pen
 
 inline string EncodeBase58(const vector<unsigned char>& vch)
 {
-    return EncodeBase58(&vch[0], &vch[0] + vch.size());
+    // data(), not &vch[0]: indexing an empty vector is undefined.
+    return EncodeBase58(vch.data(), vch.data() + vch.size());
 }
 
 inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
@@ -66,7 +67,9 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
     CBigNum bn58 = 58;
     CBigNum bn = 0;
     CBigNum bnChar;
-    while (isspace(*psz))
+    // isspace takes an unsigned char's value: a byte from 0x80 up in a plain
+    // (signed) char is a negative argument, which is undefined.
+    while (isspace((unsigned char)*psz))
         psz++;
 
     // Convert big endian string to bignum
@@ -75,7 +78,7 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
         const char* p1 = strchr(pszBase58, *p);
         if (p1 == NULL)
         {
-            while (isspace(*p))
+            while (isspace((unsigned char)*p))
                 p++;
             if (*p != '\0')
                 return false;
@@ -105,8 +108,17 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
     return true;
 }
 
+// The string overloads refuse a string with a NUL in it. They used to hand
+// c_str() on, so "<address>\0<anything>" -- from a payment link, say -- read
+// as the address alone while the caller still held, and might show, the
+// whole string (fuzz-decoders, honggfuzz).
 inline bool DecodeBase58(const string& str, vector<unsigned char>& vchRet)
 {
+    if (str.find('\0') != string::npos)
+    {
+        vchRet.clear();
+        return false;
+    }
     return DecodeBase58(str.c_str(), vchRet);
 }
 
@@ -144,6 +156,11 @@ inline bool DecodeBase58Check(const char* psz, vector<unsigned char>& vchRet)
 
 inline bool DecodeBase58Check(const string& str, vector<unsigned char>& vchRet)
 {
+    if (str.find('\0') != string::npos)
+    {
+        vchRet.clear();
+        return false;
+    }
     return DecodeBase58Check(str.c_str(), vchRet);
 }
 
@@ -185,6 +202,8 @@ inline bool AddressToHash160(const char* psz, uint160& hash160Ret)
 
 inline bool AddressToHash160(const string& str, uint160& hash160Ret)
 {
+    if (str.find('\0') != string::npos)
+        return false;
     return AddressToHash160(str.c_str(), hash160Ret);
 }
 
@@ -199,7 +218,7 @@ inline string Hash160ToScriptAddress(uint160 hash160)
 inline bool DecodeAnyAddress(const string& str, uint160& hash160Ret, bool& fScriptRet)
 {
     vector<unsigned char> vch;
-    if (!DecodeBase58Check(str.c_str(), vch))
+    if (!DecodeBase58Check(str, vch))
         return false;
     if (vch.size() != sizeof(hash160Ret) + 1)
         return false;
@@ -218,7 +237,8 @@ inline bool IsValidBitcoinAddress(const char* psz)
 
 inline bool IsValidBitcoinAddress(const string& str)
 {
-    return IsValidBitcoinAddress(str.c_str());
+    uint160 hash160;
+    return AddressToHash160(str, hash160);
 }
 
 
