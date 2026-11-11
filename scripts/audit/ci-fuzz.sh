@@ -65,10 +65,18 @@ log=$OUT/fuzz-$engine-$t.log
 echo "fuzzing $t with $engine for $FUZZ_SECS s, corpus $(ls "$CORPUS" | wc -l) inputs"
 case $engine in
     libfuzzer)
-        # One worker per core; a crash is saved and the run goes on.
-        (cd "$w" && "$bin" -fork="$(nproc)" -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 \
-            -max_total_time="$FUZZ_SECS" -timeout=20 -rss_limit_mb=4096 \
-            -print_final_stats=1 -artifact_prefix="$OUT/crashes/libfuzzer-$t-" "$CORPUS") > "$log" 2>&1 ;;
+        # One worker per core; a crash is saved and the run goes on. Fork
+        # mode keeps each worker's log in a temporary directory it deletes,
+        # so a finding's stack is lost: FUZZ_FORK=0 runs one process that
+        # stops at the first finding and prints its full report here.
+        if [ "${FUZZ_FORK:-1}" = 0 ]; then
+            (cd "$w" && "$bin" -max_total_time="$FUZZ_SECS" -timeout=20 -rss_limit_mb=4096 \
+                -print_final_stats=1 -artifact_prefix="$OUT/crashes/libfuzzer-$t-" "$CORPUS") > "$log" 2>&1
+        else
+            (cd "$w" && "$bin" -fork="$(nproc)" -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 \
+                -max_total_time="$FUZZ_SECS" -timeout=20 -rss_limit_mb=4096 \
+                -print_final_stats=1 -artifact_prefix="$OUT/crashes/libfuzzer-$t-" "$CORPUS") > "$log" 2>&1
+        fi ;;
     afl)
         # A main instance and one secondary per remaining core, sharing $w/out.
         export AFL_SKIP_CPUFREQ=1 AFL_NO_UI=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_NO_AFFINITY=1

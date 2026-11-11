@@ -22,6 +22,10 @@ on:
         description: "Also run the self-tests under ASan+UBSan, TSan and Valgrind"
         type: boolean
         default: true
+      fork:
+        description: "libFuzzer in fork mode (one worker per core, keeps going after a finding); off = one process that stops at the first finding with its full stack"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -86,6 +90,7 @@ jobs:
       - name: Fuzz
         env:
           FUZZ_SECS: ${{ inputs.seconds }}
+          FUZZ_FORK: ${{ inputs.fork && '1' || '0' }}
           CORPUS: corpus/${{ matrix.target }}
           OUT: fuzz-out
         run: scripts/audit/ci-fuzz.sh "${{ matrix.engine }}" "${{ matrix.target }}"
