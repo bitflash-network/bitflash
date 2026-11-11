@@ -37,6 +37,12 @@ namespace btfchat
 
 static const size_t MAX_SWAP_NOTE = 200;
 
+// What an offer and a take carry as "v". 2: a Bitflash contract is locked by
+// time (median time past), never by height (swap.h, THE TIMING). An offer or
+// a take without it was made by a version that locks Bitflash by height: it
+// is refused before anybody locks anything, rather than half understood.
+static const int SWAP_PROTOCOL_VERSION = 2;
+
 // 21 million coins, in satoshis, on either side.
 static const int64_t MAX_SWAP_AMOUNT = (int64_t)21000000 * 100000000;
 
@@ -51,8 +57,14 @@ struct SwapOffer
     SwapOffer() : giveAmount(0), wantAmount(0) {}
 };
 
+// Neither parser throws, whatever the text: a field of the wrong type is a
+// refusal with errOut, like any other malformed offer or step.
 bool ParseSwapOffer(const std::string& text, SwapOffer& out, std::string& errOut);
 std::string FormatSwapOffer(const SwapOffer& o);
+// The least an offer may give or ask on that coin, in its base units: a
+// contract under it costs more to spend than it holds, so the side that
+// locked against it could be taken and receive nothing it can spend.
+int64_t SwapMinAmount(const std::string& coin);
 // "100 BTF for 0.001 BTC"
 std::string DescribeSwapOffer(const SwapOffer& o);
 

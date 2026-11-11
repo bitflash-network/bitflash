@@ -19,8 +19,10 @@
 //
 // WHAT IS CHECKED BEFORE A COIN MOVES.
 //   taker, before locking: the maker's contract is on the chain, unspent,
-//     confirmed, pays the taker's own address the agreed amount, and has at
-//     least 36 hours left -- the taker's own lock is 24.
+//     confirmed, not a coinbase, locked by time, pays the taker's own address
+//     the agreed amount, and has at least 36 hours left -- the taker's own
+//     lock is 24, or 18 on Bitflash (swap.h, THE TIMING); a taker giving BTF
+//     also waits while Bitflash blocks are coming slowly.
 //   maker, before redeeming (which shows the secret): the taker's contract
 //     is on the chain, unspent, confirmed, pays the maker's own address the
 //     agreed amount under the maker's secret hash, and has at least 6 hours
@@ -106,8 +108,9 @@ public:
     virtual bool FindMyOffer(const std::string& offerId, SwapOffer& out) = 0;
     virtual bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& resultOut,
                         std::string& errOut) = 0;
-    // Something changed that has to survive a restart: save now.
-    virtual void Changed() = 0;
+    // Something changed that has to survive a restart: save now. False when
+    // it could not be saved; no new lock is made until it can.
+    virtual bool Changed() = 0;
 };
 
 struct SwapConfig
@@ -118,8 +121,12 @@ struct SwapConfig
     int64_t nAnswerWithin = 24 * 3600;   // a take nobody answers
     int64_t nRedeemBumpAfter = 3600;     // a light-client Bitcoin redeem still unconfirmed: send again, fee doubled
     int     nMinConfirmations = 0;       // 0: 1 on testnet; on mainnet 2, 8 on Litecoin
-    // Test chains only (the wallet refuses them on mainnet): shorter locks.
-    int     nBtfInitiatorBlocks = 0, nBtfParticipantBlocks = 0;
+    // A taker giving BTF waits while the Bitflash tip's median time is this
+    // far behind the clock (swap.h, THE TIMING); 0: no such wait.
+    int64_t nBtfMaxMedianLag = 3600;
+    // Test chains only (the wallet refuses them on mainnet): shorter locks,
+    // in seconds on every chain.
+    int64_t nBtfInitiatorSecs = 0, nBtfParticipantSecs = 0;
     int64_t nBtcInitiatorSecs = 0, nBtcParticipantSecs = 0;
 };
 
@@ -140,9 +147,13 @@ struct ChatSwap
     std::string redeemTxid, refundTxid;
     int         stage = SW_INVITING;
     bool        fUserOk = false, fInvited = false, fSentLock = false;
+    // A lock call (initiate/participate) gave no answer: until the wallet's
+    // journal says whether it locked anything (swaplookup), the swap is
+    // neither locked again nor called off.
+    bool        fLockTried = false;
     std::string status, lastError;
     int64_t     created = 0, updated = 0, theirSince = 0;
-    int64_t     refundSince = 0;   // a DigiByte refund sent, no block has it yet
+    int64_t     refundSince = 0, refundFeeRate = 0;   // a refund sent, no block has it yet
     int64_t     redeemSince = 0, redeemFeeRate = 0;   // a Bitcoin redeem the light client sent, not yet confirmed
 };
 
@@ -172,6 +183,7 @@ private:
     CCriticalSection cs;
     std::map<std::string, ChatSwap> swaps;
     std::set<std::string> stepsSeen;
+    std::string strStoreError;     // the last save that failed; "" when the store is on the disk
 
     int  MinConfirmations(const std::string& coin) const;
     bool Wallet(const char* method, const nlohmann::json& params, nlohmann::json& r, std::string& err);
@@ -185,7 +197,13 @@ private:
                      std::string& hashOut, std::string& why);
     bool MyTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err);
     bool FindSecret(const std::string& coin, const std::string& contract, const std::string& ref,
-                    bool& fSpent, std::string& secretOut, bool& fRefunded, std::string& err);
+                    bool& fSpent, std::string& secretOut, bool& fRefunded, std::string& err,
+                    bool* pfConfirmed = NULL, int* pnSpendConf = NULL, std::string* pSpendTxid = NULL);
+    void RefundSeen(ChatSwap& s, bool fConfirmed, int nConf);
+    bool SaveLockAttempt(ChatSwap& s);
+    int  LookupLock(ChatSwap& s, std::string& err);
+    bool AdoptLock(ChatSwap& s, const nlohmann::json& r, std::string& err);
+    bool StoreSaved(ChatSwap& s);
     void TryRefund(ChatSwap& s);
     nlohmann::json LockParams(const ChatSwap& s, bool fInitiator) const;
     void Tick(ChatSwap& s);

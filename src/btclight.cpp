@@ -1513,14 +1513,24 @@ static void Round(State& s, Peer& primary, Peer* second)
         (s.net.regtest || (int64)s.headers.Tip().time > GetTime()-7200);
     // Confirmed transactions remain saved so a reorg can resume rebroadcast.
     std::set<uint256> confirmed;
+    std::set<COutPoint> spentInBlock;
     for (auto it = s.blocks.begin(); it != s.blocks.end(); ++it)
         if (s.headers.ActiveHeight(it->first) >= 0)
         {
             std::vector<CTransaction> txs; btcswap::ParseBlockTxs(it->second,txs,s.net.auxPow,s.net.headerSize);
-            for (const auto& tx : txs) confirmed.insert(tx.GetHash());
+            for (const auto& tx : txs) { confirmed.insert(tx.GetHash()); for (const auto& in : tx.vin) spentInBlock.insert(in.prevout); }
         }
+    // Neither what a block already has, nor a spend that lost to another one
+    // in a block (the redeem or refund sent before a fee bump, say): kept for
+    // a reorg, not sent again every round.
     std::vector<Bytes> broadcasts;
-    for (auto it = s.pending.begin(); it != s.pending.end(); ++it) if (!confirmed.count(it->first)) broadcasts.push_back(it->second);
+    for (auto it = s.pending.begin(); it != s.pending.end(); ++it)
+    {
+        if (confirmed.count(it->first)) continue;
+        CTransaction tx; bool conflicted = false;
+        if (btcswap::ParseTx(it->second,tx)) for (const auto& in : tx.vin) if (spentInBlock.count(in.prevout)) conflicted = true;
+        if (!conflicted) broadcasts.push_back(it->second);
+    }
     lock.unlock();
     try { for (const auto& raw : broadcasts) { primary.Send("tx",raw); if (second) second->Send("tx",raw); } lock.lock(); }
     catch (...) { lock.lock(); throw; }
@@ -1802,6 +1812,13 @@ void Watch(const btcswap::Chain& chain, const CScript& contract)
             // only the blocks since the contract was made.
             swap::Contract c;
             int64 start = swap::ParseContract(contract,c) ? c.nLockTime-btcswap::INITIATOR_LOCK_SECS-7200 : GetTime()-3*86400;
+            // The lock is whatever the contract says, and a contract can come
+            // from the other side of a swap: a lock of 1 would send the cursor
+            // back to the anchor and every swap on this chain would wait for
+            // months of blocks. btfchat refuses such a contract before it gets
+            // here; by hand, nothing older than two weeks past a lock's window
+            // is read for a contract watched for the first time.
+            start = std::max<int64>(start, GetTime()-btcswap::INITIATOR_LOCK_SECS-7200-14*86400);
             int height = s.headers.Tip().height;
             while (height > s.headers.Base()+1 && (int64)s.headers.At(height-1).time >= start) --height;
             s.scan = std::min(s.scan,height);
@@ -1885,13 +1902,15 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
     if ((size_t)output >= funding->second.tx.vout.size() || funding->second.tx.vout[output].scriptPubKey != script) throw std::runtime_error(s.net.label+" output does not pay this contract");
     j["confirmations"] = CountsByWork(s.net) ? ConfirmationsByWork(s.net,s.headers,funding->second.height) : s.headers.Tip().height-funding->second.height+1;
     j["unspent"] = true;
+    j["coinbase"] = funding->second.tx.IsCoinBase();
     j["amount"] = (double)funding->second.tx.vout[output].nValue/CoinUnit(s.net.coin);
     COutPoint prev(txid,(unsigned int)output); swap::Contract c; swap::ParseContract(contract,c);
     for (auto it = txs.begin(); it != txs.end(); ++it)
         for (size_t k = 0; k < it->second.tx.vin.size(); ++k) if (it->second.tx.vin[k].prevout == prev)
         {
-            j["spent"] = true; j["unspent"] = false; j["amount"] = nullptr; j["found"] = true;
+            j["spent"] = true; j["unspent"] = false; j["amount"] = nullptr; j["found"] = true; j["confirmed"] = true;
             j["txid"] = it->first.GetHex(); j["height"] = it->second.height;
+            j["spendConfirmations"] = CountsByWork(s.net) ? ConfirmationsByWork(s.net,s.headers,it->second.height) : s.headers.Tip().height-it->second.height+1;
             if (secret)
             {
                 Bytes value;

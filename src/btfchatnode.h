@@ -173,8 +173,10 @@ bool ChatCommunityPost(const std::string& id, const std::string& text, std::stri
 bool ChatCommunityPostOffer(const std::string& id, const std::string& offerText, std::string& errOut);
 bool ChatSendSwapStep(const std::string& peerAddr, const std::string& stepText,
                       bool& fLeftInMailboxOut, std::string& errOut);
-// Seal and write the store now (after the swap engine changed a swap).
-void ChatSaveStore();
+// Seal and write the store now (after the swap engine changed a swap). False,
+// with why in *pErrOut, when it is not on the disk: the swap engine then
+// makes no new lock until it is.
+bool ChatSaveStore(std::string* pErrOut = NULL);
 
 // The public X25519 half of this epoch's mailbox key, hex; empty when locked.
 // What others seal to -- for the self-test that it survives closing the app.

@@ -504,7 +504,7 @@ int main()
         CHECK(btfchat::SignFrame(ctx, alice, f, js, err) && btfchat::OpenFrame(ctx, js, g, err) &&
               g.kind == btfchat::MSG_SWAP_OFFER && g.text == f.text, "an offer signs and opens");
         btfchat::SwapOffer o2 = o;
-        o2.wantAmount = 1;
+        o2.wantAmount = 200000;     // still a valid offer: only the signature can refuse it
         CHECK(!btfchat::OpenFrame(ctx, EditField(js, "text", btfchat::FormatSwapOffer(o2)), g, err),
               "an offer's price changed in transit breaks the signature");
         btfchat::Frame bad = f;

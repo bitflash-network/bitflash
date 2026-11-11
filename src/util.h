@@ -154,6 +154,13 @@ bool RestrictFileToOwner(const string& strPath);
 // predictable (OpenSSL's RAND_bytes reports that by its return value, which
 // is easy to ignore -- Bitcoin Core's GetStrongRandBytes does the same).
 void GetStrongRandBytes(unsigned char* pbuf, int nSize);
+// Replaces path with data so that a crash or a full disk leaves either the
+// old file or the whole new one, never part of one or neither: written to
+// path.new (a private file, as above), flushed to the disk, then renamed over
+// path in one step, and on POSIX the directory flushed too so the rename
+// itself survives a power cut. False with errOut on any failure, path as it
+// was. For files whose loss loses coins (swap secrets, the chat store).
+bool WriteFileAtomicPrivate(const std::string& path, const std::string& data, std::string& errOut);
 int GetFilesize(FILE* file);
 uint64 GetRand(uint64 nMax);
 int64 GetTime();

@@ -92,6 +92,161 @@ CScript RefundScriptSig(const valtype& sig, const valtype& pubkey, const CScript
     return s;
 }
 
+int64_t SecondsUntilRefund(int64_t nLockTime, int64_t nMedianTimePast)
+{
+    return nMedianTimePast > nLockTime ? 0 : nLockTime - nMedianTimePast + 1;
+}
+
+bool NewSecret(valtype& secretOut, valtype& hashOut)
+{
+    secretOut.assign(SECRET_BYTES, 0);
+    hashOut.clear();
+    if (RAND_bytes(&secretOut[0], (int)secretOut.size()) != 1)
+    {
+        OPENSSL_cleanse(&secretOut[0], secretOut.size());
+        secretOut.clear();
+        return false;
+    }
+    hashOut.resize(32);
+    SHA256(&secretOut[0], secretOut.size(), &hashOut[0]);
+    return true;
+}
+
+// ---- the journal ------------------------------------------------------------
+
+static CCriticalSection cs_journal;
+static std::string g_strJournalPath;
+
+std::string JournalPath()
+{
+    CRITICAL_BLOCK(cs_journal)
+        if (!g_strJournalPath.empty())
+            return g_strJournalPath;
+    return GetAppDir() + "/swaps.log";
+}
+
+void JournalSetPathForTest(const std::string& path)
+{
+    CRITICAL_BLOCK(cs_journal)
+        g_strJournalPath = path;
+}
+
+bool JournalTagOk(const std::string& tag)
+{
+    if (tag.empty() || tag.size() > 64)
+        return false;
+    for (size_t i = 0; i < tag.size(); i++)
+        if (!isalnum((unsigned char)tag[i]) && tag[i] != '_' && tag[i] != ':' && tag[i] != '-')
+            return false;
+    return true;
+}
+
+// The whole file, or "" when there is none yet. False when it is there but
+// cannot be read: writing over it then would lose every secret it holds.
+static bool ReadJournalFile(const std::string& path, std::string& out, std::string& errOut)
+{
+    out.clear();
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+    {
+        if (errno == ENOENT)
+            return true;
+        errOut = strprintf("cannot read %s (%s)", path.c_str(), strerror(errno));
+        return false;
+    }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    bool fErr = ferror(f) != 0;
+    fclose(f);
+    if (fErr)
+    {
+        errOut = "cannot read " + path;
+        return false;
+    }
+    return true;
+}
+
+bool JournalAppend(const nlohmann::json& line, std::string& errOut)
+{
+    errOut.clear();
+    nlohmann::json j = line;
+    if (!j.is_object())
+    {
+        errOut = "a journal line is an object";
+        return false;
+    }
+    if (!j.contains("time"))
+        j["time"] = (int64_t)GetTime();
+    std::string path = JournalPath();
+    CRITICAL_BLOCK(cs_journal)
+    {
+        std::string all;
+        if (!ReadJournalFile(path, all, errOut))
+            return false;
+        // A line cut short by a crash of an older version ends without a
+        // newline: the next one starts on its own.
+        if (!all.empty() && all[all.size() - 1] != '\n')
+            all += "\n";
+        all += j.dump() + "\n";
+        bool fOk = WriteFileAtomicPrivate(path, all, errOut);
+        if (!all.empty())
+            OPENSSL_cleanse(&all[0], all.size());
+        return fOk;
+    }
+    return false;
+}
+
+bool JournalRead(std::vector<nlohmann::json>& out, std::string& errOut)
+{
+    out.clear();
+    errOut.clear();
+    std::string all;
+    CRITICAL_BLOCK(cs_journal)
+        if (!ReadJournalFile(JournalPath(), all, errOut))
+            return false;
+    size_t nStart = 0;
+    while (nStart < all.size())
+    {
+        size_t nEnd = all.find('\n', nStart);
+        if (nEnd == std::string::npos)
+            nEnd = all.size();
+        if (nEnd > nStart)
+        {
+            try
+            {
+                nlohmann::json j = nlohmann::json::parse(all.substr(nStart, nEnd - nStart));
+                if (j.is_object())
+                    out.push_back(j);
+            }
+            catch (...) {}    // a torn line from before the journal was atomic
+        }
+        nStart = nEnd + 1;
+    }
+    if (!all.empty())
+        OPENSSL_cleanse(&all[0], all.size());
+    return true;
+}
+
+bool JournalLookup(const std::string& tag, nlohmann::json& mergedOut, std::string& errOut)
+{
+    mergedOut = nlohmann::json();
+    std::vector<nlohmann::json> lines;
+    if (!JournalRead(lines, errOut))
+        return false;
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        if (!lines[i].contains("tag") || !lines[i]["tag"].is_string() || lines[i]["tag"].get<std::string>() != tag)
+            continue;
+        if (mergedOut.is_null())
+            mergedOut = nlohmann::json::object();
+        for (nlohmann::json::const_iterator it = lines[i].begin(); it != lines[i].end(); ++it)
+            mergedOut[it.key()] = it.value();
+    }
+    return true;
+}
+
 bool ExtractSecret(const CScript& scriptSig, const valtype& secretHash, valtype& secretOut)
 {
     CScript::const_iterator pc = scriptSig.begin();

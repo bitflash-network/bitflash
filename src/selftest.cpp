@@ -8599,7 +8599,8 @@ struct SwapTestHost : public btfchat::SwapHost
         e.from = addr;
         e.sent = GetTime();
         unsigned char b[16];
-        RAND_bytes(b, sizeof(b));
+        if (RAND_bytes(b, sizeof(b)) != 1)
+            throw std::runtime_error("the random number generator failed");
         e.id = HexStr(b, b + sizeof(b), false);
         e.text = text;
         e.kind = btfchat::MSG_SWAP;
@@ -8622,7 +8623,7 @@ struct SwapTestHost : public btfchat::SwapHost
     {
         return LoopbackRpcCall(wallet, method, params, r, err);
     }
-    void Changed() {}
+    bool Changed() { return true; }
 };
 
 static nlohmann::json SwapTestBtc(int nPort, const std::string& method, const nlohmann::json& params,
@@ -8864,9 +8865,10 @@ static int RunChatSwapSelfTest()
         try {
             printf("  3. Alice offers 0.5 BTF for 0.03 BTC; Bob locks; Alice vanishes\n");
             btfchat::SwapConfig cfg;
-            // Short locks (test chains only): 12 Bitflash blocks for Alice, 15
-            // minutes of Bitcoin median time for Bob, and the margins to match.
-            cfg.nBtfInitiatorBlocks = 12;
+            // Short locks (test chains only): 24 minutes of Bitflash median
+            // time for Alice, 15 minutes of Bitcoin median time for Bob, and
+            // the margins to match.
+            cfg.nBtfInitiatorSecs = 1440;
             cfg.nBtcParticipantSecs = 900;
             cfg.nTakerMinLeft = 240;
             cfg.nMakerMinLeft = 60;
@@ -8891,6 +8893,19 @@ static int RunChatSwapSelfTest()
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
     return nFail == 0 ? 0 : 1;
+}
+
+// A canonical swap contract, hex, locked at nLockTime under hash (hex).
+static std::string SwapTestContract(int64_t nLockTime, const std::string& hash,
+                                    const std::vector<unsigned char>& recipient = std::vector<unsigned char>(20, 0x11))
+{
+    swap::Contract c;
+    c.recipientPkh = recipient;
+    c.refundPkh.assign(20, 0x22);
+    c.secretHash = ParseHex(hash);
+    c.nLockTime = nLockTime;
+    CScript k = swap::BuildContract(c);
+    return HexStr(k.begin(), k.end(), false);
 }
 
 // -selftest=swap-wait-payment -- a swap whose Bitcoin contract waits to be paid
@@ -8952,7 +8967,7 @@ struct WaitPayHost : public btfchat::SwapHost
         err = "not in this test: " + method;
         return false;
     }
-    void Changed() {}
+    bool Changed() { return true; }
 
     void Unpaid(int64_t nSecondsLeft, int64_t nLockTime)
     {
@@ -9005,9 +9020,14 @@ static int RunSwapWaitPaymentSelfTest()
         h.Paid(0.01, 0, nNow - 60);
         e.Round();
         btfchat::SwapView v = WaitPayView(e);
+        nFail += Check(h.nRefunds == 1 && v.stage == btfchat::SW_REFUNDING,
+                       "a payment on Litecoin is refunded at its lock, and watched until a block has the refund") ? 0 : 1;
+        h.finds["00"] = { { "spent", true }, { "refunded", true }, { "confirmed", true } };
+        e.Round();
+        v = WaitPayView(e);
         nFail += Check(h.nCoinCalls >= 1, "a Litecoin swap asks the wallet through coin* with its chain") ? 0 : 1;
         nFail += Check(v.give == "LTC" && h.nRefunds == 1 && v.stage == btfchat::SW_REFUNDED,
-                       "and a payment on Litecoin comes back at its lock") ? 0 : 1;
+                       "and once a block has it, it came back") ? 0 : 1;
         nFail += Check(h.refundParams.size() == 3 && h.refundParams[1] == std::string(64, 'a') + ":1",
                        "from the output that was paid, named as on Bitcoin") ? 0 : 1;
     }
@@ -9040,7 +9060,16 @@ static int RunSwapWaitPaymentSelfTest()
         h.Paid(0.01, 0, nNow - 60);
         e.Round();
         v = WaitPayView(e);
-        nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRefunds == 1, "at the lock it comes back") ? 0 : 1;
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRefunds == 1, "at the lock it is refunded") ? 0 : 1;
+        h.finds["00"] = { { "spent", true }, { "refunded", true }, { "confirmed", false } };
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRefunds == 1,
+                       "a refund only in a memory pool is not the end yet") ? 0 : 1;
+        h.finds["00"]["confirmed"] = true;
+        e.Round();
+        v = WaitPayView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRefunds == 1, "in a block, it came back") ? 0 : 1;
         nFail += Check(h.refundParams.size() == 3 && h.refundParams[1] == std::string(64, 'a') + ":1" &&
                        h.refundParams[2] == "bcrt1qdestination",
                        "to the person's own Bitcoin address, from the output that was paid") ? 0 : 1;
@@ -9093,18 +9122,19 @@ static int RunSwapWaitPaymentSelfTest()
     // sits goes out again with twice the fee -- the secret is already public.
     {
         const std::string secret(64, 'a'), hash(64, 'c');
+        const std::string theirs = SwapTestContract(nNow + 8 * 3600, hash);
         nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", true },
                               { "give", "BTF" }, { "ga", 100000000 }, { "want", "BTC" }, { "wa", 1000000 },
                               { "btcDestination", "bcrt1qdestination" }, { "myRecv", "mvMine" },
                               { "secret", secret }, { "hash", hash },
                               { "myC", "22" }, { "myTx", std::string(64, '2') },
-                              { "thC", "11" }, { "thTx", std::string(64, '1') }, { "thN", 0 },
+                              { "thC", theirs }, { "thTx", std::string(64, '1') }, { "thN", 0 },
                               { "stage", (int)btfchat::SW_REDEEMING }, { "ok", true }, { "inv", true },
                               { "created", nNow }, { "updated", nNow }, { "since", nNow } };
         std::string state = nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump();
         WaitPayHost h;
-        h.audits["11"] = { { "recipientIsMine", true }, { "recipient", "mvMine" }, { "secretHash", hash },
-                           { "unspent", true }, { "confirmations", 6 }, { "amount", 0.01 }, { "secondsUntilRefund", 8 * 3600 } };
+        h.audits[theirs] = { { "recipientIsMine", true }, { "recipient", "mvMine" }, { "secretHash", hash },
+                             { "unspent", true }, { "confirmations", 6 }, { "amount", 0.01 }, { "secondsUntilRefund", 8 * 3600 } };
         btfchat::SwapEngine e(&h);
         e.FromJson(state);
         e.Round();
@@ -9113,7 +9143,7 @@ static int RunSwapWaitPaymentSelfTest()
                        "light redeem sent: not done until it confirms") ? 0 : 1;
         nFail += Check(h.redeemParams.size() == 4 && h.redeemParams[3] == "bcrt1qdestination", "to the person's own address") ? 0 : 1;
         nFail += Check(h.lastStep.find("redeemed") != std::string::npos, "and the other side is told") ? 0 : 1;
-        h.audits["11"]["secondsUntilRefund"] = 60;
+        h.audits[theirs]["secondsUntilRefund"] = 60;
         e.Round();
         v = WaitPayView(e);
         nFail += Check(h.nRedeems == 1 && v.stage == btfchat::SW_REDEEMING,
@@ -9128,15 +9158,17 @@ static int RunSwapWaitPaymentSelfTest()
         nFail += Check(h.nRedeems == 2 && h.redeemParams.size() == 5 && h.redeemParams[4] == "0.00020000" &&
                        v.redeemTxid == strprintf("%064d", 2),
                        "still unconfirmed: sent again at twice the fee rate") ? 0 : 1;
-        h.finds["11"] = { { "spent", true }, { "secret", secret } };
+        h.finds[theirs] = { { "spent", true }, { "secret", secret } };
         e2.Round();
         v = WaitPayView(e2);
         nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 2, "in a block: done") ? 0 : 1;
     }
 
     // A taker's refund is not the end while the maker can still redeem ours
-    // with the secret instead: until their lock opens, that is watched for.
-    for (int nCase = 0; nCase < 2; nCase++)
+    // with the secret instead: before a block has the refund, or by a
+    // reorganisation that replaces the block. Watched until the refund has
+    // the chain's confirmations and the maker's contract is spent or open.
+    for (int nCase = 0; nCase < 3; nCase++)
     {
         const std::string secret(64, 'b');
         nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false },
@@ -9148,7 +9180,7 @@ static int RunSwapWaitPaymentSelfTest()
                               { "created", nNow }, { "updated", nNow } };
         WaitPayHost h;
         h.audits["33"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
-        h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 100 } };
+        h.audits["44"] = { { "unspent", true }, { "secondsUntilRefund", 3600 } };
         btfchat::SwapEngine e(&h);
         e.FromJson(nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump());
         e.Round();
@@ -9167,14 +9199,909 @@ static int RunSwapWaitPaymentSelfTest()
             nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 1 && h.redeemParams.size() >= 3 && h.redeemParams[2] == secret,
                            "ours was taken instead: theirs is taken with the secret") ? 0 : 1;
         }
-        else
+        else if (nCase == 1)
         {
-            h.audits["44"] = { { "unspent", true }, { "blocksUntilRefund", 0 } };
+            // Our refund is in one block; a reorganisation replaces it with
+            // their redeem, which shows the secret on the chain.
+            h.finds["33"] = { { "spent", true }, { "refunded", true }, { "confirmed", true }, { "spendConfirmations", 1 } };
             e.Round();
             v = WaitPayView(e);
-            nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRedeems == 0, "their lock opened: the refund stands, it is over") ? 0 : 1;
+            nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRedeems == 0,
+                           "our refund one block deep: not over, still watching") ? 0 : 1;
+            h.finds["33"] = { { "spent", true }, { "secret", secret }, { "confirmed", true }, { "spendConfirmations", 1 } };
+            e.Round();
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_DONE && h.nRedeems == 1 && h.redeemParams.size() >= 3 && h.redeemParams[2] == secret,
+                           "reorganised into their redeem: theirs is taken with the secret") ? 0 : 1;
+        }
+        else
+        {
+            // Their lock opening is not enough while our refund is in no
+            // block; nor is a refund deep enough while their lock still runs.
+            h.audits["44"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_REFUNDING && h.nRedeems == 0,
+                           "their lock opened, our refund is in no block yet: still watching") ? 0 : 1;
+            h.audits["44"] = { { "unspent", true }, { "secondsUntilRefund", 3600 } };
+            h.finds["33"] = { { "spent", true }, { "refunded", true }, { "confirmed", true }, { "spendConfirmations", 6 } };
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_REFUNDING, "our refund deep, their lock still running: still watching") ? 0 : 1;
+            h.audits["44"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+            e.Round();
+            v = WaitPayView(e);
+            nFail += Check(v.stage == btfchat::SW_REFUNDED && h.nRedeems == 0,
+                           "our refund deep and their lock open: it is over") ? 0 : 1;
         }
     }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- swap hardening (review of 2026-11-10) -------------------------------------
+
+// -selftest=swap-timelock -- Bitflash contracts locked by time, and the margins
+// that keep the swap's ordering (swap.h, THE TIMING).
+static int RunSwapTimelockSelfTest()
+{
+    printf("swap-timelock self-test\n");
+    int nFail = 0;
+
+    // What the wallet reports as seconds left is exactly when the next block
+    // takes the refund (IsFinalAt at the tip's median time).
+    {
+        const int64_t L = 1800000000;
+        CTransaction t;
+        t.vin.resize(1);
+        t.vin[0].nSequence = 0;
+        t.nLockTime = (unsigned int)L;
+        bool fAgree = true;
+        for (int64_t d = -3; d <= 3; d++)
+        {
+            int64_t nMedian = L + d;
+            bool fFinal = t.IsFinalAt(1000, nMedian);
+            if (fFinal != (swap::SecondsUntilRefund(L, nMedian) == 0))
+                fAgree = false;
+        }
+        nFail += Check(fAgree, "seconds left reach 0 exactly when the next block may hold the refund") ? 0 : 1;
+        nFail += Check(swap::SecondsUntilRefund(L, L - 3600) == 3601 && swap::SecondsUntilRefund(L, L + 1) == 0,
+                       "and count down by the median time, not the clock") ? 0 : 1;
+    }
+
+    // The locks are times; the margins hold the worst case the comment argues.
+    btfchat::SwapConfig cfg;
+    const int64_t nBlock = 120, nWorstBlock = 64 * nBlock;      // three largest retarget steps
+    const int64_t nDogeEarly = 2 * 3600;                        // no BIP113 on Dogecoin
+    nFail += Check(swap::BTF_INITIATOR_LOCK_SECS == 48 * 3600 && swap::BTF_PARTICIPANT_LOCK_SECS == 18 * 3600,
+                   "Bitflash locks are 48 and 18 hours of median time") ? 0 : 1;
+    nFail += Check(cfg.nTakerMinLeft - swap::BTF_PARTICIPANT_LOCK_SECS >= 7 * nWorstBlock + nDogeEarly,
+                   "a taker giving BTF has room for its refund's seven blocks at 64 times the target, Dogecoin included") ? 0 : 1;
+    nFail += Check(cfg.nTakerMinLeft - btcswap::PARTICIPANT_LOCK_SECS >= 6 * 3600 + 2 * 3600,
+                   "a taker giving another coin keeps six hours past a Bitflash median running two hours ahead") ? 0 : 1;
+    nFail += Check(swap::BTF_PARTICIPANT_LOCK_SECS >= cfg.nMakerMinLeft + 4 * 30 * nBlock,
+                   "a maker can see 30 confirmations of a BTF lock at a quarter of the speed and still have 6 hours") ? 0 : 1;
+    nFail += Check(swap::BTF_INITIATOR_LOCK_SECS > cfg.nTakerMinLeft && btcswap::INITIATOR_LOCK_SECS > cfg.nTakerMinLeft,
+                   "every initiator lock leaves the taker time to check and lock") ? 0 : 1;
+    nFail += Check(cfg.nBtfMaxMedianLag > 0 && cfg.nBtfMaxMedianLag <= 3600,
+                   "a taker giving BTF waits while the chain's median time is over an hour behind") ? 0 : 1;
+
+    // Both sides agree on the contract form: an offer or a take from a
+    // version that locks BTF by height is refused before anything moves.
+    {
+        std::string err;
+        btfchat::SwapOffer o;
+        o.give = "BTF"; o.giveAmount = COIN; o.want = "LTC"; o.wantAmount = 200000000;
+        std::string text = btfchat::FormatSwapOffer(o);
+        nFail += Check(text.find("\"v\":2") != std::string::npos, "an offer says it locks BTF by time") ? 0 : 1;
+        btfchat::SwapOffer back;
+        nFail += Check(!btfchat::ParseSwapOffer("{\"give\":\"BTF\",\"ga\":100000000,\"want\":\"LTC\",\"wa\":200000000}", back, err) &&
+                       err.find("older") != std::string::npos,
+                       "an offer from an older version is refused, saying why") ? 0 : 1;
+        btfchat::SwapStep st;
+        std::string take = "{\"s\":\"" + std::string(32, 'a') + "\",\"step\":\"take\",\"offer\":\"" + std::string(32, 'b') +
+                           "\",\"terms\":{\"give\":\"BTF\",\"ga\":100000000,\"want\":\"LTC\",\"wa\":200000000},"
+                           "\"to\":\"BE39QRszEZSeqHnGEHqsZZV2hu5d8GCQAw\"}";
+        nFail += Check(!btfchat::ParseSwapStep(take, st, err), "and so is a take from one") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+static std::string SwapTestReadFile(const std::string& path)
+{
+    std::string out;
+    FILE* f = fopen(path.c_str(), "rb");
+    char buf[4096];
+    size_t n;
+    while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    if (f)
+        fclose(f);
+    return out;
+}
+
+// -selftest=swap-journal -- the secret on the disk before anything is sent
+// (H2), the file private and replaced in one step, the secret's randomness
+// checked.
+static int RunSwapJournalSelfTest()
+{
+    printf("swap-journal self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary directory\n");
+        return 1;
+    }
+    std::string err;
+
+    // The atomic private write.
+    std::string path = tmp + "/store";
+    nFail += Check(WriteFileAtomicPrivate(path, "one", err) && SwapTestReadFile(path) == "one", "a file is written") ? 0 : 1;
+    nFail += Check(WriteFileAtomicPrivate(path, "two", err) && SwapTestReadFile(path) == "two" &&
+                   !FileExists((path + ".new").c_str()),
+                   "and replaced whole, nothing left beside it") ? 0 : 1;
+#ifndef _WIN32
+    struct stat st;
+    nFail += Check(stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "only its owner can read it (0600)") ? 0 : 1;
+#endif
+    nFail += Check(!WriteFileAtomicPrivate(tmp + "/no-such-dir/store", "x", err) && !err.empty(),
+                   "a write that cannot happen fails and says why") ? 0 : 1;
+    {
+        // A store whose new copy cannot be made keeps the old one, byte for byte.
+        std::string blocked = tmp + "/blocked";
+        WriteFileAtomicPrivate(blocked, "old", err);
+#ifdef _WIN32
+        CreateDirectoryA((blocked + ".new").c_str(), NULL);
+#else
+        mkdir((blocked + ".new").c_str(), 0700);
+#endif
+        bool fRefused = !WriteFileAtomicPrivate(blocked, "new", err);
+        nFail += Check(fRefused && SwapTestReadFile(blocked) == "old", "a failed save leaves the old file as it was") ? 0 : 1;
+    }
+
+    // The secret.
+    std::vector<unsigned char> secret, hash;
+    nFail += Check(swap::NewSecret(secret, hash) && secret.size() == 32 && hash.size() == 32 &&
+                   secret != std::vector<unsigned char>(32, 0), "a new secret is 32 random bytes") ? 0 : 1;
+    unsigned char h[32];
+    SHA256(&secret[0], secret.size(), h);
+    nFail += Check(std::vector<unsigned char>(h, h + 32) == hash, "and its hash is SHA-256 of it") ? 0 : 1;
+
+    // The journal.
+    std::string journal = tmp + "/swaps.log";
+    swap::JournalSetPathForTest(journal);
+    nlohmann::json merged;
+    nFail += Check(swap::JournalLookup("abc", merged, err) && merged.is_null(), "an empty journal knows no tag") ? 0 : 1;
+    nlohmann::json intent = { { "tag", "abc" }, { "state", "intent" }, { "chain", "btf" }, { "secret", "5e" },
+                              { "contract", "63" }, { "contractAddress", "3x" } };
+    nFail += Check(swap::JournalAppend(intent, err), "an intent is written") ? 0 : 1;
+    std::string raw = SwapTestReadFile(journal);
+    nFail += Check(raw.find("\"secret\":\"5e\"") != std::string::npos, "with the secret in it, on the disk") ? 0 : 1;
+#ifndef _WIN32
+    nFail += Check(stat(journal.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "swaps.log is 0600") ? 0 : 1;
+#endif
+    // A line cut short by an older version's crash does not hide the others.
+    {
+        FILE* f = fopen(journal.c_str(), "ab");
+        if (f) { fputs("{\"tag\":\"abc\",\"state\":\"fun", f); fclose(f); }
+    }
+    nFail += Check(swap::JournalAppend(nlohmann::json{ { "tag", "abc" }, { "state", "funded" }, { "contractTxid", "77" } }, err),
+                   "a line is added after a torn one") ? 0 : 1;
+    nFail += Check(swap::JournalAppend(nlohmann::json{ { "tag", "other" }, { "state", "failed" } }, err), "another tag") ? 0 : 1;
+    nFail += Check(swap::JournalLookup("abc", merged, err) && merged.is_object() && merged.value("state", "") == "funded" &&
+                   merged.value("secret", "") == "5e" && merged.value("contractTxid", "") == "77",
+                   "a tag's lines merge: the secret from its intent, the transaction from its funding") ? 0 : 1;
+    std::vector<nlohmann::json> lines;
+    nFail += Check(swap::JournalRead(lines, err) && lines.size() == 3, "the torn line is skipped, the rest read") ? 0 : 1;
+    nFail += Check(swap::JournalTagOk(std::string(32, 'a')) && !swap::JournalTagOk("") && !swap::JournalTagOk("a b") &&
+                   !swap::JournalTagOk(std::string(65, 'a')), "a tag is 1 to 64 plain characters") ? 0 : 1;
+    swap::JournalSetPathForTest("");
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=swap-parse -- an offer or a step of any shape is refused, never
+// thrown out of the parser (M4), and offers have floors (L3).
+static int RunSwapParseSelfTest()
+{
+    printf("swap-parse self-test\n");
+    int nFail = 0;
+    std::string err;
+    btfchat::SwapOffer o;
+    btfchat::SwapStep st;
+    const std::string sid = std::string(32, 'a');
+    const char* badOffers[] = {
+        "{\"v\":2,\"give\":5,\"ga\":100000000,\"want\":\"LTC\",\"wa\":200000000}",
+        "{\"v\":2,\"give\":\"BTF\",\"ga\":100000000,\"want\":[\"LTC\"],\"wa\":200000000}",
+        "{\"v\":2,\"give\":\"BTF\",\"ga\":100000000,\"want\":\"LTC\",\"wa\":200000000,\"note\":{}}",
+        "{\"v\":\"2\",\"give\":\"BTF\",\"ga\":100000000,\"want\":\"LTC\",\"wa\":200000000}",
+        "[1,2,3]", "null", "\"text\"",
+    };
+    bool fAllRefused = true;
+    for (size_t i = 0; i < sizeof(badOffers) / sizeof(badOffers[0]); i++)
+    {
+        try { if (btfchat::ParseSwapOffer(badOffers[i], o, err)) fAllRefused = false; }
+        catch (...) { fAllRefused = false; }
+    }
+    nFail += Check(fAllRefused, "offers with fields of the wrong type are refused, not thrown") ? 0 : 1;
+    std::vector<std::string> badSteps = {
+        "{\"s\":123,\"step\":\"cancel\"}",
+        "{\"s\":\"" + sid + "\",\"step\":false}",
+        "{\"s\":\"" + sid + "\",\"step\":\"take\",\"offer\":7}",
+        "{\"s\":\"" + sid + "\",\"step\":\"take\",\"offer\":\"" + std::string(32, 'b') + "\",\"terms\":{\"v\":2,\"give\":{}}}",
+        "{\"s\":\"" + sid + "\",\"step\":\"lock1\",\"chain\":[\"BTC\"],\"c\":\"dd\",\"tx\":\"" + std::string(64, 'e') + "\"}",
+        "{\"s\":\"" + sid + "\",\"step\":\"lock2\",\"chain\":\"BTC\",\"c\":1,\"tx\":\"" + std::string(64, 'e') + "\",\"n\":0}",
+        "{\"s\":\"" + sid + "\",\"step\":\"lock2\",\"chain\":\"BTC\",\"c\":\"dd\",\"tx\":\"" + std::string(64, 'e') + "\",\"n\":4294967297}",
+        "{\"s\":\"" + sid + "\",\"step\":\"redeemed\",\"tx\":null}",
+    };
+    fAllRefused = true;
+    for (size_t i = 0; i < badSteps.size(); i++)
+    {
+        try { if (btfchat::ParseSwapStep(badSteps[i], st, err)) fAllRefused = false; }
+        catch (...) { fAllRefused = false; }
+    }
+    nFail += Check(fAllRefused, "steps with fields of the wrong type are refused, an output past 2^31 too") ? 0 : 1;
+    nFail += Check(btfchat::ParseSwapStep("{\"s\":\"" + sid + "\",\"step\":\"cancel\",\"why\":5}", st, err) && st.why.empty(),
+                   "a cancel with a reason of the wrong type still cancels") ? 0 : 1;
+
+    // A community post of that kind, before any signature is checked: the
+    // frame is refused, and the thread reading it goes on.
+    {
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+        nlohmann::json fr = { { "v", btfchat::FRAME_VERSION }, { "k", (int)btfchat::MSG_SWAP_OFFER }, { "from", "x" },
+                              { "t", 1 }, { "id", std::string(32, 'c') }, { "g", "community" },
+                              { "text", badOffers[0] }, { "sig", "" } };
+        btfchat::Frame f;
+        bool fThrew = false, fOpened = true;
+        try { fOpened = btfchat::OpenFrame(ctx, fr.dump(), f, err); }
+        catch (...) { fThrew = true; }
+        nFail += Check(!fThrew && !fOpened, "a frame carrying such an offer is refused without throwing") ? 0 : 1;
+        fr["k"] = (int)btfchat::MSG_SWAP;
+        fr["g"] = "";
+        fr["text"] = badSteps[0];
+        fThrew = false; fOpened = true;
+        try { fOpened = btfchat::OpenFrame(ctx, fr.dump(), f, err); }
+        catch (...) { fThrew = true; }
+        nFail += Check(!fThrew && !fOpened, "and so is a direct step of that shape") ? 0 : 1;
+        secp256k1_context_destroy(ctx);
+    }
+
+    // Floors: no contract that costs more to spend than it holds.
+    o = btfchat::SwapOffer();
+    o.give = "BTF"; o.giveAmount = 5; o.want = "BTC"; o.wantAmount = 100000;
+    nFail += Check(!btfchat::ParseSwapOffer(btfchat::FormatSwapOffer(o), o, err), "5 satoshis of BTF is not an offer") ? 0 : 1;
+    o.give = "BTF"; o.giveAmount = COIN; o.want = "BTC"; o.wantAmount = 100;
+    nFail += Check(!btfchat::ParseSwapOffer(btfchat::FormatSwapOffer(o), o, err), "nor is 100 satoshis of Bitcoin") ? 0 : 1;
+    o.give = "BTF"; o.giveAmount = COIN; o.want = "BTC"; o.wantAmount = 100000;
+    nFail += Check(btfchat::ParseSwapOffer(btfchat::FormatSwapOffer(o), o, err), "1 BTF for 0.001 BTC is") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=swap-engine -- the engine's side of the fixes, against a wallet
+// stand-in: a lock that gave no answer is found, never made twice (H2); a
+// refund is over only in a block, and bumped (M2); a maker whose redeem lost
+// the race refunds its own (M3); their contract's lock is read before any
+// chain is asked (M1, H1); a coinbase or a height lock is refused (L2, H1); a
+// taker giving BTF waits out a crawling chain (H1); a destination is checked
+// (L5); and nothing is locked while the store cannot be saved (M5).
+namespace
+{
+struct EngineHost : public btfchat::SwapHost
+{
+    std::map<std::string, nlohmann::json> answers;   // method -> its answer; absent: an error
+    std::map<std::string, std::string> errors;       // method -> the error it gives
+    std::vector<std::pair<std::string, nlohmann::json> > calls;
+    std::vector<std::string> steps;
+    std::vector<btfchat::LogEntry> convo;            // what "them" sent
+    bool fSaveOk = true;
+    btfchat::SwapEngine* pEngine = NULL;             // to read back what a save wrote
+    std::string lastSaved, savedAtLock;
+
+    std::string MyAddress() { return "me"; }
+    bool PeerAccepted(const std::string&) { return true; }
+    bool Invite(const std::string&, const std::string&, std::string&) { return true; }
+    bool SendStep(const std::string&, const std::string& text, std::string&) { steps.push_back(text); return true; }
+    void Contacts(std::vector<std::string>& out) { out.assign(1, "them"); }
+    void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out = convo; }
+    bool FindMyOffer(const std::string&, btfchat::SwapOffer&) { return false; }
+    bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
+    {
+        calls.push_back(std::make_pair(method, params));
+        if (method == "swapinitiate" || method == "swapparticipate" || method == "coininitiate" || method == "coinparticipate")
+            savedAtLock = lastSaved;
+        if (errors.count(method)) { err = errors[method]; return false; }
+        if (!answers.count(method)) { err = "not in this test: " + method; return false; }
+        r = answers[method];
+        return true;
+    }
+    bool Changed()
+    {
+        if (fSaveOk && pEngine)
+            lastSaved = pEngine->ToJson();
+        return fSaveOk;
+    }
+    int Count(const std::string& method) const
+    {
+        int n = 0;
+        for (size_t i = 0; i < calls.size(); i++)
+            if (calls[i].first == method)
+                n++;
+        return n;
+    }
+    nlohmann::json Last(const std::string& method) const
+    {
+        for (size_t i = calls.size(); i-- > 0; )
+            if (calls[i].first == method)
+                return calls[i].second;
+        return nlohmann::json();
+    }
+};
+
+static std::string EngineState(const nlohmann::json& sw)
+{
+    return nlohmann::json{ { "swaps", nlohmann::json::array({ sw }) }, { "seen", nlohmann::json::array() } }.dump();
+}
+
+static btfchat::SwapView EngineView(btfchat::SwapEngine& e)
+{
+    std::vector<btfchat::SwapView> v;
+    e.List(v);
+    return v.empty() ? btfchat::SwapView() : v[0];
+}
+} // namespace
+
+static int RunSwapEngineSelfTest()
+{
+    printf("swap-engine self-test\n");
+    int nFail = 0;
+    const std::string id(32, '1'), hash(64, 'c'), secret(64, 'a');
+    int64_t nNow = GetTime();
+
+    // ---- H1 / M1: their lock is read from the contract before any audit
+    {
+        // The maker gives BTF; its contract is locked by height (an older version).
+        swap::Contract c;
+        c.recipientPkh.assign(20, 0x11); c.refundPkh.assign(20, 0x22); c.secretHash = ParseHex(hash);
+        c.nLockTime = 100000;
+        CScript k = swap::BuildContract(c);
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false }, { "give", "BTC" }, { "ga", 1000000 },
+                              { "want", "BTF" }, { "wa", 100000000 }, { "myRecv", "Bmine" },
+                              { "thC", HexStr(k.begin(), k.end(), false) }, { "thTx", std::string(64, '4') },
+                              { "stage", (int)btfchat::SW_CHECKING_THEIRS }, { "created", nNow }, { "since", nNow } };
+        EngineHost h;
+        h.answers["swapauditcontract"] = { { "recipientIsMine", true }, { "recipient", "Bmine" }, { "secretHash", hash },
+                                           { "unspent", true }, { "confirmations", 40 }, { "amount", 1.0 },
+                                           { "lockIsHeight", true }, { "blocksUntilRefund", 1400 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(EngineState(sw));
+        e.Round();
+        btfchat::SwapView v = EngineView(e);
+        nFail += Check(v.stage == btfchat::SW_CANCELLED && h.Count("swapauditcontract") == 0,
+                       "a Bitflash contract locked by height is refused, before its chain is even asked") ? 0 : 1;
+
+        // A time lock far in the past: a light client would rescan from its anchor.
+        c.nLockTime = (int64_t)LOCKTIME_THRESHOLD + 1;
+        k = swap::BuildContract(c);
+        sw["thC"] = HexStr(k.begin(), k.end(), false);
+        sw["give"] = "BTF"; sw["want"] = "LTC"; sw["wa"] = 200000000; sw["myRecv"] = "Lmine";
+        EngineHost h2;
+        btfchat::SwapEngine e2(&h2);
+        e2.FromJson(EngineState(sw));
+        e2.Round();
+        v = EngineView(e2);
+        nFail += Check(v.stage == btfchat::SW_CANCELLED && h2.Count("coinauditcontract") == 0,
+                       "a lock time long past is refused without an audit that would rescan the other chain") ? 0 : 1;
+
+        // A good time lock, paid by a coinbase.
+        c.nLockTime = nNow + 47 * 3600;
+        k = swap::BuildContract(c);
+        sw["thC"] = HexStr(k.begin(), k.end(), false);
+        EngineHost h3;
+        h3.answers["coinauditcontract"] = { { "recipientIsMine", true }, { "recipient", "Lmine" }, { "secretHash", hash },
+                                            { "unspent", true }, { "confirmations", 40 }, { "amount", 2.0 },
+                                            { "secondsUntilRefund", 47 * 3600 }, { "coinbase", true } };
+        btfchat::SwapEngine e3(&h3);
+        e3.FromJson(EngineState(sw));
+        e3.Round();
+        v = EngineView(e3);
+        nFail += Check(v.stage == btfchat::SW_CANCELLED && v.status.find("coinbase") != std::string::npos,
+                       "a contract paid by a coinbase is refused") ? 0 : 1;
+        h3.answers["coinauditcontract"]["coinbase"] = false;
+        btfchat::SwapEngine e4(&h3);
+        e4.FromJson(EngineState(sw));
+        e4.Round();
+        v = EngineView(e4);
+        nFail += Check(v.stage == btfchat::SW_READY_TO_LOCK, "the same contract paid normally checks out") ? 0 : 1;
+
+        // ---- H1: the taker gives BTF; the Bitflash chain crawls.
+        h3.answers["coinswapinfo"] = { { "backend", "core" } };
+        h3.answers["getinfo"] = { { "mediantime", nNow - 2 * 3600 } };
+        h3.answers["swapparticipate"] = { { "contract", "aa" }, { "contractTxid", std::string(64, '9') },
+                                          { "secretHash", hash } };
+        std::string err;
+        e4.Approve(id, err);
+        e4.Round();
+        v = EngineView(e4);
+        nFail += Check(h3.Count("swapparticipate") == 0 && v.stage == btfchat::SW_READY_TO_LOCK &&
+                       v.status.find("slow") != std::string::npos,
+                       "a taker giving BTF does not lock while the chain's median time is two hours behind") ? 0 : 1;
+        h3.answers["getinfo"] = { { "mediantime", nNow - 600 } };
+        h3.fSaveOk = false;
+        e4.Round();
+        nFail += Check(h3.Count("swapparticipate") == 0, "nor while the chat store cannot be saved") ? 0 : 1;
+        h3.fSaveOk = true;
+        e4.Round();
+        v = EngineView(e4);
+        nlohmann::json p = h3.Last("swapparticipate");
+        nFail += Check(h3.Count("swapparticipate") == 1 && v.stage == btfchat::SW_LOCKED,
+                       "with the chain at its pace and the store saved, it locks") ? 0 : 1;
+        nFail += Check(p.is_array() && p.size() == 5 && p[3].is_null() && p[4] == id,
+                       "the standard lock, named in the wallet's journal by the swap's id") ? 0 : 1;
+    }
+
+    // ---- H2: a lock call that gives no answer
+    {
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", true }, { "give", "BTF" }, { "ga", 100000000 },
+                              { "want", "LTC" }, { "wa", 200000000 }, { "theirRecv", "Btheirs" }, { "myRecv", "Lmine" },
+                              { "stage", (int)btfchat::SW_TAKE_RECEIVED }, { "ok", true }, { "created", nNow } };
+        EngineHost h;
+        h.answers["coinswapinfo"] = { { "backend", "core" } };
+        h.errors["swapinitiate"] = "the wallet is not answering on 127.0.0.1:18432";
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        e.FromJson(EngineState(sw));
+        e.Round();
+        btfchat::SwapView v = EngineView(e);
+        nFail += Check(h.savedAtLock.find("\"lockTried\":true") != std::string::npos,
+                       "the store said a lock was under way before the wallet was asked for it") ? 0 : 1;
+        // Their cancel arrives while nobody knows whether ours was paid.
+        {
+            btfchat::LogEntry le;
+            le.from = "them"; le.kind = btfchat::MSG_SWAP; le.id = std::string(32, '7'); le.outgoing = false;
+            le.text = "{\"s\":\"" + id + "\",\"step\":\"cancel\",\"why\":\"no lock1\"}";
+            h.convo.push_back(le);
+            h.answers["swaplookup"] = { { "state", "intent" } };
+            e.Round();
+            h.convo.clear();
+            v = EngineView(e);
+            nFail += Check(v.stage == btfchat::SW_TAKE_RECEIVED,
+                           "a cancel from them does not end a swap whose lock is still unresolved") ? 0 : 1;
+            h.answers.erase("swaplookup");
+        }
+        std::string err;
+        nFail += Check(h.Count("swapinitiate") == 1 && !v.fCanCancel && !e.Cancel(id, err),
+                       "no answer to the lock: the swap cannot be called off while that is unknown") ? 0 : 1;
+        nlohmann::json p = h.Last("swapinitiate");
+        nFail += Check(p.is_array() && p.size() == 4 && p[3] == id, "the lock was asked for under the swap's id") ? 0 : 1;
+        h.errors.clear();
+        h.answers["swaplookup"] = { { "state", "funded" }, { "contract", "bb" }, { "contractTxid", std::string(64, '8') },
+                                    { "secret", secret }, { "secretHash", hash } };
+        e.Round();
+        e.FromJson(e.ToJson());
+        v = EngineView(e);
+        nFail += Check(v.stage == btfchat::SW_LOCKED && v.myTxid == std::string(64, '8') && h.Count("swapinitiate") == 1,
+                       "the journal says it was paid: that lock is the swap's, and no second one is made") ? 0 : 1;
+        nFail += Check(e.ToJson().find(secret) != std::string::npos, "with its secret kept") ? 0 : 1;
+
+        EngineHost h2;
+        h2.answers["coinswapinfo"] = { { "backend", "core" } };
+        h2.errors["swapinitiate"] = "send failed: insufficient balance once the fee is counted";
+        btfchat::SwapEngine e2(&h2);
+        e2.FromJson(EngineState(sw));
+        e2.Round();
+        h2.answers["swaplookup"] = { { "state", "failed" } };
+        e2.Round();
+        v = EngineView(e2);
+        nFail += Check(v.fCanCancel && e2.Cancel(id, err), "the journal says nothing went out: it can be called off") ? 0 : 1;
+
+        EngineHost h3;
+        h3.answers["coinswapinfo"] = { { "backend", "core" } };
+        h3.fSaveOk = false;
+        btfchat::SwapEngine e3(&h3);
+        e3.FromJson(EngineState(sw));
+        e3.Round();
+        v = EngineView(e3);
+        nFail += Check(h3.Count("swapinitiate") == 0 && v.status.find("cannot be saved") != std::string::npos,
+                       "no lock while the chat store cannot be saved") ? 0 : 1;
+    }
+
+    // ---- M2: a light refund is over in a block, and sent again with a higher fee
+    {
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false }, { "give", "BTC" }, { "ga", 1000000 },
+                              { "want", "BTF" }, { "wa", 100000000 }, { "btcDestination", "bcrt1qdestination" },
+                              { "hash", hash }, { "myC", "33" }, { "myTx", std::string(64, '3') }, { "myN", 1 },
+                              { "thC", "44" }, { "thTx", std::string(64, '4') },
+                              { "stage", (int)btfchat::SW_LOCKED }, { "ok", true }, { "sent", true }, { "created", nNow } };
+        EngineHost h;
+        h.answers["btcfindsecret"] = { { "spent", false } };
+        h.answers["btcauditcontract"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+        h.answers["btcrefund"] = { { "txid", std::string(64, 'f') }, { "feeRatePerKvB", 0.0001 }, { "awaitingConfirmation", true } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(EngineState(sw));
+        e.Round();
+        e.Round();
+        btfchat::SwapView v = EngineView(e);
+        nFail += Check(h.Count("btcrefund") == 1 && v.stage == btfchat::SW_REFUNDING,
+                       "a light refund sent is not the end, and not sent twice within the hour") ? 0 : 1;
+        btfchat::SwapConfig quick;
+        quick.nRedeemBumpAfter = 0;
+        btfchat::SwapEngine e2(&h, quick);
+        e2.FromJson(e.ToJson());
+        e2.Round();
+        nlohmann::json p = h.Last("btcrefund");
+        nFail += Check(h.Count("btcrefund") == 2 && p.size() == 4 && p[3] == "0.00020000",
+                       "still in no block: sent again at twice the fee rate") ? 0 : 1;
+        h.answers["btcfindsecret"] = { { "spent", true }, { "secret", secret } };
+        e2.Round();
+        v = EngineView(e2);
+        nFail += Check(v.stage == btfchat::SW_REDEEMING, "outbid by their redeem: the secret is ours, theirs is taken") ? 0 : 1;
+
+        btfchat::SwapEngine e3(&h);
+        e3.FromJson(e.ToJson());
+        h.answers["btcfindsecret"] = { { "spent", true }, { "refunded", true }, { "confirmed", true }, { "spendConfirmations", 1 } };
+        h.answers["swapauditcontract"] = { { "unspent", true }, { "secondsUntilRefund", 3600 } };
+        e3.Round();
+        v = EngineView(e3);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "our refund one block deep: still watching for the secret") ? 0 : 1;
+        h.answers["btcfindsecret"]["spendConfirmations"] = 2;
+        e3.Round();
+        v = EngineView(e3);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING, "deep enough, but their lock still runs: still watching") ? 0 : 1;
+        h.answers["swapauditcontract"] = { { "unspent", true }, { "secondsUntilRefund", 0 } };
+        e3.Round();
+        v = EngineView(e3);
+        nFail += Check(v.stage == btfchat::SW_REFUNDED, "deep enough and their lock open: refunded") ? 0 : 1;
+    }
+
+    // ---- M3: a maker whose redeem lost the race refunds its own
+    {
+        swap::Contract c;
+        c.recipientPkh.assign(20, 0x11); c.refundPkh.assign(20, 0x22); c.secretHash = ParseHex(hash);
+        c.nLockTime = nNow + 6 * 3600;
+        CScript k = swap::BuildContract(c);
+        std::string theirs = HexStr(k.begin(), k.end(), false);
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", true }, { "give", "BTF" }, { "ga", 100000000 },
+                              { "want", "BTC" }, { "wa", 1000000 }, { "btcDestination", "bcrt1qdestination" },
+                              { "secret", secret }, { "hash", hash }, { "myC", "22" }, { "myTx", std::string(64, '2') },
+                              { "thC", theirs }, { "thTx", std::string(64, '1') }, { "thN", 0 },
+                              { "stage", (int)btfchat::SW_REDEEMING }, { "rsince", nNow - 60 }, { "created", nNow } };
+        EngineHost h;
+        h.answers["btcfindsecret"] = { { "spent", true }, { "refunded", true }, { "confirmed", true } };
+        h.answers["swapauditcontract"] = { { "unspent", true }, { "secondsUntilRefund", 3600 } };
+        btfchat::SwapEngine e(&h);
+        e.FromJson(EngineState(sw));
+        e.Round();
+        btfchat::SwapView v = EngineView(e);
+        nFail += Check(v.stage == btfchat::SW_REFUNDING,
+                       "their contract refunded under the maker's redeem: the maker goes on to refund its own, not FAILED") ? 0 : 1;
+    }
+
+    // ---- L5: the destination is checked by the wallet
+    {
+        nlohmann::json sw = { { "id", id }, { "peer", "them" }, { "maker", false }, { "give", "BTC" }, { "ga", 1000000 },
+                              { "want", "BTF" }, { "wa", 100000000 }, { "stage", (int)btfchat::SW_TAKE_SENT }, { "created", nNow } };
+        EngineHost h;
+        btfchat::SwapEngine e(&h);
+        e.FromJson(EngineState(sw));
+        nFail += Check(!e.SetBitcoinDestination(id, "bc1q not an address"), "an address with spaces in it is not kept") ? 0 : 1;
+        nFail += Check(e.SetBitcoinDestination(id, "bcrt1qdestination") && EngineView(e).btcDestination == "bcrt1qdestination",
+                       "a plausible one is") ? 0 : 1;
+        nFail += Check(h.Count("btcvalidatedestination") == 0, "without a wallet call that could freeze the screen") ? 0 : 1;
+        // The round checks it with the wallet before anything is locked.
+        nlohmann::json sw2 = sw;
+        sw2["maker"] = true; sw2["stage"] = (int)btfchat::SW_TAKE_RECEIVED; sw2["ok"] = true;
+        sw2["btcDestination"] = "bcrt1qwrongnetwork"; sw2["give"] = "BTF"; sw2["want"] = "BTC";
+        sw2["ga"] = 100000000; sw2["wa"] = 1000000; sw2["myRecv"] = "mvMine";
+        EngineHost h2;
+        h2.answers["btcswapinfo"] = { { "backend", "light" } };
+        h2.errors["btcvalidatedestination"] = "not an address of this network";
+        btfchat::SwapEngine e2(&h2);
+        e2.FromJson(EngineState(sw2));
+        e2.Round();
+        btfchat::SwapView v2 = EngineView(e2);
+        nFail += Check(h2.Count("swapinitiate") == 0 && v2.fNeedsMe && v2.status.find("receiving address") != std::string::npos,
+                       "an address the wallet refuses stops the lock, and the person is asked again") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=chat-store-save -- the chat store is replaced in one step, private,
+// a failed save is reported and leaves the old store, and a store left only as
+// btfchat.dat.new by an older version's interrupted save is read (M5).
+static int RunChatStoreSaveSelfTest()
+{
+    printf("chat-store-save self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+    std::string err;
+    nFail += Check(SetHDSeedFromMnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", err),
+                   "a phrase installs") ? 0 : 1;
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err), "the chat opens") ? 0 : 1;
+    std::string strAddr = btfchat::ChatAddress();
+    std::string strFile = btfchat::ChatStorePath();
+    nFail += Check(btfchat::ChatSaveStore(&err) && !SwapTestReadFile(strFile).empty() && !FileExists((strFile + ".new").c_str()),
+                   "a save puts the store in place, nothing left beside it") ? 0 : 1;
+#ifndef _WIN32
+    struct stat st;
+    nFail += Check(stat(strFile.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "and only its owner can read it") ? 0 : 1;
+#endif
+    std::string strBefore = SwapTestReadFile(strFile);
+    std::string blocker = strFile + ".new";
+#ifdef _WIN32
+    CreateDirectoryA(blocker.c_str(), NULL);
+#else
+    mkdir(blocker.c_str(), 0700);
+#endif
+    err.clear();
+    nFail += Check(!btfchat::ChatSaveStore(&err) && !err.empty(), "a save that cannot be written says so") ? 0 : 1;
+    nFail += Check(SwapTestReadFile(strFile) == strBefore, "and the store on the disk is left as it was") ? 0 : 1;
+#ifdef _WIN32
+    RemoveDirectoryA(blocker.c_str());
+#else
+    rmdir(blocker.c_str());
+#endif
+    nFail += Check(btfchat::ChatSaveStore(&err), "once it can be written, it saves again") ? 0 : 1;
+    btfchat::ChatLock();
+
+    // What an interrupted save of an older version left: only the new copy.
+    std::string strStore = SwapTestReadFile(strFile);
+    remove(strFile.c_str());
+    WriteFileAtomicPrivate(strFile + ".new", strStore, err);
+    nFail += Check(btfchat::ChatUnlock("senha-bem-comprida", err) && btfchat::ChatAddress() == strAddr,
+                   "a store left only as btfchat.dat.new opens") ? 0 : 1;
+    btfchat::ChatLock();
+    nFail += Check(!btfchat::ChatSaveStore(&err) && err.find("locked") != std::string::npos,
+                   "a locked chat saves nothing, and says why") ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=wallet-final -- a transaction with a unix-time nLockTime (a
+// time-locked refund, an atomic swap's) is counted and spent by the wallet
+// once a block holds it. The 0.1.0 rule (nLockTime < nBestHeight) never
+// called it final, and such a refund vanished from balance and coin choice.
+static int RunWalletFinalSelfTest()
+{
+    printf("wallet-final self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+    std::vector<unsigned char> vchKey = GetKeyFromPool();
+    nFail += Check(!vchKey.empty(), "a key of this wallet") ? 0 : 1;
+    CScript script;
+    script << vchKey << OP_CHECKSIG;
+
+    // A refund: input non-final (nSequence 0), nLockTime a unix time.
+    CWalletTx wtx;
+    wtx.vin.resize(1);
+    wtx.vin[0].prevout = COutPoint(uint256(4242), 0);
+    wtx.vin[0].nSequence = 0;
+    wtx.vout.push_back(CTxOut(5 * COIN, script));
+    wtx.nLockTime = 1800000000;
+
+    // A block of the main chain that holds it (a one-transaction block:
+    // the merkle root is the transaction's hash).
+    CBlockIndex* pSavedBest = pindexBest;
+    int nSavedHeight = nBestHeight;
+    CBlockIndex* p = new CBlockIndex();
+    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.insert(std::make_pair(uint256(777777), p)).first;
+    p->phashBlock = &mi->first;
+    p->nHeight = 10;
+    p->nTime = 1700000000;      // its median time is before the lock
+    p->hashMerkleRoot = wtx.GetHash();
+    pindexBest = p;
+    nBestHeight = 10;
+    wtx.hashBlock = mi->first;
+    wtx.nIndex = 0;
+
+    nFail += Check(!wtx.IsFinal(), "the 0.1.0 rule calls a confirmed time-locked refund not final") ? 0 : 1;
+    nFail += Check(wtx.GetDepthInMainChain() == 1 && wtx.IsFinalForWallet(), "in a block of the main chain it is final for the wallet") ? 0 : 1;
+    uint256 hash = wtx.GetHash();
+    CRITICAL_BLOCK(cs_mapWallet)
+        mapWallet[hash] = wtx;
+    nFail += Check(GetBalance() == 5 * COIN, "it counts in the balance") ? 0 : 1;
+    std::set<CWalletTx*> coins;
+    nFail += Check(SelectCoins(COIN, coins) && coins.size() == 1 && (*coins.begin())->GetHash() == hash,
+                   "and coin selection spends it") ? 0 : 1;
+
+    // Not in a block, and the next block's median time before the lock: not yet.
+    CWalletTx loose = wtx;
+    loose.hashBlock = 0;
+    loose.nIndex = -1;
+    nFail += Check(!loose.IsFinalForWallet(), "the same refund outside a block, before its lock, is not final yet") ? 0 : 1;
+    CWalletTx plain = loose;
+    plain.nLockTime = 0;
+    nFail += Check(plain.IsFinalForWallet(), "an ordinary transaction is final as before") ? 0 : 1;
+
+    CRITICAL_BLOCK(cs_mapWallet)
+        mapWallet.erase(hash);
+    mapBlockIndex.erase(mi);
+    delete p;
+    pindexBest = pSavedBest;
+    nBestHeight = nSavedHeight;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=swap-rpc -- the lock RPCs through the node's own JSON-RPC server,
+// on a test network wallet with nothing in it: the lock is a time 48 or 18
+// hours out, its intent (and the secret) is in swaps.log before the send that
+// fails, a tag answers for its lock, and a journal that cannot be written
+// stops the lock before anything is sent.
+static int RunSwapRpcSelfTest()
+{
+    printf("swap-rpc self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock wsa;
+#endif
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("could not make a temp datadir\n");
+        return 1;
+    }
+    SelectChainParams(true);       // swaps are open on the test network
+    strSetDataDir = tmp;
+    if (!LoadWallet())
+    {
+        printf("LoadWallet failed\n");
+        return 1;
+    }
+    {
+        // An empty transaction index, so a send gets as far as the wallet's
+        // own refusal (no coins) instead of failing to open the database.
+        CTxDB txdb("cr");
+    }
+    int nPort = FreeLoopbackPort();
+    if (!JsonRpcConfigureCookie(strprintf("%d", nPort)) || _beginthread(ThreadJsonRpcServer, 0, NULL) == -1)
+    {
+        printf("could not start the RPC server\n");
+        return 1;
+    }
+    Sleep(500);
+    LoopbackRpc to;
+    to.nPort = nPort;
+    std::string err;
+    if (!ReadRpcCookie(GetAppDir() + "/.cookie", to.strAuth, err))
+    {
+        printf("no cookie: %s\n", err.c_str());
+        return 1;
+    }
+    auto call = [&](const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& e) {
+        return LoopbackRpcCall(to, method, params, r, e);
+    };
+    auto lines = [&]() {
+        std::vector<nlohmann::json> v;
+        std::string e;
+        swap::JournalRead(v, e);
+        return v;
+    };
+    nlohmann::json r;
+    nlohmann::json addr;
+    call("getnewaddress", nlohmann::json::array(), addr, err);
+    nFail += Check(addr.is_string(), "a Bitflash address of the wallet") ? 0 : 1;
+
+    // No chain yet, so rules v3 are not locked in: refused before anything
+    // is made or written.
+    bool fGuard = call("swapinitiate", nlohmann::json::array({ addr, "1", nullptr, "rpc-guard" }), r, err);
+    std::vector<nlohmann::json> v0;
+    std::string e0;
+    swap::JournalRead(v0, e0);
+    nFail += Check(!fGuard && err.find("rules v3 locked in") != std::string::npos && v0.empty(),
+                   "before rules v3 are locked in by median time, no lock and no journal line") ? 0 : 1;
+    // A tip whose median time is now: past the test network's switch.
+    CBlockIndex* pTip = new CBlockIndex();
+    std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.insert(std::make_pair(uint256(888888), pTip)).first;
+    pTip->phashBlock = &miTip->first;
+    pTip->nHeight = 1;
+    pTip->nTime = (unsigned int)GetTime();
+    pindexBest = pTip;
+    nBestHeight = 1;
+
+    int64_t nNow = GetTime();
+    bool fOk = call("swapinitiate", nlohmann::json::array({ addr, "1", nullptr, "rpc-t1" }), r, err);
+    nFail += Check(!fOk && err.find("send failed") != std::string::npos, "an empty wallet cannot pay the lock") ? 0 : 1;
+    if (fOk || err.find("send failed") == std::string::npos)
+        printf("       (%s)\n", fOk ? "it was paid" : err.c_str());
+    std::vector<nlohmann::json> v = lines();
+    nlohmann::json intent, failed;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t1")
+            (v[i].value("state", "") == "intent" ? intent : failed) = v[i];
+    nFail += Check(intent.is_object() && intent.value("secret", "").size() == 64 && intent.value("chain", "") == "btf",
+                   "the intent, with the secret, was written before the send") ? 0 : 1;
+    int64_t nLock = intent.value("lockTime", (int64_t)0);
+    nFail += Check(nLock >= (int64_t)LOCKTIME_THRESHOLD && nLock >= nNow + swap::BTF_INITIATOR_LOCK_SECS - 3600 &&
+                   nLock <= GetTime() + swap::BTF_INITIATOR_LOCK_SECS,
+                   "the initiator's lock is a time, 48 hours out") ? 0 : 1;
+    nFail += Check(failed.is_object() && failed.value("state", "") == "failed", "and the failed send is recorded after it") ? 0 : 1;
+    nFail += Check(call("swaplookup", nlohmann::json::array({ "rpc-t1" }), r, err) && r.value("state", "") == "failed",
+                   "swaplookup says nothing was paid") ? 0 : 1;
+    nFail += Check(call("swaplookup", nlohmann::json::array({ "rpc-none" }), r, err) && r.value("state", "") == "none",
+                   "and knows no lock under a tag never used") ? 0 : 1;
+    fOk = call("swapinitiate", nlohmann::json::array({ addr, "2", nullptr, "rpc-t1" }), r, err);
+    nFail += Check(!fOk && err.find("different swap lock") != std::string::npos,
+                   "a tag already used names that lock only: other terms are refused") ? 0 : 1;
+
+    std::string hash(64, 'c');
+    fOk = call("swapparticipate", nlohmann::json::array({ addr, "1", hash, nullptr, "rpc-t2" }), r, err);
+    v = lines();
+    int64_t nLock2 = 0;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t2" && v[i].value("state", "") == "intent")
+            nLock2 = v[i].value("lockTime", (int64_t)0);
+    nFail += Check(!fOk && nLock2 >= nNow + swap::BTF_PARTICIPANT_LOCK_SECS - 3600 && nLock2 <= GetTime() + swap::BTF_PARTICIPANT_LOCK_SECS,
+                   "the participant's lock is a time, 18 hours out") ? 0 : 1;
+    fOk = call("swapinitiate", nlohmann::json::array({ addr, "1", 600, "rpc-t4" }), r, err);
+    v = lines();
+    int64_t nLock4 = 0;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t4" && v[i].value("state", "") == "intent")
+            nLock4 = v[i].value("lockTime", (int64_t)0);
+    nFail += Check(nLock4 >= nNow + 600 - 60 && nLock4 <= GetTime() + 600, "on the test network a shorter lock, in seconds") ? 0 : 1;
+
+    // swaps.log cannot be replaced: refused before any send.
+    std::string blocker = swap::JournalPath() + ".new";
+#ifdef _WIN32
+    CreateDirectoryA(blocker.c_str(), NULL);
+#else
+    mkdir(blocker.c_str(), 0700);
+#endif
+    fOk = call("swapinitiate", nlohmann::json::array({ addr, "1", nullptr, "rpc-t3" }), r, err);
+    nFail += Check(!fOk && err.find("nothing was sent") != std::string::npos,
+                   "a journal that cannot be written stops the lock before anything is sent") ? 0 : 1;
+#ifdef _WIN32
+    RemoveDirectoryA(blocker.c_str());
+#else
+    rmdir(blocker.c_str());
+#endif
+    v = lines();
+    bool fT3 = false;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t3")
+            fT3 = true;
+    nFail += Check(!fT3, "and nothing about that lock is in the journal") ? 0 : 1;
 
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
@@ -11702,6 +12629,20 @@ int RunSelfTest(const std::string& name)
         return RunChatSwapSelfTest();
     if (name == "swap-wait-payment")
         return RunSwapWaitPaymentSelfTest();
+    if (name == "swap-timelock")
+        return RunSwapTimelockSelfTest();
+    if (name == "swap-journal")
+        return RunSwapJournalSelfTest();
+    if (name == "swap-parse")
+        return RunSwapParseSelfTest();
+    if (name == "swap-engine")
+        return RunSwapEngineSelfTest();
+    if (name == "chat-store-save")
+        return RunChatStoreSaveSelfTest();
+    if (name == "wallet-final")
+        return RunWalletFinalSelfTest();
+    if (name == "swap-rpc")
+        return RunSwapRpcSelfTest();
     if (name == "fee-policy")
         return RunFeePolicySelfTest();
     if (name == "invoice")
@@ -11734,6 +12675,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
     return 1;
 }

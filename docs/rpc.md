@@ -79,8 +79,9 @@ null.
 | `gettreasuryinfo` | — | `configured`, `network`, `page`; when configured: `required`, `keys`, the `script` decoded, `howToPay`, this node's `treasuryShare` and `poolFeeTo` |
 | `donate` | `amount` | txid of a transaction paying the treasury; the same as `sendtoaddress treasury <amount>` |
 | `sendburn` | `amount`, `datahex` | txid of a transaction burning `amount` into an OP_RETURN carrying the data (1 to 80 bytes): a public community listing, for one |
-| `swapinitiate` | `address`, `amount` | starts an atomic swap: contract, its address and txid, the **secret**, its hash, the lock -- `docs/atomic-swaps.md` |
-| `swapparticipate` | `address`, `amount`, `secrethash` | the other half: contract under someone else's secret hash |
+| `swapinitiate` | `address`, `amount`, [`lockseconds` (testnet) \| null], [`tag`] | starts an atomic swap: contract, its address and txid, the **secret**, its hash, the lock (a time, 48 h on) -- written to `swaps.log` before it is paid; asked again under the same tag, the same lock -- `docs/atomic-swaps.md` |
+| `swapparticipate` | `address`, `amount`, `secrethash`, [`lockseconds` \| null], [`tag`] | the other half: contract under someone else's secret hash (18 h) |
+| `swaplookup` | `tag` | what `swaps.log` knows of the lock named `tag` on any chain: `none`, `intent`, `failed`, `unpaid`, `funded` or `made` |
 | `swapauditcontract` | `contract`, `txid` | the terms of a contract and whether it pays this wallet |
 | `swapredeem` | `contract`, `txid`, `secret` | takes the coins with the secret |
 | `swaprefund` | `contract`, `txid` | takes them back after the lock |

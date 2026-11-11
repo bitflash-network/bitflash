@@ -31,17 +31,21 @@ int main()
               back.giveAmount == o.giveAmount && back.wantAmount == o.wantAmount && back.note == o.note,
               "an offer round-trips");
         CHECK(DescribeSwapOffer(o) == "100 BTF for 0.0015 BTC", "and reads as '100 BTF for 0.0015 BTC'");
-        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
               "BTF for BTF is not a swap");
-        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":1,\"want\":\"ETH\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":1,\"want\":\"ETH\",\"wa\":1}", back, err),
               "a coin this build does not swap is refused");
-        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":0,\"want\":\"BTC\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":0,\"want\":\"BTC\",\"wa\":1}", back, err),
               "nothing for something is refused");
-        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":2100000000000001,\"want\":\"BTC\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":2100000000000001,\"want\":\"BTC\",\"wa\":1}", back, err),
               "more than 21 million is refused");
-        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":1.5,\"want\":\"BTC\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":1.5,\"want\":\"BTC\",\"wa\":1}", back, err),
               "an amount is whole satoshis, never a float");
         CHECK(!ParseSwapOffer("100 BTF for 0.0015 BTC", back, err), "free text is not an offer");
+        CHECK(!ParseSwapOffer("{\"give\":\"BTF\",\"ga\":100000000,\"want\":\"BTC\",\"wa\":100000}", back, err),
+              "an offer without the protocol version (an older Bitflash) is refused");
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":5,\"ga\":100000000,\"want\":\"BTC\",\"wa\":100000}", back, err),
+              "a coin that is not text is refused, not thrown");
         o.note = std::string(MAX_SWAP_NOTE + 1, 'x');
         CHECK(!ParseSwapOffer(FormatSwapOffer(o), back, err), "a note past the limit is refused");
     }
@@ -52,11 +56,11 @@ int main()
         t.swap = std::string(32, 'a');
         t.step = "take";
         t.offer = std::string(32, 'b');
-        t.terms.give = "BTF"; t.terms.giveAmount = 5; t.terms.want = "BTC"; t.terms.wantAmount = 7;
+        t.terms.give = "BTF"; t.terms.giveAmount = 500000000; t.terms.want = "BTC"; t.terms.wantAmount = 700000;
         t.to = BTF_ADDR;
         SwapStep back;
         CHECK(ParseSwapStep(FormatSwapStep(t), back, err) && back.step == "take" && back.offer == t.offer &&
-              back.terms.giveAmount == 5 && back.to == BTF_ADDR, "a take round-trips");
+              back.terms.giveAmount == 500000000 && back.to == BTF_ADDR, "a take round-trips");
         t.to = BTC_ADDR;
         CHECK(!ParseSwapStep(FormatSwapStep(t), back, err),
               "a take whose address is for the wrong coin is refused (paid in BTF, it needs a B address)");
@@ -152,15 +156,15 @@ int main()
         CHECK(DescribeSwapOffer(back) == "1234.56 XEC for 1 BTF", "the offer counts XEC to two places");
         o.give = "BCH"; o.giveAmount = 200000000;
         CHECK(ParseSwapOffer(FormatSwapOffer(o), back, err) && back.give == "BCH", "an offer of BCH for BTF");
-        CHECK(!ParseSwapOffer("{\"give\":\"BCH\",\"ga\":1,\"want\":\"XEC\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"BCH\",\"ga\":1,\"want\":\"XEC\",\"wa\":1}", back, err),
               "one side of an offer is Bitflash, on these chains too");
-        CHECK(!ParseSwapOffer("{\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
               "one side of an offer is always BTF");
-        CHECK(!ParseSwapOffer("{\"give\":\"RVN\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
-              "a chain this wallet does not know is refused");
-        CHECK(!ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":1999999,\"want\":\"BTF\",\"wa\":1}", back, err) &&
-              !ParseSwapOffer("{\"give\":\"BTF\",\"ga\":1,\"want\":\"DOGE\",\"wa\":1999999}", back, err) &&
-              ParseSwapOffer("{\"give\":\"DOGE\",\"ga\":2000000,\"want\":\"BTF\",\"wa\":1}", back, err),
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"RVN\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
+              "a Ravencoin amount under its floor is refused");
+        CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"DOGE\",\"ga\":1999999,\"want\":\"BTF\",\"wa\":1}", back, err) &&
+              !ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":100000000,\"want\":\"DOGE\",\"wa\":1999999}", back, err) &&
+              ParseSwapOffer("{\"v\":2,\"give\":\"DOGE\",\"ga\":2000000,\"want\":\"BTF\",\"wa\":100000000}", back, err),
               "a Dogecoin contract under 0.02 DOGE could not be spent");
         SwapStep l, step;
         l.swap = std::string(32, 'c'); l.step = "lock1"; l.chain = "LTC"; l.contract = "00"; l.txid = std::string(64, 'a');

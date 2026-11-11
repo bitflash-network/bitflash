@@ -362,8 +362,19 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
         return false;
     }
 
-    if (!CheckFields(f, errOut))
+    // The field checks run before the signature, on whatever a stranger sent.
+    // They parse offers and swap steps; none of that may throw out of here
+    // and take the thread reading the mailbox with it.
+    try
+    {
+        if (!CheckFields(f, errOut))
+            return false;
+    }
+    catch (...)
+    {
+        errOut = "the frame has a field of the wrong type";
         return false;
+    }
 
     // The sender's key comes from the address, never from the frame. A frame
     // that carried its own public key would let anyone sign as anyone and point
