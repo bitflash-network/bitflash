@@ -13,6 +13,7 @@ and none of it needs an account.
 | every night (GitHub) | ClusterFuzzLite, one hour per sanitizer, corpus kept between runs | `.github/workflows/cflite.yml` |
 | every Monday (GitHub) | CodeQL over `main` | `.github/workflows/codeql.yml` |
 | before a release, or by hand | the full pass below: every tool, every sanitizer, three fuzzing engines | `scripts/audit/run-audit.sh` |
+| by hand on GitHub (Actions, "Audit campaign") | every harness under every engine in parallel, up to 6 h a job, corpora kept between runs; coverage per harness; the self-tests under ASan+UBSan, TSan and Valgrind | `.github/workflows/audit-campaign.yml`, `scripts/audit/ci-fuzz.sh` |
 
 CodeQL and ClusterFuzzLite report into the repository's **Security** tab
 (code scanning alerts). The full pass writes to a directory of its own; read
@@ -98,7 +99,7 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Four harnesses in `src/`:
+Five harnesses in `src/`:
 
 | target | what it feeds |
 |---|---|
@@ -106,6 +107,7 @@ Four harnesses in `src/`:
 | `fuzz-script` | one script through the parser, the standard-form extractors and `EvalScript` |
 | `fuzz-sigcheck` | signatures and keys into OpenSSL and libsecp256k1 side by side; any disagreement is a crash |
 | `fuzz-light-pow` | headers and histories into the DigiByte and Ravencoin difficulty and proof-of-work checks |
+| `fuzz-p2p-payload` | one message and its payload straight into `ProcessMessage()`, as from a peer past the version handshake: `block`, `tx`, `inv`, `getdata`, `getblocks`, the chat and P2Pool messages. The envelope checksum no fuzzer can forge is behind it, and a flag recomputes a block's merkle root. The node keeps its chain between inputs, and in this binary alone (`-DBITFLASH_FUZZ`, `fFuzzSkipPoW`) the RandomX comparison is skipped, so block acceptance, connection and reorganisation are reached; every other check runs as released |
 
 Each runs under **libFuzzer**, **AFL++** and **honggfuzz** in turn, all three
 with AddressSanitizer and UndefinedBehaviorSanitizer. They share one corpus

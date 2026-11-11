@@ -1,0 +1,209 @@
+name: Audit campaign
+
+# Long fuzzing and the instrumented self-test passes, by hand, on GitHub's
+# runners: every harness under every engine in parallel, the corpora kept
+# between runs (cache, plus an artifact per run), crashes and coverage
+# uploaded. docs/AUDIT.md says what each check is and records where each
+# result ran.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Fuzzing time per job, in seconds (a job may run 6 h at most)"
+        default: "19800"
+      targets:
+        description: "Harnesses, space separated (empty = all)"
+        default: ""
+      engines:
+        description: "Engines, space separated: libfuzzer afl hfuzz"
+        default: "libfuzzer afl hfuzz"
+      selftests:
+        description: "Also run the self-tests under ASan+UBSan, TSan and Valgrind"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-campaign-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      targets: ${{ steps.m.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: m
+        env:
+          IN_TARGETS: ${{ inputs.targets }}
+          IN_ENGINES: ${{ inputs.engines }}
+        run: |
+          all=$(sed -n 's/^TARGETS="\(.*\)"$/\1/p' scripts/audit/run-audit.sh)
+          targets=${IN_TARGETS:-$all}
+          python3 - "$targets" "$IN_ENGINES" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          t = sys.argv[1].split()
+          e = sys.argv[2].split()
+          for x in e:
+              assert x in ("libfuzzer", "afl", "hfuzz"), x
+          print("matrix=" + json.dumps({"target": t, "engine": e}))
+          print("targets=" + json.dumps(t))
+          PY
+
+  fuzz:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: fuzz ${{ matrix.target }} / ${{ matrix.engine }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies
+        run: make deps-linux
+      - name: AFL++
+        if: matrix.engine == 'afl'
+        run: sudo apt-get install -y afl++
+      - name: honggfuzz 2.6
+        if: matrix.engine == 'hfuzz'
+        run: |
+          sudo apt-get install -y libunwind-dev libblocksruntime-dev binutils-dev
+          git clone -q --depth 1 --branch 2.6 https://github.com/google/honggfuzz.git "$RUNNER_TEMP/honggfuzz"
+          make -C "$RUNNER_TEMP/honggfuzz" -j"$(nproc)" > /dev/null
+          sudo make -C "$RUNNER_TEMP/honggfuzz" install > /dev/null
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}-${{ matrix.engine }}
+          restore-keys: corpus-${{ matrix.target }}-
+      - name: Fuzz
+        env:
+          FUZZ_SECS: ${{ inputs.seconds }}
+          CORPUS: corpus/${{ matrix.target }}
+          OUT: fuzz-out
+        run: scripts/audit/ci-fuzz.sh "${{ matrix.engine }}" "${{ matrix.target }}"
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}-${{ matrix.engine }}
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.target }}-${{ matrix.engine }}
+          path: corpus/${{ matrix.target }}
+          retention-days: 30
+      - name: Upload crashes and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ matrix.engine }}
+          path: |
+            fuzz-out/crashes
+            fuzz-out/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Fail on a crash
+        run: |
+          n=$(ls fuzz-out/crashes 2>/dev/null | wc -l)
+          echo "### ${{ matrix.target }} / ${{ matrix.engine }}: $n crash file(s), corpus $(ls corpus/${{ matrix.target }} | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$n" -eq 0 ]
+
+  # All engines' corpora per harness, minimised into one, saved for the next
+  # run, and replayed through a coverage build.
+  merge-and-coverage:
+    needs: [plan, fuzz]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    name: coverage ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies
+        run: make deps-linux
+      - name: llvm tools
+        run: sudo apt-get install -y llvm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: corpus-${{ matrix.target }}-*
+          path: in
+      - name: Merge and measure
+        env:
+          T: ${{ matrix.target }}
+        run: |
+          mkdir -p merged in
+          cd src
+          make -j"$(nproc)" "$T" > ../build-lf.log 2>&1 || { tail -40 ../build-lf.log; exit 1; }
+          ./"$T" -merge=1 ../merged ../in/* > ../merge.log 2>&1 || true
+          echo "merged corpus: $(ls ../merged | wc -l) inputs"
+          rm -rf obj-fuzz "$T"
+          make -j"$(nproc)" FUZZ_CXXFLAGS="\$(filter-out -O2,\$(CXXFLAGS)) -O1 -g -fsanitize=fuzzer-no-link -fprofile-instr-generate -fcoverage-mapping" \
+              FUZZ_LDFLAGS="-fsanitize=fuzzer -fprofile-instr-generate -fcoverage-mapping" "$T" > ../build-cov.log 2>&1 || { tail -40 ../build-cov.log; exit 1; }
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          LLVM_PROFILE_FILE="$RUNNER_TEMP/cov-%p.profraw" ./"$T" -runs=0 ../merged > ../replay.log 2>&1 || true
+          llvm-profdata merge -sparse "$RUNNER_TEMP"/cov-*.profraw -o ../cov.profdata
+          llvm-cov report "./$T" -instr-profile=../cov.profdata > ../coverage.txt
+          llvm-cov report -show-functions "./$T" -instr-profile=../cov.profdata main.cpp script.cpp net.cpp > ../coverage-functions.txt 2>/dev/null || true
+          { echo "### coverage, $T"; echo '```'; grep -E 'TOTAL|/(main|script|net|serialize|p2pool_net|p2pool_chain|btclight|btcswap|btfchatswap|nostr|tor|proxy|jsonrpc|base58|btfaddr|bip32|invoice)\.(cpp|h) ' ../coverage.txt | sed 's|.*/src/||'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save merged corpus
+        uses: actions/cache/save@v4
+        with:
+          path: merged
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}-merged
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.target }}
+          path: |
+            coverage.txt
+            coverage-functions.txt
+            merged
+          retention-days: 30
+
+  selftests:
+    if: inputs.selftests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [asan, tsan, valgrind]
+    name: self-tests under ${{ matrix.phase }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Build dependencies
+        run: make deps-linux
+      - name: Valgrind
+        if: matrix.phase == 'valgrind'
+        run: sudo apt-get install -y valgrind
+      - name: Run
+        env:
+          OUT: ${{ github.workspace }}/audit-out
+          J: "4"
+        run: scripts/audit/run-audit.sh "${{ matrix.phase }}"
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### ${{ matrix.phase }}"; echo '```'; cat audit-out/SUMMARY.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          grep -q ' 0 with a failure' audit-out/SUMMARY.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftests-${{ matrix.phase }}
+          path: audit-out
+          retention-days: 30

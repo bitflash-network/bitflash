@@ -37,6 +37,9 @@ jobs:
       - name: Run signature-verifier differential fuzz (OpenSSL vs libsecp256k1)
         run: make fuzz-sigcheck-smoke
 
+      - name: Run P2P payload fuzz smoke (block, tx, inv past the handshake)
+        run: make fuzz-p2p-payload-smoke
+
   windows-ucrt64:
     name: Windows UCRT64 selftests
     runs-on: windows-latest
