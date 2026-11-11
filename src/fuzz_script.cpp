@@ -6,8 +6,8 @@
 // OP_VER* invalid) and v4 (CSV, CTV, CSFS), all eight combinations, through
 // EvalScript, VerifyScriptP2SH and VerifySignature -- and with rules v5 (the
 // OP_CHECKMULTISIG key cap) on top of all three -- the call ConnectInputs
-// makes for the block, the miner and the pool alike. (main has no relay-only
-// script flags yet; when it gets them they belong in kFlagSets.)
+// makes for the block, the miner and the pool alike -- and with the pool's
+// relay policy (SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4) on the v4 sets.
 //
 // Every input is used twice.
 //
@@ -44,7 +44,8 @@
 //    Signatures are made last, over the script as it ends up, so they verify.
 //
 // Invariants, each an abort when broken:
-//  - rules v5 only take away, and only from OP_CHECKMULTISIG.
+//  - rules v5 only take away, and only from OP_CHECKMULTISIG; the relay policy
+//    only takes away, and only from the v4 opcodes.
 //  - rules v4 only adds: a spend that passes with v4 off passes with v4 on,
 //    leaving the same stack; with no v4 opcode in it the answer is the same.
 //  - with no CLTV or OP_VER* the v3 switch does not change EvalScript, and
