@@ -79,9 +79,10 @@ inline const char* BtfNetworkName() { return IsTestNet() ? "bitflash-testnet" : 
 // which is no protection at all for something a stranger can send unprompted.
 static const unsigned int MAX_PEX_DESCRIPTORS      = 20;
 static const unsigned int MAX_PEX_DESCRIPTOR_BYTES = 1024;
-// Ignore a peer's exchange more often than this. One announcement per side per
-// connection is the intended traffic; anything faster is someone else's idea.
-static const int64        PEX_MIN_INTERVAL         = 60;
+// One announcement per side per connection is the intended traffic, and all a
+// connection gets (ProcessBtfPeers in main.cpp): this used to allow one a
+// minute, which a peer that stayed connected could use to keep churning the
+// cache.
 
 // How long to sit registered at a rendezvous relay before giving up on this
 // attempt and registering again. Bounded because a registration socket that
@@ -132,6 +133,73 @@ static const int          BTF_HANDSHAKE_GRACE_SECS = 60;
 // partial payload after a complete header has arrived.
 static const unsigned int MAX_PROTOCOL_MESSAGE_SIZE = MAX_SIZE;
 static const int          BTF_INCOMPLETE_MESSAGE_TIMEOUT_SECS = 2 * 60;
+
+// --- Per-peer resource bounds ----------------------------------------------
+//
+// What one peer can make this node hold or do. Bitcoin carried most of these
+// by 0.3.x; Bitflash forked from 0.1.0 and had none of them, so a peer could
+// ask for gigabytes of output with one getdata, for the whole chain with one
+// getblocks, and leave entries in a global map with every inv.
+//
+// Entries in one inv or getdata. Bitcoin's MAX_INV_SZ. A getdata over it is
+// refused and scored: no node of ours ever announces that much at once. An inv
+// over it is cut to its first MAX_INV_SZ entries without a score, because a
+// 1.2.x node answers getblocks with the whole chain in one inv, and a node
+// syncing from one must still take the start of it.
+#ifndef BTF_MAX_INV_SZ
+#define BTF_MAX_INV_SZ 50000   // a bench build may lower it to exercise the cut
+#endif
+static const unsigned int MAX_INV_SZ = BTF_MAX_INV_SZ;
+// Block hashes one getblocks answer offers. The rest of the chain follows
+// because every batch of blocks we serve ends with an inv of our tip when the
+// last block was not the tip (ProcessGetData), which a 1.2.x node turns into
+// its next getblocks.
+static const int          MAX_GETBLOCKS_RESULTS = 500;
+// Hashes in a block locator. One built by CBlockLocator::Set has about 10 +
+// log2(height) of them, so 101 is far past any real chain.
+static const unsigned int MAX_LOCATOR_SZ = 101;
+// Requests one peer can have queued with us (mapAskFor), and the global memory
+// of what was asked and when (mapAlreadyAskedFor). The global one used to be
+// erased only when the item arrived, so every random hash ever announced stayed.
+static const unsigned int MAX_ASKFOR_PER_PEER  = MAX_INV_SZ;
+static const unsigned int MAX_ALREADY_ASKED_FOR = 2 * MAX_INV_SZ;
+// Inventory remembered as known to a peer, most recent kept.
+static const unsigned int MAX_INVENTORY_KNOWN = 10000;
+// Messages taken from one peer per pass of the message thread, and the time
+// spent on it, so one peer's backlog cannot hold up everybody else's.
+static const int          MAX_MESSAGES_PER_PASS = 100;
+static const int64        MAX_PEER_PASS_MILLIS  = 250;
+
+// Bytes queued to a peer before this node stops producing more for it (served
+// getdata waits in vRecvGetData, a getblocks answer waits as pending), and
+// bytes received from a peer and not yet processed before its socket is no
+// longer read. A message larger than the receive bound is still read to its
+// end, so the bound never refuses a message the protocol allows. Variables so
+// the self-test can shrink them.
+extern unsigned int nSendBufferSize;
+extern unsigned int nReceiveFloodSize;
+inline unsigned int SendBufferSize()    { return nSendBufferSize; }
+inline unsigned int ReceiveFloodSize()  { return nReceiveFloodSize; }
+// Past this many bytes queued to a peer, it is dropped (Bitcoin 0.3.x's send
+// flood control). Above everything this node queues on purpose -- a P2Pool
+// history stops at 32 MB -- so only a peer that asks and does not read gets
+// here, whatever path it asked through.
+static const unsigned int MAX_SEND_BUFFER_HARD = 64 * 1000 * 1000;
+// Transaction hashes from one peer's inv looked up in the database, per second
+// and at most at once. The rest of a bigger inv is not asked for.
+static const int TX_INV_LOOKUPS_PER_SEC = 100;
+static const int TX_INV_LOOKUPS_MAX     = 5000;
+// An inbound peer connected this long no longer draws on the inbound block
+// budget (InboundBlockBudgetTake): it has had its chance to misbehave, and a
+// dropped peer starts over.
+static const int64 INBOUND_BLOCK_BUDGET_EXEMPT_SECS = 10 * 60;
+// Blocks the budget refused, kept per peer to ask for again later.
+static const unsigned int MAX_BLOCKS_REFUSED_PER_PEER = 8;
+
+// Inbound connections. Outbound dials are this node's own choice and are not
+// counted against it; the room above it is theirs. When inbound is full a new
+// inbound peer evicts the least useful one instead of being refused.
+static const unsigned int MAX_INBOUND_CONNECTIONS = 117;
 
 // Ceiling on simultaneous connections.
 //
@@ -228,6 +296,9 @@ void BtfChurnNoteHandshakeTimeout(const string& strBtfAddr, const string& strMee
 void BtfPexCollect(std::vector<std::string>& vDescOut);
 // Verify descriptors a peer sent and remember the good ones. Returns how many.
 int  BtfPexAccept(const std::vector<std::string>& vDesc);
+// Self-test access to the peer cache (btfpeers.json in the data directory).
+void BtfRememberPeerForTest(const std::string& strBtfAddr, const std::string& strOnion, bool fVerified);
+void BtfPeerCacheStatsForTest(int& nVerified, int& nHearsay, std::vector<std::string>& vDialOrder);
 void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1);
 bool AnySubscribed(unsigned int nChannel);
 void ThreadBitcoinMiner(void* parg);
@@ -649,6 +720,65 @@ extern map<CInv, CDataStream> mapRelay;
 extern deque<pair<int64, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern map<CInv, int64> mapAlreadyAskedFor;
+// Forget requests that no longer stagger anything, then the oldest, until at
+// most nTarget remain. Under cs_main, like every use of the map.
+void PruneAlreadyAskedFor(int64 nNowMicros, size_t nTarget);
+
+
+// A set that keeps only its most recently inserted nMax elements (Bitcoin's
+// mruset). Used for what a peer is known to have, which was a plain set that
+// one inv could grow by a million entries.
+template <typename T>
+class mruset
+{
+public:
+    typedef typename std::set<T>::iterator iterator;
+
+    explicit mruset(size_t nMaxIn) : nMax(nMaxIn) {}
+
+    std::pair<iterator, bool> insert(const T& x)
+    {
+        std::pair<iterator, bool> ret = set.insert(x);
+        if (ret.second)
+        {
+            order.push_back(x);
+            while (set.size() > nMax && !order.empty())
+            {
+                set.erase(order.front());
+                order.pop_front();
+            }
+            // erase() leaves stale names in the order queue; rebuild it before
+            // they outnumber the live ones.
+            if (order.size() > 2 * nMax + 16)
+                Compact();
+            ret.first = set.find(x);
+        }
+        return ret;
+    }
+    size_t erase(const T& x) { return set.erase(x); }
+    size_t count(const T& x) const { return set.count(x); }
+    size_t size() const { return set.size(); }
+    bool empty() const { return set.empty(); }
+    void clear() { set.clear(); order.clear(); }
+    size_t max_size() const { return nMax; }
+    size_t order_size() const { return order.size(); }
+
+private:
+    void Compact()
+    {
+        std::deque<T> keep;
+        std::set<T> seen;
+        // Newest first, so a name inserted twice keeps its latest position.
+        for (typename std::deque<T>::reverse_iterator it = order.rbegin(); it != order.rend(); ++it)
+            if (set.count(*it) && seen.insert(*it).second)
+                keep.push_front(*it);
+        order.swap(keep);
+    }
+
+    std::set<T> set;
+    std::deque<T> order;
+    size_t nMax;
+};
 
 
 
@@ -701,16 +831,55 @@ public:
     CCriticalSection cs_mapRequests;
 
     // inventory based relay
-    set<CInv> setInventoryKnown;
+    mruset<CInv> setInventoryKnown;
     set<CInv> setInventoryKnown2;
     vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
     multimap<int64, CInv> mapAskFor;
 
+    // getdata entries not served yet because the send buffer was full; served
+    // from the front as it drains (ProcessGetData in main.cpp). Message thread
+    // only, under cs_vRecv.
+    deque<CInv> vRecvGetData;
+    // The last block served from the current getdata batch (0: none yet).
+    // The batch may finish in a later call that serves only transactions,
+    // so it is kept here rather than per call. Same thread and lock.
+    uint256 hashBatchLastBlock;
+    // A getblocks that arrived while the send buffer was full, answered once it
+    // has room. Only the latest is kept: a newer locator supersedes the older.
+    bool fGetBlocksPending;
+    vector<uint256> vGetBlocksHave;
+    uint256 hashGetBlocksStop;
+    // ProcessMessages stopped on its per-pass budget with complete messages
+    // still waiting, so the message thread should come back soon.
+    bool fRecvMorePending;
+
+    // The last block hash kept of an inv cut at MAX_INV_SZ (a 1.2.x node's
+    // whole-chain getblocks answer). When that block arrives, getblocks is
+    // sent again to the same peer for the rest. Message thread only.
+    uint256 hashInvContinue;
+    // Blocks the inbound budget refused from this peer, asked for again once
+    // there is budget (SendMessages). Under cs_vRecv and cs_vSend, as
+    // mapAskFor: the message thread touches it holding one or the other.
+    vector<uint256> vBlocksRefused;
+    // Database lookups left for transaction hashes this peer announces, and
+    // when they were last topped up (TX_INV_LOOKUPS_PER_SEC).
+    int nTxInvTokens;
+    int64 nTxInvRefilled;
+
+    // Dropped for misbehavior or evicted: no drain grace, nothing more read.
+    bool fDropWithoutDrain;
+    // When this peer last gave us something we kept, and how many of its
+    // blocks we took. What eviction protects, and what lets an inbound peer's
+    // blocks skip the shared budget for unproven peers.
+    int64 nLastBlockTime;
+    int64 nLastTxTime;
+    int nGoodBlocks;
+
     // publish and subscription
     vector<char> vfSubscribe;
 
-    // Last "btfpeers" we accepted from this node, to rate-limit the exchange.
+    // When we took this node's "btfpeers" (0: not yet). One per connection.
     int64 nLastPexRecv;
 
     // Chat records this peer has handed us in the current minute, the minute
@@ -754,7 +923,19 @@ public:
 
 
     CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
+        : setInventoryKnown(MAX_INVENTORY_KNOWN)
     {
+        fGetBlocksPending = false;
+        hashGetBlocksStop = 0;
+        hashBatchLastBlock = 0;
+        fRecvMorePending = false;
+        hashInvContinue = 0;
+        nTxInvTokens = TX_INV_LOOKUPS_MAX;
+        nTxInvRefilled = GetTime();
+        fDropWithoutDrain = false;
+        nLastBlockTime = 0;
+        nLastTxTime = 0;
+        nGoodBlocks = 0;
         nServices = 0;
         hSocket = hSocketIn;
         vSend.SetType(SER_NETWORK);
@@ -878,22 +1059,38 @@ public:
                 vInventoryToSend.push_back(inv);
     }
 
-    void AskFor(const CInv& inv)
+    // False when this peer already has MAX_ASKFOR_PER_PEER requests queued:
+    // the item is then not asked of it at all.
+    bool AskFor(const CInv& inv)
     {
-        // We're using mapAskFor as a priority queue,
-        // the key is the earliest time the request can be sent
-        int64& nRequestTime = mapAlreadyAskedFor[inv];
-        if (LogAcceptsCategory("net")) printf("askfor %s  %lld\n", inv.ToString().c_str(), nRequestTime);
+        if (mapAskFor.size() >= MAX_ASKFOR_PER_PEER)
+            return false;
 
         // Make sure not to reuse time indexes to keep things in the same order
         int64 nNow = (GetTime() - 1) * 1000000;
         static int64 nLastTime;
         nLastTime = nNow = max(nNow, ++nLastTime);
 
-        // Each retry is 2 minutes after the last
-        nRequestTime = max(nRequestTime + 2 * 60 * 1000000, nNow);
+        // We're using mapAskFor as a priority queue,
+        // the key is the earliest time the request can be sent
+        int64 nRequestTime;
+        {
+            int64& nSlot = mapAlreadyAskedFor[inv];
+            if (LogAcceptsCategory("net")) printf("askfor %s  %lld\n", inv.ToString().c_str(), nSlot);
+            // Each retry is 2 minutes after the last
+            nSlot = max(nSlot + 2 * 60 * 1000000, nNow);
+            nRequestTime = nSlot;
+        }
         mapAskFor.insert(make_pair(nRequestTime, inv));
+        if (mapAlreadyAskedFor.size() > MAX_ALREADY_ASKED_FOR)
+            PruneAlreadyAskedFor(nNow, MAX_ALREADY_ASKED_FOR * 3 / 4);
+        return true;
     }
+
+    // Whether a receive would only add to a backlog this node has not got to:
+    // more than ReceiveFloodSize() unprocessed, and the message at its front
+    // already complete. Under cs_vRecv.
+    bool RecvFloodPaused();
 
 
 
@@ -1148,6 +1345,46 @@ public:
     // and the peer is now being dropped (and its .btf address banned).
     bool Misbehaving(int nHowMuch);
 };
+
+// Whether the socket thread should take a node out of vNodes now: it is marked
+// and either drained, dropped without drain, or stuck past the drain grace.
+bool NodeReadyToDrop(CNode* pnode, int64 nNow);
+
+// What eviction looks at for one inbound peer, and the choice itself: the
+// index of the peer to evict, or -1 when every candidate is protected.
+struct NodeEvictionCandidate
+{
+    int64 nTimeConnected;
+    int64 nLastBlockTime;
+    int64 nLastTxTime;
+    int64 nLastShareTime;
+    bool  fHandshakeDone;
+};
+int SelectNodeToEvict(const std::vector<NodeEvictionCandidate>& vCandidates);
+
+// Blocks from an inbound peer that has not yet given us a block draw on one
+// shared budget before this node spends a proof-of-work check on them. An
+// inbound onion peer has no address: dropped, it comes back at once with a
+// clean score, so a per-peer score alone does not bound what it costs.
+//
+// The token is taken in CheckBlock right before the RandomX hash, after every
+// cheap check, so a block that fails those costs no token. A peer connected
+// for INBOUND_BLOCK_BUDGET_EXEMPT_SECS, or that has given us a block that
+// connected, does not draw on it at all.
+bool InboundBlockBudgetTake();
+bool InboundBlockBudgetAvailable();
+bool PeerNeedsBlockBudget(const CNode* pnode);
+extern int64 nInboundBlocksRefused;
+void InboundBlockBudgetResetForTest(int nTokens, bool fFreeze = false);
+int  InboundBlockBudgetTokensForTest();
+
+// Drop a peer whose send buffer is past MAX_SEND_BUFFER_HARD. Caller holds
+// cs_vSend. True when it did.
+bool SendFloodCheck(CNode* pnode);
+
+// Mark one inbound peer for eviction (SelectNodeToEvict) to make room for a
+// new one. False when every inbound peer is protected.
+bool AttemptToEvictConnection();
 
 static const int BAN_MISBEHAVIOR_THRESHOLD = 100;
 static const int64 BAN_SECONDS = 24 * 60 * 60;

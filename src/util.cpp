@@ -50,12 +50,61 @@ struct LogDedupState {
     int64       windowStart;   // GetTime() when the current window opened
     int         suppressed;    // calls swallowed so far this window
     std::string lastMsg;       // most recent message text, for the summary line
+    std::string prefix;        // what the summary line starts with
 };
 
 static std::map<std::string, LogDedupState> g_logDedup;
 static CCriticalSection cs_logDedup;
+int64 nLogLinesSuppressed = 0;
 
-void LogPrintDedup(const char* category, const char* file, int line, const std::string& msgIn)
+long nDebugLogMaxBytes = 50L * 1000 * 1000;
+
+const std::string& DebugLogPath()
+{
+    // Bound once, on first use, as it always was: OutputDebugStringF calls
+    // this under its own lock; the lock here covers any other caller.
+    static std::string strDebugFile;
+    static CCriticalSection cs_debugPath;
+    CRITICAL_BLOCK(cs_debugPath)
+    {
+        if (strDebugFile.empty())
+        {
+            std::string dir = GetAppDir();
+            if (!dir.empty())
+                strDebugFile = dir +
+#ifdef _WIN32
+                    "\\"
+#else
+                    "/"
+#endif
+                    + "debug.log";
+            else
+                strDebugFile = "debug.log";
+        }
+    }
+    return strDebugFile;
+}
+
+bool DebugLogRotateIfOver(const std::string& strPath, long nSize, long nMax)
+{
+    if (nSize >= 0 && nSize <= nMax)
+        return false;
+    // No logging in here: this runs inside OutputDebugStringF.
+    std::string strOld = strPath + ".1";
+    remove(strOld.c_str());
+    if (rename(strPath.c_str(), strOld.c_str()) == 0)
+        return true;
+    // Something holds the file so it cannot be renamed (a viewer on Windows):
+    // empty it instead, so the cap holds either way.
+    FILE* f = fopen(strPath.c_str(), "w");
+    if (f)
+        fclose(f);
+    return f != NULL;
+}
+
+// One line through the burst collapse. key names the call site; strPrefix
+// starts both the line and the summary that replaces the swallowed ones.
+static void LogDedupEmit(const std::string& key, const std::string& strPrefix, const std::string& msgIn)
 {
     // Call sites follow the existing printf() convention of ending their
     // format string with \n; strip it here so the single \n this function
@@ -63,9 +112,6 @@ void LogPrintDedup(const char* category, const char* file, int line, const std::
     std::string msg = msgIn;
     while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
         msg.pop_back();
-
-    char key[512];
-    my_snprintf(key, sizeof(key), "%s|%s:%d", category, file, line);
 
     int64 now = GetTime();
     bool  fEmitNow = false;
@@ -79,7 +125,7 @@ void LogPrintDedup(const char* category, const char* file, int line, const std::
         {
             // First time this call site has fired (or its last window is long
             // gone) -- print it directly and open a fresh window.
-            g_logDedup[key] = LogDedupState{now, 0, msg};
+            g_logDedup[key] = LogDedupState{now, 0, msg, strPrefix};
             fEmitNow = true;
         }
         else if (now - it->second.windowStart >= DEDUP_WINDOW_SECS)
@@ -99,14 +145,53 @@ void LogPrintDedup(const char* category, const char* file, int line, const std::
             // count this occurrence instead of writing another near-duplicate.
             it->second.suppressed++;
             it->second.lastMsg = msg;
+            nLogLinesSuppressed++;
         }
+        // The map is keyed by call site, so it is as large as the number of
+        // distinct sites that ever logged; error() keys by format string, and
+        // a few of those are built at run time. Keep it from growing for good.
+        if (g_logDedup.size() > 4096)
+            g_logDedup.clear();
     }
 
     if (suppressedToFlush > 0)
-        OutputDebugStringF("[%s] (%d similar in %llds, last: %s)\n",
-                            category, suppressedToFlush, (long long)DEDUP_WINDOW_SECS, flushedMsg.c_str());
+        OutputDebugStringF("%s(%d similar in %llds, last: %s)\n",
+                            strPrefix.c_str(), suppressedToFlush, (long long)DEDUP_WINDOW_SECS, flushedMsg.c_str());
     if (fEmitNow)
-        OutputDebugStringF("[%s] %s\n", category, msg.c_str());
+        OutputDebugStringF("%s%s\n", strPrefix.c_str(), msg.c_str());
+}
+
+// Write the summary of every window that has closed with lines swallowed in
+// it. Without this the count of a burst was written only when the same call
+// site fired again, so the tail of the last burst before a crash was lost.
+// Called about once a second from the message thread.
+void LogDedupFlush()
+{
+    std::vector<std::pair<std::string, std::pair<int, std::string> > > vOut;
+    int64 now = GetTime();
+    CRITICAL_BLOCK(cs_logDedup)
+    {
+        for (std::map<std::string, LogDedupState>::iterator it = g_logDedup.begin(); it != g_logDedup.end(); ++it)
+        {
+            if (it->second.suppressed > 0 && now - it->second.windowStart >= DEDUP_WINDOW_SECS)
+            {
+                vOut.push_back(std::make_pair(it->second.prefix,
+                                              std::make_pair(it->second.suppressed, it->second.lastMsg)));
+                it->second.suppressed = 0;
+            }
+        }
+    }
+    for (size_t i = 0; i < vOut.size(); i++)
+        OutputDebugStringF("%s(%d similar in %llds, last: %s)\n",
+                           vOut[i].first.c_str(), vOut[i].second.first, (long long)DEDUP_WINDOW_SECS,
+                           vOut[i].second.second.c_str());
+}
+
+void LogPrintDedup(const char* category, const char* file, int line, const std::string& msg)
+{
+    char key[512];
+    my_snprintf(key, sizeof(key), "%s|%s:%d", category, file, line);
+    LogDedupEmit(key, strprintf("[%s] ", category), msg);
 }
 
 
@@ -278,7 +363,16 @@ bool error(const char* format, ...)
         ret = limit - 1;
         buffer[limit-1] = 0;
     }
-    printf("ERROR: %s\n", buffer);
+    // Burst-collapsed per format string, as LogPrint is per call site. Many
+    // of these are reachable by any peer at no cost to it (a duplicate block,
+    // a non-standard transaction) and wrote a line each, unconditionally.
+    // A format that is all placeholder ("%s") says nothing about where it
+    // came from, and every such site would share one key; the start of the
+    // message tells them apart instead.
+    std::string key = std::string("error|") + format;
+    if (strspn(format, "%s") == strlen(format))
+        key += std::string("|") + std::string(buffer).substr(0, 40);
+    LogDedupEmit(key, "ERROR: ", buffer);
     return false;
 }
 

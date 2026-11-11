@@ -3745,6 +3745,15 @@ static bool DoS(int* pnDoS, int nScore, bool fRet)
 // false.
 bool fFuzzSkipPoW = false;
 #endif
+// Relay policy, never validity. The block message handler sets the gate around
+// one ProcessBlock call for a block from an inbound peer that has to draw on
+// the shared inbound budget (PeerNeedsBlockBudget). CheckBlock takes the token
+// right before the proof-of-work hash, after every cheap check, and clears the
+// gate. With no token the block is not looked at: false with no score and
+// nothing recorded about it, so it can be fetched again. Only the thread that
+// set it sees it, and nothing else ever sets it.
+static thread_local bool tl_fPoWBudgetGate = false;
+static thread_local bool tl_fPoWBudgetRefused = false;
 
 bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
 {
@@ -3811,6 +3820,15 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
         return DoS(pnDoS, 100, error("CheckBlock() : nBits is not a positive target"));
     if (bnTarget > bnProofOfWorkLimit)
         return DoS(pnDoS, 100, error("CheckBlock() : nBits below minimum work"));
+    if (tl_fPoWBudgetGate)
+    {
+        tl_fPoWBudgetGate = false;
+        if (!InboundBlockBudgetTake())
+        {
+            tl_fPoWBudgetRefused = true;
+            return false;
+        }
+    }
 #ifdef BITFLASH_FUZZ
     if (!fFuzzSkipPoW)
 #endif
@@ -4588,12 +4606,194 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 
 
 
+// Serve queued getdata entries from the front until the send buffer is full.
+// One getdata of a single block hash repeated hundreds of thousands of times
+// used to be answered in full, all at once and under cs_main, into a send
+// buffer nothing bounded: one message was enough to run the node out of
+// memory. Now what does not fit waits in vRecvGetData and goes out as the peer
+// reads (Bitcoin's ProcessGetData). Message thread, under cs_vRecv.
+static void ProcessGetData(CNode* pfrom)
+{
+    CRITICAL_BLOCK(cs_main)
+    {
+        while (!pfrom->vRecvGetData.empty() && !fShutdown)
+        {
+            unsigned int nQueued;
+            CRITICAL_BLOCK(pfrom->cs_vSend)
+                nQueued = pfrom->vSend.size();
+            if (nQueued >= SendBufferSize())
+                break;
+
+            const CInv inv = pfrom->vRecvGetData.front();
+            pfrom->vRecvGetData.pop_front();
+            if (LogAcceptsCategory("net")) printf("received getdata for: %s\n", inv.ToString().c_str());
+
+            if (inv.type == MSG_BLOCK)
+            {
+                // Send block from disk
+                map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(inv.hash);
+                if (mi != mapBlockIndex.end())
+                {
+                    //// could optimize this to send header straight from blockindex for client
+                    CBlock block;
+                    block.ReadFromDisk((*mi).second, !pfrom->fClient);
+                    pfrom->PushMessage("block", block);
+                    pfrom->hashBatchLastBlock = inv.hash;
+                }
+            }
+            else if (inv.type == MSG_CHATREC)
+            {
+                // From the chat store, not the relay memory: records live for a
+                // day, the relay memory for fifteen minutes.
+                ChatRelayServeGetData(pfrom, inv);
+            }
+            else if (inv.IsKnownType())
+            {
+                // Send stream from relay memory
+                CRITICAL_BLOCK(cs_mapRelay)
+                {
+                    map<CInv, CDataStream>::iterator mi = mapRelay.find(inv);
+                    if (mi != mapRelay.end())
+                        pfrom->PushMessage(inv.GetCommand(), (*mi).second);
+                }
+            }
+        }
+
+        // A batch of blocks that did not end at our tip ends with an inv of
+        // the tip. A 1.2.x node does not have it, or holds it as an orphan,
+        // and either way sends getblocks from where it now is: that is how a
+        // getblocks answer cut at MAX_GETBLOCKS_RESULTS continues. This used
+        // to be sent only after one block (the 500th of the last answer), and
+        // a sync whose connection was replaced mid-round could lose it for
+        // good: the old node asks nothing on its own. Every batch end comes
+        // after the peer has the batch, so the getblocks it answers with is a
+        // new question (a repeat is dropped by the peer itself). A peer in
+        // step asks for our tip, which is the last block, and gets no inv.
+        // The batch is over when the queue is empty, which may be in a later
+        // call than the one that served its last block.
+        if (pfrom->vRecvGetData.empty() && pfrom->hashBatchLastBlock != 0)
+        {
+            if (pfrom->hashBatchLastBlock != hashBestChain)
+            {
+                vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
+                pfrom->PushMessage("inv", vTip);
+            }
+            pfrom->hashBatchLastBlock = 0;
+        }
+    }
+}
+
+// Answer a getblocks: up to MAX_GETBLOCKS_RESULTS block hashes after the first
+// locator entry on our main chain, stopping at hashStop. It used to walk to the
+// tip whatever the distance -- the whole chain, as one inv, for every request.
+// Under cs_main.
+static void ServeGetBlocks(CNode* pfrom, CBlockLocator& locator, const uint256& hashStop)
+{
+    // Find the first block the caller has in the main chain
+    CBlockIndex* pindex = locator.GetBlockIndex();
+
+    // Send the rest of the chain
+    if (pindex)
+        pindex = pindex->pnext;
+    int nLimit = MAX_GETBLOCKS_RESULTS;
+    if (LogAcceptsCategory("net")) printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,14).c_str(), nLimit);
+    for (; pindex; pindex = pindex->pnext)
+    {
+        if (pindex->GetBlockHash() == hashStop)
+        {
+            if (LogAcceptsCategory("net")) printf("  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
+            break;
+        }
+
+        // Bypass setInventoryKnown in case an inventory message got lost
+        CRITICAL_BLOCK(pfrom->cs_inventory)
+        {
+            CInv inv(MSG_BLOCK, pindex->GetBlockHash());
+            // returns true if wasn't already contained in the set
+            if (pfrom->setInventoryKnown2.insert(inv).second)
+            {
+                pfrom->setInventoryKnown.erase(inv);
+                pfrom->vInventoryToSend.push_back(inv);
+            }
+        }
+        if (--nLimit <= 0)
+        {
+            // The peer comes back for the rest after the tip inv that ends
+            // the batch it fetches (ProcessGetData).
+            if (LogAcceptsCategory("net")) printf("  getblocks stopping at limit %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
+            break;
+        }
+    }
+}
+
+// Peer exchange. Nothing here is taken on trust: BtfPexAccept checks every
+// descriptor's signature against the key its .btf address decodes to, and drops
+// the rest. One message per connection: a node sends its list once, right after
+// the version, and nothing more is needed from it.
+static bool ProcessBtfPeers(CNode* pfrom, CDataStream& vRecv)
+{
+    if (pfrom->nLastPexRecv != 0)
+    {
+        LogPrint("net", "btfpeers: ignoring, %s already sent its list\n",
+                 pfrom->addr.ToString().c_str());
+        vRecv.clear();
+        return true;
+    }
+    pfrom->nLastPexRecv = GetTime();
+
+    vector<string> vDesc;
+    vRecv >> vDesc;
+    int nKept = BtfPexAccept(vDesc);
+    LogPrint("net", "btfpeers: kept %d of %zu descriptor(s) from %s\n",
+             nKept, vDesc.size(), pfrom->addr.ToString().c_str());
+    return true;
+}
+
+// A getblocks that waited for room in the send buffer. Under cs_main.
+static void ServePendingGetBlocks(CNode* pfrom)
+{
+    if (!pfrom->fGetBlocksPending || pfrom->fDisconnect)
+        return;
+    unsigned int nQueued;
+    CRITICAL_BLOCK(pfrom->cs_vSend)
+        nQueued = pfrom->vSend.size();
+    if (nQueued >= SendBufferSize())
+        return;
+    CBlockLocator locator(pfrom->vGetBlocksHave);
+    uint256 hashStop = pfrom->hashGetBlocksStop;
+    pfrom->fGetBlocksPending = false;
+    vector<uint256>().swap(pfrom->vGetBlocksHave);
+    ServeGetBlocks(pfrom, locator, hashStop);
+}
+
 bool ProcessMessages(CNode* pfrom)
 {
     CDataStream& vRecv = pfrom->vRecv;
+    pfrom->fRecvMorePending = false;
+
+    // A peer dropped for misbehavior (or evicted) is not listened to any more.
+    // Its messages used to be processed in full for as long as it was kept
+    // for its send buffer to drain -- a minute, for a peer that kept sending.
+    // A peer that is only on its way out (it closed, it timed out) is no
+    // longer read from, but what it already sent is still taken: those are
+    // often the blocks we asked it for.
+    if (pfrom->fDropWithoutDrain)
+    {
+        vRecv.clear();
+        pfrom->vRecvGetData.clear();
+        return true;
+    }
+
+    // What an earlier getdata asked for and did not fit yet.
+    if (!pfrom->vRecvGetData.empty())
+        ProcessGetData(pfrom);
+
     if (vRecv.empty())
         return true;
     LogPrint("net", "ProcessMessages(%d bytes)\n", (int)vRecv.size());
+    int nMessages = 0;
+    const int64 nPassStart = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     //
     // Message format
@@ -4605,6 +4805,23 @@ bool ProcessMessages(CNode* pfrom)
 
     loop
     {
+        // Dropped by something it sent this pass: stop listening now.
+        if (pfrom->fDropWithoutDrain)
+        {
+            vRecv.clear();
+            pfrom->vRecvGetData.clear();
+            return true;
+        }
+        // This peer's share of the pass is used up; the rest waits for the
+        // next one, after every other peer has had its turn.
+        if (nMessages >= MAX_MESSAGES_PER_PASS ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() - nPassStart > MAX_PEER_PASS_MILLIS)
+        {
+            pfrom->fRecvMorePending = !vRecv.empty();
+            break;
+        }
+
         // Scan for message start
         // 20 bytes until the peer's version message, 24 (with checksum) from
         // 102 on -- see CMessageHeader.
@@ -4683,9 +4900,9 @@ bool ProcessMessages(CNode* pfrom)
             memcpy(&nChecksum, &hash, sizeof(nChecksum));
             if (nChecksum != hdr.nChecksum)
             {
-                printf("ProcessMessages(%s, %u bytes) from %s: CHECKSUM ERROR nChecksum=%08x hdr.nChecksum=%08x\n",
-                       strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(),
-                       nChecksum, hdr.nChecksum);
+                LogPrintAlways("net", "ProcessMessages(%s, %u bytes) from %s: CHECKSUM ERROR nChecksum=%08x hdr.nChecksum=%08x\n",
+                               strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(),
+                               nChecksum, hdr.nChecksum);
                 vRecv.ignore(nMessageSize);
                 pfrom->Misbehaving(20);
                 continue;
@@ -4695,6 +4912,7 @@ bool ProcessMessages(CNode* pfrom)
         // Copy message to its own buffer
         CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
         vRecv.ignore(nMessageSize);
+        nMessages++;
 
         // Process message
         bool fRet = false;
@@ -4711,12 +4929,29 @@ bool ProcessMessages(CNode* pfrom)
                 CDataStream vCopy(vMsg);
                 fDone = fRet = P2PoolProcessMessage(pfrom, strCommand, vCopy);
             }
+            // Peer exchange reads no chain state either: signature checks and
+            // a file, which have no business holding up everything else.
+            if (!fDone && strCommand == "btfpeers" && pfrom->nVersion != 0)
+                fDone = fRet = ProcessBtfPeers(pfrom, vMsg);
             if (!fDone)
                 CRITICAL_BLOCK(cs_main)
                     fRet = ProcessMessage(pfrom, strCommand, vMsg);
             CheckForShutdown(2);
         }
-        CATCH_PRINT_EXCEPTION("ProcessMessage()")
+        // A message that does not parse: one line, burst-collapsed. This was
+        // a multi-line EXCEPTION block in debug.log for every short message,
+        // written whatever the log settings, at no cost to the sender.
+        CATCH_FORCED_UNWIND
+        catch (std::exception& e)
+        {
+            LogPrintAlways("net", "ProcessMessage(%s, %u bytes) from %s: %s\n",
+                           strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(), e.what());
+        }
+        catch (...)
+        {
+            LogPrintAlways("net", "ProcessMessage(%s, %u bytes) from %s: unknown exception\n",
+                           strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str());
+        }
         if (!fRet)
             if (LogAcceptsCategory("net")) printf("ProcessMessage(%s, %d bytes) from %s to %s FAILED\n", strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(), addrLocalHost.ToString().c_str());
     }
@@ -4727,6 +4962,19 @@ bool ProcessMessages(CNode* pfrom)
 
 
 
+
+// Version-time getblocks: whether we have asked anybody yet, and when we last
+// asked a peer only because it said it was ahead of us.
+static bool fAskedForBlocks = false;
+static int64 nLastAheadGetBlocks = 0;
+static const int AHEAD_GETBLOCKS_MIN_GAP = 3;          // blocks: relay lag is not "ahead"
+static const int64 AHEAD_GETBLOCKS_INTERVAL = 5 * 60;  // seconds
+
+void VersionGetBlocksResetForTest()
+{
+    fAskedForBlocks = true;
+    nLastAheadGetBlocks = 0;
+}
 
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
@@ -4792,14 +5040,34 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Ask the first connected node for block updates, and ask again when
         // a node is the only one there is: the first may be long gone, and
         // nothing else would ask before the next block is announced.
-        static bool fAskedForBlocks;
         bool fOnlyPeer = false;
         CRITICAL_BLOCK(cs_vNodes)
             fOnlyPeer = (vNodes.size() <= 1);
-        if ((!fAskedForBlocks || fOnlyPeer) && !pfrom->fClient)
+        // Also ask a peer that says it is clearly ahead of us, whoever else
+        // we have: a node behind its peers used to wait for the next block to
+        // be announced before it asked anybody. At most one such extra
+        // request per AHEAD_GETBLOCKS_INTERVAL: a 1.2.x peer answers with an
+        // inv of its whole chain, and a fresh node meeting many of them must
+        // not download that once per peer.
+        bool fAhead = pfrom->nStartingHeight > nBestHeight + AHEAD_GETBLOCKS_MIN_GAP &&
+                      GetTime() - nLastAheadGetBlocks >= AHEAD_GETBLOCKS_INTERVAL;
+        if ((!fAskedForBlocks || fOnlyPeer || fAhead) && !pfrom->fClient)
         {
+            if (fAskedForBlocks && !fOnlyPeer)
+                nLastAheadGetBlocks = GetTime();
             fAskedForBlocks = true;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
+        }
+
+        // A peer behind us gets our tip. A 1.2.x node turns it into a
+        // getblocks on this connection (orphan path, or ask, receive, then
+        // orphan path), which restarts a sync whose continuation went down
+        // with an earlier connection: its own version-time getblocks is
+        // skipped while the old connection is still draining.
+        if (!pfrom->fClient && pfrom->nStartingHeight >= 0 && pfrom->nStartingHeight < nBestHeight)
+        {
+            vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
+            pfrom->PushMessage("inv", vTip);
         }
 
         // Introduce ourselves and hand over the .btf peers that answered us.
@@ -4830,24 +5098,9 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
     else if (strCommand == "btfpeers")
     {
-        // Peer exchange. Nothing here is taken on trust: BtfPexAccept checks
-        // every descriptor's signature against the key its .btf address
-        // decodes to, and drops the rest.
-        int64 nNow = GetTime();
-        if (nNow - pfrom->nLastPexRecv < PEX_MIN_INTERVAL)
-        {
-            if (LogAcceptsCategory("net"))
-                printf("btfpeers: ignoring, %s is sending them too fast\n",
-                       pfrom->addr.ToString().c_str());
-            return true;
-        }
-        pfrom->nLastPexRecv = nNow;
-
-        vector<string> vDesc;
-        vRecv >> vDesc;
-        int nKept = BtfPexAccept(vDesc);
-        LogPrint("net", "btfpeers: kept %d of %zu descriptor(s) from %s\n",
-                 nKept, vDesc.size(), pfrom->addr.ToString().c_str());
+        // ProcessMessages hands this over before taking cs_main; this branch
+        // is for callers that come straight here.
+        return ProcessBtfPeers(pfrom, vRecv);
     }
 
 
@@ -4855,19 +5108,68 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     {
         vector<CInv> vInv;
         vRecv >> vInv;
+        // No score for a long one: a 1.2.x node answers getblocks with every
+        // block from the fork point to its tip in a single inv, which is past
+        // MAX_INV_SZ on the chain as it is. Its start is what a syncing node
+        // needs first. The last block kept is remembered, and when it arrives
+        // the same peer is sent getblocks again for the rest (block handler):
+        // without that, a node syncing from 1.2.x peers stopped there until
+        // somebody announced a new block.
+        if (vInv.size() > MAX_INV_SZ)
+        {
+            LogPrint("net", "inv from %s: %u entries, taking the first %u\n",
+                     pfrom->addr.ToString().c_str(), (unsigned int)vInv.size(), MAX_INV_SZ);
+            vInv.resize(MAX_INV_SZ);
+            if (vInv.back().type == MSG_BLOCK)
+                pfrom->hashInvContinue = vInv.back().hash;
+        }
 
         CTxDB txdb("r");
+        // Nothing is asked of a peer whose send buffer is full -- the getdata
+        // would only add to it -- so its transactions are not worth a read.
+        bool fAskForFull = false;
+        unsigned int nQueued;
+        CRITICAL_BLOCK(pfrom->cs_vSend)
+            nQueued = pfrom->vSend.size();
+        if (nQueued >= SendBufferSize())
+            fAskForFull = true;
+        // Database reads for transaction hashes are rationed per peer.
+        {
+            int64 nNow = GetTime();
+            int64 nAdd = (nNow - pfrom->nTxInvRefilled) * TX_INV_LOOKUPS_PER_SEC;
+            if (nAdd > 0)
+            {
+                pfrom->nTxInvTokens = (int)min((int64)TX_INV_LOOKUPS_MAX, pfrom->nTxInvTokens + nAdd);
+                pfrom->nTxInvRefilled = nNow;
+            }
+        }
         foreach(const CInv& inv, vInv)
         {
             if (fShutdown)
                 return true;
             pfrom->AddInventoryKnown(inv);
 
+            // Once this peer has MAX_ASKFOR_PER_PEER requests queued nothing
+            // more is asked of it, so a transaction it names is not worth the
+            // database read. Blocks are looked up in memory and may still need
+            // the orphan follow-up below.
+            if (fAskForFull && inv.type != MSG_BLOCK)
+                continue;
+            if (inv.type == MSG_TX)
+            {
+                if (pfrom->nTxInvTokens <= 0)
+                    continue;
+                pfrom->nTxInvTokens--;
+            }
+
             bool fAlreadyHave = AlreadyHave(txdb, inv);
             if (LogAcceptsCategory("net")) printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
 
             if (!fAlreadyHave)
-                pfrom->AskFor(inv);
+            {
+                if (!pfrom->AskFor(inv))
+                    fAskForFull = true;
+            }
             else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash))
                 pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(mapOrphanBlocks[inv.hash]));
         }
@@ -4878,42 +5180,29 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     {
         vector<CInv> vInv;
         vRecv >> vInv;
-
-        foreach(const CInv& inv, vInv)
+        // Nothing this node sends makes an honest peer ask for this much at
+        // once: getblocks answers carry MAX_GETBLOCKS_RESULTS.
+        if (vInv.size() > MAX_INV_SZ)
         {
-            if (fShutdown)
-                return true;
-            if (LogAcceptsCategory("net")) printf("received getdata for: %s\n", inv.ToString().c_str());
-
-            if (inv.type == MSG_BLOCK)
-            {
-                // Send block from disk
-                map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(inv.hash);
-                if (mi != mapBlockIndex.end())
-                {
-                    //// could optimize this to send header straight from blockindex for client
-                    CBlock block;
-                    block.ReadFromDisk((*mi).second, !pfrom->fClient);
-                    pfrom->PushMessage("block", block);
-                }
-            }
-            else if (inv.type == MSG_CHATREC)
-            {
-                // From the chat store, not the relay memory: records live for a
-                // day, the relay memory for fifteen minutes.
-                ChatRelayServeGetData(pfrom, inv);
-            }
-            else if (inv.IsKnownType())
-            {
-                // Send stream from relay memory
-                CRITICAL_BLOCK(cs_mapRelay)
-                {
-                    map<CInv, CDataStream>::iterator mi = mapRelay.find(inv);
-                    if (mi != mapRelay.end())
-                        pfrom->PushMessage(inv.GetCommand(), (*mi).second);
-                }
-            }
+            pfrom->Misbehaving(20);
+            LogPrint("net", "getdata from %s: %u entries, refused\n",
+                     pfrom->addr.ToString().c_str(), (unsigned int)vInv.size());
+            return true;
         }
+
+        // Queued, and served as the send buffer drains. The queue as a whole
+        // is held to MAX_INV_SZ: a peer that keeps asking without reading gets
+        // the start of what it asked for and nothing more.
+        size_t nRoom = pfrom->vRecvGetData.size() < MAX_INV_SZ ? MAX_INV_SZ - pfrom->vRecvGetData.size() : 0;
+        if (vInv.size() > nRoom)
+        {
+            LogPrint("net", "getdata from %s: %u entries queued already, dropping %u\n",
+                     pfrom->addr.ToString().c_str(), (unsigned int)pfrom->vRecvGetData.size(),
+                     (unsigned int)(vInv.size() - nRoom));
+            vInv.resize(nRoom);
+        }
+        pfrom->vRecvGetData.insert(pfrom->vRecvGetData.end(), vInv.begin(), vInv.end());
+        ProcessGetData(pfrom);
     }
 
 
@@ -4923,32 +5212,34 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         uint256 hashStop;
         vRecv >> locator >> hashStop;
 
-        // Find the first block the caller has in the main chain
-        CBlockIndex* pindex = locator.GetBlockIndex();
-
-        // Send the rest of the chain
-        if (pindex)
-            pindex = pindex->pnext;
-        if (LogAcceptsCategory("net")) printf("getblocks %d to %s\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,14).c_str());
-        for (; pindex; pindex = pindex->pnext)
+        // CBlockLocator::Set makes about 10 + log2(height) entries; each one
+        // costs a lookup here, under cs_main.
+        if (locator.Have().size() > MAX_LOCATOR_SZ)
         {
-            if (pindex->GetBlockHash() == hashStop)
-            {
-                if (LogAcceptsCategory("net")) printf("  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
-                break;
-            }
+            pfrom->Misbehaving(20);
+            LogPrint("net", "getblocks from %s: locator of %u entries, refused\n",
+                     pfrom->addr.ToString().c_str(), (unsigned int)locator.Have().size());
+            return true;
+        }
 
-            // Bypass setInventoryKnown in case an inventory message got lost
-            CRITICAL_BLOCK(pfrom->cs_inventory)
-            {
-                CInv inv(MSG_BLOCK, pindex->GetBlockHash());
-                // returns true if wasn't already contained in the set
-                if (pfrom->setInventoryKnown2.insert(inv).second)
-                {
-                    pfrom->setInventoryKnown.erase(inv);
-                    pfrom->vInventoryToSend.push_back(inv);
-                }
-            }
+        // With the send buffer full the answer waits: the latest request
+        // replaces an older one, and SendMessages answers it once there is
+        // room. A stream of getblocks to a peer that does not read used to
+        // grow its send buffer by a whole-chain inv each.
+        unsigned int nQueued;
+        CRITICAL_BLOCK(pfrom->cs_vSend)
+            nQueued = pfrom->vSend.size();
+        if (nQueued >= SendBufferSize())
+        {
+            pfrom->fGetBlocksPending = true;
+            pfrom->vGetBlocksHave = locator.Have();
+            pfrom->hashGetBlocksStop = hashStop;
+        }
+        else
+        {
+            pfrom->fGetBlocksPending = false;
+            vector<uint256>().swap(pfrom->vGetBlocksHave);
+            ServeGetBlocks(pfrom, locator, hashStop);
         }
     }
 
@@ -4990,6 +5281,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             RelayMessage(inv, vMsg);
             mapAlreadyAskedFor.erase(inv);
             vWorkQueue.push_back(inv.hash);
+            pfrom->nLastTxTime = GetTime();
 
             // Recursively process any orphan transactions that depended on this one
             for (int i = 0; i < vWorkQueue.size(); i++)
@@ -5028,19 +5320,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
     else if (strCommand == "review")
     {
-        CDataStream vMsg(vRecv);
-        CReview review;
-        vRecv >> review;
-
-        CInv inv(MSG_REVIEW, review.GetHash());
-        pfrom->AddInventoryKnown(inv);
-
-        if (review.AcceptReview())
-        {
-            // Relay the original message as-is in case it's a higher version than we know how to parse
-            RelayMessage(inv, vMsg);
-            mapAlreadyAskedFor.erase(inv);
-        }
+        // The 0.1.0 marketplace's reviews: an ECDSA check against a key the
+        // sender chose, under cs_main, then reviews.dat read and rewritten in
+        // full with no dedup or cap (nTime is not signed, so one review could
+        // be replayed for ever). Nothing in Bitflash sends or reads them, and
+        // AlreadyHave never asks for one. A quiet no-op, like checkorder.
+        vRecv.clear();
     }
 
 
@@ -5055,11 +5340,59 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CInv inv(MSG_BLOCK, pblock->GetHash());
         pfrom->AddInventoryKnown(inv);
 
+        // The last block of a cut whole-chain inv: once it is here, ask the
+        // same peer for the rest (see hashInvContinue).
+        bool fContinue = pfrom->hashInvContinue != 0 && inv.hash == pfrom->hashInvContinue;
+
+        // A new inbound peer draws on a budget shared by all such peers before
+        // its block costs a proof-of-work check. Dropped for bad work, an
+        // inbound onion peer is back at once with a clean score (it has no
+        // address to ban), so its own score bounds nothing over time; this
+        // does. The token is taken inside CheckBlock right before the hash,
+        // so a block that fails a cheap check costs none.
+        struct PoWBudgetGate
+        {
+            explicit PoWBudgetGate(bool f) { tl_fPoWBudgetGate = f; tl_fPoWBudgetRefused = false; }
+            ~PoWBudgetGate() { tl_fPoWBudgetGate = false; tl_fPoWBudgetRefused = false; }
+        };
         int nDoS = 0;
-        if (ProcessBlock(pfrom, pblock.release(), &nDoS))
+        bool fOk = false, fRefused = false;
+        {
+            PoWBudgetGate gate(PeerNeedsBlockBudget(pfrom));
+            fOk = ProcessBlock(pfrom, pblock.release(), &nDoS);
+            fRefused = tl_fPoWBudgetRefused;
+        }
+        if (fRefused)
+        {
+            // Not looked at, and not forgotten: the next peer that announces
+            // it is asked at once, and this one again once there is budget.
+            nInboundBlocksRefused++;
+            LogPrintAlways("net", "block %s from new inbound peer %s not checked yet: inbound budget spent\n",
+                           inv.hash.ToString().substr(0,14).c_str(), pfrom->addr.ToString().c_str());
             mapAlreadyAskedFor.erase(inv);
+            if (pfrom->vBlocksRefused.size() < MAX_BLOCKS_REFUSED_PER_PEER &&
+                find(pfrom->vBlocksRefused.begin(), pfrom->vBlocksRefused.end(), inv.hash) == pfrom->vBlocksRefused.end())
+                pfrom->vBlocksRefused.push_back(inv.hash);
+            return true;
+        }
+        if (fOk)
+        {
+            mapAlreadyAskedFor.erase(inv);
+            // Good only once it connected: an orphan at the floor proves little.
+            if (mapBlockIndex.count(inv.hash))
+            {
+                pfrom->nGoodBlocks++;
+                pfrom->nLastBlockTime = GetTime();
+            }
+        }
         else if (nDoS > 0)
             pfrom->Misbehaving(nDoS);
+
+        if (fContinue)
+        {
+            pfrom->hashInvContinue = 0;
+            pfrom->PushGetBlocks(pindexBest, uint256(0));
+        }
     }
 
 
@@ -5169,6 +5502,21 @@ bool SendMessages(CNode* pto)
         if (pto->nLastSend && GetTime() - pto->nLastSend > BTF_PING_INTERVAL_SECS && pto->vSend.empty())
             pto->PushMessage("ping");
 
+        // A getblocks that arrived with the send buffer full, now that it has
+        // room. Its answer goes out with the inventory below.
+        ServePendingGetBlocks(pto);
+
+        // Forget requests that stagger nothing any more, once a minute. AskFor
+        // also trims the map when it passes MAX_ALREADY_ASKED_FOR.
+        {
+            static int64 nLastPrune = 0;
+            if (GetTime() - nLastPrune > 60)
+            {
+                nLastPrune = GetTime();
+                PruneAlreadyAskedFor(GetTime() * 1000000, MAX_ALREADY_ASKED_FOR);
+            }
+        }
+
 
         //
         // Message: inventory
@@ -5191,21 +5539,44 @@ bool SendMessages(CNode* pto)
 
 
         //
+        // Blocks the inbound budget refused from this peer: asked for again
+        // once there is budget, or once the peer no longer needs any.
+        //
+        if (!pto->vBlocksRefused.empty() && (!PeerNeedsBlockBudget(pto) || InboundBlockBudgetAvailable()))
+        {
+            vector<uint256> vRefused;
+            vRefused.swap(pto->vBlocksRefused);
+            foreach(const uint256& hash, vRefused)
+                if (!mapBlockIndex.count(hash) && !mapOrphanBlocks.count(hash))
+                    pto->AskFor(CInv(MSG_BLOCK, hash));
+        }
+
+        //
         // Message: getdata
         //
-        vector<CInv> vAskFor;
-        int64 nNow = GetTime() * 1000000;
-        CTxDB txdb("r");
-        while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
+        // Not while the send buffer is full: a peer that announces and does
+        // not read would otherwise grow it by a getdata for every inv. The
+        // requests wait in mapAskFor, which is capped.
+        //
+        unsigned int nQueuedNow;
+        CRITICAL_BLOCK(pto->cs_vSend)
+            nQueuedNow = pto->vSend.size();
+        if (nQueuedNow < SendBufferSize())
         {
-            const CInv& inv = (*pto->mapAskFor.begin()).second;
-            if (LogAcceptsCategory("net")) printf("sending getdata: %s\n", inv.ToString().c_str());
-            if (!AlreadyHave(txdb, inv))
-                vAskFor.push_back(inv);
-            pto->mapAskFor.erase(pto->mapAskFor.begin());
+            vector<CInv> vAskFor;
+            int64 nNow = GetTime() * 1000000;
+            CTxDB txdb("r");
+            while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
+            {
+                const CInv& inv = (*pto->mapAskFor.begin()).second;
+                if (LogAcceptsCategory("net")) printf("sending getdata: %s\n", inv.ToString().c_str());
+                if (!AlreadyHave(txdb, inv))
+                    vAskFor.push_back(inv);
+                pto->mapAskFor.erase(pto->mapAskFor.begin());
+            }
+            if (!vAskFor.empty())
+                pto->PushMessage("getdata", vAskFor);
         }
-        if (!vAskFor.empty())
-            pto->PushMessage("getdata", vAskFor);
 
     }
     return true;

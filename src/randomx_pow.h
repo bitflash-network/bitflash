@@ -83,6 +83,9 @@ bool RandomXInitDataset(int nVersion, int nThreads);
 // PoWHashHeader; this is for tests and for the pool, which builds its own
 // inputs.
 uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize);
+// Self-test only: hold (or let go of) the first verification VM from the
+// calling thread.
+void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold);
 
 // Create a VM for a mining thread (own VM, not shared) keyed for one version.
 // Uses that version's dataset (fast) if ready, otherwise its cache (light).

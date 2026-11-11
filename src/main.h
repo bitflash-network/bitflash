@@ -499,6 +499,9 @@ bool IsInitialBlockDownload();
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast);
 extern CCriticalSection cs_mapTransactions;
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
+// Self-test only: the version-time getblocks state (already asked; no extra
+// request to a peer ahead of us yet).
+void VersionGetBlocksResetForTest();
 bool SendMessages(CNode* pto);
 int64 GetBalance();
 struct WalletRecoveryAudit
@@ -1990,6 +1993,15 @@ public:
         if (mi != mapBlockIndex.end())
             Set((*mi).second);
     }
+
+    // A locator a peer sent, kept as its hashes while the answer waits for
+    // room in that peer's send buffer (CNode cannot hold this type: net.h
+    // comes before main.h).
+    explicit CBlockLocator(const vector<uint256>& vHaveIn) : vHave(vHaveIn)
+    {
+    }
+
+    const vector<uint256>& Have() const { return vHave; }
 
     IMPLEMENT_SERIALIZE
     (

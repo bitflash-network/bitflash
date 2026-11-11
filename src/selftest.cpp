@@ -12735,6 +12735,916 @@ static int RunReorgSafetySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// p2p-dos: the bounds on what one peer can make this node hold or do.
+// ---------------------------------------------------------------------------
+
+// A peer whose version message has been read, with an empty send buffer that
+// frames at the current protocol.
+static CNode* P2PDoSPeer(bool fInbound = false)
+{
+    CNode* p = new CNode(INVALID_SOCKET, CAddress("127.0.0.1"), fInbound);
+    p->nVersion = VERSION;
+    p->vSend.clear();
+    p->vSend.SetVersion(VERSION);
+    p->vRecv.SetVersion(VERSION);
+    return p;
+}
+
+// Append one framed message to a peer's receive buffer.
+static void P2PDoSQueue(CNode& node, const char* pszCommand, const CDataStream& payload)
+{
+    CMessageHeader hdr(pszCommand, payload.size());
+    if (node.vRecv.GetVersion() >= PROTO_CHECKSUM_VERSION)
+    {
+        uint256 hash = Hash(payload.begin(), payload.end());
+        memcpy(&hdr.nChecksum, &hash, sizeof(hdr.nChecksum));
+    }
+    CDataStream ss(SER_NETWORK, node.vRecv.GetVersion());
+    ss << hdr;
+    node.vRecv.insert(node.vRecv.end(), ss.begin(), ss.end());
+    node.vRecv.insert(node.vRecv.end(), payload.begin(), payload.end());
+}
+
+// The commands queued in a peer's send buffer, in order, with their sizes.
+static std::vector<std::string> P2PDoSSent(CNode& node, std::vector<unsigned int>* pvSizes = NULL)
+{
+    std::vector<std::string> v;
+    unsigned int nHdr = CMessageHeader::SizeOnWire(node.vSend.GetVersion());
+    size_t pos = 0;
+    while (pos + nHdr <= node.vSend.size())
+    {
+        CDataStream h(node.vSend.begin() + pos, node.vSend.begin() + pos + nHdr,
+                      SER_NETWORK, node.vSend.GetVersion());
+        CMessageHeader hdr;
+        h >> hdr;
+        v.push_back(hdr.GetCommand());
+        if (pvSizes)
+            pvSizes->push_back(hdr.nMessageSize);
+        pos += nHdr + hdr.nMessageSize;
+    }
+    return v;
+}
+
+static bool P2PDoSProcess(CNode* p, const char* pszCommand, CDataStream& ss)
+{
+    bool fRet = false;
+    CRITICAL_BLOCK(cs_main)
+        fRet = ProcessMessage(p, pszCommand, ss);
+    return fRet;
+}
+
+// A block that passes every check CheckBlock makes before the proof-of-work
+// hash: one coinbase, floor nBits, merkle root set. Its work is random, so it
+// almost always fails the hash itself.
+static CBlock P2PDoSBlock(unsigned int nNonce, int64 nTimeOffset)
+{
+    CBlock block;
+    CTransaction txCoinbase;
+    txCoinbase.vin.resize(1);
+    txCoinbase.vin[0].prevout.SetNull();
+    txCoinbase.vin[0].scriptSig = CScript() << (int64)nNonce << 2;
+    txCoinbase.vout.push_back(CTxOut(1, CScript() << OP_TRUE));
+    block.vtx.push_back(txCoinbase);
+    block.nBits = bnProofOfWorkLimit.GetCompact();
+    block.nTime = GetAdjustedTime() + nTimeOffset;
+    block.nNonce = nNonce;
+    block.hashMerkleRoot = block.BuildMerkleTree();
+    return block;
+}
+
+static int RunP2PDoSSelfTest()
+{
+    fflush(stdout);
+    printf("p2p-dos self-test\n");
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    std::string strOldDataDir = strSetDataDir;
+    strSetDataDir = tmp;
+    int nFail = 0;
+    std::vector<CBlockIndex*> vMade;
+    CBlockIndex* pindexBestSaved = NULL;
+    const unsigned int nSendSaved = nSendBufferSize, nRecvSaved = nReceiveFloodSize;
+    try
+    {
+        if (!LoadBlockIndex())
+            throw std::runtime_error("LoadBlockIndex failed");
+        pindexBestSaved = pindexBest;
+
+        // ---- C1: getdata is queued and served only while the send buffer has room
+        {
+            CInv invBig(MSG_TX, uint256(0xd05));
+            CDataStream ssItem(SER_NETWORK);
+            ssItem << std::vector<unsigned char>(20000, 0x5a);
+            CRITICAL_BLOCK(cs_mapRelay)
+                mapRelay[invBig] = ssItem;
+
+            CNode* p = P2PDoSPeer();
+            CDataStream ss(SER_NETWORK);
+            ss << std::vector<CInv>(MAX_INV_SZ, invBig);    // one item, asked for 50000 times
+            P2PDoSProcess(p, "getdata", ss);
+            unsigned int nSent = p->vSend.size();
+            size_t nQueued = p->vRecvGetData.size();
+            nFail += Check(nSent >= SendBufferSize() && nSent < SendBufferSize() + 2 * ssItem.size(),
+                           "one getdata of 50000 copies queues about SendBufferSize(), not 1 GB") ? 0 : 1;
+            nFail += Check(nQueued > 0 && nQueued + P2PDoSSent(*p).size() == MAX_INV_SZ,
+                           "and the rest waits in the getdata queue") ? 0 : 1;
+
+            p->vSend.clear();                          // the peer read it
+            ProcessMessages(p);
+            nFail += Check(p->vRecvGetData.size() < nQueued && p->vSend.size() < SendBufferSize() + 2 * ssItem.size(),
+                           "as the buffer drains, the queue is served from where it stopped") ? 0 : 1;
+
+            CDataStream ssMore(SER_NETWORK);
+            ssMore << std::vector<CInv>(MAX_INV_SZ, invBig);
+            P2PDoSProcess(p, "getdata", ssMore);
+            nFail += Check(p->vRecvGetData.size() <= MAX_INV_SZ,
+                           "asking again without reading never queues more than MAX_INV_SZ") ? 0 : 1;
+            delete p;
+
+            CNode* q = P2PDoSPeer();
+            CDataStream ssOver(SER_NETWORK);
+            ssOver << std::vector<CInv>(MAX_INV_SZ + 1, invBig);
+            P2PDoSProcess(q, "getdata", ssOver);
+            nFail += Check(q->nMisbehavior == 20 && q->vRecvGetData.empty() && q->vSend.empty(),
+                           "a getdata over MAX_INV_SZ is refused and costs 20 points") ? 0 : 1;
+            delete q;
+            CRITICAL_BLOCK(cs_mapRelay)
+                mapRelay.erase(invBig);
+
+            // A batch of blocks that does not end at our tip ends with an inv
+            // of the tip; one that does, does not. The only block on disk
+            // here is genesis, so the tip is pretended for the first case.
+            {
+                uint256 hashBestSaved = hashBestChain;
+                hashBestChain = uint256(0xbe57);
+                CNode* r = P2PDoSPeer();
+                CDataStream ssBlock(SER_NETWORK);
+                ssBlock << std::vector<CInv>(1, CInv(MSG_BLOCK, hashGenesisBlock));
+                P2PDoSProcess(r, "getdata", ssBlock);
+                std::vector<std::string> vCmd = P2PDoSSent(*r);
+                bool fInvOfTip = false;
+                if (vCmd.size() == 2 && vCmd[1] == "inv")
+                {
+                    unsigned int nHdr = CMessageHeader::SizeOnWire(r->vSend.GetVersion());
+                    std::vector<unsigned int> vSizes;
+                    P2PDoSSent(*r, &vSizes);
+                    size_t nInvAt = nHdr + vSizes[0] + nHdr;
+                    CDataStream ssInv(r->vSend.begin() + nInvAt, r->vSend.end(), SER_NETWORK, r->vSend.GetVersion());
+                    std::vector<CInv> vInv;
+                    ssInv >> vInv;
+                    fInvOfTip = vInv.size() == 1 && vInv[0].hash == uint256(0xbe57);
+                }
+                nFail += Check(vCmd.size() == 2 && vCmd[0] == "block" && fInvOfTip,
+                               "a batch of blocks that does not end at our tip is followed by an inv of the tip") ? 0 : 1;
+                delete r;
+                hashBestChain = hashBestSaved;
+
+                CNode* t = P2PDoSPeer();
+                CDataStream ssTip(SER_NETWORK);
+                ssTip << std::vector<CInv>(1, CInv(MSG_BLOCK, hashGenesisBlock));
+                P2PDoSProcess(t, "getdata", ssTip);
+                vCmd = P2PDoSSent(*t);
+                nFail += Check(vCmd.size() == 1 && vCmd[0] == "block",
+                               "a peer that asks for our tip gets the block and no inv") ? 0 : 1;
+                delete t;
+
+                // The block is served, the send buffer fills, and the batch
+                // ends in a later call that serves only a transaction.
+                hashBestChain = uint256(0xbe57);
+                CInv invTx(MSG_TX, uint256(0xd07));
+                CDataStream ssTx(SER_NETWORK);
+                ssTx << std::vector<unsigned char>(50, 2);
+                CRITICAL_BLOCK(cs_mapRelay)
+                    mapRelay[invTx] = ssTx;
+                CNode* u = P2PDoSPeer();
+                u->vSend.resize(SendBufferSize() - 10);
+                std::vector<CInv> vMixed;
+                vMixed.push_back(CInv(MSG_BLOCK, hashGenesisBlock));
+                vMixed.push_back(invTx);
+                CDataStream ssMixed(SER_NETWORK);
+                ssMixed << vMixed;
+                P2PDoSProcess(u, "getdata", ssMixed);
+                bool fWaits = u->vRecvGetData.size() == 1;
+                u->vSend.clear();
+                ProcessMessages(u);
+                vCmd = P2PDoSSent(*u);
+                nFail += Check(fWaits && vCmd.size() == 2 && vCmd[0] == "tx" && vCmd[1] == "inv" &&
+                               u->hashBatchLastBlock == 0,
+                               "a batch that ends in a later call serving only a transaction still ends with the tip inv") ? 0 : 1;
+                delete u;
+                CRITICAL_BLOCK(cs_mapRelay)
+                    mapRelay.erase(invTx);
+                hashBestChain = hashBestSaved;
+            }
+
+            // At version time: a peer behind us is told our tip, and a peer
+            // ahead of us is asked for blocks even when we have other peers.
+            {
+                std::vector<CNode*> vSavedNodes;
+                CRITICAL_BLOCK(cs_vNodes)
+                    vSavedNodes.swap(vNodes);
+                CNode* other1 = P2PDoSPeer();
+                CNode* other2 = P2PDoSPeer();
+                CRITICAL_BLOCK(cs_vNodes)
+                {
+                    vNodes.push_back(other1);
+                    vNodes.push_back(other2);
+                }
+                int nBestHeightSaved = nBestHeight;
+                nBestHeight = 100;
+                VersionGetBlocksResetForTest();
+                // behind, level, ahead, ahead again (rate-limited), barely ahead
+                int nHeights[5] = { 40, 100, 200, 300, 102 };
+                bool fTipInv[5], fGetBlocks[5];
+                for (int i = 0; i < 5; i++)
+                {
+                    CNode* v = new CNode(INVALID_SOCKET, CAddress("127.0.0.1"), true);
+                    v->vSend.clear();
+                    CDataStream ssVer(SER_NETWORK);
+                    ssVer << (int)VERSION << (uint64)NODE_NETWORK << (int64)GetAdjustedTime()
+                          << CAddress("127.0.0.1") << nHeights[i] << std::string("1.2.32");
+                    P2PDoSProcess(v, "version", ssVer);
+                    v->vSend.SetVersion(VERSION);
+                    std::vector<std::string> vCmd = P2PDoSSent(*v);
+                    fTipInv[i] = std::find(vCmd.begin(), vCmd.end(), "inv") != vCmd.end();
+                    fGetBlocks[i] = std::find(vCmd.begin(), vCmd.end(), "getblocks") != vCmd.end();
+                    delete v;
+                }
+                nBestHeight = nBestHeightSaved;
+                CRITICAL_BLOCK(cs_vNodes)
+                    vNodes.swap(vSavedNodes);
+                delete other1;
+                delete other2;
+                nFail += Check(fTipInv[0] && !fTipInv[1] && !fTipInv[2],
+                               "at version time a peer behind us, and only that peer, is sent an inv of our tip") ? 0 : 1;
+                nFail += Check(fGetBlocks[2] && !fGetBlocks[1],
+                               "a peer ahead of us is asked for blocks though we have other peers") ? 0 : 1;
+                nFail += Check(!fGetBlocks[3] && !fGetBlocks[4] && !fGetBlocks[0],
+                               "but only one such request per five minutes, and not for a peer a few blocks ahead") ? 0 : 1;
+                VersionGetBlocksResetForTest();
+            }
+        }
+
+        // ---- H2: getblocks answers at most 500 and says where to continue
+        {
+            CBlockIndex* pprev = NULL;
+            CBlockIndex* pRoot = NULL;
+            CBlockIndex* p500 = NULL;
+            for (int i = 0; i < 1200; i++)
+            {
+                CBlockIndex* pindex = new CBlockIndex();
+                map<uint256, CBlockIndex*>::iterator mi =
+                    mapBlockIndex.insert(make_pair(uint256(7700000 + i), pindex)).first;
+                pindex->phashBlock = &((*mi).first);
+                pindex->pprev = pprev;
+                pindex->nHeight = i;
+                if (pprev)
+                    pprev->pnext = pindex;
+                vMade.push_back(pindex);
+                pprev = pindex;
+                if (i == 0) pRoot = pindex;
+                if (i == 500) p500 = pindex;
+            }
+            std::vector<uint256> vHave(1, pRoot->GetBlockHash());
+
+            CNode* p = P2PDoSPeer();
+            CDataStream ss(SER_NETWORK);
+            ss << CBlockLocator(vHave) << uint256(0);
+            P2PDoSProcess(p, "getblocks", ss);
+            nFail += Check(p->vInventoryToSend.size() == (size_t)MAX_GETBLOCKS_RESULTS,
+                           "a getblocks from far behind gets 500 hashes, not the whole chain") ? 0 : 1;
+            nFail += Check(p->vInventoryToSend.back().hash == p500->GetBlockHash(),
+                           "and they are the 500 after the locator, in order") ? 0 : 1;
+
+            CDataStream ssStop(SER_NETWORK);
+            ssStop << CBlockLocator(vHave) << vMade[11]->GetBlockHash();
+            CNode* s = P2PDoSPeer();
+            P2PDoSProcess(s, "getblocks", ssStop);
+            nFail += Check(s->vInventoryToSend.size() == 10,
+                           "hashStop still ends the answer early") ? 0 : 1;
+            delete s;
+
+            CNode* q = P2PDoSPeer();
+            std::vector<uint256> vLong(MAX_LOCATOR_SZ + 1, pRoot->GetBlockHash());
+            CDataStream ssLong(SER_NETWORK);
+            ssLong << CBlockLocator(vLong) << uint256(0);
+            P2PDoSProcess(q, "getblocks", ssLong);
+            nFail += Check(q->nMisbehavior == 20 && q->vInventoryToSend.empty(),
+                           "a locator over 101 hashes is refused and costs 20 points") ? 0 : 1;
+            delete q;
+
+            // With the send buffer full the answer waits, then goes out.
+            CNode* w = P2PDoSPeer();
+            w->vSend.resize(SendBufferSize());
+            CDataStream ssWait(SER_NETWORK);
+            ssWait << CBlockLocator(vHave) << uint256(0);
+            P2PDoSProcess(w, "getblocks", ssWait);
+            nFail += Check(w->fGetBlocksPending && w->vInventoryToSend.empty(),
+                           "a getblocks to a peer that is not reading waits") ? 0 : 1;
+            CDataStream ssWait2(SER_NETWORK);
+            ssWait2 << CBlockLocator(vHave) << uint256(0);
+            P2PDoSProcess(w, "getblocks", ssWait2);
+            nFail += Check(w->fGetBlocksPending && w->vInventoryToSend.empty() && w->vSend.size() == SendBufferSize(),
+                           "and so does the next, replacing it: nothing piles up") ? 0 : 1;
+            w->vSend.clear();
+            CRITICAL_BLOCK(w->cs_vSend)
+                SendMessages(w);
+            std::vector<unsigned int> vSizes;
+            std::vector<std::string> vCmd = P2PDoSSent(*w, &vSizes);
+            nFail += Check(!w->fGetBlocksPending && vCmd.size() == 1 && vCmd[0] == "inv" &&
+                           vSizes[0] == 3 + 36 * (unsigned int)MAX_GETBLOCKS_RESULTS,
+                           "once it has room, SendMessages answers it: one inv of 500") ? 0 : 1;
+            delete w;
+            delete p;
+        }
+
+        // ---- H3: inv, mapAskFor, mapAlreadyAskedFor, setInventoryKnown
+        {
+            mruset<int> m(100);
+            for (int i = 0; i < 300; i++)
+                m.insert(i);
+            nFail += Check(m.size() == 100 && m.count(299) && !m.count(199),
+                           "mruset keeps the most recent 100") ? 0 : 1;
+            for (int i = 0; i < 10000; i++)
+            {
+                m.erase(299);
+                m.insert(299);
+            }
+            nFail += Check(m.size() == 100 && m.order_size() <= 2 * 100 + 16,
+                           "erase and insert in a loop do not grow it") ? 0 : 1;
+
+            mapAlreadyAskedFor.clear();
+            std::vector<CNode*> vPeers;
+            for (int n = 0; n < 3; n++)
+            {
+                CNode* p = P2PDoSPeer();
+                vPeers.push_back(p);
+                std::vector<CInv> vInv;
+                for (unsigned int i = 0; i < MAX_INV_SZ + 10000; i++)
+                    vInv.push_back(CInv(MSG_BLOCK, uint256(((uint64)(n + 1) << 32) + i)));
+                CDataStream ss(SER_NETWORK);
+                ss << vInv;
+                P2PDoSProcess(p, "inv", ss);
+            }
+            nFail += Check(vPeers[0]->nMisbehavior == 0,
+                           "an inv over MAX_INV_SZ costs nothing: 1.2.x nodes send whole-chain invs") ? 0 : 1;
+            nFail += Check(vPeers[0]->mapAskFor.size() <= MAX_ASKFOR_PER_PEER,
+                           "one peer queues at most MAX_ASKFOR_PER_PEER requests") ? 0 : 1;
+            nFail += Check(vPeers[0]->setInventoryKnown.size() <= MAX_INVENTORY_KNOWN,
+                           "what a peer is known to have is held to MAX_INVENTORY_KNOWN") ? 0 : 1;
+            nFail += Check(mapAlreadyAskedFor.size() <= MAX_ALREADY_ASKED_FOR,
+                           "three invs of random hashes leave at most MAX_ALREADY_ASKED_FOR behind") ? 0 : 1;
+            for (size_t i = 0; i < vPeers.size(); i++)
+                delete vPeers[i];
+
+            // Entries more than two minutes in the past go for free.
+            mapAlreadyAskedFor.clear();
+            int64 nNow = GetTime() * 1000000LL;
+            for (int i = 0; i < 1000; i++)
+                mapAlreadyAskedFor[CInv(MSG_TX, uint256(9100000 + i))] = nNow - (i < 600 ? 10 * 60 : 30) * 1000000LL;
+            PruneAlreadyAskedFor(nNow, MAX_ALREADY_ASKED_FOR);
+            nFail += Check(mapAlreadyAskedFor.size() == 400,
+                           "requests older than the two-minute stagger are forgotten") ? 0 : 1;
+            PruneAlreadyAskedFor(nNow, 100);
+            nFail += Check(mapAlreadyAskedFor.size() == 100,
+                           "and past the target the oldest go") ? 0 : 1;
+            mapAlreadyAskedFor.clear();
+        }
+
+        // ---- H1: receive backpressure and a per-pass share for each peer
+        {
+            nReceiveFloodSize = 1000;
+            CNode* p = P2PDoSPeer();
+            for (int i = 0; i < 60; i++)
+                P2PDoSQueue(*p, "ping", CDataStream(SER_NETWORK));
+            nFail += Check(p->RecvFloodPaused(),
+                           "over ReceiveFloodSize() with a complete message waiting: not read") ? 0 : 1;
+            delete p;
+
+            CNode* q = P2PDoSPeer();
+            CDataStream ssBig(SER_NETWORK);
+            ssBig << std::vector<unsigned char>(5000, 1);
+            P2PDoSQueue(*q, "tx", ssBig);
+            q->vRecv.resize(q->vRecv.size() - 2000);       // 3000 of its 5000 bytes so far
+            nFail += Check(!q->RecvFloodPaused(),
+                           "a message larger than the bound is still read to its end") ? 0 : 1;
+            delete q;
+            nReceiveFloodSize = nRecvSaved;
+
+            CNode* r = P2PDoSPeer();
+            for (int i = 0; i < 250; i++)
+                P2PDoSQueue(*r, "ping", CDataStream(SER_NETWORK));
+            unsigned int nPing = 24;
+            ProcessMessages(r);
+            bool fFirst = r->vRecv.size() == 150 * nPing && r->fRecvMorePending;
+            ProcessMessages(r);
+            ProcessMessages(r);
+            nFail += Check(fFirst && r->vRecv.empty() && !r->fRecvMorePending,
+                           "a backlog of 250 is taken 100 per pass, and the thread told to come back") ? 0 : 1;
+            delete r;
+        }
+
+        // ---- H4: a dropped peer is not listened to, and goes without drain grace
+        {
+            CInv invItem(MSG_TX, uint256(0xd06));
+            CDataStream ssItem(SER_NETWORK);
+            ssItem << std::vector<unsigned char>(100, 1);
+            CRITICAL_BLOCK(cs_mapRelay)
+                mapRelay[invItem] = ssItem;
+            CDataStream ssGet(SER_NETWORK);
+            ssGet << std::vector<CInv>(1, invItem);
+
+            // A peer dropped for misbehavior is not listened to any more; one
+            // that is merely on its way out still has what it sent taken.
+            CNode* p = P2PDoSPeer();
+            p->fDisconnect = true;
+            p->fDropWithoutDrain = true;
+            P2PDoSQueue(*p, "getdata", ssGet);
+            ProcessMessages(p);
+            nFail += Check(p->vRecv.empty() && p->vSend.empty(),
+                           "a peer dropped for misbehavior: its messages are dropped unread") ? 0 : 1;
+            delete p;
+
+            CNode* closing = P2PDoSPeer();
+            closing->fDisconnect = true;
+            P2PDoSQueue(*closing, "getdata", ssGet);
+            ProcessMessages(closing);
+            std::vector<std::string> vClosing = P2PDoSSent(*closing);
+            nFail += Check(closing->vRecv.empty() && vClosing.size() == 1 && vClosing[0] == "tx",
+                           "a peer that only closed: what it already sent is still processed") ? 0 : 1;
+            delete closing;
+
+            CNode* q = P2PDoSPeer();
+            CDataStream ssEmpty(SER_NETWORK);
+            for (int i = 0; i < 5; i++)
+            {
+                P2PDoSQueue(*q, "ping", ssEmpty);
+                // Corrupt the checksum of the ping just queued: with no
+                // payload, it is the last four bytes in the buffer.
+                q->vRecv[q->vRecv.size() - 4] ^= 0x55;
+            }
+            P2PDoSQueue(*q, "getdata", ssGet);
+            ProcessMessages(q);
+            nFail += Check(q->fDisconnect && q->fDropWithoutDrain && q->vSend.empty() && q->vRecv.empty(),
+                           "dropped mid-pass for bad checksums: what follows is not processed") ? 0 : 1;
+            nFail += Check(NodeReadyToDrop(q, GetTime()),
+                           "and it leaves at once, without the drain grace") ? 0 : 1;
+            delete q;
+            CRITICAL_BLOCK(cs_mapRelay)
+                mapRelay.erase(invItem);
+
+            CNode* d = P2PDoSPeer();
+            d->fDisconnect = true;
+            d->vSend.resize(100);
+            d->nDisconnectSince = GetTime();
+            bool fWaits = !NodeReadyToDrop(d, GetTime());
+            nFail += Check(fWaits && NodeReadyToDrop(d, GetTime() + DISCONNECT_DRAIN_SECS + 1),
+                           "an ordinary disconnect still gets its drain grace, bounded") ? 0 : 1;
+            delete d;
+
+            // The inbound block budget: a token is spent only by a block that
+            // passed every cheap check and is about to be hashed.
+            InboundBlockBudgetResetForTest(3, true);
+            {
+                CNode* in = P2PDoSPeer(true);
+                CBlock bFuture = P2PDoSBlock(500, 24 * 60 * 60);
+                CDataStream ssB(SER_NETWORK);
+                ssB << bFuture;
+                P2PDoSProcess(in, "block", ssB);
+                CNode* in2 = P2PDoSPeer(true);
+                CBlock bEmpty;
+                bEmpty.nNonce = 501;
+                CDataStream ssE(SER_NETWORK);
+                ssE << bEmpty;
+                P2PDoSProcess(in2, "block", ssE);
+                nFail += Check(InboundBlockBudgetTokensForTest() == 3 && in->nMisbehavior == 0,
+                               "a block from the future, or with no coinbase, spends no token") ? 0 : 1;
+                delete in;
+                delete in2;
+            }
+            int64 nRefusedBefore = nInboundBlocksRefused;
+            int64 nBefore = nBlocksReceived;
+            CNode* r = NULL;
+            uint256 hashRefused = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                CNode* in = P2PDoSPeer(true);
+                CBlock block = P2PDoSBlock(1000 + i, 0);
+                CDataStream ssB(SER_NETWORK);
+                ssB << block;
+                P2PDoSProcess(in, "block", ssB);
+                if (i == 4)
+                {
+                    r = in;
+                    hashRefused = block.GetHash();
+                }
+                else
+                    delete in;
+            }
+            nFail += Check(nBlocksReceived - nBefore == 5 && InboundBlockBudgetTokensForTest() == 0 &&
+                           nInboundBlocksRefused - nRefusedBefore == 2,
+                           "five well-formed blocks from new inbound peers, budget of three: two not hashed") ? 0 : 1;
+            nFail += Check(r && r->nMisbehavior == 0 && r->vBlocksRefused.size() == 1 &&
+                           r->vBlocksRefused[0] == hashRefused &&
+                           !mapAlreadyAskedFor.count(CInv(MSG_BLOCK, hashRefused)),
+                           "a refused block costs nothing and is remembered, not forgotten") ? 0 : 1;
+            if (r)
+            {
+                CRITICAL_BLOCK(r->cs_vSend)
+                    SendMessages(r);
+                bool fNotYet = P2PDoSSent(*r).empty() && r->vBlocksRefused.size() == 1;
+                InboundBlockBudgetResetForTest(1);
+                CRITICAL_BLOCK(r->cs_vSend)
+                    SendMessages(r);
+                std::vector<std::string> vCmd = P2PDoSSent(*r);
+                nFail += Check(fNotYet && r->vBlocksRefused.empty() && vCmd.size() == 1 && vCmd[0] == "getdata",
+                               "and it is asked for again once there is budget") ? 0 : 1;
+                delete r;
+            }
+
+            InboundBlockBudgetResetForTest(0, true);
+            nRefusedBefore = nInboundBlocksRefused;
+            nBefore = nBlocksReceived;
+            CNode* old = P2PDoSPeer(true);
+            old->nTimeConnected = GetTime() - INBOUND_BLOCK_BUDGET_EXEMPT_SECS - 1;
+            CNode* out = P2PDoSPeer(false);
+            CNode* proven = P2PDoSPeer(true);
+            proven->nGoodBlocks = 1;
+            CNode* vPeers3[3] = { old, out, proven };
+            for (int i = 0; i < 3; i++)
+            {
+                CBlock block = P2PDoSBlock(2000 + i, 0);
+                CDataStream ssB(SER_NETWORK);
+                ssB << block;
+                P2PDoSProcess(vPeers3[i], "block", ssB);
+            }
+            nFail += Check(nBlocksReceived - nBefore == 3 && nInboundBlocksRefused == nRefusedBefore,
+                           "inbound peers connected ten minutes, outbound peers, and peers that gave a block are not limited") ? 0 : 1;
+            delete old;
+            delete out;
+            delete proven;
+            InboundBlockBudgetResetForTest(32);
+
+            // A peer that announces and does not read gets no getdata from us.
+            {
+                CNode* h = P2PDoSPeer();
+                h->vSend.resize(SendBufferSize());
+                std::vector<CInv> vInv;
+                for (int i = 0; i < 100; i++)
+                    vInv.push_back(CInv(MSG_BLOCK, uint256(0xa000000 + i)));
+                for (int i = 0; i < 100; i++)
+                    vInv.push_back(CInv(MSG_TX, uint256(0xb000000 + i)));
+                CDataStream ss(SER_NETWORK);
+                ss << vInv;
+                P2PDoSProcess(h, "inv", ss);
+                size_t nAsked = h->mapAskFor.size();
+                CRITICAL_BLOCK(h->cs_vSend)
+                    SendMessages(h);
+                nFail += Check(nAsked == 100 && h->vSend.size() == SendBufferSize() && h->mapAskFor.size() == 100,
+                               "with its send buffer full: transactions are not looked up, nothing is sent, requests wait") ? 0 : 1;
+                h->vSend.clear();
+                CRITICAL_BLOCK(h->cs_vSend)
+                    SendMessages(h);
+                std::vector<std::string> vCmd = P2PDoSSent(*h);
+                nFail += Check(vCmd.size() == 1 && vCmd[0] == "getdata" && h->mapAskFor.empty(),
+                               "and they go out once it reads") ? 0 : 1;
+                delete h;
+
+                CNode* f = P2PDoSPeer();
+                f->vSend.resize(MAX_SEND_BUFFER_HARD);
+                bool fUnder = !SendFloodCheck(f) && !f->fDisconnect;
+                f->vSend.resize(MAX_SEND_BUFFER_HARD + 1);
+                bool fOver = SendFloodCheck(f) && f->fDisconnect && f->fDropWithoutDrain;
+                f->vSend.release();
+                nFail += Check(fUnder && fOver, "past MAX_SEND_BUFFER_HARD queued, the peer is dropped") ? 0 : 1;
+                delete f;
+            }
+
+            // Database reads for announced transactions are rationed per peer.
+            {
+                CNode* t = P2PDoSPeer();
+                std::vector<CInv> vInv;
+                for (int i = 0; i < 2 * TX_INV_LOOKUPS_MAX; i++)
+                    vInv.push_back(CInv(MSG_TX, uint256(0xc0000000ULL + i)));
+                CDataStream ss(SER_NETWORK);
+                ss << vInv;
+                P2PDoSProcess(t, "inv", ss);
+                nFail += Check(t->mapAskFor.size() == (size_t)TX_INV_LOOKUPS_MAX && t->nTxInvTokens == 0,
+                               "an inv of 10000 transactions: 5000 looked up, the rest not asked for") ? 0 : 1;
+                delete t;
+            }
+
+            // Disconnect() gives the buffers back, and touches what the
+            // message thread uses under cs_vSend only when it holds cs_vSend.
+            {
+                CNode* x = P2PDoSPeer();
+                P2PDoSQueue(*x, "ping", CDataStream(SER_NETWORK));
+                x->vRecvGetData.push_back(CInv(MSG_TX, uint256(1)));
+                x->fGetBlocksPending = true;
+                x->vGetBlocksHave.assign(5, uint256(2));
+                x->vBlocksRefused.push_back(uint256(3));
+                x->AskFor(CInv(MSG_TX, uint256(0xd1)));
+                x->vSend.resize(1000);
+                std::atomic<int> nHold(0);
+                std::thread holder([&]() {
+                    CRITICAL_BLOCK(x->cs_vSend)
+                    {
+                        nHold = 1;
+                        while (nHold == 1)
+                            Sleep(5);
+                    }
+                });
+                while (nHold == 0)
+                    Sleep(5);
+                x->Disconnect();
+                bool fHeld = x->vRecv.empty() && x->vRecvGetData.empty() &&
+                             x->fGetBlocksPending && x->vGetBlocksHave.size() == 5 &&
+                             x->vBlocksRefused.size() == 1 && x->mapAskFor.size() == 1 &&
+                             x->vSend.size() == 1000;
+                nHold = 2;
+                holder.join();
+                nFail += Check(fHeld, "with cs_vSend held elsewhere, Disconnect leaves the pending getblocks alone") ? 0 : 1;
+                x->Disconnect();
+                nFail += Check(!x->fGetBlocksPending && x->vGetBlocksHave.empty() && x->vBlocksRefused.empty() &&
+                               x->mapAskFor.empty() && x->vSend.empty(),
+                               "and frees it all when it can take both locks") ? 0 : 1;
+                delete x;
+            }
+        }
+
+        // ---- M2: eviction picks a fresh, idle peer and never a useful one
+        {
+            int64 nNow = GetTime();
+            std::vector<NodeEvictionCandidate> v;
+            for (int i = 0; i < 40; i++)
+            {
+                NodeEvictionCandidate c;
+                c.nTimeConnected = nNow - 10000 + i * 100;    // larger i: younger
+                c.nLastBlockTime = c.nLastTxTime = c.nLastShareTime = 0;
+                c.fHandshakeDone = true;
+                v.push_back(c);
+            }
+            // The four youngest relayed blocks, the next four transactions.
+            for (int i = 36; i < 40; i++) v[i].nLastBlockTime = nNow - (40 - i);
+            for (int i = 32; i < 36; i++) v[i].nLastTxTime = nNow - (40 - i);
+            int n = SelectNodeToEvict(v);
+            nFail += Check(n == 31, "the youngest peer that has given us nothing is evicted") ? 0 : 1;
+            v[20].fHandshakeDone = false;
+            n = SelectNodeToEvict(v);
+            nFail += Check(n == 20, "one that never finished its handshake goes first") ? 0 : 1;
+            v[0].fHandshakeDone = false;
+            n = SelectNodeToEvict(v);
+            nFail += Check(n == 20, "but not from among the longest connected") ? 0 : 1;
+            std::vector<NodeEvictionCandidate> vUseful(v.begin() + 32, v.end());
+            nFail += Check(SelectNodeToEvict(vUseful) == -1,
+                           "with every peer useful, nobody is evicted") ? 0 : 1;
+        }
+
+        // ---- M2 (review): a whole-chain inv cut at MAX_INV_SZ continues
+        {
+            CNode* c = P2PDoSPeer();
+            std::vector<CInv> vInv;
+            for (unsigned int i = 0; i < MAX_INV_SZ + 5; i++)
+                vInv.push_back(CInv(MSG_BLOCK, uint256(((uint64)7 << 40) + i)));
+            CDataStream ss(SER_NETWORK);
+            ss << vInv;
+            P2PDoSProcess(c, "inv", ss);
+            bool fKept = c->hashInvContinue == vInv[MAX_INV_SZ - 1].hash;
+            c->mapAskFor.clear();
+            // When that block arrives (here one refused for its timestamp,
+            // which costs nothing), the same peer is asked for the rest.
+            CBlock block = P2PDoSBlock(3000, 24 * 60 * 60);
+            c->hashInvContinue = block.GetHash();
+            CDataStream ssB(SER_NETWORK);
+            ssB << block;
+            P2PDoSProcess(c, "block", ssB);
+            std::vector<std::string> vCmd = P2PDoSSent(*c);
+            nFail += Check(fKept && c->hashInvContinue == 0 && vCmd.size() == 1 && vCmd[0] == "getblocks",
+                           "an inv cut at MAX_INV_SZ: when its last block arrives, getblocks goes to the same peer") ? 0 : 1;
+            delete c;
+        }
+
+        // ---- M2: eviction with real nodes in vNodes
+        {
+            std::vector<CNode*> vSavedNodes;
+            CRITICAL_BLOCK(cs_vNodes)
+                vSavedNodes.swap(vNodes);
+            int64 nNow = GetTime();
+            std::vector<CNode*> vMine;
+            for (int i = 0; i < 6; i++)
+            {
+                CNode* n = P2PDoSPeer(true);
+                n->nTimeConnected = nNow - 1000 + i * 10;   // larger i: younger
+                vMine.push_back(n);
+            }
+            vMine[5]->fDisconnect = true;                    // the youngest, already going
+            CNode* outbound = P2PDoSPeer(false);
+            outbound->nTimeConnected = nNow;
+            vMine.push_back(outbound);
+            CRITICAL_BLOCK(cs_vNodes)
+                vNodes = vMine;
+            bool fEvicted = AttemptToEvictConnection();
+            nFail += Check(fEvicted && vMine[4]->fDisconnect && vMine[4]->fDropWithoutDrain &&
+                           !vMine[5]->fDropWithoutDrain && !outbound->fDisconnect &&
+                           !vMine[0]->fDisconnect && !vMine[3]->fDisconnect,
+                           "eviction among real nodes: the youngest live inbound peer, never outbound") ? 0 : 1;
+            CRITICAL_BLOCK(cs_vNodes)
+                vNodes.swap(vSavedNodes);
+            for (size_t i = 0; i < vMine.size(); i++)
+                delete vMine[i];
+        }
+
+        // ---- M4: hearsay never pushes a peer that answered out of the cache
+        {
+            for (int i = 0; i < 10; i++)
+                BtfRememberPeerForTest(strprintf("selftest-verified-%d", i), "", true);
+            for (int i = 0; i < 200; i++)
+                BtfRememberPeerForTest(strprintf("selftest-hearsay-%d", i), "", false);
+            int nVerified = 0, nHearsay = 0;
+            std::vector<std::string> vOrder;
+            BtfPeerCacheStatsForTest(nVerified, nHearsay, vOrder);
+            bool fFirst = vOrder.size() >= 10;
+            for (int i = 0; fFirst && i < 10; i++)
+                fFirst = vOrder[i].compare(0, 18, "selftest-verified-") == 0;
+            nFail += Check(nVerified == 10 && nHearsay == 50,
+                           "200 peers heard of: the 10 that answered stay, hearsay is held to 50") ? 0 : 1;
+            nFail += Check(fFirst, "and the ones that answered are dialled first") ? 0 : 1;
+            for (int i = 10; i < 70; i++)
+                BtfRememberPeerForTest(strprintf("selftest-verified-%d", i), "", true);
+            BtfPeerCacheStatsForTest(nVerified, nHearsay, vOrder);
+            nFail += Check(nVerified == 50 && nHearsay == 50,
+                           "peers that answered have their own 50") ? 0 : 1;
+
+            CNode* p = P2PDoSPeer(true);
+            CDataStream ss1(SER_NETWORK), ss2(SER_NETWORK);
+            ss1 << std::vector<std::string>();
+            ss2 << std::vector<std::string>(1, "x");
+            P2PDoSProcess(p, "btfpeers", ss1);
+            int64 nFirst = p->nLastPexRecv;
+            P2PDoSProcess(p, "btfpeers", ss2);
+            nFail += Check(nFirst != 0 && ss2.empty() && p->nLastPexRecv == nFirst,
+                           "one btfpeers per connection is read, the next is not") ? 0 : 1;
+            delete p;
+        }
+
+        // ---- L1: the legacy review message does nothing
+        {
+            CNode* p = P2PDoSPeer();
+            CDataStream ss(SER_NETWORK);
+            ss << std::vector<unsigned char>(64, 0xee);
+            bool fOk = P2PDoSProcess(p, "review", ss);
+            nFail += Check(fOk && ss.empty() && p->nMisbehavior == 0 && p->vSend.empty() &&
+                           !FileExists((tmp + "/reviews.dat").c_str()),
+                           "a review is dropped unread: no signature check, no file") ? 0 : 1;
+            delete p;
+        }
+
+        // ---- H5: what a peer can write to debug.log is bounded
+        {
+            std::string strLog = tmp + "/rotate-test.log";
+            FILE* f = fopen(strLog.c_str(), "w");
+            if (f)
+            {
+                std::string s(2000, 'x');
+                fwrite(s.data(), 1, s.size(), f);
+                fclose(f);
+            }
+            bool fNo = !DebugLogRotateIfOver(strLog, 500, 1000);
+            bool fYes = DebugLogRotateIfOver(strLog, 2000, 1000);
+            nFail += Check(fNo && fYes && FileExists((strLog + ".1").c_str()) && !FileExists(strLog.c_str()),
+                           "a log over the cap is moved to .1") ? 0 : 1;
+            f = fopen(strLog.c_str(), "w");
+            if (f) { fputs("second", f); fclose(f); }
+            bool fAgain = DebugLogRotateIfOver(strLog, -1, 1000);
+            long nOld = -1;
+            f = fopen((strLog + ".1").c_str(), "r");
+            if (f) { fseek(f, 0, SEEK_END); nOld = ftell(f); fclose(f); }
+            nFail += Check(fAgain && nOld == 6, "and a later rotation replaces the old .1") ? 0 : 1;
+
+            int64 nSuppressedBefore = nLogLinesSuppressed;
+            for (int i = 0; i < 50; i++)
+                error("p2p-dos self-test repeated error %d", i);
+            nFail += Check(nLogLinesSuppressed - nSuppressedBefore == 49,
+                           "50 identical errors in a burst write one line") ? 0 : 1;
+            nSuppressedBefore = nLogLinesSuppressed;
+            error("%s", "p2p-dos alpha");
+            error("%s", "p2p-dos beta");
+            nFail += Check(nLogLinesSuppressed == nSuppressedBefore,
+                           "different errors through one bare \"%s\" format are not merged") ? 0 : 1;
+
+            const std::string& strPath = DebugLogPath();
+            if (strPath.compare(0, tmp.size(), tmp) == 0)
+            {
+                long nSavedMax = nDebugLogMaxBytes;
+                nDebugLogMaxBytes = 4000;
+                for (int i = 0; i < 100; i++)
+                    OutputDebugStringF("p2p-dos rotation check, line %d of a hundred\n", i);
+                nDebugLogMaxBytes = nSavedMax;
+                long nNow = -1;
+                FILE* fl = fopen(strPath.c_str(), "r");
+                if (fl) { fseek(fl, 0, SEEK_END); nNow = ftell(fl); fclose(fl); }
+                nFail += Check(FileExists((strPath + ".1").c_str()) && nNow >= 0 && nNow <= 4000 + 200,
+                               "through the real logging path, debug.log rotates at the cap") ? 0 : 1;
+
+                // A burst's count reaches the log once its window closes,
+                // without waiting for the same line to come again.
+                for (int i = 0; i < 5; i++)
+                    error("p2p-dos flush check %d", i);
+                Sleep(3200);
+                LogDedupFlush();
+                std::string body;
+                fl = fopen(strPath.c_str(), "r");
+                if (fl)
+                {
+                    char buf[4096];
+                    size_t r;
+                    while ((r = fread(buf, 1, sizeof(buf), fl)) > 0)
+                        body.append(buf, r);
+                    fclose(fl);
+                }
+                nFail += Check(body.find("(4 similar in 3s, last: p2p-dos flush check 4)") != std::string::npos,
+                               "and a burst's count is written once its window closes") ? 0 : 1;
+            }
+            else
+                printf("  skip debug.log path checks: this process logs to %s\n", strPath.c_str());
+
+            // A message that does not parse is one line and the next is read.
+            CNode* p = P2PDoSPeer();
+            CDataStream ssShort(SER_NETWORK);
+            ssShort << (unsigned char)5;             // claims five entries, has none
+            P2PDoSQueue(*p, "inv", ssShort);
+            P2PDoSQueue(*p, "ping", CDataStream(SER_NETWORK));
+            ProcessMessages(p);
+            nFail += Check(p->vRecv.empty() && !p->fDisconnect,
+                           "a short inv is dropped and the next message read") ? 0 : 1;
+            delete p;
+        }
+
+        // ---- M5: block checks do not wait behind another verifier
+        {
+            unsigned char data[80];
+            memset(data, 0x42, sizeof(data));
+            uint256 hRef = RandomXPoWHash(2, data, sizeof(data));
+            std::atomic<int> nHolder(0);
+            std::thread holder([&]() {
+                RandomXHoldPrimaryVerifyForTest(2, true);
+                nHolder = 1;
+                while (nHolder == 1)
+                    Sleep(10);
+                RandomXHoldPrimaryVerifyForTest(2, false);
+            });
+            while (nHolder == 0)
+                Sleep(10);
+            std::atomic<bool> fDone(false);
+            uint256 hGot = 0;
+            std::thread hasher([&]() {
+                hGot = RandomXPoWHash(2, data, sizeof(data));
+                fDone = true;
+            });
+            for (int i = 0; i < 3000 && !fDone; i++)
+                Sleep(10);
+            bool fFinished = fDone;
+            nHolder = 2;
+            holder.join();
+            hasher.join();
+            nFail += Check(fFinished && hGot == hRef && hRef != 0,
+                           "with the first VM held, a hash completes on another, and agrees") ? 0 : 1;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+
+    nSendBufferSize = nSendSaved;
+    nReceiveFloodSize = nRecvSaved;
+    for (size_t i = 0; i < vMade.size(); i++)
+    {
+        mapBlockIndex.erase(vMade[i]->GetBlockHash());
+        delete vMade[i];
+    }
+    if (pindexBestSaved)
+        pindexBest = pindexBestSaved;
+    DBFlush(true);
+    strSetDataDir = strOldDataDir;
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -12809,6 +13719,8 @@ int RunSelfTest(const std::string& name)
         return RunRulesV2SelfTest();
     if (name == "net-hardening")
         return RunNetHardeningSelfTest();
+    if (name == "p2p-dos")
+        return RunP2PDoSSelfTest();
     if (name == "multisig")
         return RunMultisigSelfTest();
     if (name == "socks5-proxy")
@@ -12909,6 +13821,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
     return 1;
 }
