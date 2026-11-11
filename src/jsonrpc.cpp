@@ -4452,6 +4452,19 @@ int WalletRpcV4SelfTest()
     // they open with rules v3, and this test must not depend on the date).
     bool fWasTestNetVault = IsTestNet();
     SelectNetworkParams(true);
+    // Script addresses need rules v3 locked in by the tip's median time
+    // (RulesV3LockedIn): a stand-in tip dated now, which is past the testnet
+    // switch. Restored below.
+    CBlockIndex fakeTipVault;
+    fakeTipVault.nTime = (unsigned int)GetAdjustedTime();
+    CBlockIndex* pSavedBestVault = pindexBest;
+    struct CRestoreBest
+    {
+        CBlockIndex* p;
+        ~CRestoreBest() { pindexBest = p; }   // also on an exception
+    } restoreBest = { pSavedBestVault };
+    pindexBest = &fakeTipVault;
+    nFail += T::Check(RulesV3LockedIn(), "rules v3 are locked in on the stand-in testnet tip");
     {
         CKey keyHot, keyRec;
         keyHot.MakeNewKey();
@@ -4562,6 +4575,7 @@ int WalletRpcV4SelfTest()
         catch (std::exception& e) { fGone = string(e.what()).find("neither in the chain") != string::npos; }
         nFail += T::Check(fGone, "an unvault in neither the chain nor the pool is refused, pointing to vaultunvault");
     }
+    pindexBest = pSavedBestVault;
     SelectNetworkParams(fWasTestNetVault);
 
     fprintf(stdout, "  -- signrawtransaction's temporary keys\n");
