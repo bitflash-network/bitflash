@@ -1962,9 +1962,9 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
                     gHaveJob = false; // job is stale regardless
                 }
             } else {
+                // ProcessBlock has already freed it, whatever the refusal.
                 LogPrint("pool", "[pool] BLOCK REJECTED height=%d (ProcessBlock returned false)\n",
                          sj.height);
-                delete pblock;
             }
         }
 

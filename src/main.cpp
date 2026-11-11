@@ -3052,12 +3052,24 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
     if (pfrom)
         nBlocksReceived++;
 
+    // ProcessBlock owns pblock on every path: it is kept as an orphan or
+    // deleted here. The two duplicate returns used to leave it to the caller,
+    // which the network path never freed (every repeated block leaked) while
+    // the pool freed it on any refusal, so a block refused by CheckBlock or
+    // AcceptBlock was freed twice. fuzz-p2p-payload found the leak.
     // Check for duplicate
     uint256 hash = pblock->GetHash();
     if (mapBlockIndex.count(hash))
-        return error("ProcessBlock() : already have block %d %s", mapBlockIndex[hash]->nHeight, hash.ToString().substr(0,14).c_str());
+    {
+        int nHeight = mapBlockIndex[hash]->nHeight;
+        delete pblock;
+        return error("ProcessBlock() : already have block %d %s", nHeight, hash.ToString().substr(0,14).c_str());
+    }
     if (mapOrphanBlocks.count(hash))
+    {
+        delete pblock;
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,14).c_str());
+    }
 
     // Preliminary checks
     if (!pblock->CheckBlock(pnDoS))

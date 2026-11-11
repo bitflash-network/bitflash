@@ -13,7 +13,11 @@
 //   byte 0   command, an index into kCommands (the last entry reads the
 //            command name from the next 12 bytes instead)
 //   byte 1   flags: bit 0 = for "block", recompute the merkle root before the
-//            block is handled, so inputs get past that check too
+//            block is handled, so inputs get past that check too;
+//            bit 1 = the rest is a sequence of messages from the same peer,
+//            each [command][flags][length, 2 bytes little-endian][payload],
+//            up to 16 of them (a branch, then the block that makes it the
+//            best chain, is how reorganisation is reached)
 //   rest     the payload
 //
 // The node keeps its state between inputs, in a private temporary data
@@ -59,6 +63,7 @@ static const char* const kCommands[] = {
 };
 static const size_t kNumCommands = sizeof(kCommands) / sizeof(kCommands[0]);
 static const unsigned char FLAG_FIX_MERKLE = 1;
+static const unsigned char FLAG_SEQUENCE = 2;
 
 static size_t CommandIndex(const char* psz)
 {
@@ -82,6 +87,30 @@ static void WriteSeed(const string& strDir, const char* pszName, const char* psz
     fwrite(hdr, 1, 2, f);
     if (ss.size())
         fwrite(&ss[0], 1, ss.size(), f);
+    fclose(f);
+}
+
+// One record of a sequence input (see the layout at the top).
+static void AppendRecord(string& str, const char* pszCommand, unsigned char nFlags, const CDataStream& ss)
+{
+    str += (char)CommandIndex(pszCommand);
+    str += (char)nFlags;
+    str += (char)(ss.size() & 0xff);
+    str += (char)((ss.size() >> 8) & 0xff);
+    if (ss.size())
+        str.append(&ss[0], ss.size());
+}
+
+static void WriteRaw(const string& strDir, const char* pszName, const string& str)
+{
+    string strPath = strDir + "/" + pszName;
+    FILE* f = fopen(strPath.c_str(), "wb");
+    if (!f)
+    {
+        perror(strPath.c_str());
+        exit(1);
+    }
+    fwrite(str.data(), 1, str.size(), f);
     fclose(f);
 }
 
@@ -120,6 +149,32 @@ static void WriteSeeds(const string& strDir)
         CDataStream ss(SER_NETWORK);
         ss << genesis;
         WriteSeed(strDir, "block-genesis", "block", 0, ss);
+    }
+
+    // A reorganisation in one input: block A at height 1, a competing B at
+    // height 1, then C on B. B and C carry more work than A, so the node
+    // disconnects A and connects B and C.
+    {
+        CBlock blockB = block;
+        blockB.vtx[0].vin[0].scriptSig = CScript() << 1 << block.nBits << CBigNum(2);
+        blockB.hashMerkleRoot = blockB.BuildMerkleTree();
+        CBlock blockC = block;
+        blockC.hashPrevBlock = blockB.GetHash();
+        blockC.nTime = blockB.nTime + 1;
+        blockC.vtx[0].vin[0].scriptSig = CScript() << 2 << block.nBits << CBigNum(1);
+        blockC.vtx[0].vout[0].nValue = blockC.GetBlockValue(2, 0);
+        blockC.hashMerkleRoot = blockC.BuildMerkleTree();
+        string str;
+        str += (char)CommandIndex("block");
+        str += (char)FLAG_SEQUENCE;
+        CDataStream ssA(SER_NETWORK), ssB(SER_NETWORK), ssC(SER_NETWORK);
+        ssA << block;
+        ssB << blockB;
+        ssC << blockC;
+        AppendRecord(str, "block", 0, ssA);
+        AppendRecord(str, "block", 0, ssB);
+        AppendRecord(str, "block", 0, ssC);
+        WriteRaw(strDir, "sequence-reorg", str);
     }
 
     // A transaction spending the coinbase above: missing input, so it goes
@@ -171,6 +226,30 @@ static void WriteSeeds(const string& strDir)
     }
 }
 
+// The Berkeley DB environment stays open for the whole run, as in a node. Its
+// internal allocations are referenced from memory the library maps for
+// itself, which LeakSanitizer does not scan, so they read as leaks at exit.
+// Closing the environment from an exit handler is no way out: by then some of
+// the globals it logs through are already destroyed. Only allocations made
+// inside libdb are suppressed; a Berkeley DB handle the node itself leaks is
+// allocated from node code and is still reported (that is how the CDB open
+// leak was found).
+extern "C" const char* __lsan_default_suppressions()
+{
+    return "leak:__os_malloc\n";
+}
+
+// The chain this harness builds lives for the whole run (block index entries,
+// orphan blocks and transactions), held in global maps. At exit those maps
+// are destroyed before the final leak check and their pointers are lost, as
+// in the node, which never frees them either. So no leak check at exit;
+// libFuzzer still checks after every input that changed the heap, which is
+// where a leak an input causes shows up.
+extern "C" const char* __asan_default_options()
+{
+    return "leak_check_at_exit=0";
+}
+
 static void FuzzP2PInit()
 {
     SelectChainParams(false);
@@ -189,25 +268,17 @@ static void FuzzP2PInit()
     }
 }
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
+// One message from the peer: its command (index into kCommands), flags and
+// payload, handled as ProcessMessages() hands messages over.
+static void HandleOne(CNode& node, size_t nIndex, unsigned char nFlags, const uint8_t* data, size_t size)
 {
-    // Large enough for blocks with many transactions, small enough that the
-    // size checks, not the allocator, are what a huge input meets.
-    if (size < 2 || size > 200000)
-        return 0;
-
-    size_t nIndex = data[0] % kNumCommands;
-    unsigned char nFlags = data[1];
-    data += 2;
-    size -= 2;
-
     string strCommand;
     if (kCommands[nIndex])
         strCommand = kCommands[nIndex];
     else
     {
         if (size < 12)
-            return 0;
+            return;
         strCommand.assign((const char*)data, strnlen((const char*)data, 12));
         data += 12;
         size -= 12;
@@ -235,11 +306,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         }
     }
 
-    CNode node(INVALID_SOCKET, CAddress("127.0.0.1"));
-    node.nVersion = VERSION;
-    node.vSend.SetVersion(VERSION);
-    node.vRecv.SetVersion(VERSION);
-
     // As in ProcessMessages(): share-chain messages outside cs_main, the rest
     // under it, and a deserialisation failure is an exception that ends the
     // message, not the node.
@@ -257,6 +323,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     }
     catch (...)
     {
+    }
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
+{
+    // Large enough for blocks with many transactions, small enough that the
+    // size checks, not the allocator, are what a huge input meets.
+    if (size < 2 || size > 200000)
+        return 0;
+
+    CNode node(INVALID_SOCKET, CAddress("127.0.0.1"));
+    node.nVersion = VERSION;
+    node.vSend.SetVersion(VERSION);
+    node.vRecv.SetVersion(VERSION);
+
+    size_t nIndex = data[0] % kNumCommands;
+    unsigned char nFlags = data[1];
+    if (!(nFlags & FLAG_SEQUENCE))
+    {
+        HandleOne(node, nIndex, nFlags, data + 2, size - 2);
+        return 0;
+    }
+    data += 2;
+    size -= 2;
+    for (int n = 0; n < 16 && size >= 4; n++)
+    {
+        size_t nRec = data[0] % kNumCommands;
+        unsigned char nRecFlags = data[1] & ~FLAG_SEQUENCE;
+        size_t nLen = data[2] | ((size_t)data[3] << 8);
+        data += 4;
+        size -= 4;
+        if (nLen > size)
+            nLen = size;
+        HandleOne(node, nRec, nRecFlags, data, nLen);
+        data += nLen;
+        size -= nLen;
     }
     return 0;
 }

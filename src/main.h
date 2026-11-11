@@ -383,6 +383,7 @@ bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmine
 // pnDoS, when given, receives the misbehavior score a failure is worth: 0 for
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
+// Takes ownership of pblock on every path (kept as an orphan or deleted).
 bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL);
 bool SelectCoins(int64 nTargetValue, std::set<CWalletTx*>& setCoinsRet);
 bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock);
