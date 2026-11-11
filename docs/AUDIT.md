@@ -99,12 +99,13 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Seven harnesses in `src/`:
+Eight harnesses in `src/`:
 
 | target | what it feeds |
 |---|---|
 | `fuzz-net-message` | raw bytes into the P2P receive buffer of a peer, through `ProcessMessages()` |
-| `fuzz-script` | one script through the parser, the standard-form extractors and `EvalScript` |
+| `fuzz-script` | one script through the parser, the standard-form extractors, the sigop counts and `EvalScript`; then a spend: a fuzzed transaction (version, lock time, sequences, outputs) with scriptSig and scriptPubKey or redeem script, valid ECDSA and BIP340 signatures, keys and CTV hashes put in by placeholder, through `EvalScript`, `VerifyScriptP2SH` and `VerifySignature` under all eight combinations of rules v2, v3 and v4. Aborts when v4 turns a pass into a failure or changes an answer with no v4 opcode in the script, when v3 or strict signatures change an answer they cannot affect, when `VerifySignature` disagrees with the path it delegates to, when the CTV hash misses a field it commits to or covers one it must not, or when a spend starts more signature checks than the block and the pool charge for it (a counter compiled only with `-DBITFLASH_FUZZ`) |
+| `fuzz-v4-templates` | the vault, CTV batch and inheritance scripts built from fuzzed parameters by the wallet's own builders (`v4templates.h`) and spent as the RPCs spend them, through `VerifySignature`. Aborts when a vault or batch output can leave other than by its template, when the template rebuilt from the contracts file differs, when the honest spend fails or passes before v4, when the hot key or the heir passes outside the timelock or is refused inside it, when any other key or a scriptSig without the right key passes, when a third party's added pushes break a spend, or when `ParseInheritScript` accepts anything but an inheritance script |
 | `fuzz-sigcheck` | signatures and keys into OpenSSL and libsecp256k1 side by side; any disagreement is a crash |
 | `fuzz-light-pow` | headers and histories into the DigiByte and Ravencoin difficulty and proof-of-work checks |
 | `fuzz-p2p-payload` | one message and its payload straight into `ProcessMessage()`, as from a peer past the version handshake: `block`, `tx`, `inv`, `getdata`, `getblocks`, the chat and P2Pool messages. The envelope checksum no fuzzer can forge is behind it, and a flag recomputes a block's merkle root. The node keeps its chain between inputs, and in this binary alone (`-DBITFLASH_FUZZ`, `fFuzzSkipPoW`) the RandomX comparison is skipped, so block acceptance, connection and reorganisation are reached; every other check runs as released |

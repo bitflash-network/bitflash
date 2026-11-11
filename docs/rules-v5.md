@@ -18,6 +18,7 @@ hashrate, as with rules v3.
 | own coinbase | a transaction may not spend the coinbase of the block it is in | coinbase maturity covered depths 1-99, never depth 0 |
 | unsigned lock time | `nLockTime` is read as unsigned for finality | lock times of 2^31 and up (2038-2106) counted as already past |
 | pre-v4 CSFS | `OP_CHECKSIGFROMSTACK` in a bare output made before rules v4 counts as a signature operation when it is spent | such outputs were never counted against any block's limit |
+| multisig keys | an `OP_CHECKMULTISIG` takes at most 20 keys | it is charged 20 signature operations but checked one signature per key, up to the stack's 1000 |
 
 Also in this release, with no switch (see below): no block subsidy after 64
 halvings (BIP42).
@@ -148,6 +149,27 @@ Counting only the outputs that were missed keeps the limit what it was meant
 to be without changing what any ordinary transaction costs: standard scripts
 contain no `OP_CHECKSIGFROMSTACK`.
 
+## At most 20 keys in an OP_CHECKMULTISIG
+
+An `OP_CHECKMULTISIG` (or `-VERIFY`) is charged 20 signature operations
+against the block's limit, whatever it does. It pops a key count from the
+stack and then checks signatures against up to that many keys, one check per
+key tried. The 0.1.0 code never bounded the count except by the stack itself
+(1000 items), so a script that computes its key count (`OP_16 OP_9 OP_ADD`
+rather than a literal `OP_16`) could check many times more signatures than it
+was charged for. `fuzz-script`, which holds the checks a spend starts to what
+the block and the pool charge for it, aborts on such a spend.
+
+Bitcoin has always capped the count at 20 (`MAX_PUBKEYS_PER_MULTISIG`), and so
+do rules v5: an `OP_CHECKMULTISIG` handed more than 20 keys fails the script,
+so its checks never exceed the 20 it is charged. No wallet here makes such a
+script (the multisig and treasury scripts take at most 16 keys, as a literal).
+
+Until v5 are scheduled, the relay policy does the same job for honest blocks:
+the memory pool refuses a spend whose scriptPubKey or redeem script runs an
+`OP_CHECKMULTISIG` without a literal `OP_0`..`OP_16` key count right before it
+(`MultisigKeyCountsAreLiteral`), and miners build blocks from the pool.
+
 ## No subsidy after 64 halvings (BIP42)
 
 `GetBlockValue` shifted 50 coins right by `nHeight / 210000`. From height
@@ -175,6 +197,7 @@ switch:
 - on a real chain in a temporary data directory, through `AcceptBlock` and
   `ConnectBlock`: a block spending its own coinbase, a block spending 103
   pre-v4 CSFS outputs (20,085 operations), the same number made under v4 (not
-  counted twice), a block holding a transaction locked to 2^31, and a
-  window-closing block timed before its window's first block. Each of the
-  refused blocks is accepted with the switch off.
+  counted twice), a block holding a transaction locked to 2^31, a block
+  spending a 25-key `OP_CHECKMULTISIG`, and a window-closing block timed
+  before its window's first block. Each of the refused blocks is accepted
+  with the switch off.

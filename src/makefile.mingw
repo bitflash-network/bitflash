@@ -119,7 +119,7 @@ HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
           selftest.h walletcmd.h wallet_sqlite.h sockcount.h \
           btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h coinunit.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
           proxy.h tor.h treasury.h compat.h gui_chat.h gui_explorer.h explorer.h font_roboto.h jsonrpc.h \
-          dgb_anchors.h rvn_anchors.h x16rv2.h
+          dgb_anchors.h rvn_anchors.h x16rv2.h v4templates.h
 
 all: bitflash.exe
 
@@ -405,6 +405,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=wallet-final
 	./bitflash.exe -selftest=swap-rpc
 	./bitflash.exe -selftest=fee-policy
+	./bitflash.exe -selftest=script-sigops
 	./bitflash.exe -selftest=invoice
 	./bitflash.exe -selftest=net-hardening
 	./bitflash.exe -selftest=p2p-dos

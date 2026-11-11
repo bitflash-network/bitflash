@@ -21,6 +21,7 @@
 #include "headers.h"
 #include "btfsock.h"
 #include "jsonrpc.h"
+#include "v4templates.h"
 #include "tor.h"
 #include "treasury.h"
 #include "swap.h"
@@ -104,9 +105,9 @@ bool JsonRpcConfigureCookie(const string& strPort)
 // ---------------------------------------------------------------------------
 // small helpers
 
-static double ValueFromAmount(int64 n) { return (double)n / (double)COIN; }
+double ValueFromAmount(int64 n) { return (double)n / (double)COIN; }
 
-static int64 AmountFromValue(const json& v)
+int64 AmountFromValue(const json& v)
 {
     // Exchanges send amounts as JSON numbers or as strings; accept both, and
     // go through ParseMoney so "1.5" and 1.5 land on the same satoshi count.
@@ -1944,7 +1945,7 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
 
 // The outputs of an {address: amount} object, in address order (the order
 // the JSON object keeps), the same for templatehash and spendscript.
-static vector<CTxOut> OutputsFromParam(const json& o)
+vector<CTxOut> OutputsFromParam(const json& o)
 {
     if (!o.is_object() || o.empty())
         throw runtime_error("outputs: {\"address\": amount, ...}");
@@ -2256,7 +2257,7 @@ static void KeepNewV4Contract(const string& strAddr, const json& rec, json& resu
 
 // The one-input transaction a CTV hash fixes: version 2, sequence final,
 // lock time 0 -- what spendscript builds by default.
-static uint256 TemplateHashFor(const vector<CTxOut>& vout)
+uint256 TemplateHashFor(const vector<CTxOut>& vout)
 {
     CTransaction tx;
     tx.nVersion = 2;
@@ -2274,8 +2275,8 @@ static uint256 TemplateHashFor(const vector<CTxOut>& vout)
 // and mine it: larger than MAX_STANDARD_TX_SIZE, or paying less than the fee
 // every miner asks of it (GetMinFee without the free-transaction discount,
 // counted with room for a scriptSig a relay pads by a few bytes).
-static void CheckCtvSpendPolicy(const CScript& redeem, const vector<CTxOut>& vout, int64 nFee,
-                                const char* pszWhat)
+void CheckCtvSpendPolicy(const CScript& redeem, const vector<CTxOut>& vout, int64 nFee,
+                         const char* pszWhat)
 {
     CTransaction tx;
     tx.nVersion = 2;
@@ -2300,7 +2301,7 @@ static void CheckCtvSpendPolicy(const CScript& redeem, const vector<CTxOut>& vou
                                       FormatMoney(nMinFee).c_str()));
 }
 
-static CScript CtvScript(uint256 hash)   // by value: uint256's begin() is not const
+CScript CtvScript(uint256 hash)   // by value: uint256's begin() is not const
 {
     CScript s;
     s << vector<unsigned char>(hash.begin(), hash.end()) << OP_CHECKTEMPLATEVERIFY;
@@ -2323,6 +2324,25 @@ static vector<unsigned char> FreshWalletKey()
     if (v.empty())
         throw runtime_error("could not draw a key from the wallet");
     return v;
+}
+
+// The vault's second stage: the hot key after nDelay blocks (OP_IF branch), or
+// the recovery key at once (OP_ELSE).
+CScript VaultUnvaultScript(unsigned int nDelay, const uint160& hashHot, const uint160& hashRecovery)
+{
+    CScript unvault;
+    unvault << OP_IF << (int64)nDelay << OP_CHECKSEQUENCEVERIFY << OP_DROP
+            << OP_DUP << OP_HASH160 << hashHot << OP_EQUALVERIFY << OP_CHECKSIG
+            << OP_ELSE
+            << OP_DUP << OP_HASH160 << hashRecovery << OP_EQUALVERIFY << OP_CHECKSIG
+            << OP_ENDIF;
+    return unvault;
+}
+
+// The one output the vault's template fixes: the unvault script's address.
+vector<CTxOut> VaultUnvaultOutputs(const CScript& unvault, int64 nUnvaultAmount)
+{
+    return vector<CTxOut>(1, CTxOut(nUnvaultAmount, ScriptForAddress(Hash160ToScriptAddress(Hash160(unvault)))));
 }
 
 // vaultcreate <amount> <delay blocks> [recovery address] [fee=0.01]
@@ -2355,15 +2375,10 @@ static json rpc_vaultcreate(const json& p)
         throw runtime_error("the recovery address is not a Bitflash address");
 
     // Stage 2: the hot key after the delay, or the recovery key at once.
-    CScript unvault;
-    unvault << OP_IF << (int64)nDelay << OP_CHECKSEQUENCEVERIFY << OP_DROP
-            << OP_DUP << OP_HASH160 << Hash160(vchHot) << OP_EQUALVERIFY << OP_CHECKSIG
-            << OP_ELSE
-            << OP_DUP << OP_HASH160 << hashRecovery << OP_EQUALVERIFY << OP_CHECKSIG
-            << OP_ENDIF;
+    CScript unvault = VaultUnvaultScript(nDelay, Hash160(vchHot), hashRecovery);
     string strUnvault = Hash160ToScriptAddress(Hash160(unvault));
     // Stage 1: out only by the unvault transaction, its fee paid in advance.
-    vector<CTxOut> vUnvault(1, CTxOut(nAmount - nFee, ScriptForAddress(strUnvault)));
+    vector<CTxOut> vUnvault = VaultUnvaultOutputs(unvault, nAmount - nFee);
     CScript vault = CtvScript(TemplateHashFor(vUnvault));
     string strVault = Hash160ToScriptAddress(Hash160(vault));
     CheckCtvSpendPolicy(vault, vUnvault, nFee, "unvault transaction");
@@ -2689,7 +2704,7 @@ static const int INHERIT_MIN_DAYS_MAINNET = 30;
 // The RPC thread and the renewer must not both spend the same output.
 static CCriticalSection cs_inherit;
 
-static unsigned int InheritSequence(double dDays)
+unsigned int InheritSequence(double dDays)
 {
     if (!(dDays > 0))
         throw runtime_error("the period is a number of days");
@@ -2703,12 +2718,12 @@ static unsigned int InheritSequence(double dDays)
     return SEQUENCE_LOCKTIME_TYPE_FLAG | (unsigned int)dUnits;
 }
 
-static int64 InheritPeriodSecs(unsigned int nSequence)
+int64 InheritPeriodSecs(unsigned int nSequence)
 {
     return (int64)(nSequence & SEQUENCE_LOCKTIME_MASK) * INHERIT_UNIT_SECS;
 }
 
-static CScript InheritScript(const uint160& hashOwner, const uint160& hashHeir, unsigned int nSequence)
+CScript InheritScript(const uint160& hashOwner, const uint160& hashHeir, unsigned int nSequence)
 {
     CScript s;
     s << OP_IF
@@ -2722,7 +2737,7 @@ static CScript InheritScript(const uint160& hashOwner, const uint160& hashHeir, 
 
 // The owner, heir and period of an inheritance script; false for anything
 // else, byte for byte.
-static bool ParseInheritScript(const CScript& s, uint160& hashOwner, uint160& hashHeir, unsigned int& nSequence)
+bool ParseInheritScript(const CScript& s, uint160& hashOwner, uint160& hashHeir, unsigned int& nSequence)
 {
     vector<vector<unsigned char> > vPush;
     CScript::const_iterator pc = s.begin();

@@ -42,6 +42,10 @@ void MakeSameSize(valtype& vch1, valtype& vch2)
 #define stacktop(i)  (stack.at(stack.size()+(i)))
 #define altstacktop(i)  (altstack.at(altstack.size()+(i)))
 
+#ifdef BITFLASH_FUZZ
+unsigned int nFuzzSigChecks = 0;
+#endif
+
 static uint256 Sha256Of(const CDataStream& ss)
 {
     uint256 hash;
@@ -77,7 +81,7 @@ uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache
 
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType,
                 vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs, bool fRulesV3,
-                bool fRulesV4, unsigned int nPolicyFlags)
+                bool fRulesV4, unsigned int nPolicyFlags, bool fRulesV5)
 {
     const bool fDiscourageUpgradableV4 = (nPolicyFlags & SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4) != 0;
     CAutoBN_CTX pctx;
@@ -949,6 +953,9 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 {
                     // A signature that is there and wrong fails the script:
                     // nobody can make a passing script fail by swapping it.
+#ifdef BITFLASH_FUZZ
+                    nFuzzSigChecks++;
+#endif
                     if (!SigCheckSchnorr(vchSig, vchMsg, vchPubKey))
                         return false;
                     fSuccess = true;
@@ -978,6 +985,13 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 // first keeps i += nKeysCount from overflowing an int on a
                 // count near INT_MAX (undefined, found by fuzz-script).
                 if (nKeysCount > (int)stack.size())
+                    return false;
+                // Rules v5: at most 20 keys, the 20 signature operations it is
+                // charged (GetSigOpCount). Without the cap it checks one
+                // signature per key, up to the stack's 1000, for the same 20;
+                // found by fuzz-script, which holds the checks a spend makes to
+                // what the block pays for it.
+                if (fRulesV5 && nKeysCount > MAX_PUBKEYS_PER_MULTISIG)
                     return false;
                 int ikey = ++i;
                 i += nKeysCount;
@@ -1241,6 +1255,9 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
               const CTransaction& txTo, unsigned int nIn, int nHashType, bool fStrictSigs,
               SigHashCache* pCache)
 {
+#ifdef BITFLASH_FUZZ
+    nFuzzSigChecks++;
+#endif
     // Rules v2: one encoding per signature. OpenSSL's parser accepts more
     // than DER -- and how much more has changed between its versions, which
     // is how two Bitcoin nodes came to disagree on a block in 2015. Low S
@@ -1701,13 +1718,52 @@ bool ScriptHasUpgradableCsfsKey(const CScript& script)
     return false;
 }
 
+bool MultisigKeyCountsAreLiteral(const CScript& script)
+{
+    CScript::const_iterator pc = script.begin();
+    opcodetype opcode, prev = OP_INVALIDOPCODE;
+    valtype vch;
+    while (pc < script.end())
+    {
+        if (!script.GetOp(pc, opcode, vch))
+            return false;
+        // The op right before it in the bytes runs exactly when it runs (no
+        // branch op between them), and leaves its number on top.
+        if ((opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY) &&
+            !(prev == OP_0 || (prev >= OP_1 && prev <= OP_16)))
+            return false;
+        prev = opcode;
+    }
+    return true;
+}
+
+bool InputMultisigKeyCountsAreLiteral(const CScript& scriptSig, const CScript& scriptPubKey, bool fRulesV3)
+{
+    if (!MultisigKeyCountsAreLiteral(scriptPubKey))
+        return false;
+    if (!fRulesV3 || !scriptPubKey.IsPayToScriptHash())
+        return true;
+    // The redeem script is the last push, as GetP2SHSigOpCount reads it.
+    CScript::const_iterator pc = scriptSig.begin();
+    opcodetype opcode;
+    valtype vch, last;
+    while (pc < scriptSig.end())
+    {
+        if (!scriptSig.GetOp(pc, opcode, vch))
+            return false;
+        last = vch;
+    }
+    return MultisigKeyCountsAreLiteral(CScript(last.begin(), last.end()));
+}
+
 bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                      bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags)
+                      bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags,
+                      bool fRulesV5)
 {
     if (!scriptSig.IsPushOnly())
         return false;
     if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4,
-                    nPolicyFlags))
+                    nPolicyFlags, fRulesV5))
         return false;
     if (!scriptPubKey.IsPayToScriptHash())
         return true;
@@ -1743,7 +1799,7 @@ bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, con
         return false;
     CScript inner(scriptSig.begin(), pcLastStart);
     return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4,
-                      nPolicyFlags);
+                      nPolicyFlags, fRulesV5);
 }
 
 CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn,
@@ -1790,7 +1846,7 @@ CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, uns
 }
 
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType,
-                     bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags)
+                     bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags, bool fRulesV5)
 {
     assert(nIn < txTo.vin.size());
     const CTxIn& txin = txTo.vin[nIn];
@@ -1815,8 +1871,8 @@ bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsig
     // or not -- which is why the wallet refused to pay to one.
     if (fRulesV3 && txout.scriptPubKey.IsPayToScriptHash())
         return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true, fRulesV4,
-                                nPolicyFlags);
+                                nPolicyFlags, fRulesV5);
 
     return EvalScript(txin.scriptSig + CScript(OP_CODESEPARATOR) + txout.scriptPubKey, txTo, nIn, nHashType, NULL,
-                      fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags);
+                      fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags, fRulesV5);
 }

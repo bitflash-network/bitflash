@@ -12,12 +12,12 @@ make -j"$(nproc)" RANDOMX_DIR="$HOME/RandomX" FUZZ_CXX="$CXX" \
     FUZZ_CXXFLAGS="\$(filter-out -O2,\$(CXXFLAGS)) $CXXFLAGS -g" \
     FUZZ_LDFLAGS="$CXXFLAGS $LIB_FUZZING_ENGINE" \
     fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload \
-    fuzz-deserialize fuzz-decoders
+    fuzz-deserialize fuzz-decoders fuzz-v4-templates
 
 # The runner image has none of the shared libraries the node links, so they
 # travel with the targets and are found through $ORIGIN.
 mkdir -p "$OUT/lib"
-for t in fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders; do
+for t in fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates; do
     cp "$t" "$OUT/"
     ldd "$t" | awk '/=> \// {print $3}' | grep -E 'libdb|libsqlite3|libsodium|libssl|libcrypto|libboost' | while read -r lib; do
         cp -L -n "$lib" "$OUT/lib/" || true
@@ -33,10 +33,13 @@ mk_seed fuzz-sigcheck '\000\000\001\001' '\030\001\040\001'
 
 # fuzz-p2p-payload, fuzz-deserialize and fuzz-decoders write their own seeds
 # (a block on genesis, a transaction, inv, ...; every serialized type; every
-# decoder). Built for the fuzzing engine, they run here as well.
-for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders; do
+# decoder), and so do fuzz-script (signed spends under each rule set) and
+# fuzz-v4-templates (vault, batch, inheritance). Built for the fuzzing
+# engine, they run here as well. fuzz-script's zip already holds the two raw
+# seeds above; its own are added to it.
+for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates; do
     d=$(mktemp -d)
-    if BITFLASH_FUZZ_WRITE_SEEDS="$d" ./$t -runs=0 > /dev/null 2>&1 && [ -n "$(ls -A "$d")" ]; then
+    if BITFLASH_FUZZ_WRITE_SEEDS="$d" ./"$t" -runs=0 > /dev/null 2>&1 && [ -n "$(ls -A "$d")" ]; then
         (cd "$d" && zip -q "$OUT/${t}_seed_corpus.zip" ./*)
     fi
     rm -rf "$d"

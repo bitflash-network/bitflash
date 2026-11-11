@@ -83,7 +83,7 @@ HEADERS = headers_core.h headers.h fuzz_datadir.h util.h main.h serialize.h uint
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
           btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h coinunit.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h sigcheck.h \
           proxy.h tor.h treasury.h gui_chat.h gui_explorer.h explorer.h font_roboto.h \
-          dgb_anchors.h rvn_anchors.h x16rv2.h
+          dgb_anchors.h rvn_anchors.h x16rv2.h v4templates.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
              obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
@@ -324,7 +324,7 @@ obj-fuzz/fuzz_net_message.o: fuzz_net_message.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
-obj-fuzz/fuzz_script.o: fuzz_script.cpp $(HEADERS)
+obj-fuzz/fuzz_script.o: fuzz_script.cpp fuzz_script_util.h $(HEADERS)
 	@mkdir -p $(dir $@)
 	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
 
@@ -337,6 +337,15 @@ fuzz-script: $(FUZZ_SCRIPT_OBJS)
 	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: fuzz-script"
+
+obj-fuzz/fuzz_v4_templates.o: fuzz_v4_templates.cpp fuzz_script_util.h $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-v4-templates: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_v4_templates.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-v4-templates"
 
 obj-fuzz/fuzz_sigcheck.o: fuzz_sigcheck.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
@@ -408,10 +417,18 @@ fuzz-script-smoke: fuzz-script
 	@printf '\000\121' > ../work/fuzz-corpus/script/op-true
 	@printf '\001\166\251\024\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\210\254' > ../work/fuzz-corpus/script/p2pkh-shape
 	@printf '\000\115\377\377' > ../work/fuzz-corpus/script/truncated-pushdata2
-	./fuzz-script -runs=128 ../work/fuzz-corpus/script
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/script ./fuzz-script -runs=0
+	./fuzz-script -runs=2000 ../work/fuzz-corpus/script
+
+# The vault, CTV batch and inheritance scripts, built by the wallet's own
+# functions and spent through the interpreter; the harness writes its seeds.
+fuzz-v4-templates-smoke: fuzz-v4-templates
+	@rm -rf ../work/fuzz-corpus/v4-templates && mkdir -p ../work/fuzz-corpus/v4-templates
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/v4-templates ./fuzz-v4-templates -runs=0
+	./fuzz-v4-templates -runs=2000 ../work/fuzz-corpus/v4-templates
 
 clean:
-	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -562,6 +579,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=wallet-final
 	./bitflash-node -selftest=swap-rpc
 	./bitflash-node -selftest=fee-policy
+	./bitflash-node -selftest=script-sigops
 	./bitflash-node -selftest=invoice
 	./bitflash-node -selftest=net-hardening
 	./bitflash-node -selftest=p2p-dos
@@ -575,4 +593,4 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-wallet
 
 .PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
-        fuzz-deserialize-smoke fuzz-decoders-smoke
+        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke

@@ -38,7 +38,7 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -245,13 +245,19 @@ phase_fuzz() {
     mkdir -p "$OUT/fuzz-work"
     for t in $TARGETS; do fuzz_seed "$t"; done
     LF=$(fuzz_build libfuzzer)
-    # Some harnesses write structured seeds of their own (the payload one a
-    # block on genesis, a transaction, inv, ...; the deserializer one every
-    # type; the decoder one a sample of every format); an empty corpus gets
-    # them first.
-    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders; do
-        if [ -x "$LF/$t" ] && [ "$(ls -A "$CORPUS/$t")" = "seed0" ]; then
-            (cd "$OUT" && BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS/$t" "$LF/$t" -runs=0 > "$OUT/fuzz-seeds-$t.log" 2>&1)                 || say "fuzz seeds for $t FAILED, see fuzz-seeds-$t.log"
+    # Some harnesses write structured seeds of their own: the payload one
+    # (a block on genesis, a transaction, inv, ...), the deserializer one
+    # (every type), the decoder one (a sample of every format), fuzz-script
+    # (signed spends under each rule set) and fuzz-v4-templates (vault,
+    # batch, inheritance). They join the corpus without replacing anything.
+    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates; do
+        [ -x "$LF/$t" ] || continue
+        sd=$OUT/fuzz-seeds/$t
+        rm -rf "$sd"; mkdir -p "$sd"
+        if (cd "$OUT" && BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$LF/$t" -runs=0 > "$OUT/fuzz-seeds-$t.log" 2>&1); then
+            cp -n "$sd"/* "$CORPUS/$t/" 2>/dev/null || true
+        else
+            say "fuzz seeds for $t FAILED, see fuzz-seeds-$t.log"
         fi
     done
     have afl-clang-fast++ && AF=$(fuzz_build afl) || AF=""

@@ -31,8 +31,11 @@ jobs:
       - name: Run P2P message fuzz smoke
         run: make fuzz-net-message-smoke
 
-      - name: Run script fuzz smoke
+      - name: Run script fuzz smoke (every rule set, signed spends, sigop bound)
         run: make fuzz-script-smoke
+
+      - name: Run rules v4 contract fuzz smoke (vault, CTV batch, inheritance)
+        run: make fuzz-v4-templates-smoke
 
       - name: Run signature-verifier differential fuzz (OpenSSL vs libsecp256k1)
         run: make fuzz-sigcheck-smoke
