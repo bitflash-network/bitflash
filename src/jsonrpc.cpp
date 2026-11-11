@@ -583,7 +583,7 @@ static json rpc_getbalance(const json& p)
             for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
             {
                 const CWalletTx& wtx = it->second;
-                if (!wtx.IsFinal() || wtx.fSpent)
+                if (!wtx.IsFinalForWallet() || wtx.fSpent)
                     continue;
                 int nDepth = wtx.GetDepthInMainChain();
                 if (nDepth >= 1 || (nDepth == 0 && wtx.GetDebit() > 0))

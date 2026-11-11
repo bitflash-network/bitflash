@@ -1568,7 +1568,10 @@ void RestrictWalletFileModes()
     // the ones that hold keys are tightened here, on every start.
     string strDir = GetAppDir();
     const char* apszFiles[] = { "wallet.dat", "wallet.sqlite", "wallet.sqlite-wal",
-                                "wallet.sqlite-shm", "wallet.sqlite-journal", "nostr.key" };
+                                "wallet.sqlite-shm", "wallet.sqlite-journal", "nostr.key",
+                                // swap secrets and the chat store (with every running
+                                // swap's secret), as an older build left them
+                                "swaps.log", "btfchat.dat" };
     for (size_t i = 0; i < sizeof(apszFiles) / sizeof(apszFiles[0]); i++)
         if (!RestrictFileToOwner(strDir + "/" + apszFiles[i]))
             printf("RestrictWalletFileModes() : could not make %s owner-only\n", apszFiles[i]);
