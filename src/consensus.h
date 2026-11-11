@@ -71,6 +71,40 @@ bool RulesV4Active(unsigned int nBlockTime);
 // on mainnet; 0 when not given.
 extern unsigned int nBenchRulesV4Time;
 
+// Rules v5 (docs/rules-v5.md): tightenings of what a block may hold, each one
+// closing a gap 0.1.0 left open. A block that follows them is valid to every
+// older node too.
+//   - the block that closes a retarget window may not be timed before the
+//     window's first block, so the retarget's unsigned timespan never wraps
+//   - a coinbase may not be spent in the block that creates it
+//   - nLockTime is read as unsigned for finality: 2^31 and up are the times
+//     of 2038-2106, not already past
+//   - OP_CHECKSIGFROMSTACK in a bare output made before rules v4 counts as a
+//     signature operation when it is spent
+//
+// Unlike v2-v4, the switch is the PARENT's median time past, not the block's
+// own nTime: a block's time is its miner's pick, within two hours either
+// side, but the median of the eleven blocks before it can only move forward.
+// Once one block runs under v5, every block after it does; there is no window
+// in which a miner can time a block back under the old rules.
+//
+// Not scheduled: 0 means never, on both networks, until the founder sets a
+// date in a release. Never active before rules v4.
+static const unsigned int RULES_V5_TIME_MAINNET = 0;
+static const unsigned int RULES_V5_TIME_TESTNET = 0;
+
+class CBlockIndex;
+unsigned int RulesV5Time();
+// Do rules v5 hold for a block whose parent's median time past is this?
+bool RulesV5ActiveAtMedianTime(int64 nMedianTimePast);
+// Do rules v5 hold for the block that follows pindexPrev? NULL: no.
+bool RulesV5Active(const CBlockIndex* pindexPrev);
+// -benchrulesv5=TIME: rules v5 from TIME (as the parent's median time past)
+// on an isolated testnet bench (-isolate). Refused on mainnet; 0 when not
+// given. Still never ahead of rules v4, so a bench before the v4 date also
+// needs -benchrulesv4.
+extern unsigned int nBenchRulesV5Time;
+
 // The day atomic swaps open in the wallet and in btfchat on mainnet:
 // 2026-12-25 12:00 UTC. Not a consensus rule. Rules v3 still switch on at
 // 2026-11-21, as 1.2.29 shipped them; moving that date in a later release

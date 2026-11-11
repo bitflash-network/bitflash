@@ -2268,7 +2268,17 @@ int64 CBlock::GetBlockValue(int nHeight, int64 nFees) const
     // the validating node's own tip makes the answer depend on how far that
     // node happens to have synced, so two nodes at different heights would
     // disagree about the same block across a halving boundary.
-    nSubsidy >>= (nHeight / 210000);
+    //
+    // No subsidy after 64 halvings (BIP42). Shifting a 64-bit value by 64 or
+    // more is undefined behaviour; on x86 the count wraps, and at height
+    // 13,440,000 the subsidy would have jumped back to 50. Below that height
+    // nHeight / 210000 is at most 63 and this returns exactly what it always
+    // did, so the check needs no switch: it only decides heights no chain has
+    // reached (the rules-v5 self-test runs every height below it).
+    int nHalvings = nHeight / 210000;
+    if (nHalvings >= 64)
+        return nFees;
+    nSubsidy >>= nHalvings;
 
     return nSubsidy + nFees;
 }
@@ -2324,6 +2334,59 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
     if (LogAcceptsCategory("net")) { printf("\n\n\nGetNextWorkRequired RETARGET *****\n"); printf("nTargetTimespan = %d    nActualTimespan = %d\n", nTargetTimespan, nActualTimespan); printf("Before: %08x  %s\n", pindexLast->nBits, CBigNum().SetCompact(pindexLast->nBits).getuint256().ToString().c_str()); printf("After:  %08x  %s\n", bnNew.GetCompact(), bnNew.getuint256().ToString().c_str()); }
 
     return bnNew.GetCompact();
+}
+
+// Rules v5. GetNextWorkRequired measures a window as the closing block's time
+// minus the first block's, in unsigned arithmetic. Only the median of the
+// last eleven blocks bounds a block's time from below, and the first block
+// is thirty back, so the closing block may legally be timed before it: the
+// difference then wraps to about 4.29e9, is clamped to four windows, and the
+// target becomes four times easier where Bitcoin's signed arithmetic makes it
+// four times harder. Changing the arithmetic would change which nBits is
+// valid in both directions (a hard fork). Refusing the closing block that is
+// timed before the first block (as BIP94 bounds its timestamps) only removes
+// blocks, so it is a soft fork, and the subtraction can then never wrap.
+//
+// The window is GetNextWorkRequired's, mirrored: thirty blocks, the closing
+// one at a height of 29 mod 30, and from rules v2 (by the closing block's own
+// time) the whole window, nInterval-1 blocks before. The walk stops at the
+// genesis block instead of running off it.
+static const int RETARGET_INTERVAL = 30;
+
+static const CBlockIndex* RetargetWindowFirst(const CBlockIndex* pindexPrev, unsigned int nTime)
+{
+    if (!pindexPrev || (pindexPrev->nHeight + 2) % RETARGET_INTERVAL != 0)
+        return NULL;    // the block after pindexPrev closes no window
+    int nWindow = RulesV2Active(nTime) ? RETARGET_INTERVAL : RETARGET_INTERVAL - 1;
+    const CBlockIndex* pindexFirst = pindexPrev;
+    for (int i = 0; pindexFirst->pprev && i < nWindow - 1; i++)
+        pindexFirst = pindexFirst->pprev;
+    return pindexFirst;
+}
+
+bool RetargetTimeAllowed(const CBlockIndex* pindexPrev, unsigned int nTime)
+{
+    if (!RulesV5Active(pindexPrev))
+        return true;
+    const CBlockIndex* pindexFirst = RetargetWindowFirst(pindexPrev, nTime);
+    return !pindexFirst || nTime >= pindexFirst->nTime;
+}
+
+int64 BlockTimeFloor(const CBlockIndex* pindexPrev)
+{
+    if (!pindexPrev)
+        return 0;
+    int64 nFloor = pindexPrev->GetMedianTimePast() + 1;
+    if (RulesV5Active(pindexPrev))
+    {
+        // The window's first block for a block timed at the floor. The window
+        // size depends on rules v2 by the closing block's time, and v5 is
+        // never on before v2, so it is the full window at any time from here.
+        const CBlockIndex* pindexFirst = RetargetWindowFirst(pindexPrev, (unsigned int)nFloor);
+        if (pindexFirst && (int64)pindexFirst->nTime > nFloor)
+            nFloor = pindexFirst->nTime;
+    }
+    return nFloor;
 }
 
 
@@ -2428,6 +2491,19 @@ bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmine
     return nNextHeight >= nCoinHeight + nValue;
 }
 
+// Rules v5: were the outputs of the transaction at txindex counted under
+// rules v4 when their block was checked (OP_CHECKSIGFROMSTACK included)?
+// fUnmined: not in a block yet, so it will be in the next one or later, which
+// is under v4 whenever v5 asks. A coin whose block cannot be found is taken
+// as not counted: counting it is the side that never lets more through.
+static bool CoinCountedUnderRulesV4(const CTxIndex& txindex, bool fUnmined)
+{
+    if (fUnmined)
+        return true;
+    const CBlockIndex* pindexCoin = BlockIndexAtDiskPos(txindex.pos.nFile, txindex.pos.nBlockPos);
+    return pindexCoin && RulesV4Active(pindexCoin->nTime);
+}
+
 bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime,
                                  unsigned int* pnP2SHSigOps, const CBlockIndex* pindexPrev)
 {
@@ -2439,6 +2515,8 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
     // block, the tip for the mempool and the miner.
     if (!pindexPrev)
         pindexPrev = pindexBest;
+    // Rules v5 follow the parent, not the block's own time (consensus.h).
+    bool fRulesV5 = RulesV5Active(pindexPrev);
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
     {
@@ -2496,6 +2574,17 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             // reorganization pindexPrev is pindexBest, as before.
             if (txPrev.IsCoinBase())
             {
+                // Rules v5: nor in the block that creates it. The walk below
+                // starts at the parent, so depth 0 was never looked at: the
+                // coinbase is indexed first in ConnectBlock, a later
+                // transaction of the same block found it, and its coins left
+                // the block as ordinary outputs, spendable at once. Only a
+                // block being connected can hold its own coinbase; the pool
+                // never holds one.
+                if (fRulesV5 && fBlock && txindex.pos.nFile == posThisTx.nFile &&
+                    txindex.pos.nBlockPos == posThisTx.nBlockPos)
+                    return error("ConnectInputs() : %s spends the coinbase of its own block",
+                                 GetHash().ToString().substr(0,6).c_str());
                 int nPrevHeight = pindexPrev ? pindexPrev->nHeight : nBestHeight;
                 for (const CBlockIndex* pindex = pindexPrev; pindex && nPrevHeight - pindex->nHeight < COINBASE_MATURITY-1; pindex = pindex->pprev)
                     if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
@@ -2518,6 +2607,21 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             // a P2SH scriptSig's last push was data and cost nothing to check.
             if (fRulesV3 && pnP2SHSigOps && txPrev.vout[prevout.n].scriptPubKey.IsPayToScriptHash())
                 *pnP2SHSigOps += GetP2SHSigOpCount(vin[i].scriptSig, fRulesV4);
+
+            // Rules v5: an output's script is counted once, by the block that
+            // makes it, under that block's rules. Before rules v4
+            // OP_CHECKSIGFROMSTACK counted nothing, so a bare output made then
+            // could carry a verification per byte that no block ever paid
+            // for. Its CSFS operations count now, when it is spent. Outputs
+            // made under rules v4 were counted when made and are not counted
+            // twice; a P2SH output's script carries no operations of its own.
+            if (fRulesV5 && pnP2SHSigOps)
+            {
+                const CScript& scriptPrev = txPrev.vout[prevout.n].scriptPubKey;
+                unsigned int nCsfs = scriptPrev.GetSigOpCount(true) - scriptPrev.GetSigOpCount(false);
+                if (nCsfs && !CoinCountedUnderRulesV4(txindex, !fFound || txindex.pos == CDiskTxPos(1,1,1)))
+                    *pnP2SHSigOps += nCsfs;
+            }
 
             // Check for conflicts
             if (!txindex.vSpent[prevout.n].IsNull())
@@ -2960,7 +3064,12 @@ bool IsFinalForNextBlock(const CTransaction& tx)
 {
     if (!pindexBest || !RulesV3Active((unsigned int)GetAdjustedTime()))
         return tx.IsFinal();
-    return tx.IsFinalAt(pindexBest->nHeight + 1, pindexBest->GetMedianTimePast());
+    return IsFinalAfter(tx, pindexBest);
+}
+
+bool IsFinalAfter(const CTransaction& tx, const CBlockIndex* pindexPrev)
+{
+    return tx.IsFinalAt(pindexPrev->nHeight + 1, pindexPrev->GetMedianTimePast(), RulesV5Active(pindexPrev));
 }
 
 bool CBlock::AcceptBlock(int* pnDoS)
@@ -2990,6 +3099,13 @@ bool CBlock::AcceptBlock(int* pnDoS)
     if (nTime <= pindexPrev->GetMedianTimePast())
         return error("AcceptBlock() : block's timestamp is too early");
 
+    // Rules v5: a block that closes a retarget window is not timed before the
+    // window's first block (see RetargetTimeAllowed). Scored like the
+    // finality rule below: a miner on an older release can produce one.
+    if (!RetargetTimeAllowed(pindexPrev, nTime))
+        return DoS(pnDoS, 10, error("AcceptBlock() : block at height %d closes a retarget window and is timed before its first block",
+                                    pindexPrev->nHeight + 1));
+
     // Check proof of work
     if (nBits != GetNextWorkRequired(pindexPrev))
         return DoS(pnDoS, 100, error("AcceptBlock() : incorrect proof of work"));
@@ -3010,12 +3126,12 @@ bool CBlock::AcceptBlock(int* pnDoS)
     // Rules v3: every transaction in the block is final at its height and at
     // the median time past of the block before it (BIP113 -- not this block's
     // own time, which its miner picks). See CTransaction::IsFinalAt.
+    // From rules v5, nLockTime is read unsigned (IsFinalAfter).
     if (RulesV3Active(nTime))
     {
         int nHeight = pindexPrev->nHeight + 1;
-        int64 nCutoff = pindexPrev->GetMedianTimePast();
         foreach(const CTransaction& tx, vtx)
-            if (!tx.IsFinalAt(nHeight, nCutoff))
+            if (!IsFinalAfter(tx, pindexPrev))
                 return DoS(pnDoS, 10, error("AcceptBlock() : transaction %s is not final at height %d",
                                             tx.GetHash().ToString().substr(0,10).c_str(), nHeight));
     }
@@ -5096,8 +5212,10 @@ bool BitcoinMiner(int nThreadId)
             unsigned int nBlockSize = ::GetSerializeSize(*pblock, SER_NETWORK) + MINER_COINBASE_ROOM;
             // The block's time before its contents: the rules its
             // transactions are checked under follow from it, and it was still
-            // 0 here, so they were the clock's.
-            pblock->nTime = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+            // 0 here, so they were the clock's. Never under BlockTimeFloor:
+            // the median time past, and under rules v5 a window-closing block
+            // is not timed before its window's first block.
+            pblock->nTime = max(BlockTimeFloor(pindexPrev), GetAdjustedTime());
             // Under MAX_BLOCK_SIGOPS, counted as ConnectBlock counts: the
             // scripts, plus the redeem scripts rules v3 run. This miner did not
             // count at all, and one transaction over the cap in the pool made
@@ -5170,7 +5288,7 @@ bool BitcoinMiner(int nThreadId)
         // its transactions were chosen under: it keeps the time it was built
         // at then, which is still after the median time past.
         {
-            unsigned int nNow = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+            unsigned int nNow = max(BlockTimeFloor(pindexPrev), GetAdjustedTime());
             if (RulesV4Active(nNow) == fSelectedV4)
                 pblock->nTime = nNow;
         }
@@ -5278,7 +5396,7 @@ bool BitcoinMiner(int nThreadId)
                     break;
                 if (!fGenerateBitcoins)
                     break;
-                pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+                pblock->nTime = max(BlockTimeFloor(pindexPrev), GetAdjustedTime());
                 if (PoWVersionAt(pblock->nTime) != nPoWVersion)
                     break;          // the switch happened under us: rebuild, keyed for v2
                 if (RulesV4Active(pblock->nTime) != fRulesV4Built)

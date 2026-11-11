@@ -9318,6 +9318,475 @@ static int RunChainWorkSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- rules v5 (docs/rules-v5.md)
+
+// A block on pindexPrev for the rules-v5 bench chain: an anyone-can-spend
+// coinbase that starts with the height (BIP34), then vtx, at the nBits the
+// chain asks for. No proof of work: AcceptBlock, which holds every rule that
+// depends on the chain, does not look at it (CheckBlock does, without
+// context), so the whole contextual path runs with no mining at all.
+static CBlock V5Block(const CBlockIndex* pindexPrev, unsigned int nTime, const std::vector<CTransaction>& vtx,
+                      const std::vector<CTxOut>* pvCoinbaseOut = NULL)
+{
+    CBlock b;
+    b.hashPrevBlock = pindexPrev->GetBlockHash();
+    b.nTime = nTime;
+    b.nBits = GetNextWorkRequired(pindexPrev);
+    b.nNonce = 0;
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << (pindexPrev->nHeight + 1) << OP_0;
+    if (pvCoinbaseOut)
+        cb.vout = *pvCoinbaseOut;
+    else
+        cb.vout.push_back(CTxOut(b.GetBlockValue(pindexPrev->nHeight + 1, 0), CScript() << OP_TRUE));
+    b.vtx.push_back(cb);
+    b.vtx.insert(b.vtx.end(), vtx.begin(), vtx.end());
+    b.hashMerkleRoot = b.BuildMerkleTree();
+    return b;
+}
+
+// One transaction spending these outpoints (anyone-can-spend, so empty
+// scriptSigs) into outputs of nEach to scriptOut, nOut of them.
+static CTransaction V5Spend(const std::vector<COutPoint>& vIn, int64 nEach, int nOut, const CScript& scriptOut)
+{
+    CTransaction tx;
+    for (size_t i = 0; i < vIn.size(); i++)
+    {
+        CTxIn in;
+        in.prevout = vIn[i];
+        tx.vin.push_back(in);
+    }
+    for (int i = 0; i < nOut; i++)
+        tx.vout.push_back(CTxOut(nEach, scriptOut));
+    return tx;
+}
+
+static CBlockIndex* V5IndexOf(const CBlock& b)
+{
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(b.GetHash());
+    return mi == mapBlockIndex.end() ? NULL : mi->second;
+}
+
+// -selftest=rules-v5: every rule of rules v5, each one with the rules off
+// (what this chain does today, unchanged) and on (through -benchrulesv5's
+// switch on testnet), and the switch itself.
+static int RunRulesV5SelfTest()
+{
+    fflush(stdout);
+    printf("rules-v5 self-test\n");
+    int nFail = 0;
+    bool fWasTestNet = IsTestNet();
+    std::vector<CBlockIndex*> vMade;
+    std::string tmp;
+    std::string strOldDataDir = strSetDataDir;
+    try
+    {
+        // ---- the switch: not scheduled anywhere
+        SelectNetworkParams(false);
+        nFail += Check(RULES_V5_TIME_MAINNET == 0 && RULES_V5_TIME_TESTNET == 0,
+                       "rules v5 are not scheduled on either network") ? 0 : 1;
+        nFail += Check(RulesV5Time() == 0 && !RulesV5ActiveAtMedianTime(1798200000) &&
+                       !RulesV5ActiveAtMedianTime(0xffffffffLL) && !RulesV5Active(NULL),
+                       "mainnet: never, at any time") ? 0 : 1;
+        nBenchRulesV5Time = 1796000000;
+        nFail += Check(RulesV5Time() == 0 && !RulesV5ActiveAtMedianTime(1799000000),
+                       "a bench time never reaches mainnet") ? 0 : 1;
+        SelectNetworkParams(true);
+        nBenchRulesV5Time = 0;
+        nFail += Check(RulesV5Time() == 0 && !RulesV5ActiveAtMedianTime(0xffffffffLL),
+                       "testnet: never, without the bench switch") ? 0 : 1;
+        nBenchRulesV5Time = 1796000000;
+        nFail += Check(RulesV5Time() == 1796000000 && !RulesV5ActiveAtMedianTime(1796000000 - 1) &&
+                       RulesV5ActiveAtMedianTime(1796000000),
+                       "an isolated testnet bench moves it (-benchrulesv5), by median time past") ? 0 : 1;
+        nBenchRulesV5Time = 1793000000;   // before testnet's rules v4 (1795176000)
+        nFail += Check(!RulesV5ActiveAtMedianTime(1793000000) && !RulesV5ActiveAtMedianTime(1795176000 - 1) &&
+                       RulesV5ActiveAtMedianTime(1795176000),
+                       "never ahead of rules v4") ? 0 : 1;
+        nBenchRulesV4Time = 1792900000;
+        nFail += Check(RulesV5ActiveAtMedianTime(1793000000),
+                       "and with rules v4 moved too, from its own time") ? 0 : 1;
+        nBenchRulesV4Time = 0;
+
+        // The parent decides, once: a made-up chain two minutes a block,
+        // with the switch at block 10's time.
+        const unsigned int nBase = 1796000000;
+        nBenchRulesV5Time = nBase + 10 * 120;
+        CBlockIndex* p = NULL;
+        std::vector<CBlockIndex*> vChain;
+        for (int i = 0; i <= 30; i++)
+        {
+            p = ChainWorkTestBlock(p, 0x1f0fffff, 50000 + i, vMade);
+            p->nTime = nBase + 120 * i;
+            vChain.push_back(p);
+        }
+        // The block after vChain[i] is timed past the switch from i = 10 on,
+        // but runs v5 only once the median of its last eleven has passed it.
+        bool fMonotonic = true;
+        int nFirstOn = -1;
+        for (int i = 0; i <= 30; i++)
+        {
+            bool fOn = RulesV5Active(vChain[i]);
+            if (fOn && nFirstOn < 0)
+                nFirstOn = i;
+            if (!fOn && nFirstOn >= 0)
+                fMonotonic = false;
+        }
+        nFail += Check(nFirstOn == 15 && fMonotonic && !RulesV5Active(vChain[11]),
+                       "a block timed past the switch is not under v5 until its parent's median time is; from there on every block is") ? 0 : 1;
+
+        // ---- finding 12: no subsidy after 64 halvings (no switch needed)
+        {
+            CBlock b;
+            bool fSame = true;
+            for (int nBench = 0; nBench < 2; nBench++)
+            {
+                nBenchRulesV5Time = nBench ? 1 : 0;
+                for (int h = 0; h < 64 * 210000 && fSame; h++)
+                    if (b.GetBlockValue(h, 7) != ((int64)(50 * COIN) >> (h / 210000)) + 7)
+                        fSame = false;
+            }
+            nFail += Check(fSame, "every height below 13,440,000 pays exactly what it always did, v5 or not") ? 0 : 1;
+            nFail += Check(b.GetBlockValue(64 * 210000 - 1, 0) == 0 && b.GetBlockValue(64 * 210000, 123) == 123 &&
+                           b.GetBlockValue(65 * 210000, 0) == 0 && b.GetBlockValue(0x7fffffff, 5) == 5,
+                           "from 64 halvings the subsidy is 0, fees only (no shift by 64 back to 50)") ? 0 : 1;
+        }
+
+        // ---- finding 8: nLockTime read unsigned
+        {
+            CTransaction lt;
+            lt.vin.resize(1);
+            lt.vin[0].prevout = COutPoint(uint256(1), 0);
+            lt.vin[0].nSequence = 0;
+            lt.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+            lt.nLockTime = (int)0x80000000u;
+            nFail += Check(lt.IsFinalAt(100, nBase, false),
+                           "v5 off: a lock time of 2^31 counts as final at once, as it always has") ? 0 : 1;
+            nFail += Check(!lt.IsFinalAt(100, nBase, true),
+                           "v5 on: it is a time in 2038, not final yet") ? 0 : 1;
+            nFail += Check(!lt.IsFinalAt(100, 0x80000000LL, true) && lt.IsFinalAt(100, 0x80000001LL, true),
+                           "and final once the median time is past it") ? 0 : 1;
+            lt.nLockTime = -1;
+            nFail += Check(lt.IsFinalAt(100, nBase, false) && !lt.IsFinalAt(100, 0xffffffffLL, true),
+                           "0xffffffff: final at once before, never by time under v5") ? 0 : 1;
+            lt.vin[0].nSequence = UINT_MAX;
+            nFail += Check(lt.IsFinalAt(100, nBase, true), "a final nSequence still makes it final") ? 0 : 1;
+            lt.vin[0].nSequence = 0;
+            // Below 2^31 nothing changes.
+            const unsigned int vLock[] = { 1, 100, 101, 499999999, 500000000, nBase, nBase + 1, 0x7fffffff };
+            const int vHeight[] = { 1, 100, 101, 1000000 };
+            const int64 vCut[] = { 0, 499999999, nBase, nBase + 1, 0x7fffffffLL, 0x80000000LL, 0xffffffffLL };
+            bool fSame = true;
+            for (size_t a = 0; a < sizeof(vLock) / sizeof(vLock[0]); a++)
+                for (size_t b = 0; b < sizeof(vHeight) / sizeof(vHeight[0]); b++)
+                    for (size_t c = 0; c < sizeof(vCut) / sizeof(vCut[0]); c++)
+                    {
+                        lt.nLockTime = (int)vLock[a];
+                        if (lt.IsFinalAt(vHeight[b], vCut[c], false) != lt.IsFinalAt(vHeight[b], vCut[c], true))
+                            fSame = false;
+                    }
+            nFail += Check(fSame, "every lock time below 2^31 gives the same answer either way") ? 0 : 1;
+            lt.nLockTime = (int)0x80000000u;
+            nBenchRulesV5Time = 0;
+            bool fOff = IsFinalAfter(lt, vChain[30]);
+            nBenchRulesV5Time = nBase;
+            bool fOn = IsFinalAfter(lt, vChain[30]);
+            nFail += Check(fOff && !fOn, "the block rule (IsFinalAfter) follows the switch") ? 0 : 1;
+        }
+
+        // ---- finding 2: the retarget window, on a made-up index
+        {
+            // Heights 0..59 at nHard; block 29, the first block of the window
+            // block 59 closes, is timed 100000 s ahead.
+            const unsigned int nHard = 0x1e0fffff;
+            const unsigned int nAhead = nBase + 29 * 120 + 100000;
+            CBlockIndex* q = NULL;
+            std::vector<CBlockIndex*> w;
+            for (int i = 0; i <= 59; i++)
+            {
+                q = ChainWorkTestBlock(q, nHard, 60000 + i, vMade);
+                q->nTime = (i == 29) ? nAhead : nBase + 120 * i;
+                w.push_back(q);
+            }
+            const unsigned int nNormal59 = nBase + 120 * 59;
+            nBenchRulesV5Time = 0;
+            nFail += Check(RetargetTimeAllowed(w[58], nNormal59) && BlockTimeFloor(w[58]) == w[58]->GetMedianTimePast() + 1,
+                           "v5 off: block 59 may be timed before block 29, and builders start at the median time") ? 0 : 1;
+            // What the retarget does with it is what it always did: the
+            // timespan wraps and is clamped to four windows, 4x easier.
+            CBigNum bnOld;
+            bnOld.SetCompact(nHard);
+            CBigNum bnEasier = bnOld * 4;
+            if (bnEasier > bnProofOfWorkLimit)
+                bnEasier = bnProofOfWorkLimit;
+            CBigNum bnHarder = bnOld * 900;
+            bnHarder /= 3600;
+            nFail += Check(GetNextWorkRequired(w[59]) == bnEasier.GetCompact(),
+                           "v5 off: the wrapped timespan still makes the next target 4x easier, bit for bit") ? 0 : 1;
+            nBenchRulesV5Time = nBase;
+            nFail += Check(!RetargetTimeAllowed(w[58], nNormal59) && !RetargetTimeAllowed(w[58], nAhead - 1),
+                           "v5 on: block 59 timed before block 29 is refused") ? 0 : 1;
+            nFail += Check(RetargetTimeAllowed(w[58], nAhead) && RetargetTimeAllowed(w[58], nAhead + 1),
+                           "timed at or after it, it is allowed") ? 0 : 1;
+            nFail += Check(RetargetTimeAllowed(w[57], w[57]->GetMedianTimePast() + 1) &&
+                           RetargetTimeAllowed(w[29], w[29]->GetMedianTimePast() + 1),
+                           "a block that closes no window is not held to it") ? 0 : 1;
+            nFail += Check(BlockTimeFloor(w[58]) == nAhead && BlockTimeFloor(w[57]) == w[57]->GetMedianTimePast() + 1,
+                           "builders start the closing block at the window's first block, the others at the median time") ? 0 : 1;
+            // The first block is block 29 exactly: moving the outlier to 28
+            // or 30 moves the bound with it.
+            w[29]->nTime = nBase + 120 * 29;
+            w[28]->nTime = nAhead;
+            bool f28 = RetargetTimeAllowed(w[58], nNormal59);
+            w[28]->nTime = nBase + 120 * 28;
+            w[30]->nTime = nAhead;
+            bool f30 = RetargetTimeAllowed(w[58], nNormal59);
+            w[30]->nTime = nBase + 120 * 30;
+            w[29]->nTime = nAhead;
+            nFail += Check(f28 && f30, "the bound is block 29, the one the retarget subtracts: an outlier at 28 or 30 binds nothing") ? 0 : 1;
+            w[59]->nTime = nAhead;
+            nFail += Check(GetNextWorkRequired(w[59]) == bnHarder.GetCompact(),
+                           "at the earliest time v5 allows, the timespan is 0 and the target 4x harder, as in Bitcoin") ? 0 : 1;
+        }
+        nBenchRulesV5Time = 0;
+        for (size_t i = 0; i < vMade.size(); i++)
+        {
+            mapBlockIndex.erase(vMade[i]->GetBlockHash());
+            delete vMade[i];
+        }
+        vMade.clear();
+
+        // ---- a real chain: findings 4, 8, 2 and review-v4 4 through AcceptBlock
+        if (!MakeTempDir(tmp))
+            throw std::runtime_error("could not create a temporary data directory");
+        strSetDataDir = tmp;
+        SelectChainParams(true);
+        if (!LoadBlockIndex())
+            throw std::runtime_error("LoadBlockIndex failed");
+
+        // Blocks 1-29 two minutes apart from the genesis, before rules v2 (the
+        // first retarget's window then stays on the chain); from block 30 on,
+        // under rules v3, two minutes apart from T0. Rules v4 from block 129's
+        // time (bench), rules v5 from the same time when switched on: the
+        // block after height 134 is the first whose parent's median time has
+        // reached it.
+        const unsigned int T0 = 1792600000;
+        const unsigned int TV4 = T0 + 120 * 100;
+        nBenchRulesV4Time = TV4;
+        struct TimeOf
+        {
+            static unsigned int At(int h, unsigned int t0)
+            {
+                return h <= 29 ? 1787184000 + 120 * h : t0 + 120 * (h - 29);
+            }
+        };
+        std::vector<CTransaction> vNone;
+        std::vector<uint256> vCb(1, uint256(0));   // coinbase txid by height
+        bool fBuilt = true;
+        // Extend the best chain to height h with plain blocks.
+        struct Grow
+        {
+            static bool To(int h, std::vector<uint256>& vCb, unsigned int t0, const std::vector<CTransaction>& vNone)
+            {
+                while (nBestHeight < h)
+                {
+                    CBlock b = V5Block(pindexBest, TimeOf::At(nBestHeight + 1, t0), vNone);
+                    if (!b.AcceptBlock())
+                        return false;
+                    vCb.push_back(b.vtx[0].GetHash());
+                }
+                return true;
+            }
+        };
+        const int64 nCb = 50 * COIN;
+        CScript scriptCsfs;
+        scriptCsfs << OP_0 << OP_IF;
+        for (int i = 0; i < 195; i++)
+            scriptCsfs << OP_CHECKSIGFROMSTACK;
+        scriptCsfs << OP_ENDIF << OP_1;
+        nFail += Check(scriptCsfs.GetSigOpCount(false) == 0 && scriptCsfs.GetSigOpCount(true) == 195,
+                       "the test output carries 195 CSFS, counted only under rules v4") ? 0 : 1;
+
+        fBuilt = Grow::To(109, vCb, T0, vNone);
+        // Block 110, before rules v4: 103 bare CSFS outputs, counted as nothing.
+        CTransaction txPre = V5Spend(std::vector<COutPoint>(1, COutPoint(vCb[1], 0)), nCb / 103, 103, scriptCsfs);
+        {
+            CBlock b = V5Block(pindexBest, TimeOf::At(110, T0), std::vector<CTransaction>(1, txPre));
+            fBuilt = fBuilt && !RulesV4Active(b.nTime) && b.AcceptBlock();
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+        fBuilt = fBuilt && Grow::To(129, vCb, T0, vNone);
+        // Blocks 130 and 131, under rules v4: 52 and 51 more, counted when made.
+        CTransaction txPost1 = V5Spend(std::vector<COutPoint>(1, COutPoint(vCb[2], 0)), nCb / 52, 52, scriptCsfs);
+        CTransaction txPost2 = V5Spend(std::vector<COutPoint>(1, COutPoint(vCb[3], 0)), nCb / 51, 51, scriptCsfs);
+        {
+            CBlock b = V5Block(pindexBest, TimeOf::At(130, T0), std::vector<CTransaction>(1, txPost1));
+            fBuilt = fBuilt && RulesV4Active(b.nTime) && b.AcceptBlock();
+            vCb.push_back(b.vtx[0].GetHash());
+            CBlock c = V5Block(pindexBest, TimeOf::At(131, T0), std::vector<CTransaction>(1, txPost2));
+            fBuilt = fBuilt && c.AcceptBlock();
+            vCb.push_back(c.vtx[0].GetHash());
+        }
+        fBuilt = fBuilt && Grow::To(139, vCb, T0, vNone);
+        nFail += Check(fBuilt && nBestHeight == 139, "the bench chain is built to height 139") ? 0 : 1;
+        nBenchRulesV5Time = TV4;
+        {
+            const CBlockIndex* p134 = pindexBest;
+            while (p134 && p134->nHeight > 134)
+                p134 = p134->pprev;
+            nFail += Check(p134 && p134->nHeight == 134 && RulesV5Active(p134) && !RulesV5Active(p134->pprev),
+                           "on it, switched on, rules v5 hold from block 135: the first whose parent's median time has reached the switch") ? 0 : 1;
+        }
+
+        // Finding 4: block 140 spends its own coinbase.
+        {
+            int nDoS = 0;
+            CBlock b = V5Block(pindexBest, TimeOf::At(140, T0), vNone);
+            CTransaction self = V5Spend(std::vector<COutPoint>(1, COutPoint(b.vtx[0].GetHash(), 0)), nCb, 1,
+                                        CScript() << OP_TRUE);
+            b.vtx.push_back(self);
+            b.hashMerkleRoot = b.BuildMerkleTree();
+            nBenchRulesV5Time = TV4;
+            nFail += Check(!b.AcceptBlock(&nDoS) && nBestHeight == 139 && V5IndexOf(b) == NULL,
+                           "v5 on: a block spending its own coinbase is refused") ? 0 : 1;
+            nBenchRulesV5Time = 0;
+            nFail += Check(b.AcceptBlock() && nBestHeight == 140 && pindexBest == V5IndexOf(b),
+                           "v5 off: the same block is accepted, as it always was") ? 0 : 1;
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+
+        // Review-v4 finding 4: block 141 spends the 103 outputs made before
+        // rules v4, 20085 CSFS that no block ever counted.
+        {
+            std::vector<COutPoint> vIn;
+            for (unsigned int i = 0; i < 103; i++)
+                vIn.push_back(COutPoint(txPre.GetHash(), i));
+            CTransaction spend = V5Spend(vIn, (nCb / 103) * 103, 1, CScript() << OP_TRUE);
+            CBlock b = V5Block(pindexBest, TimeOf::At(141, T0), std::vector<CTransaction>(1, spend));
+            nBenchRulesV5Time = TV4;
+            nFail += Check(!b.AcceptBlock() && nBestHeight == 140,
+                           "v5 on: spending pre-v4 CSFS outputs counts them, and 20085 is over the block's 20000") ? 0 : 1;
+            nBenchRulesV5Time = 0;
+            nFail += Check(b.AcceptBlock() && nBestHeight == 141,
+                           "v5 off: the same block is accepted, as it always was") ? 0 : 1;
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+        // Block 142 spends the 103 made under rules v4: counted when made,
+        // not again.
+        {
+            std::vector<COutPoint> vIn;
+            for (unsigned int i = 0; i < 52; i++)
+                vIn.push_back(COutPoint(txPost1.GetHash(), i));
+            for (unsigned int i = 0; i < 51; i++)
+                vIn.push_back(COutPoint(txPost2.GetHash(), i));
+            CTransaction spend = V5Spend(vIn, (nCb / 52) * 52 + (nCb / 51) * 51, 1, CScript() << OP_TRUE);
+            CBlock b = V5Block(pindexBest, TimeOf::At(142, T0), std::vector<CTransaction>(1, spend));
+            nBenchRulesV5Time = TV4;
+            nFail += Check(b.AcceptBlock() && nBestHeight == 142,
+                           "v5 on: the same 20085 CSFS made under rules v4 are not counted twice") ? 0 : 1;
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+
+        // Finding 8: block 143 holds a transaction locked until 2^31 (2038).
+        {
+            CTransaction locked = V5Spend(std::vector<COutPoint>(1, COutPoint(vCb[4], 0)), nCb, 1, CScript() << OP_TRUE);
+            locked.vin[0].nSequence = 0;
+            locked.nLockTime = (int)0x80000000u;
+            nBenchRulesV5Time = TV4;
+            bool fNextOn = IsFinalForNextBlock(locked);
+            nBenchRulesV5Time = 0;
+            bool fNextOff = IsFinalForNextBlock(locked);
+            nFail += Check(fNextOff && !fNextOn, "block builders leave it out under v5 only") ? 0 : 1;
+            CBlock b = V5Block(pindexBest, TimeOf::At(143, T0), std::vector<CTransaction>(1, locked));
+            int nDoS = 0;
+            nBenchRulesV5Time = TV4;
+            nFail += Check(!b.AcceptBlock(&nDoS) && nDoS == 10 && nBestHeight == 142,
+                           "v5 on: a block with it is refused (not final until 2038)") ? 0 : 1;
+            nBenchRulesV5Time = 0;
+            nFail += Check(b.AcceptBlock() && nBestHeight == 143,
+                           "v5 off: the same block is accepted, as it always was") ? 0 : 1;
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+
+        // Finding 2: block 149 is timed 30000 s ahead; block 179 closes the
+        // window it opens.
+        nBenchRulesV5Time = TV4;
+        fBuilt = Grow::To(148, vCb, T0, vNone);
+        const unsigned int nAhead = TimeOf::At(149, T0) + 30000;
+        {
+            CBlock b = V5Block(pindexBest, nAhead, vNone);
+            fBuilt = fBuilt && b.AcceptBlock();
+            vCb.push_back(b.vtx[0].GetHash());
+        }
+        fBuilt = fBuilt && Grow::To(178, vCb, T0, vNone);
+        nFail += Check(fBuilt && nBestHeight == 178, "the chain is built to height 178") ? 0 : 1;
+        {
+            CBlockIndex* p178 = pindexBest;
+            unsigned int nEarly = (unsigned int)p178->GetMedianTimePast() + 1;
+            nFail += Check(nEarly < nAhead && BlockTimeFloor(p178) == nAhead,
+                           "builders time block 179 no earlier than block 149") ? 0 : 1;
+            CBlock bad = V5Block(p178, nEarly, vNone);
+            CBlock good = V5Block(p178, nAhead, vNone);
+            int nDoS = 0;
+            nBenchRulesV5Time = TV4;
+            nFail += Check(!bad.AcceptBlock(&nDoS) && nDoS == 10 && V5IndexOf(bad) == NULL,
+                           "v5 on: block 179 timed before block 149 is refused") ? 0 : 1;
+            nFail += Check(good.AcceptBlock() && nBestHeight == 179, "and timed at block 149's time it is accepted") ? 0 : 1;
+            nBenchRulesV5Time = 0;
+            nFail += Check(BlockTimeFloor(p178) == p178->GetMedianTimePast() + 1,
+                           "v5 off: builders start at the median time, as they did") ? 0 : 1;
+            nFail += Check(bad.AcceptBlock() && V5IndexOf(bad) != NULL,
+                           "v5 off: the early block is accepted, as it always was (here as a side branch)") ? 0 : 1;
+            CBlockIndex* pBad = V5IndexOf(bad);
+            CBlockIndex* pGood = V5IndexOf(good);
+            if (pBad && pGood)
+            {
+                CBigNum bnOld;
+                bnOld.SetCompact(p178->nBits);
+                CBigNum bnEasier = bnOld * 4;
+                if (bnEasier > bnProofOfWorkLimit)
+                    bnEasier = bnProofOfWorkLimit;
+                CBigNum bnHarder = bnOld * 900;
+                bnHarder /= 3600;
+                nFail += Check(GetNextWorkRequired(pBad) == bnEasier.GetCompact() &&
+                               GetNextWorkRequired(pGood) == bnHarder.GetCompact(),
+                               "after the early block the target eases (the old arithmetic, unchanged); after the allowed one it hardens") ? 0 : 1;
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+    nBenchRulesV4Time = 0;
+    nBenchRulesV5Time = 0;
+    for (size_t i = 0; i < vMade.size(); i++)
+    {
+        mapBlockIndex.erase(vMade[i]->GetBlockHash());
+        delete vMade[i];
+    }
+    if (!tmp.empty())
+    {
+        DBFlush(true);
+        RemoveTree(tmp);
+    }
+    strSetDataDir = strOldDataDir;
+    SelectChainParams(fWasTestNet);
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -9412,6 +9881,8 @@ int RunSelfTest(const std::string& name)
         return RunRulesV3SelfTest();
     if (name == "rules-v4")
         return RunRulesV4SelfTest();
+    if (name == "rules-v5")
+        return RunRulesV5SelfTest();
     if (name == "inheritance")
         return InheritanceSelfTest();
     if (name == "sigcheck")
@@ -9444,6 +9915,6 @@ int RunSelfTest(const std::string& name)
         return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

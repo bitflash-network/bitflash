@@ -308,7 +308,7 @@ static bool RebuildJob()
                 unsigned int sz = 0;
                 // The block's time before its contents, as in BitcoinMiner:
                 // it was 0 here, so the rules were the clock's.
-                block.nTime = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
+                block.nTime = max((unsigned int)BlockTimeFloor(pindexPrev),
                                   (unsigned int)GetAdjustedTime());
                 // Under MAX_BLOCK_SIGOPS, P2SH included, as ConnectBlock
                 // counts. This builder did not count at all, and its blocks
@@ -399,7 +399,7 @@ static bool RebuildJob()
         // Later, unless that would put the block under other rules than its
         // transactions were chosen under (BitcoinMiner does the same).
         {
-            unsigned int nNow = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),
+            unsigned int nNow = max((unsigned int)BlockTimeFloor(pindexPrev),
                                     (unsigned int)GetAdjustedTime());
             if (RulesV4Active(nNow) == fSelectedV4)
                 block.nTime = nNow;
@@ -828,8 +828,8 @@ static void QueuePayouts(int blockHeight,
     // Compute the block subsidy at the height that was just found.
     // We do not include tx fees in miner payout -- those stay in the operator
     // wallet as part of the coinbase, which is the operator's cut on top of feeFrac.
-    int64 nSubsidy = 50 * COIN;
-    nSubsidy >>= (blockHeight / 210000); // halving schedule
+    // The consensus schedule itself, so the 64-halving end (BIP42) holds here too.
+    int64 nSubsidy = CBlock().GetBlockValue(blockHeight, 0);
     int64 minerReward = (int64)((double)nSubsidy * (1.0 - feeFrac));
     int64 operatorCut = nSubsidy - minerReward;
     round.subsidy = nSubsidy;

@@ -187,7 +187,7 @@ static void PrintUsage()
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
     printf("            consensus-limits, chain-work, pool-stratum,\n");
-    printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, net-hardening, multisig, network-params, socks5-proxy,\n");
+    printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, rules-v5, net-hardening, multisig, network-params, socks5-proxy,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
     // suites that exist were not named here, so nobody could find them without
     // reading the source. Kept in step now; a suite that cannot be discovered is
@@ -245,7 +245,8 @@ static void PrintUsage()
     printf("  /ltc... /doge... /bch... /xec... /dgb... /rvn...  (the same options for the other\n");
     printf("                              chains: /ltcchain, /ltcdatadir, /ltcrpcport, -ltcpeer...)\n");
     printf("  /isolate                   (test bench: dial nothing but /connectbtf and the /XXXpeer\n");
-    printf("                              peers; /benchrulesv4=TIME moves rules v4 there, testnet only;\n");
+    printf("                              peers; /benchrulesv4=TIME and /benchrulesv5=TIME move rules v4\n");
+    printf("                              and v5 there, testnet only;\n");
     printf("                              /benchcheckpoint=HEIGHT:HASH gives that bench a checkpoint)\n");
     printf("  /invoicewebhook=URL        (invoices: POST each status change to http://host[:port]/path)\n");
     printf("  /invoicewebhooksecret=S    (sign those POSTs: X-Bitflash-Signature: sha256=HMAC(S, body))\n");
@@ -497,13 +498,20 @@ static void ParseStartupArguments(int argc, char* argv[])
     // A testnet bench, cut off from the testnet: -isolate talks to the
     // -connectbtf peer only (and the Bitcoin light client to -btcpeer only), and -benchrulesv4=TIME switches rules v4 on at
     // TIME there, so they can be spent and broken with coins before the date.
-    // Neither exists on mainnet.
+    // -benchrulesv5=TIME does the same for rules v5, which have no date yet
+    // (TIME is the parent's median time past, and v5 still waits for v4).
+    // None of them exists on mainnet.
     bool fIsolate = arg(argc, argv, "/isolate") || arg(argc, argv, "-isolate");
     string strBenchV4 = argval2(argc, argv, "/benchrulesv4", "-benchrulesv4");
-    if ((fIsolate || !strBenchV4.empty()) && !fUseTestNet)
-        StartupRefuse("-isolate and -benchrulesv4 are for a testnet bench only", "add -testnet, or leave them out");
+    string strBenchV5 = argval2(argc, argv, "/benchrulesv5", "-benchrulesv5");
+    if ((fIsolate || !strBenchV4.empty() || !strBenchV5.empty()) && !fUseTestNet)
+        StartupRefuse("-isolate, -benchrulesv4 and -benchrulesv5 are for a testnet bench only",
+                      "add -testnet, or leave them out");
     if (!strBenchV4.empty() && !fIsolate)
         StartupRefuse("-benchrulesv4 without -isolate would fork this node off the public testnet",
+                      "add -isolate and -connectbtf=ADDRESS@HOST.onion:PORT of the other bench node");
+    if (!strBenchV5.empty() && !fIsolate)
+        StartupRefuse("-benchrulesv5 without -isolate would fork this node off the public testnet",
                       "add -isolate and -connectbtf=ADDRESS@HOST.onion:PORT of the other bench node");
     if (fIsolate && strBtfConnect.empty())
         StartupRefuse("-isolate needs the bench's other node", "add -connectbtf=ADDRESS@HOST.onion:PORT");
@@ -517,6 +525,17 @@ static void ParseStartupArguments(int argc, char* argv[])
             StartupRefuse(strprintf("-benchrulesv4=%s is not a unix time", strBenchV4.c_str()), "");
         nBenchRulesV4Time = (unsigned int)n;
         fprintf(stderr, "bench: rules v4 from block time %u on this isolated testnet\n", nBenchRulesV4Time);
+    }
+    if (!strBenchV5.empty())
+    {
+        char* end = NULL;
+        errno = 0;
+        long long n = strtoll(strBenchV5.c_str(), &end, 10);
+        if (errno || end == strBenchV5.c_str() || *end != '\0' || n <= 0 || n > 0xffffffffLL)
+            StartupRefuse(strprintf("-benchrulesv5=%s is not a unix time", strBenchV5.c_str()), "");
+        nBenchRulesV5Time = (unsigned int)n;
+        fprintf(stderr, "bench: rules v5 once the median time past reaches %u (with rules v4) on this isolated testnet\n",
+                nBenchRulesV5Time);
     }
 
     // -benchcheckpoint=HEIGHT:HASH gives the same bench a checkpoint (testnet
