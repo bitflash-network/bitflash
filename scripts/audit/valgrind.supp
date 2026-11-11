@@ -1,0 +1,32 @@
+# Berkeley DB writes its page buffers and log records to disk with the unused
+# bytes of each page left as they came from malloc. Memcheck reports that as
+# uninitialised data reaching pwrite and as a jump on uninitialised data in the
+# log writer. It is harmless and internal to the library; Berkeley DB itself
+# ships --enable-umrw to silence exactly this for Purify and Valgrind, and
+# Debian's libdb5.3 is not built with it. Only frames inside libdb_cxx match.
+{
+   bdb-uninit-page-write
+   Memcheck:Param
+   pwrite64(buf)
+   ...
+   obj:*/libdb_cxx-5.3.so
+}
+{
+   bdb-uninit-page-write-pwrite
+   Memcheck:Param
+   pwrite(buf)
+   ...
+   obj:*/libdb_cxx-5.3.so
+}
+{
+   bdb-uninit-log-cond
+   Memcheck:Cond
+   obj:*/libdb_cxx-5.3.so
+   ...
+}
+{
+   bdb-uninit-log-value8
+   Memcheck:Value8
+   obj:*/libdb_cxx-5.3.so
+   ...
+}

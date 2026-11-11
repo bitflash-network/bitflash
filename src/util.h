@@ -138,6 +138,12 @@ void ParseString(const string& str, char c, vector<string>& v);
 string FormatMoney(int64 n, bool fPlus=false);
 bool ParseMoney(const char* pszIn, int64& nRet);
 bool FileExists(const char* psz);
+// Opens a new file for writing that only this user can read, from the moment
+// it exists (fopen, then chmod, leaves a window in which another local user
+// can open it and keep reading what is written later). fExclusive refuses an
+// existing file; otherwise one is replaced. fText: text mode on Windows
+// (CRLF), for files people read. NULL on failure, errno set.
+FILE* OpenPrivateFile(const char* psz, bool fExclusive, bool fText=false);
 int GetFilesize(FILE* file);
 uint64 GetRand(uint64 nMax);
 int64 GetTime();

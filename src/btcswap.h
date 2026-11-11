@@ -57,6 +57,12 @@ void Configure(const std::string& strChain, const std::string& strDataDir, int n
 void Configure(const std::string& strCoin, const std::string& strChain, const std::string& strDataDir, int nPort,
                const std::string& strWallet, const std::string& strUser, const std::string& strPassword,
                const std::string& strFeeRate);
+// Starts the light clients that should run with the node: Bitcoin's always
+// (when it is used light), another chain's once it has been used (its state
+// file exists). Only the node calls it, after the one-shot commands and the
+// self-tests have had their turn: those must not dial peers, nor write the
+// light-client state of a node that may be running from the same directory.
+void StartLightClients();
 // The chains a swap can be made with, and whether a ticker is one of them.
 bool KnownCoin(const std::string& strCoin);
 

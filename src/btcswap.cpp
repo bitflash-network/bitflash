@@ -61,18 +61,30 @@ void Configure(const std::string& strCoin, const std::string& strChain, const st
         c.strPassword = strPassword;
         c.strFeeRate = strFeeRate;
     }
+}
+
+void StartLightClients()
+{
+    std::vector<std::string> vCoins;
+    CRITICAL_BLOCK(cs_config)
+        for (std::map<std::string, Config>::const_iterator it = g_config.begin(); it != g_config.end(); ++it)
+            vCoins.push_back(it->first);
     // Loading the queue here resumes broadcasts after a wallet restart, even
     // before the person next opens the swap screen or calls RPC. Bitcoin's
     // client always starts, as it did; another chain's only once it has been
     // used (its state file exists), so a wallet that never swaps with it
     // never dials that chain's peers.
-    std::string strState = std::string(GetAppDir()) + "/" + strCoin + "-light-" + ConfiguredChain(strCoin) + ".json";
-    if (UsingLight(strCoin) && (strCoin == "btc" || DirExists(strState)))
+    for (size_t i = 0; i < vCoins.size(); i++)
     {
-        Chain chain;
-        std::string err;
-        if (!btclight::CheckChain(strCoin, ConfiguredChain(strCoin), chain, err))
-            printf("%s light: %s\n", btclight::Label(strCoin).c_str(), err.c_str());
+        const std::string& strCoin = vCoins[i];
+        std::string strState = std::string(GetAppDir()) + "/" + strCoin + "-light-" + ConfiguredChain(strCoin) + ".json";
+        if (UsingLight(strCoin) && (strCoin == "btc" || DirExists(strState)))
+        {
+            Chain chain;
+            std::string err;
+            if (!btclight::CheckChain(strCoin, ConfiguredChain(strCoin), chain, err))
+                printf("%s light: %s\n", btclight::Label(strCoin).c_str(), err.c_str());
+        }
     }
 }
 

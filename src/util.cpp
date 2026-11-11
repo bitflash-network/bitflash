@@ -3,6 +3,9 @@
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "headers.h"
+#ifndef WIN32
+#include <fcntl.h>
+#endif
 
 
 
@@ -242,7 +245,7 @@ string strprintf(const char* format, ...)
         if (ret >= 0 && ret < limit)
             break;
         if (p != buffer)
-            delete p;
+            delete[] p;
         limit *= 2;
         p = new char[limit];
         if (p == NULL)
@@ -255,7 +258,7 @@ string strprintf(const char* format, ...)
 #endif
     string str(p, p+ret);
     if (p != buffer)
-        delete p;
+        delete[] p;
     return str;
 }
 
@@ -397,6 +400,32 @@ bool FileExists(const char* psz)
     return GetFileAttributes(psz) != -1;
 #else
     return access(psz, 0) != -1;
+#endif
+}
+
+FILE* OpenPrivateFile(const char* psz, bool fExclusive, bool fText)
+{
+#ifdef WIN32
+    // The data directory's ACL already keeps other accounts out.
+    if (fExclusive && FileExists(psz))
+    {
+        errno = EEXIST;
+        return NULL;
+    }
+    return fopen(psz, fText ? "w" : "wb");
+#else
+    // A new inode, never one that was already there: an old file keeps its
+    // old mode, and someone who opened it before keeps their handle.
+    if (!fExclusive && unlink(psz) != 0 && errno != ENOENT)
+        return NULL;
+    int fd = open(psz, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+    if (fd < 0)
+        return NULL;
+    (void)fText;
+    FILE* f = fdopen(fd, "w");
+    if (!f)
+        close(fd);
+    return f;
 #endif
 }
 

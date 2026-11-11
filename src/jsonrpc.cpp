@@ -89,15 +89,12 @@ bool JsonRpcConfigureCookie(const string& strPort)
     OPENSSL_cleanse(rnd, sizeof(rnd));
 
     string path = GetAppDir() + "/.cookie";
-    FILE* f = fopen(path.c_str(), "wb");
+    FILE* f = OpenPrivateFile(path.c_str(), false);
     if (!f)
     {
         fprintf(stderr, "-chatwallet: could not write %s\n", path.c_str());
         return false;
     }
-#ifndef _WIN32
-    chmod(path.c_str(), 0600);
-#endif
     string line = "__cookie__:" + strPass + "\n";
     fwrite(line.data(), 1, line.size(), f);
     fclose(f);
@@ -147,7 +144,8 @@ static string Base64Decode(const string& in)
 {
     static const string tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     string out;
-    int val = 0, bits = -8;
+    unsigned int val = 0;   // wraps (defined); only the low bits are read
+    int bits = -8;
     foreach(unsigned char c, in)
     {
         if (c == '=') break;

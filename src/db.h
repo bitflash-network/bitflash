@@ -50,6 +50,8 @@ public:
 
 extern DbEnv& GetDbEnv();
 extern void DBFlush(bool fShutdown);
+// How many CDB objects hold a file open now (for the self-tests).
+extern int DbFileUseCount(const string& strFile);
 // Close the environment and delete its logs. Only the encryption command calls
 // this: the logs hold the plaintext records the old wallet wrote.
 extern void PurgeDbEnvironmentLogs();

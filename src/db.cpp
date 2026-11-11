@@ -4,6 +4,9 @@
 
 #include "headers.h"
 #include "wallet_sqlite.h"
+#ifndef WIN32
+#include <fcntl.h>
+#endif
 
 
 
@@ -314,21 +317,43 @@ CDB::CDB(const char* pszFile, const char* pszMode, bool fTxn) : pdb(NULL)
             // transactions, as Bitcoin found out in March 2013.
             env.set_lk_max_locks(537000);
             env.set_lk_max_objects(537000);
-            pdbErrFile = fopen("db.log", "a"); /// debug
+            // Beside the environment, not in whatever directory the process
+            // happened to start in, and owner-only like everything else there.
+            string strDbLog = strAppDir + "/db.log";
+#ifdef WIN32
+            pdbErrFile = fopen(strDbLog.c_str(), "a");
+#else
+            int fdDbLog = open(strDbLog.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+            pdbErrFile = fdDbLog >= 0 ? fdopen(fdDbLog, "a") : NULL;
+            if (fdDbLog >= 0 && !pdbErrFile)
+                close(fdDbLog);
+#endif
             if (pdbErrFile)
                 env.set_errfile(pdbErrFile);
             ///env.log_set_config(DB_LOG_AUTO_REMOVE, 1); /// causes corruption
-            ret = env.open(strAppDir.c_str(),
-                           DB_CREATE     |
-                           DB_INIT_LOCK  |
-                           DB_INIT_LOG   |
-                           DB_INIT_MPOOL |
-                           DB_INIT_TXN   |
-                           DB_THREAD     |
-                           DB_PRIVATE    |
-                           DB_RECOVER,
-                           0);
-            if (ret > 0)
+            // The C++ API reports a failed open by throwing DbException, not
+            // by its return value, and a DbEnv whose open failed cannot be
+            // opened again: without the close below every later CDB would
+            // fail on the same dead handle. Negative values are Berkeley DB's
+            // own error codes (DB_RUNRECOVERY and the like), failures too.
+            try
+            {
+                ret = env.open(strAppDir.c_str(),
+                               DB_CREATE     |
+                               DB_INIT_LOCK  |
+                               DB_INIT_LOG   |
+                               DB_INIT_MPOOL |
+                               DB_INIT_TXN   |
+                               DB_THREAD     |
+                               DB_PRIVATE    |
+                               DB_RECOVER,
+                               0);
+            }
+            catch (DbException& e)
+            {
+                ret = e.get_errno() ? e.get_errno() : EINVAL;
+            }
+            if (ret != 0)
             {
                 CloseDbEnv();
                 throw runtime_error(strprintf("CDB() : error %d opening database environment\n", ret));
@@ -377,14 +402,25 @@ CDB::CDB(const char* pszFile, const char* pszMode, bool fTxn) : pdb(NULL)
 
     pdb = new Db(&GetDbEnv(), 0);
 
-    ret = pdb->open(NULL,      // Txn pointer
-                    pszFile,   // Filename
-                    "main",    // Logical db name
-                    DB_BTREE,  // Database type
-                    nFlags,    // Flags
-                    0);
+    // Same as the environment: a missing or unreadable file throws. Before
+    // this caught it, the Db handle leaked and the file's use count stayed
+    // up for good, so DBFlush never closed that file again (found by
+    // fuzz-net-message: every "inv" opens blkindex.dat read-only).
+    try
+    {
+        ret = pdb->open(NULL,      // Txn pointer
+                        pszFile,   // Filename
+                        "main",    // Logical db name
+                        DB_BTREE,  // Database type
+                        nFlags,    // Flags
+                        0);
+    }
+    catch (DbException& e)
+    {
+        ret = e.get_errno() ? e.get_errno() : EINVAL;
+    }
 
-    if (ret > 0)
+    if (ret != 0)
     {
         delete pdb;
         pdb = NULL;
@@ -467,6 +503,18 @@ void PurgeDbEnvironmentLogs()
             printf("PurgeDbEnvironmentLogs() : could not remove %s\n", strPath.c_str());
     }
     printf("PurgeDbEnvironmentLogs() : removed %d database log file(s)\n", nRemoved);
+}
+
+int DbFileUseCount(const string& strFile)
+{
+    int n = 0;
+    CRITICAL_BLOCK(cs_db)
+    {
+        map<string, int>::const_iterator mi = mapFileUseCount.find(strFile);
+        if (mi != mapFileUseCount.end())
+            n = (*mi).second;
+    }
+    return n;
 }
 
 void DBFlush(bool fShutdown)
@@ -1186,8 +1234,10 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
     string strLastType;
     try
     {
-    CRITICAL_BLOCK(cs_mapKeys)
+    // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+    // cs_mapKeys): the other order here was a lock-order inversion (TSan).
     CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_mapKeys)
     {
         // Get cursor
         Dbc* pcursor = GetCursor();
@@ -1560,8 +1610,10 @@ bool LoadWalletFromSQLite(const string& strPath)
     CSQLiteWalletRuntimeLoadVisitor visitor;
     try
     {
-        CRITICAL_BLOCK(cs_mapKeys)
+        // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+        // cs_mapKeys): the other order here was a lock-order inversion (TSan).
         CRITICAL_BLOCK(cs_mapWallet)
+        CRITICAL_BLOCK(cs_mapKeys)
         {
             if (!sqlite.ScanRecords(visitor, strError))
             {
@@ -1631,8 +1683,10 @@ bool LoadWalletFromSQLiteRuntime(const string& strPath)
     CSQLiteWalletRuntimeLoadVisitor visitor;
     try
     {
-        CRITICAL_BLOCK(cs_mapKeys)
+        // cs_mapWallet first, as everywhere else (IsMine under cs_mapWallet takes
+        // cs_mapKeys): the other order here was a lock-order inversion (TSan).
         CRITICAL_BLOCK(cs_mapWallet)
+        CRITICAL_BLOCK(cs_mapKeys)
         {
             if (!pWalletSQLiteRuntime->ScanRecords(visitor, strError))
             {
@@ -1983,13 +2037,11 @@ bool DumpWallet(const string& strDest)
         return error("DumpWallet() : %s already exists -- refusing to overwrite\n",
                      strDest.c_str());
 
-    FILE* pf = fopen(strDest.c_str(), "w");
+    // Owner-only before a single key reaches it, and still refusing a file
+    // that appeared since the check above.
+    FILE* pf = OpenPrivateFile(strDest.c_str(), true, true);
     if (!pf)
         return error("DumpWallet() : cannot write %s\n", strDest.c_str());
-#ifndef _WIN32
-    // Before a single key reaches it.
-    chmod(strDest.c_str(), S_IRUSR | S_IWUSR);
-#endif
 
     fprintf(pf, "# Bitflash wallet key dump\n");
     fprintf(pf, "# %s\n", DateTimeStr(GetTime()).c_str());

@@ -135,8 +135,8 @@ jobs:
     # the folder. Built and tried on GitHub's Apple silicon machines.
     runs-on: macos-15
     env:
-      TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
-      TOR_VERSION: 15.0.19
+      TOR_MAC_SHA256: b8da251eccbe9e82f3681ee3af3c97fb4291c4a4e153e5b824bde48a1117cd6a
+      TOR_VERSION: "16.0"
     steps:
       - uses: actions/checkout@v5
       - name: Homebrew libraries
@@ -261,8 +261,8 @@ jobs:
     env:
       XMRIG_MAC_SHA256: 6ae4eb4216e99a201ae9a3d2c3a7c275207c5165cfc25da1f3d735d6c4829c18
       XMRIG_LICENSE_SHA256: 589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2
-      TOR_MAC_SHA256: c99cf6f69740a443c7fffaf598ceb0952b3914041507c8afe11bed84a3333eb1
-      TOR_VERSION: 15.0.19
+      TOR_MAC_SHA256: b8da251eccbe9e82f3681ee3af3c97fb4291c4a4e153e5b824bde48a1117cd6a
+      TOR_VERSION: "16.0"
     steps:
       - uses: actions/checkout@v5
       - name: Official XMRig and Tor, checked against their published hashes
@@ -328,9 +328,9 @@ jobs:
       XMRIG_WIN_SHA256: bba8097cb37d9b458a1cb1137876b27cde6740d17fe4ccbc086ba07d87d9e147
       XMRIG_LINUX_SHA256: fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5
       XMRIG_LICENSE_SHA256: 589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2
-      TOR_WIN_SHA256: 6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f
-      TOR_LINUX_SHA256: 5a8f19f5f119b5fa2a8fd799a3a532e3236ad36164241800d6302e32f0e1c2a9
-      TOR_VERSION: 15.0.19
+      TOR_WIN_SHA256: 2ee123e9167318a3742778ff704e75f01d4780f05a14522d451fe011011077c4
+      TOR_LINUX_SHA256: cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd
+      TOR_VERSION: "16.0"
     defaults:
       run:
         shell: bash -eo pipefail {0}
@@ -410,7 +410,7 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v5
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           update: true

@@ -6,6 +6,7 @@
 // and against a temporary data directory.
 
 #include "headers_core.h"
+#include <atomic>
 #include "btfaddr.h"
 #include "bip32.h"
 #include "proxy.h"
@@ -1283,6 +1284,158 @@ static int RunWalletStorageSanitySelfTest()
         nFail++;
     }
 
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// A Berkeley DB file that cannot be opened. The C++ API throws DbException
+// for it; CDB used to look only at the return value, so the Db handle leaked
+// and the file's use count stayed up for good (DBFlush then never closed that
+// file again). fuzz-net-message found it: every "inv" opens blkindex.dat.
+static int RunDbOpenFailureSelfTest()
+{
+    fflush(stdout);
+    printf("db-open-failure self-test\n");
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    int nFail = 0;
+    std::string strOldDataDir = strSetDataDir;
+    strSetDataDir = tmp;
+    try
+    {
+        int nThrown = 0, nOther = 0;
+        for (int i = 0; i < 200; i++)
+        {
+            try { CTxDB txdb("r"); }
+            catch (const std::runtime_error&) { nThrown++; }
+            catch (...) { nOther++; }
+        }
+        nFail += Check(nThrown == 200 && nOther == 0,
+                       "a missing database file fails as runtime_error, every time") ? 0 : 1;
+        nFail += Check(DbFileUseCount("blkindex.dat") == 0,
+                       "a failed open leaves no use count behind") ? 0 : 1;
+        nFail += Check(FileExists((tmp + "/db.log").c_str()),
+                       "the Berkeley DB error log is in the data directory") ? 0 : 1;
+#ifndef _WIN32
+        struct stat stLog;
+        nFail += Check(stat((tmp + "/db.log").c_str(), &stLog) == 0 && (stLog.st_mode & 0777) == 0600,
+                       "and only its owner can read it") ? 0 : 1;
+#endif
+        {
+            CTxDB txdb("cr+");
+            nFail += Check(DbFileUseCount("blkindex.dat") == 1, "an open file counts once") ? 0 : 1;
+        }
+        nFail += Check(DbFileUseCount("blkindex.dat") == 0, "and not after it closes") ? 0 : 1;
+        bool fOpened = false;
+        try { CTxDB txdb("r"); fOpened = true; } catch (...) { }
+        nFail += Check(fOpened, "once created, the same file opens read-only") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    DBFlush(true);
+    strSetDataDir = strOldDataDir;
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// OpenPrivateFile: the RPC cookie and the key dump are owner-only from the
+// moment they exist, never fopen-then-chmod.
+static int RunPrivateFileSelfTest()
+{
+    fflush(stdout);
+    printf("private-file self-test\n");
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary directory\n");
+        return 1;
+    }
+    int nFail = 0;
+    std::string path = tmp + "/secret";
+    FILE* f = OpenPrivateFile(path.c_str(), true);
+    nFail += Check(f != NULL, "a new file opens") ? 0 : 1;
+    if (f)
+    {
+        fputs("first\n", f);
+        fclose(f);
+    }
+#ifndef _WIN32
+    struct stat st;
+    nFail += Check(stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600,
+                   "it is created owner-only (0600)") ? 0 : 1;
+#endif
+    errno = 0;
+    f = OpenPrivateFile(path.c_str(), true);
+    nFail += Check(f == NULL && errno == EEXIST, "exclusive refuses an existing file") ? 0 : 1;
+    if (f)
+        fclose(f);
+#ifndef _WIN32
+    // Someone who opened the old file (left readable on purpose) keeps that
+    // handle; it must never see what is written next. Holding it open also
+    // keeps the old inode number from being reused for the new file.
+    chmod(path.c_str(), 0644);
+    ino_t inoOld = st.st_ino;
+    FILE* fReader = fopen(path.c_str(), "r");
+#endif
+    f = OpenPrivateFile(path.c_str(), false);
+    nFail += Check(f != NULL, "non-exclusive replaces an existing file") ? 0 : 1;
+    if (f)
+    {
+        fputs("second\n", f);
+        fclose(f);
+    }
+#ifndef _WIN32
+    nFail += Check(stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600 && st.st_ino != inoOld,
+                   "with a new owner-only file, not the old one reopened") ? 0 : 1;
+    char bufOld[16] = {0};
+    if (fReader)
+    {
+        if (!fgets(bufOld, sizeof(bufOld), fReader))
+            bufOld[0] = 0;
+        fclose(fReader);
+    }
+    nFail += Check(fReader != NULL && std::string(bufOld) == "first\n",
+                   "a handle on the old file never sees the new contents") ? 0 : 1;
+    std::string target = tmp + "/target";
+    std::string link = tmp + "/link";
+    FILE* t = OpenPrivateFile(target.c_str(), true);
+    if (t)
+    {
+        fputs("keep\n", t);
+        fclose(t);
+    }
+    nFail += Check(symlink(target.c_str(), link.c_str()) == 0, "a symlink for the next checks") ? 0 : 1;
+    errno = 0;
+    f = OpenPrivateFile(link.c_str(), true);
+    nFail += Check(f == NULL, "exclusive refuses a symlink") ? 0 : 1;
+    if (f)
+        fclose(f);
+    f = OpenPrivateFile(link.c_str(), false);
+    if (f)
+        fclose(f);
+    char buf[16] = {0};
+    t = fopen(target.c_str(), "r");
+    if (t)
+    {
+        if (!fgets(buf, sizeof(buf), t))
+            buf[0] = 0;
+        fclose(t);
+    }
+    nFail += Check(std::string(buf) == "keep\n", "replacing a symlink never writes through it") ? 0 : 1;
+#endif
     RemoveTree(tmp);
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
@@ -6956,7 +7109,7 @@ static int RunChatLinkSelfTest()
             btfchat::Link*         link;
             btfchat::SocketStream* stream;
             const unsigned char*   sk;
-            bool                   fOk;
+            std::atomic<bool>      fOk;   // the main thread polls it (ThreadSanitizer)
             std::string            err;
         };
         Arg arg;
@@ -9159,6 +9312,10 @@ int RunSelfTest(const std::string& name)
         return RunDbLocksSelfTest();
     if (name == "db-env-reopen")
         return RunDbEnvReopenSelfTest();
+    if (name == "db-open-failure")
+        return RunDbOpenFailureSelfTest();
+    if (name == "private-file")
+        return RunPrivateFileSelfTest();
     if (name == "wallet-sqlite")
         return RunWalletSQLiteSelfTest();
     if (name == "wallet-sqlite-migration")
@@ -9265,6 +9422,6 @@ int RunSelfTest(const std::string& name)
         return RunChatLiveSelfTest();
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

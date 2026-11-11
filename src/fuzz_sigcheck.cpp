@@ -8,6 +8,7 @@
 // to change. Any disagreement aborts -- it would be a consensus split.
 
 #include "headers_core.h"
+#include "fuzz_datadir.h"
 #include "sigcheck.h"
 
 #include <stdint.h>

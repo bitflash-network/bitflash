@@ -124,7 +124,7 @@ enum PeerState
 
 // What a frame claims to be. The gate decides per kind, so a new kind cannot
 // quietly inherit the permissions of an old one.
-enum MsgKind
+enum MsgKind : int   // fixed type: any int is a valid value (a frame kind is range-checked on decode)
 {
     MSG_INVITE = 0,      // "let's talk" + a short note
     MSG_INVITE_ACCEPT,   // answer to an invite we sent

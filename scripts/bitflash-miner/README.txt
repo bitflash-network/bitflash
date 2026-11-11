@@ -79,7 +79,7 @@ mines normally.
 What is inside
 --------------
   xmrig/   XMRig 6.26.0, official build (GPLv3, source at github.com/xmrig/xmrig)
-  tor/     Tor 15.0.19 client from the Tor Expert Bundle (BSD 3-clause)
+  tor/     Tor 16.0 client from the Tor Expert Bundle (BSD 3-clause)
   licenses/  the licences of both
   SHA256SUMS, SHA256SUMS.asc  hashes of every file, signed by the Bitflash
            release key 910A 2B4C CA87 9E81 FB4B 2AEA 1D4A 53D3 B78A A4B8

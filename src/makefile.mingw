@@ -377,6 +377,8 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=rvn-chain
 	./bitflash.exe -selftest=explorer
 	./bitflash.exe -selftest=db-locks
+	./bitflash.exe -selftest=db-open-failure
+	./bitflash.exe -selftest=private-file
 	./bitflash.exe -selftest=swap-wait-payment
 	./bitflash.exe -selftest=fee-policy
 	./bitflash.exe -selftest=invoice
