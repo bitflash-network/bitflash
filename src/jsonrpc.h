@@ -24,5 +24,10 @@ void ThreadJsonRpcServer(void* parg);
 // (docs/inheritance.md). Runs whether or not the RPC server does.
 void ThreadInheritance(void* parg);
 int InheritanceSelfTest();   // -selftest=inheritance
+// -selftest=wallet-rpc-v4, run inside a temporary data directory: vault
+// recovery follows the chain, CTV templates are checked against mining
+// policy, the rules-v4 upgrade hooks are policy-refused, signrawtransaction's
+// temporary keys and getbalance minconf 1.
+int WalletRpcV4SelfTest();
 
 #endif

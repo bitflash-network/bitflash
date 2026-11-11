@@ -44,7 +44,6 @@ void   MainFrameRepaint();
 int    GetDiscoveredPeerCount();
 int    GetPeerMedianHeight();
 string DateTimeStr(int64 nTime);
-bool   SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
 int64  GetBalance();
 string PubKeyToAddress(const std::vector<unsigned char>& vchPubKey);
 bool   AddressToHash160(const std::string& str, uint160& hash160Ret);
@@ -73,6 +72,14 @@ static bool        g_needRefresh       = true;
 static char        g_sendAddr[128]        = {};
 static char        g_sendAmount[32]       = {};
 static std::string g_sendFor;                 // who/what a pasted payment link said
+// The send is reviewed before it goes: the first press of Send builds the
+// transaction without sending it and shows amount, fee and total; the second
+// press sends, refusing a fee above the one shown. Editing the address or the
+// amount in between asks for a new review.
+static bool        g_sendReviewed = false;
+static std::string g_sendReviewAddr;
+static std::string g_sendReviewAmount;
+static int64       g_sendReviewFee = 0;
 // "Request a payment": a bitflash: link (BIP21) for this wallet's address.
 static bool        g_showRequest          = false;
 static char        g_reqAmount[32]        = {};
@@ -787,8 +794,8 @@ static void DrawMainWindow()
 // ---------------------------------------------------------------------------
 static void DrawSendDialog()
 {
-    if (!g_showSend) return;
-    ImGui::SetNextWindowSize(ImVec2(500.0f, 180.0f), ImGuiCond_Always);
+    if (!g_showSend) { g_sendReviewed = false; return; }
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 215.0f), ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Send Coins", &g_showSend,
@@ -834,8 +841,22 @@ static void DrawSendDialog()
                 "%s", g_sendStatus.c_str());
         }
 
+        // A review is only good for what it reviewed.
+        if (g_sendReviewed &&
+            (g_sendReviewAddr != g_sendAddr || g_sendReviewAmount != g_sendAmount))
+            g_sendReviewed = false;
+        if (g_sendReviewed) {
+            int64 nv = 0;
+            ParseMoney(g_sendAmount, nv);
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
+                "Amount %s + fee %s = total %s BTF. Press Confirm to send.",
+                FmtMoney(nv).c_str(), FmtMoney(g_sendReviewFee).c_str(),
+                FmtMoney(nv + g_sendReviewFee).c_str());
+        }
+
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-        if (ImGui::Button("Send", ImVec2(90.0f, 0.0f))) {
+        if (ImGui::Button(g_sendReviewed ? "Confirm##send" : "Send##send", ImVec2(90.0f, 0.0f))) {
             uint160 h; int64 nv = 0;
             CScript sc;
             bool fTreasury = std::string(g_sendAddr) == "treasury";
@@ -846,18 +867,39 @@ static void DrawSendDialog()
             else {
                 if (!fTreasury)
                     sc << OP_DUP << OP_HASH160 << h << OP_EQUALVERIFY << OP_CHECKSIG;
-                CWalletTx wtx;
-                if (fTreasury)
-                    wtx.mapValue["comment"] = "Donation to the Bitflash treasury";
-                if (SendMoney(sc, nv, wtx)) {
-                    g_showSend = false;
-                    g_sendStatus = "";
-                    memset(g_sendAddr,   0, sizeof(g_sendAddr));
-                    memset(g_sendAmount, 0, sizeof(g_sendAmount));
-                    g_sendFor.clear();
-                    g_needRefresh = true;
+                if (!g_sendReviewed) {
+                    // First press: build it, show the fee, send nothing.
+                    int64 nFee = 0;
+                    std::string strWhy;
+                    if (PreviewSendFee(sc, nv, nFee, strWhy)) {
+                        g_sendReviewed = true;
+                        g_sendReviewAddr = g_sendAddr;
+                        g_sendReviewAmount = g_sendAmount;
+                        g_sendReviewFee = nFee;
+                        g_sendStatus = "";
+                    } else {
+                        g_sendStatus = strWhy;
+                    }
                 } else {
-                    g_sendStatus = "Transaction failed.";
+                    CWalletTx wtx;
+                    if (fTreasury)
+                        wtx.mapValue["comment"] = "Donation to the Bitflash treasury";
+                    // Never noticeably more fee than the one the user was
+                    // shown: the real transaction is built again and its
+                    // signatures can differ by a byte, so a tenth is allowed.
+                    if (SendMoney(sc, nv, wtx, SendFeeLimitAfterReview(g_sendReviewFee))) {
+                        g_showSend = false;
+                        g_sendStatus = "";
+                        memset(g_sendAddr,   0, sizeof(g_sendAddr));
+                        memset(g_sendAmount, 0, sizeof(g_sendAmount));
+                        g_sendFor.clear();
+                        g_needRefresh = true;
+                    } else {
+                        std::string strWhy = LastCreateTransactionError();
+                        g_sendStatus = strWhy.empty() ? std::string("Transaction failed.")
+                                                      : "Transaction failed: " + strWhy;
+                    }
+                    g_sendReviewed = false;
                 }
             }
         }
@@ -866,6 +908,7 @@ static void DrawSendDialog()
             g_showSend = false;
             g_sendStatus = "";
             g_sendFor.clear();
+            g_sendReviewed = false;
         }
     }
     ImGui::End();
@@ -985,6 +1028,12 @@ static void DrawOptionsDialog()
             snprintf(feeStr, sizeof(feeStr), "%s", FmtMoney(nTransactionFee).c_str());
         ImGui::SetNextItemWidth(180.0f);
         ImGui::InputText("BTF per transaction##fee", feeStr, sizeof(feeStr));
+        {
+            int64 nTyped = 0;
+            if (feeStr[0] && (!ParseMoney(feeStr, nTyped) || !IsAcceptableTxFeeSetting(nTyped)))
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                                   "0 to %s BTF; anything else is not saved", FmtMoney(MAX_TX_FEE_SETTING).c_str());
+        }
         // The rate: what a transaction pays for its size. 0 is the minimum,
         // which is free while blocks have room.
         static char rateStr[32] = {};
@@ -1128,8 +1177,11 @@ static void DrawOptionsDialog()
             if (g_torAutoBridges != (nTorBridgeFallbackSecs > 0))
                 BtfSetTorFallbackEnabled(g_torAutoBridges);
 
+            // The flat fee is paid on every send and every pool payout, so a
+            // unit slip here ("1000" meant as satoshis) would be expensive.
+            // Values above MAX_TX_FEE_SETTING (1 BTF) are not taken.
             int64 fee = 0;
-            if (ParseMoney(feeStr, fee)) {
+            if (ParseMoney(feeStr, fee) && IsAcceptableTxFeeSetting(fee)) {
                 nTransactionFee = fee;
                 CWalletDB().WriteSetting("nTransactionFee", nTransactionFee);
             }
@@ -1159,6 +1211,12 @@ static void DrawOptionsDialog()
                 fGenerateBitcoins = 0;
             } else {
                 fGenerateBitcoins = 1;
+                // Every block mined needs a wallet key: a pending automatic
+                // relock (/walletunlocktimeout) is cancelled, and said so.
+                if (GetWalletRelockTime() != 0) {
+                    SetWalletRelockTimeout(0);
+                    g_torActionMsg = "Mining is on, so the wallet stays unlocked: the unlock timeout was cancelled.";
+                }
                 if (!vfThreadRunning[3]) StartMinerThreads();
             }
 
@@ -1229,10 +1287,12 @@ static void RestoreThread(std::string strPhrase)
     int nRecovered = 0, nDerived = 0;
     bool fOk = RestoreFromPhrase(strPhrase, "", 0, RestoreProgress, NULL,
                                  strError, nRecovered, nDerived);
+    if (!strPhrase.empty())
+        OPENSSL_cleanse(&strPhrase[0], strPhrase.size());
     {
         std::lock_guard<std::mutex> lock(g_restoreResultMutex);
         if (!fOk)
-            g_restoreResult = "Nothing was changed. " + strError;
+            g_restoreResult = "Restore failed: " + strError;
         else if (nRecovered > 0)
             g_restoreResult = strprintf(
                 "Restored %d transaction(s) across %d derived addresses. "
@@ -1350,7 +1410,7 @@ static void DrawRestorePhraseDialog()
             "derive the addresses they describe and search the chain for their coins.");
         ImGui::Spacing();
 
-        if (HaveHDSeed())
+        if (WalletHasHDSeed())
         {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.25f, 1.0f));
             ImGui::TextWrapped(
@@ -1390,6 +1450,10 @@ static void DrawRestorePhraseDialog()
                 // batch and would otherwise freeze the window for as long as it
                 // takes.
                 std::thread(RestoreThread, std::string(g_restoreInput)).detach();
+                // The words now live in the thread's own copy only: the box is
+                // wiped so they do not sit in memory, or come back when the
+                // dialog is opened again.
+                OPENSSL_cleanse(g_restoreInput, sizeof(g_restoreInput));
             }
         }
         if (fBusy)
@@ -1501,7 +1565,7 @@ static void DrawWalletSafetyDialog()
 
         ImGui::Spacing();
         ImGui::SeparatorText("Recovery Phrase");
-        if (HaveHDSeed())
+        if (WalletHasHDSeed())
             ImGui::TextColored(ImVec4(0.55f, 1.0f, 0.6f, 1.0f),
                                "This wallet has a recovery phrase.");
         else
@@ -1555,7 +1619,17 @@ static void DrawWalletSafetyDialog()
                                "All known wallet balance is covered by the phrase.");
         }
 
-        if (!HaveHDSeed())
+        // A locked encrypted wallet cannot take a phrase (the seed is stored
+        // encrypted, which needs the unlocked key), and HaveHDSeed() says
+        // nothing about it -- its seed is simply not decrypted. Asking that
+        // offered "Create recovery phrase" on every locked wallet that had one.
+        const bool fLockedWallet = IsWalletLocked();
+        if (fLockedWallet)
+        {
+            ImGui::TextWrapped("The wallet is encrypted and locked: recovery phrase actions need it "
+                               "unlocked (start with /walletpassphrase).");
+        }
+        else if (!WalletHasHDSeed())
         {
             if (ImGui::Button("Create recovery phrase", ImVec2(200.0f, 0.0f)))
             {
@@ -1573,8 +1647,12 @@ static void DrawWalletSafetyDialog()
             }
             ImGui::SameLine();
         }
+        if (fLockedWallet)
+            ImGui::BeginDisabled();
         if (ImGui::Button("Restore from phrase", ImVec2(190.0f, 0.0f)))
             g_showRestorePhrase = true;
+        if (fLockedWallet)
+            ImGui::EndDisabled();
 
         if (!g_phraseStatus.empty())
             ImGui::TextWrapped("%s", g_phraseStatus.c_str());

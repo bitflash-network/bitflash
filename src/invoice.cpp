@@ -319,12 +319,15 @@ json Create(int64_t nAmount, const std::string& strDescription, int64_t nExpiryS
         throw std::runtime_error("description up to 200 characters, order id up to 100");
     if (nExpirySecs < 60 || nExpirySecs > 30 * 86400)
         throw std::runtime_error("an invoice stays open from 60 seconds to 30 days");
+    // The id first: it is the invoice's only secret-ish handle (status lookups
+    // and webhooks name it), and GetStrongRandBytes stops the process rather
+    // than hand back a guessable one -- before a wallet key has been spent.
+    unsigned char rnd[16];
+    GetStrongRandBytes(rnd, sizeof(rnd));
     std::vector<unsigned char> vchPubKey = GetKeyFromPool();
     if (vchPubKey.empty())
         throw std::runtime_error("could not draw a key from the wallet (is it locked?)");
     Invoice v;
-    unsigned char rnd[16];
-    RAND_bytes(rnd, sizeof(rnd));
     v.id = HexStr(rnd, rnd + sizeof(rnd), false);
     v.address = PubKeyToAddress(vchPubKey);
     CScript script;

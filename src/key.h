@@ -72,6 +72,28 @@ public:
         EC_KEY_free(pkey);
     }
 
+    // Keep the public half only. Assigning a public-only CKey does not do it:
+    // EC_KEY_copy leaves the destination's private key in place when the
+    // source has none. The old object is freed (EC_KEY_free clears the
+    // secret) and a new one gets the public key.
+    bool ForgetPrivKey()
+    {
+        vector<unsigned char> vchPub;
+        try { vchPub = GetPubKey(); }
+        catch (...) { return false; }
+        EC_KEY* pNew = EC_KEY_new_by_curve_name(NID_secp256k1);
+        if (pNew == NULL)
+            return false;
+        EC_KEY_free(pkey);
+        pkey = pNew;
+        return SetPubKey(vchPub);
+    }
+
+    bool HasPrivKey() const
+    {
+        return EC_KEY_get0_private_key(pkey) != NULL;
+    }
+
     void MakeNewKey()
     {
         if (!EC_KEY_generate_key(pkey))

@@ -64,6 +64,7 @@ inline int _mkdir(const char* p) { return ::mkdir(p); }
 #include <algorithm>
 #include <numeric>
 #include <array>
+#include <atomic>
 #include <boost/foreach.hpp>
 #pragma hdrstop
 using namespace std;

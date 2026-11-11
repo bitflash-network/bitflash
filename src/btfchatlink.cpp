@@ -247,7 +247,20 @@ bool Inbox::Deliver(const std::string& frameJson, const std::string& peer, int64
 
     // 4. Replay. After consent, so only frames we were willing to receive can
     //    take room in the table.
-    if (!replay->Accept(f, nNow, errOut))
+    //
+    //    An invite from somebody we have not accepted is a stranger's: it
+    //    takes room only in the strangers' share of the table, and not at all
+    //    when the pending-invite list it would land in is already full (it
+    //    would be refused there anyway, after spending a slot for a day).
+    const PeerState stSender = roster->State(f.from);
+    const bool fStrangerInvite = (f.kind == MSG_INVITE || f.kind == MSG_GROUP_INVITE) &&
+                                 stSender != PEER_ACCEPTED && stSender != PEER_INVITE_OUT;
+    if (fStrangerInvite && roster->PendingInvitesFull())
+    {
+        errOut = "the pending invite list is full";
+        return false;
+    }
+    if (!replay->Accept(f, nNow, errOut, fStrangerInvite))
         return false;
 
     // 5. The effect. Exactly one of these per frame.

@@ -367,9 +367,13 @@ bool WalletSQLiteRuntimeWriteRecord(const vector<unsigned char>& vchKey,
                                     const vector<unsigned char>& vchValue,
                                     bool fOverwrite);
 bool WalletSQLiteRuntimeEraseRecord(const vector<unsigned char>& vchKey);
+// Brackets nest; a rollback at any depth dooms the whole transaction. The
+// connection is shared by every thread: callers hold cs_main, cs_mapWallet and
+// cs_keyPool (in that order) so other wallet writes cannot join a bracket.
 bool WalletSQLiteRuntimeBeginTxn();
 bool WalletSQLiteRuntimeCommitTxn();
 void WalletSQLiteRuntimeRollbackTxn();
+extern int nWalletSQLiteWritesBeforeFailForTest;   // selftests only, -1 otherwise
 bool WalletSQLiteRuntimeOpenReadOnly(const string& strPath, string& strErrorRet);
 bool WalletSQLiteRuntimeCheckpoint(string& strErrorRet);
 string ReadWalletBackendMarker();
@@ -587,6 +591,14 @@ public:
     {
         return WriteWalletRecord(string("cryptedhdmaster"), vchCryptedMaster)
             && WriteWalletRecord(string("cryptedhdchaincode"), vchCryptedChainCode);
+    }
+
+    // Drop the plaintext seed records. Used where the seed must exist only
+    // encrypted; a record that is not there counts as erased.
+    bool EraseHDMaster()
+    {
+        return EraseWalletRecord(string("hdmaster"))
+            && EraseWalletRecord(string("hdchaincode"));
     }
 
     bool WriteHDNext(unsigned int nNext)

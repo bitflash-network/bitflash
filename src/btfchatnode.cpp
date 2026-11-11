@@ -40,7 +40,23 @@ bool ChatSeedFromWallet(std::vector<unsigned char>& out, std::string& errOut)
     out.clear();
     errOut.clear();
 
-    if (!HaveHDSeed())
+    // Read under cs_keyPool, the lock the seed is cleared under when the
+    // wallet locks again (LockWallet).
+    bool fHaveSeed = false;
+    CRITICAL_BLOCK(cs_keyPool)
+    {
+        fHaveSeed = HaveHDSeed();
+        if (fHaveSeed)
+        {
+            // master || chain code. Both are exactly the two halves of the
+            // HMAC-SHA512 that BIP32 computes over the BIP39 seed, so this is
+            // as deterministic as the seed itself and carries the same entropy.
+            out.reserve(64);
+            out.insert(out.end(), vchHDMaster.begin(), vchHDMaster.end());
+            out.insert(out.end(), vchHDChainCode.begin(), vchHDChainCode.end());
+        }
+    }
+    if (!fHaveSeed)
     {
         // Either a wallet from before recovery phrases existed, or an encrypted
         // one that is still locked -- the master key is not readable either way,
@@ -48,13 +64,6 @@ bool ChatSeedFromWallet(std::vector<unsigned char>& out, std::string& errOut)
         errOut = "this wallet has no recovery phrase installed, or is locked";
         return false;
     }
-
-    // master || chain code. Both are exactly the two halves of the HMAC-SHA512
-    // that BIP32 computes over the BIP39 seed, so this is as deterministic as the
-    // seed itself and carries the same entropy.
-    out.reserve(64);
-    out.insert(out.end(), vchHDMaster.begin(), vchHDMaster.end());
-    out.insert(out.end(), vchHDChainCode.begin(), vchHDChainCode.end());
     if (out.size() != 64)
     {
         sodium_memzero(&out[0], out.size());
@@ -168,7 +177,7 @@ static bool EnsureSecp()
     if (!g_secp)
         return false;
     unsigned char rnd[32];
-    RAND_bytes(rnd, sizeof(rnd));
+    GetStrongRandBytes(rnd, sizeof(rnd));
     if (!secp256k1_context_randomize(g_secp, rnd))
     {
         secp256k1_context_destroy(g_secp);

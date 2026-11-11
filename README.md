@@ -96,7 +96,7 @@ The words are printed once, to the terminal or the window, and never written to 
 
 ```bash
 bitflash -newphrase                          # create a phrase and show it once
-bitflash -restorephrase="twelve words ..."   # rebuild a wallet from the phrase
+bitflash -restorephrase                      # rebuild a wallet from the phrase (typed on stdin, or -restorephrase=@FILE)
 bitflash -backupwallet=/path/to/backup       # write a backup file that opens on its own
 ```
 

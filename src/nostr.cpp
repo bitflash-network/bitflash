@@ -328,8 +328,11 @@ public:
         if (f) { char buf[65] = {0}; fread(buf, 1, 64, f); fclose(f); strHex = buf; }
         if (!HexDecode(strHex, sk, 32) || !secp256k1_ec_seckey_verify(ctx, sk))
         {
-            do { RAND_bytes(sk, sizeof(unsigned char) * 32); } while (!secp256k1_ec_seckey_verify(ctx, sk));
-            FILE* fw = fopen(file.c_str(), "wb");
+            // GetStrongRandBytes aborts if the generator fails, so this loop
+            // can neither spin forever nor keep a stale or zero key.
+            do { GetStrongRandBytes(sk, 32); } while (!secp256k1_ec_seckey_verify(ctx, sk));
+            // Owner-only from the moment it exists: it is this node's identity.
+            FILE* fw = OpenPrivateFile(file.c_str(), false);
             if (fw) { string h = HexEncode(sk, 32); fwrite(h.c_str(), 1, h.size(), fw); fclose(fw); }
         }
     }
@@ -340,7 +343,7 @@ public:
         if (!ctx)
             return false;
         unsigned char seed[32];
-        RAND_bytes(seed, sizeof(seed));
+        GetStrongRandBytes(seed, sizeof(seed));
         secp256k1_context_randomize(ctx, seed);
 
         LoadOrGenSecp(ctx, GetAppDir() + "/nostr.key", seckey);
@@ -388,7 +391,7 @@ public:
     {
         unsigned char sig[64];
         unsigned char aux[32];
-        RAND_bytes(aux, sizeof(aux));
+        GetStrongRandBytes(aux, sizeof(aux));
         if (!secp256k1_schnorrsig_sign32(ctx, sig, id, &keypair, aux))
             return false;
         sigHexOut = HexEncode(sig, 64);
@@ -651,7 +654,7 @@ public:
 
         // WebSocket handshake (HTTP Upgrade)
         unsigned char keybytes[16];
-        RAND_bytes(keybytes, sizeof(keybytes));
+        GetStrongRandBytes(keybytes, sizeof(keybytes));
         string wskey = Base64Encode(keybytes, sizeof(keybytes));
         string req =
             "GET " + path + " HTTP/1.1\r\n"
@@ -704,7 +707,7 @@ public:
             for (int i = 7; i >= 0; i--) frame += (char)((len >> (8 * i)) & 0xff);
         }
         unsigned char mask[4];
-        RAND_bytes(mask, 4);
+        GetStrongRandBytes(mask, 4);
         frame.append((char*)mask, 4);
         string masked = msg;
         for (size_t i = 0; i < masked.size(); i++)
@@ -783,7 +786,7 @@ private:
         string frame;
         frame += (char)0x8A;
         frame += (char)(0x80 | (payload.size() & 0x7f));
-        unsigned char mask[4]; RAND_bytes(mask, 4);
+        unsigned char mask[4]; GetStrongRandBytes(mask, 4);
         frame.append((char*)mask, 4);
         string m = payload;
         for (size_t i = 0; i < m.size(); i++) m[i] ^= mask[i & 3];

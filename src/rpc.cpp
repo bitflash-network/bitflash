@@ -253,7 +253,18 @@ static bool RebuildJob()
         // wallet.dat with thousands a day that nothing ever paid.
         vector<unsigned char> vchPubKey;
         if (!fP2PoolMode)
+        {
             vchPubKey = GetKeyFromPool();
+            // A locked wallet (or a full disk) gives no key. A template built
+            // on it would pay its block to "<empty> OP_CHECKSIG", which nobody
+            // can ever spend; no template at all is the safe answer, as
+            // P2PoolCoinbase already does.
+            if (vchPubKey.empty())
+            {
+                printf("RebuildJob: no wallet key for the coinbase (wallet locked?); no template built\n");
+                return false;
+            }
+        }
         static std::atomic<uint32_t> sExtra{0};
         uint32_t extraNonce = ++sExtra;
 

@@ -201,6 +201,15 @@ struct PoolWorkerStatView
 // Settings
 extern int fGenerateBitcoins;
 extern int64 nTransactionFee;
+// The flat fee setting is at most this. Above it is a unit mistake ("1000"
+// meant as satoshis), and it would be paid on every send and pool payout.
+static const int64 MAX_TX_FEE_SETTING = COIN;
+inline bool IsAcceptableTxFeeSetting(int64 nFee) { return nFee >= 0 && nFee <= MAX_TX_FEE_SETTING; }
+// The most CreateTransaction pays in fees without being told (/maxtxfee).
+extern int64 nMaxTxFee;
+// Fee settings read from the wallet that are out of range go back to the
+// minimum, said in debug.log.
+void ClampLoadedFeeSettings();
 extern CAddress addrIncoming;
 
 
@@ -228,11 +237,38 @@ extern CKeyingMaterial vWalletMasterKey;
 extern vector<unsigned char> vchCryptedHDMaster;
 extern vector<unsigned char> vchCryptedHDChainCode;
 extern bool fWalletEncrypted;
-extern bool fWalletLocked;
+extern std::atomic<bool> fWalletLocked;
 bool IsWalletEncrypted();
 bool IsWalletLocked();
+// Clears the master key and the decrypted seed, under every wallet lock in
+// order; whatever was using them finishes first.
 void LockWallet();
 bool UnlockWallet(const string& strPassphrase, string& strErrorRet);
+// Unlock, then lock again by itself nSeconds later (0: stays unlocked).
+bool UnlockWalletFor(const string& strPassphrase, int64 nSeconds, string& strErrorRet);
+void SetWalletRelockTimeout(int64 nSeconds);
+int64 GetWalletRelockTime();      // unix time of the automatic relock, 0 for none
+// True (with the reason) when this node must not lock its wallet: it mines or
+// runs a pool, which take a wallet key for every block.
+bool WalletLockRefusedWhy(string& strWhyRet);
+// Another reason, registered by a part of the node that needs the keys
+// (jsonrpc.cpp: an inheritance that renews itself). NULL: none.
+extern bool (*pfnWalletLockRefusedExtra)(string& strWhyRet);
+// A plaintext seed in an encrypted wallet (left there by older builds): set
+// aside at load, settled at the next unlock. strWalletSeedNotice says what was
+// found and what was done; empty when there was nothing.
+extern vector<unsigned char> vchPlainSeedPendingMaster;
+extern vector<unsigned char> vchPlainSeedPendingChainCode;
+extern string strWalletSeedNotice;
+void QuarantinePlainSeedInEncryptedWallet();
+void RepairPlainSeedAfterUnlock();
+// At unlock: a BIP44 pool holding addresses already handed out (encrypted by
+// a release up to 1.2.32) is rebuilt past every held key. True if it was.
+bool RepairReissuedPool();
+// Wallet files owner-only on POSIX (wallet.dat, wallet.sqlite and its
+// sidecars, nostr.key, encryption backups, database/); warns when the data
+// directory itself is open to other accounts. No-op on Windows.
+void RestrictWalletFileModes();
 bool DeriveWalletPassphraseKey(const string& strPassphrase,
                                const vector<unsigned char>& vchSalt,
                                unsigned int nDeriveIterations,
@@ -308,6 +344,11 @@ extern unsigned int nHDReceiveNext;            // BIP44 external chain
 extern unsigned int nHDChangeNext;             // BIP44 internal chain
 extern unsigned int nHDCoinType;               // BIP44 coin_type'
 inline bool HaveHDSeed() { return vchHDMaster.size() == 32 && vchHDChainCode.size() == 32; }
+// Whether the wallet HAS a seed, decrypted or not. HaveHDSeed() is only the
+// decrypted copy in memory, false for every locked encrypted wallet: asking it
+// "may I offer to create a phrase?" offered to replace the seed of every
+// locked wallet.
+bool WalletHasHDSeed();
 string HDKeySchemaName(int nSchema);
 std::vector<unsigned int> HDLegacyPath(unsigned int nIndex);
 std::vector<unsigned int> HDBIP44Path(unsigned int nCoinType,
@@ -328,6 +369,13 @@ bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphras
 // to run ahead of the pool.
 bool DeriveHDKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet);
 bool DeriveHDChangeKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet);
+// The same, on an explicit schema's receive path, without touching the
+// global nHDKeySchema (restore's compatibility scan of the legacy path).
+bool DeriveHDKeyForSchema(int nSchema, unsigned int nIndex, CKey& keyRet, string& strErrorRet);
+// Store a key unless the wallet already holds it (encrypted or not).
+bool WalletAddKeyIfMissing(const CKey& key);
+// Erase every key-pool record, on disk and in memory. Takes cs_keyPool.
+bool ResetKeyPoolRecords(string& strErrorRet);
 
 // Fill the pool back up to KEYPOOL_SIZE. Every key it creates is written to
 // wallet.dat before it is offered to anybody.
@@ -478,7 +526,13 @@ struct WalletRecoveryAudit
     }
 };
 WalletRecoveryAudit GetWalletRecoveryAudit();
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int64& nFeeRequiredRet);
+// nFeeLimit: refuse a fee above it (-1: nMaxTxFee). fDryRun: build and sign
+// the transaction to learn its fee, but take no change key from the wallet
+// (the default key stands in for it), so a preview costs no address.
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int64& nFeeRequiredRet,
+                       int64 nFeeLimit = -1, bool fDryRun = false);
+// Why the last CreateTransaction on this thread failed, for the user.
+string LastCreateTransactionError();
 
 // ---- fees (main.cpp) ----
 // The wallet's fee rate, satoshis per 1000 bytes; 0 means the minimum.
@@ -503,7 +557,20 @@ int64 EstimateNextBlockFeePerKB();
 bool BumpFee(const uint256& txid, int64 nNewRatePerKB, uint256& newTxidOut,
              int64& nOldFeeOut, int64& nNewFeeOut, std::string& errOut);
 bool CommitTransactionSpent(const CWalletTx& wtxNew);
-bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
+// nFeeLimit: the most the caller agreed to pay in fees (the GUI shows the fee
+// first and passes what it showed); -1 means nMaxTxFee.
+bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit = -1);
+// The fee a send would pay, from the transaction built (and signed) but not
+// sent; no change key is drawn. What the GUI shows before the user confirms.
+bool PreviewSendFee(const CScript& scriptPubKey, int64 nValue, int64& nFeeRet, string& strWhyRet);
+// The fee limit for the send that follows a review showing nReviewedFee: the
+// transaction is built again (new signatures, a byte more or less), so it may
+// pay a tenth more, never above nMaxTxFee.
+inline int64 SendFeeLimitAfterReview(int64 nReviewedFee)
+{
+    int64 n = nReviewedFee + nReviewedFee / 10 + 1;
+    return n < nMaxTxFee ? n : nMaxTxFee;
+}
 
 
 

@@ -58,58 +58,20 @@ static string argval2(int argc, char* argv[], const char* keySlash, const char* 
     return argval(argc, argv, keyDash);
 }
 
-static bool ReadPassphraseArgument(const string& strArg, string& strPassphraseRet, string& strErrorRet)
+// The one reader for every secret option (walletcmd.cpp): stdin with echo off,
+// or @FILE, never a literal.
+static bool ReadPassphraseArgument(const string& strArg, string& strPassphraseRet, string& strErrorRet,
+                                   const char* pszPrompt = "wallet passphrase")
 {
-    strPassphraseRet.clear();
-    strErrorRet.clear();
-    if (strArg.empty())
-    {
-        AttachTerminal();
-        fprintf(stderr, "Enter wallet passphrase: ");
-        fflush(stderr);
-        char buf[4096];
-        if (!fgets(buf, sizeof(buf), stdin))
-        {
-            strErrorRet = "could not read passphrase from stdin";
-            return false;
-        }
-        strPassphraseRet = buf;
-    }
-    else if (strArg[0] == '@')
-    {
-        string strPath = strArg.substr(1);
-        FILE* pf = fopen(strPath.c_str(), "rb");
-        if (!pf)
-        {
-            strErrorRet = strprintf("could not read passphrase file %s", strPath.c_str());
-            return false;
-        }
-        char buf[4096];
-        if (!fgets(buf, sizeof(buf), pf))
-        {
-            fclose(pf);
-            strErrorRet = strprintf("passphrase file %s is empty", strPath.c_str());
-            return false;
-        }
-        fclose(pf);
-        strPassphraseRet = buf;
-    }
-    else
-    {
-        strErrorRet = "passphrase literals on the command line are unsafe; use the option without a value to read stdin, or use @FILE";
-        return false;
-    }
+    return ReadSecretArgument(strArg, pszPrompt, strPassphraseRet, strErrorRet);
+}
 
-    while (!strPassphraseRet.empty() &&
-           (strPassphraseRet[strPassphraseRet.size() - 1] == '\n' ||
-            strPassphraseRet[strPassphraseRet.size() - 1] == '\r'))
-        strPassphraseRet.resize(strPassphraseRet.size() - 1);
-    if (strPassphraseRet.empty())
-    {
-        strErrorRet = "empty passphrase";
-        return false;
-    }
-    return true;
+// Wipe a std::string that held a secret before it goes out of scope.
+static void CleanseString(string& s)
+{
+    if (!s.empty())
+        OPENSSL_cleanse(&s[0], s.size());
+    s.clear();
 }
 
 // The real printf, not the one util.h remaps to OutputDebugStringF. Help that
@@ -160,7 +122,7 @@ static void PrintUsage()
     printf("  it cannot be recovered.\n");
     printf("\n");
     printf("  /newphrase                 (create a recovery phrase in this data directory)\n");
-    printf("  /restorephrase=\"...\"       (restore one)\n");
+    printf("  /restorephrase[=@FILE]     (restore one; the words from stdin or FILE)\n");
     printf("  /phrasepassword[=@FILE]    (BIP39 passphrase, read from stdin or a file)\n");
     printf("\n");
     printf("Tor (required -- there is no clearnet fallback, by design):\n");
@@ -276,15 +238,23 @@ static void PrintUsage()
     printf("  /importwallet=FILE         (load keys from such a file back in)\n");
     printf("  /encryptwallet[=@FILE]     (rewrite wallet.dat with encrypted private keys\n");
     printf("                              and encrypted HD seed, then exit)\n");
-    printf("  /walletpassphrase[=@FILE]  (unlock an encrypted wallet for one-shot\n");
-    printf("                              commands; without @FILE reads stdin)\n");
+    printf("  /walletpassphrase[=@FILE]  (unlock an encrypted wallet; without @FILE\n");
+    printf("                              reads stdin. A running node stays unlocked\n");
+    printf("                              until it stops, walletlock (RPC), or:)\n");
+    printf("  /walletunlocktimeout=SECS  (with /walletpassphrase: lock again by itself\n");
+    printf("                              SECS seconds after the node starts; not\n");
+    printf("                              while mining or running a pool)\n");
+    printf("  /maxtxfee=AMOUNT           (refuse a send whose fee is above AMOUNT;\n");
+    printf("                              default 1 BTF)\n");
     printf("  /newaddress                (print the next receiving address, then exit)\n");
     printf("  /sendto=ADDRESS,AMOUNT     (spend from this wallet, then exit -- the\n");
     printf("                              only way to send without the window)\n");
     printf("  /newphrase                 (create a twelve-word recovery phrase for a\n");
     printf("                              wallet that has none, show it once, exit)\n");
-    printf("  /restorephrase=\"WORDS\"     (rebuild this wallet from a phrase and scan\n");
-    printf("                              the chain for its coins, then exit)\n");
+    printf("  /restorephrase[=@FILE]     (rebuild this wallet from a phrase and scan\n");
+    printf("                              the chain for its coins, then exit; the\n");
+    printf("                              words are read from stdin or FILE, never\n");
+    printf("                              taken on the command line)\n");
     printf("  /restoredepth=N            (with /restorephrase: derive at least N\n");
     printf("                              addresses before giving up)\n");
     printf("  /phrasepassword[=@FILE]    (with /newphrase or /restorephrase: an\n");
@@ -630,7 +600,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         // it looks at its input, so handing it one string for both empties
         // the "@FILE" and it falls through to reading stdin.
         string strFromFile, strErr;
-        if (!ReadPassphraseArgument(strRpcPassword, strFromFile, strErr))
+        if (!ReadPassphraseArgument(strRpcPassword, strFromFile, strErr, "RPC password"))
             StartupRefuse("could not read -rpcpassword file: " + strErr, "");
         strRpcPassword = strFromFile;
     }
@@ -1353,6 +1323,13 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
+        RestrictWalletFileModes();
+        if (!strWalletSeedNotice.empty())
+        {
+            AttachTerminal();
+            fprintf(stderr, "Wallet: %s\n", strWalletSeedNotice.c_str());
+            fflush(stderr);
+        }
 
 #ifdef BITFLASH_CHAT_APP
         // Skipped, and it has to be: this walks the block index to correct spent
@@ -1409,12 +1386,58 @@ int main(int argc, char* argv[])
     {
         string strPassphrase;
         string strUnlockError;
-        if (!ReadPassphraseArgument(strWalletPassphrase, strPassphrase, strUnlockError) ||
-            !UnlockWallet(strPassphrase, strUnlockError))
+        string strNoticeBefore = strWalletSeedNotice;
+        bool fUnlocked = ReadPassphraseArgument(strWalletPassphrase, strPassphrase, strUnlockError) &&
+                         UnlockWallet(strPassphrase, strUnlockError);
+        CleanseString(strPassphrase);
+        if (!fUnlocked)
         {
             fprintf(stderr, "Cannot unlock wallet: %s\n", strUnlockError.c_str());
             DBFlush(true);
             return 1;
+        }
+        // The unlock settled a plaintext seed copy left by an older build:
+        // say what was done, where the user is looking.
+        if (strWalletSeedNotice != strNoticeBefore)
+        {
+            fprintf(stderr, "Wallet: %s\n", strWalletSeedNotice.c_str());
+            fflush(stderr);
+        }
+    }
+
+    // /maxtxfee=AMOUNT: the most a send pays in fees before it is refused as
+    // a mistake (default 1 BTF). Applies to the GUI, RPC, -sendto and payouts.
+    {
+        string strMaxFee = argval2(argc, argv, "/maxtxfee", "-maxtxfee");
+        if (!strMaxFee.empty())
+        {
+            int64 n = 0;
+            if (!ParseMoney(strMaxFee.c_str(), n) || n < CENT || n > 100 * COIN)
+            {
+                fprintf(stderr, "/maxtxfee takes an amount from 0.01 to 100 BTF.\n");
+                DBFlush(true);
+                return 1;
+            }
+            nMaxTxFee = n;
+        }
+    }
+
+    // /walletunlocktimeout=SECS: once the node is running, lock the wallet
+    // again by itself after this many seconds. Checked here, started below
+    // (after the one-shot commands, which must not be cut off half way).
+    int64 nUnlockTimeout = 0;
+    {
+        string strTimeout = argval2(argc, argv, "/walletunlocktimeout", "-walletunlocktimeout");
+        if (!strTimeout.empty())
+        {
+            nUnlockTimeout = atoi64(strTimeout.c_str());
+            if (nUnlockTimeout <= 0 || !fWalletPassphrase)
+            {
+                fprintf(stderr, "/walletunlocktimeout takes a number of seconds above 0, "
+                                "with /walletpassphrase.\n");
+                DBFlush(true);
+                return 1;
+            }
         }
     }
 
@@ -1553,12 +1576,27 @@ int main(int argc, char* argv[])
         return nRet;
     }
 
-    string strRestore = argval2(argc, argv, "/restorephrase", "-restorephrase");
-    if (!strRestore.empty())
+    // The twelve words are the most sensitive thing this program is ever
+    // given, and were the one secret still taken as a literal: from argv into
+    // the shell history and the process list. They are read the way the
+    // passphrases are -- stdin (echo off) or @FILE.
+    if (arg(argc, argv, "/restorephrase") || arg(argc, argv, "-restorephrase"))
     {
+        string strRestoreArg = argval2(argc, argv, "/restorephrase", "-restorephrase");
+        string strRestore, strErr;
+        if (!ReadPassphraseArgument(strRestoreArg, strRestore, strErr, "recovery phrase"))
+        {
+            AttachTerminal();
+            fprintf(stderr, "Cannot read the recovery phrase: %s\n", strErr.c_str());
+            CleanseString(strPhrasePassword);
+            DBFlush(true);
+            return 1;
+        }
         string strDepth = argval2(argc, argv, "/restoredepth", "-restoredepth");
         int nMinDepth = strDepth.empty() ? 0 : atoi(strDepth.c_str());
         int nRet = CmdRestorePhrase(strRestore, strPhrasePassword, nMinDepth);
+        CleanseString(strRestore);
+        CleanseString(strPhrasePassword);
         DBFlush(true);
         return nRet;
     }
@@ -1586,6 +1624,19 @@ int main(int argc, char* argv[])
                         "Start with /walletpassphrase or /walletpassphrase=@FILE, or disable mining.\n");
         DBFlush(true);
         return 1;
+    }
+
+    if (nUnlockTimeout > 0)
+    {
+        string strWhy;
+        if (WalletLockRefusedWhy(strWhy))
+        {
+            fprintf(stderr, "/walletunlocktimeout cannot be used here: %s.\n", strWhy.c_str());
+            DBFlush(true);
+            return 1;
+        }
+        SetWalletRelockTimeout(nUnlockTimeout);
+        printf("wallet: unlocked for %lld second(s), then it locks again\n", (long long)nUnlockTimeout);
     }
 
 #ifdef BITFLASH_CHAT_APP

@@ -84,7 +84,7 @@ bool JsonRpcConfigureCookie(const string& strPort)
     // for the chat (btfchatwallet.h) or any other local tool. Bitcoin's .cookie,
     // same shape, so a tool written for that reads this.
     unsigned char rnd[32];
-    RAND_bytes(rnd, sizeof(rnd));
+    GetStrongRandBytes(rnd, sizeof(rnd));
     string strPass = HexStr(rnd, rnd + sizeof(rnd), false);
     OPENSSL_cleanse(rnd, sizeof(rnd));
 
@@ -423,6 +423,8 @@ static json rpc_getinfo(const json&)
     j["testnet"]         = IsTestNet();
     j["balance"]         = ValueFromAmount(GetBalance());
     j["walletlocked"]    = IsWalletLocked();
+    // When /walletunlocktimeout locks the wallet again (unix time; 0: never).
+    j["unlocked_until"]  = IsWalletLocked() ? (int64)0 : GetWalletRelockTime();
     return j;
 }
 
@@ -560,8 +562,31 @@ static json rpc_getbalance(const json& p)
     // GetBalance() counts what the wallet would let you spend now, which
     // already excludes immature coinbase. minconf beyond that is filtered here.
     int nMinConf = (p.size() >= 1 && p[0].is_number_integer()) ? p[0].get<int>() : 1;
-    if (nMinConf <= 1)
+    if (nMinConf <= 0)
         return ValueFromAmount(GetBalance());
+    if (nMinConf == 1)
+    {
+        // The default call. GetBalance() counts every unspent wallet
+        // transaction at any depth, so it included a payment somebody else had
+        // only announced -- one the wallet itself would not spend yet, and an
+        // integration reading "minconf 1" would credit. Others' payments need
+        // a block here; our own change is ours at depth 0, as SelectCoins
+        // treats it.
+        int64 nTrusted = 0;
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            {
+                const CWalletTx& wtx = it->second;
+                if (!wtx.IsFinal() || wtx.fSpent)
+                    continue;
+                int nDepth = wtx.GetDepthInMainChain();
+                if (nDepth >= 1 || (nDepth == 0 && wtx.GetDebit() > 0))
+                    nTrusted += wtx.GetCredit();
+            }
+        }
+        return ValueFromAmount(nTrusted);
+    }
 
     int64 nTotal = 0;
     CRITICAL_BLOCK(cs_mapWallet)
@@ -637,6 +662,21 @@ static json rpc_settxfee(const json& p)
     nPayTxFeePerKB = n;
     CWalletDB().WriteSetting("nPayTxFeePerKB", nPayTxFeePerKB);
     return true;
+}
+
+// walletlock -- lock an encrypted wallet now. The passphrase never travels
+// over RPC, so unlocking again means starting the node with /walletpassphrase.
+static json rpc_walletlock(const json&)
+{
+    if (!IsWalletEncrypted())
+        throw runtime_error("the wallet is not encrypted; there is nothing to lock");
+    string strWhy;
+    if (WalletLockRefusedWhy(strWhy))
+        throw runtime_error(strWhy);
+    LockWallet();
+    json j;
+    j["walletlocked"] = IsWalletLocked();
+    return j;
 }
 
 // bumpfee <txid> [BTF per 1000 bytes] -- speed up a payment of ours that is
@@ -1033,17 +1073,28 @@ static json rpc_getrawtransaction(const json& p)
 
 // A key handed to signrawtransaction lives in the wallet's key map only for
 // the duration of the call, and is never written anywhere.
+//
+// Only keys and scripts the wallet did not already have are added, and only
+// those are taken out again. The test is "does the wallet hold it at all",
+// encrypted keys included: in an encrypted wallet mapKeys is empty, so a key
+// the wallet owned looked new, was added, and its removal then erased the
+// wallet's own mapPubKeys entry -- its coins stopped counting until restart.
 struct CTemporaryKeys
 {
     vector<vector<unsigned char> > vPubKeys;
+    vector<uint160> vScripts;
     ~CTemporaryKeys()
     {
         CRITICAL_BLOCK(cs_mapKeys)
+        {
             for (size_t i = 0; i < vPubKeys.size(); i++)
             {
                 mapKeys.erase(vPubKeys[i]);
                 mapPubKeys.erase(Hash160(vPubKeys[i]));
             }
+            for (size_t i = 0; i < vScripts.size(); i++)
+                mapScripts.erase(vScripts[i]);
+        }
     }
 };
 
@@ -1091,7 +1142,7 @@ static json rpc_signrawtransaction(const json& p)
             vector<unsigned char> vchPubKey = key.GetPubKey();
             CRITICAL_BLOCK(cs_mapKeys)
             {
-                if (!mapKeys.count(vchPubKey))
+                if (!mapKeys.count(vchPubKey) && !mapCryptedKeys.count(vchPubKey))
                 {
                     mapKeys[vchPubKey] = key.GetPrivKey();
                     mapPubKeys[Hash160(vchPubKey)] = vchPubKey;
@@ -1100,11 +1151,15 @@ static json rpc_signrawtransaction(const json& p)
             }
         }
     }
-    // Redeem scripts named by the caller are usable for this call
+    // Redeem scripts named by the caller are usable for this call, and only
+    // for this call: the ones added here are removed again on the way out.
     for (map<uint160, CScript>::iterator it = mapRedeem.begin(); it != mapRedeem.end(); ++it)
         CRITICAL_BLOCK(cs_mapKeys)
             if (!mapScripts.count(it->first))
+            {
                 mapScripts[it->first] = it->second;
+                tempKeys.vScripts.push_back(it->first);
+            }
 
     bool fComplete = true;
     json errors = json::array();
@@ -1736,6 +1791,13 @@ static json rpc_spendscript(const json& p)
         throw runtime_error("the redeem script is not hex");
     vector<unsigned char> vchRedeem = ParseHex(p[0].get<string>());
     CScript redeem(vchRedeem.begin(), vchRedeem.end());
+    // A CSFS key of another size than 32 bytes is a hook for a later rule, and
+    // under rules v4 it accepts any signature at all. Coins behind such a
+    // script are anybody's who can read it; nodes do not relay its spends.
+    if (ScriptHasUpgradableCsfsKey(redeem))
+        throw runtime_error("this script checks OP_CHECKSIGFROMSTACK against a key that is not 32 bytes "
+                            "(an x-only BIP340 key): any signature satisfies that, so it guards nothing. "
+                            "Write the script with the 32-byte x-only key");
     uint256 txid;
     txid.SetHex(p[1].get<string>());
     CTransaction txFrom;
@@ -1778,12 +1840,18 @@ static json rpc_spendscript(const json& p)
         {
             vector<unsigned char> vchPubKey = ParseHex(s.substr(4));
             CKey key;
-            CRITICAL_BLOCK(cs_mapKeys)
-            {
-                if (!mapKeys.count(vchPubKey))
-                    throw runtime_error("this wallet does not hold the key " + s.substr(4));
-                key.SetPrivKey(mapKeys[vchPubKey]);
-            }
+            // Through GetWalletPrivKey, which also decrypts the keys of an
+            // encrypted wallet: reading mapKeys alone found none of them, so a
+            // vault in an encrypted wallet could not be withdrawn or recovered.
+            CPrivKey vchPrivKey;
+            string strKeyError;
+            if (!GetWalletPrivKey(vchPubKey, vchPrivKey, strKeyError))
+                throw runtime_error("this wallet cannot sign with the key " + s.substr(4) + ": " + strKeyError);
+            bool fKeyOk = key.SetPrivKey(vchPrivKey);
+            if (!vchPrivKey.empty())
+                OPENSSL_cleanse(&vchPrivKey[0], vchPrivKey.size());
+            if (!fKeyOk)
+                throw runtime_error("the wallet key " + s.substr(4) + " does not load");
             vector<unsigned char> sig;
             if (!key.Sign(hashSig, sig))
                 throw runtime_error("signing failed");
@@ -1799,8 +1867,10 @@ static json rpc_spendscript(const json& p)
     tx.vin[0].scriptSig = scriptSig;
 
     unsigned int nNow = (unsigned int)GetAdjustedTime();
-    if (!VerifySignature(txFrom, tx, 0, 0, true, RulesV3Active(nNow), RulesV4Active(nNow)))
-        throw runtime_error("the spend does not verify under the rules now in force");
+    if (!VerifySignature(txFrom, tx, 0, 0, true, RulesV3Active(nNow), RulesV4Active(nNow),
+                         SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4))
+        throw runtime_error("the spend does not verify under the rules now in force "
+                            "(or uses a rules-v4 upgrade hook, which nodes do not relay)");
 
     uint256 hash = tx.GetHash();
     CDataStream ssTx(SER_NETWORK);
@@ -1921,13 +1991,20 @@ static void SaveV4Contracts(const json& j)
     WriteFileAtomic(V4ContractsPath(), j.dump(2));
 }
 
-// Before rules v4, OP_CHECKSEQUENCEVERIFY and OP_CHECKTEMPLATEVERIFY are
-// no-ops: coins locked behind them could be taken by anybody.
+// Before rules v4, OP_CHECKSEQUENCEVERIFY, OP_CHECKTEMPLATEVERIFY and
+// OP_CHECKSIGFROMSTACK are unknown bytes and any script that runs them fails:
+// coins locked behind them now could not be spent until the switch (and not
+// at all if the switch moved).
 static void RequireRulesV4()
 {
     if (!RulesV4Active((unsigned int)GetAdjustedTime()))
-        throw runtime_error("rules v4 are not in force on this chain yet; coins locked in such a script now could be taken by anybody");
+        throw runtime_error("rules v4 are not in force on this chain yet; until they are, a script using them cannot be spent at all, so nothing was locked");
 }
+
+static const char* V4_DEPOSIT_WARNING =
+    "send nothing else to this address: it releases exactly the deposit this call made. "
+    "Any other coin sent to it is locked for good (if smaller than the fixed outputs) or "
+    "goes to the miner (anything above them).";
 
 static json V4Contract(const string& strAddr, const char* pszType)
 {
@@ -1985,6 +2062,39 @@ static uint256 TemplateHashFor(const vector<CTxOut>& vout)
     return CheckTemplateHash(tx, 0);
 }
 
+// A CTV template fixes its fee and its outputs for good: the spend cannot be
+// replaced, bumped, or (its outputs unconfirmed) helped by a child. So before
+// any coin goes in, the exact spend is built -- one input, the redeem script
+// as its scriptSig, these outputs -- and refused if no stock node would relay
+// and mine it: larger than MAX_STANDARD_TX_SIZE, or paying less than the fee
+// every miner asks of it (GetMinFee without the free-transaction discount,
+// counted with room for a scriptSig a relay pads by a few bytes).
+static void CheckCtvSpendPolicy(const CScript& redeem, const vector<CTxOut>& vout, int64 nFee,
+                                const char* pszWhat)
+{
+    CTransaction tx;
+    tx.nVersion = 2;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(uint256(1), 0);
+    tx.vin[0].nSequence = 0xffffffff;
+    tx.vin[0].scriptSig << vector<unsigned char>(redeem.begin(), redeem.end());
+    tx.nLockTime = 0;
+    tx.vout = vout;
+    unsigned int nBytes = ::GetSerializeSize(tx, SER_NETWORK);
+    if (nBytes > MAX_STANDARD_TX_SIZE - 1000)
+        throw runtime_error(strprintf("the %s would be %u bytes; nodes relay at most %u, so it could never be "
+                                      "mined -- split it (nothing was sent)",
+                                      pszWhat, nBytes, MAX_STANDARD_TX_SIZE - 1000));
+    CTransaction txPadded = tx;
+    txPadded.vin[0].scriptSig << vector<unsigned char>(100, 0);
+    int64 nMinFee = txPadded.GetMinFee(false);
+    if (nFee < nMinFee)
+        throw runtime_error(strprintf("the %s is %u bytes and its fee is fixed now: miners need at least %s for it, "
+                                      "%s was given -- pass fee=%s or more (nothing was sent)",
+                                      pszWhat, nBytes, FormatMoney(nMinFee).c_str(), FormatMoney(nFee).c_str(),
+                                      FormatMoney(nMinFee).c_str()));
+}
+
 static CScript CtvScript(uint256 hash)   // by value: uint256's begin() is not const
 {
     CScript s;
@@ -2014,7 +2124,8 @@ static vector<unsigned char> FreshWalletKey()
 static json rpc_vaultcreate(const json& p)
 {
     if (p.size() < 2)
-        throw runtime_error("vaultcreate <amount> <delay in blocks, 1-65535> [recovery address] [fee=0.01]");
+        throw runtime_error("vaultcreate <amount> <delay in blocks, 1-65535> [recovery address] [fee=0.01]; "
+                            "the vault address takes this one deposit only: never send anything else to it.");
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
     RequireRulesV4();
@@ -2050,6 +2161,7 @@ static json rpc_vaultcreate(const json& p)
     vector<CTxOut> vUnvault(1, CTxOut(nAmount - nFee, ScriptForAddress(strUnvault)));
     CScript vault = CtvScript(TemplateHashFor(vUnvault));
     string strVault = Hash160ToScriptAddress(Hash160(vault));
+    CheckCtvSpendPolicy(vault, vUnvault, nFee, "unvault transaction");
 
     CheckV4ContractsWritable();
     CWalletTx wtx = FundScript(vault, nAmount);
@@ -2070,6 +2182,7 @@ static json rpc_vaultcreate(const json& p)
     json j = rec;
     KeepNewV4Contract(strVault, rec, j);
     j["vaultAddress"] = strVault;
+    j["depositWarning"] = V4_DEPOSIT_WARNING;
     if (fRecoveryHere)
         j["warning"] = "the recovery key is in this same wallet; for a vault worth the name, give the address of a key kept somewhere else";
     return j;
@@ -2083,23 +2196,32 @@ static json rpc_vaultunvault(const json& p)
     if (p.size() < 1 || !p[0].is_string())
         throw runtime_error("vaultunvault <vault address>");
     json rec = V4Contract(p[0].get<string>(), "vault");
+    // Who spent the vault, if anyone, is asked of the chain first: a copy of
+    // our own unvault with another txid may be the one that confirmed, and
+    // FindUnvault then forgets the hex of ours (it can never confirm).
+    const string strOurs = rec.value("unvaultTxid", "");
+    bool fSpent = FindUnvault(p[0].get<string>(), rec);
     // Done before: broadcast again. It pays no address of this wallet, so the
     // wallet does not keep it, and a restart before it was mined lost it.
-    if (rec.contains("unvaultHex"))
+    if (rec.contains("unvaultHex") && (!fSpent || rec.value("unvaultTxid", "") == strOurs))
     {
         json again = json::object();
         again["txid"] = rpc_sendrawtransaction(json::array({ rec["unvaultHex"] }));
         again["rebroadcast"] = true;
         return again;
     }
-    // Somebody else's unvault: nothing to send, the delay is already running.
-    if (FindUnvault(p[0].get<string>(), rec))
+    // Somebody else's unvault (or a copy of ours with another txid): nothing
+    // to send, the delay is already running.
+    if (fSpent)
     {
         json done = json::object();
         done["txid"] = rec["unvaultTxid"];
         done["unvaultedElsewhere"] = true;
         done["unvaultAddress"] = rec["unvaultAddress"];
-        done["withdrawFrom"] = strprintf("unvaulted by a transaction this wallet did not send; if that was not you, "
+        if (!strOurs.empty())
+            done["broadcastTxid"] = strOurs;
+        done["withdrawFrom"] = strprintf("unvaulted by a transaction this wallet did not send (or by a copy of the one "
+                                         "it sent, with another txid); if that was not you, "
                                          "vaultrecover now, before %u blocks pass after it confirms",
                                          rec["delay"].get<unsigned int>());
         return done;
@@ -2117,18 +2239,62 @@ static json rpc_vaultunvault(const json& p)
     return r;
 }
 
+// The spender of an output according to the main chain only (the transaction
+// index). The memory pool can hold a spend the chain has already replaced:
+// the pool does not evict a transaction that conflicts with a block.
+static bool ChainSpenderOf(const COutPoint& outpoint, CTransaction& txOut)
+{
+    CTxIndex txindex;
+    return CTxDB("r").ReadTxIndex(outpoint.hash, txindex) && outpoint.n < txindex.vSpent.size() &&
+           !txindex.vSpent[outpoint.n].IsNull() && txOut.ReadFromDisk(txindex.vSpent[outpoint.n]);
+}
+
+// A transaction waiting in the memory pool that can still confirm: every
+// output it spends exists (in the chain or the pool) and none of them has
+// been spent in the chain -- by anything, since this one is not in it.
+static bool PoolTxConflictFree(const CTransaction& tx)
+{
+    CTxDB txdb("r");
+    foreach(const CTxIn& txin, tx.vin)
+    {
+        CTxIndex txindex;
+        if (txdb.ReadTxIndex(txin.prevout.hash, txindex))
+        {
+            if (txin.prevout.n >= txindex.vSpent.size() || !txindex.vSpent[txin.prevout.n].IsNull())
+                return false;
+            continue;
+        }
+        bool fInPool = false;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            map<uint256, CTransaction>::iterator mi = mapTransactions.find(txin.prevout.hash);
+            fInPool = mi != mapTransactions.end() && txin.prevout.n < mi->second.vout.size();
+        }
+        if (!fInPool)
+            return false;
+    }
+    return true;
+}
+
 // The unvault needs no key, so anybody can broadcast it -- a thief with the
 // hot key first of all. Whoever did, the vault's output was spent by it:
 // find that spend and keep its txid, so the recovery key can still act.
+//
+// The spender is looked up every time, chain first, never taken from the
+// record. The record holds the txid of the unvault this wallet broadcast,
+// and that is not necessarily the one that confirms: the CTV template does
+// not cover the scriptSig, so a relayed or mined copy can carry a different
+// txid. Building the recovery on the stored txid then made a spend of an
+// output that will never exist -- accepted by this node, whose pool still
+// held the stale copy, and never confirmable anywhere.
 static bool FindUnvault(const string& strVault, json& rec)
 {
-    if (rec.contains("unvaultTxid"))
-        return true;
     CTransaction txFund, txSpend;
     unsigned int nOut = 0;
     vector<unsigned char> vchRedeem = ParseHex(rec["vaultRedeem"].get<string>());
     FindContractOutput(CScript(vchRedeem.begin(), vchRedeem.end()), uint256(rec["fundTxid"].get<string>()), txFund, nOut);
-    if (!SpenderOf(COutPoint(txFund.GetHash(), nOut), txSpend))
+    COutPoint vaultOut(txFund.GetHash(), nOut);
+    if (!ChainSpenderOf(vaultOut, txSpend) && !SpenderOf(vaultOut, txSpend))
         return false;
     // The template allows one spend only; check it all the same.
     vector<unsigned char> vchUnvault = ParseHex(rec["unvaultRedeem"].get<string>());
@@ -2140,9 +2306,44 @@ static bool FindUnvault(const string& strVault, json& rec)
             fPays = true;
     if (!fPays)
         throw runtime_error("the vault was spent by " + txSpend.GetHash().GetHex() + ", which does not pay its unvault script");
-    rec["unvaultTxid"] = txSpend.GetHash().GetHex();
-    SetV4Contract(strVault, rec);
+    string strTxid = txSpend.GetHash().GetHex();
+    if (rec.value("unvaultTxid", "") != strTxid)
+    {
+        if (rec.contains("unvaultTxid"))
+            rec["unvaultTxidBroadcast"] = rec["unvaultTxid"];
+        rec["unvaultTxid"] = strTxid;
+        // The stored hex is the copy that lost: never broadcast it again.
+        rec.erase("unvaultHex");
+        SetV4Contract(strVault, rec);
+    }
     return true;
+}
+
+// The unvault a spend is about to build on must be able to exist: in the main
+// chain, or waiting in the pool with nothing in the chain against it.
+static void RequireLiveUnvault(const json& rec)
+{
+    uint256 txid(rec["unvaultTxid"].get<string>());
+    CTxIndex txindex;
+    if (CTxDB("r").ReadTxIndex(txid, txindex))
+        return;
+    CTransaction tx;
+    bool fInPool = false;
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        map<uint256, CTransaction>::iterator mi = mapTransactions.find(txid);
+        if (mi != mapTransactions.end())
+        {
+            tx = mi->second;
+            fInPool = true;
+        }
+    }
+    if (!fInPool)
+        throw runtime_error("the unvault " + txid.GetHex() + " is neither in the chain nor in the memory pool; "
+                            "run vaultunvault to broadcast it again");
+    if (!PoolTxConflictFree(tx))
+        throw runtime_error("the unvault " + txid.GetHex() + " in the memory pool conflicts with the chain and "
+                            "can never confirm; nothing was built on it");
 }
 
 // The unvault output to `to`, by the hot key (fHot: after the delay) or the
@@ -2151,7 +2352,10 @@ static json SpendUnvault(const string& strVault, const json& p, bool fHot)
 {
     json rec = V4Contract(strVault, "vault");
     if (!FindUnvault(strVault, rec))
-        throw runtime_error("not unvaulted yet: vaultunvault first");
+        throw runtime_error(rec.contains("unvaultTxid")
+                            ? "the unvault this wallet broadcast is neither in the chain nor in the memory pool: run vaultunvault to broadcast it again"
+                            : "not unvaulted yet: vaultunvault first");
+    RequireLiveUnvault(rec);
     if (p.size() < 2 || !p[1].is_string())
         throw runtime_error(fHot ? "vaultwithdraw <vault address> <to address> [fee=0.01]"
                                  : "vaultrecover <vault address> <to address> [fee=0.01]");
@@ -2196,7 +2400,8 @@ static json rpc_vaultrecover(const json& p)
 static json rpc_ctvbatch(const json& p)
 {
     if (p.size() < 1)
-        throw runtime_error("ctvbatch {\"address\": amount, ...} [fee=0.01]");
+        throw runtime_error("ctvbatch {\"address\": amount, ...} [fee=0.01]; "
+                            "the batch address takes this one deposit only: never send anything else to it.");
     if (IsWalletLocked())
         throw runtime_error("wallet is locked");
     RequireRulesV4();
@@ -2209,6 +2414,7 @@ static json rpc_ctvbatch(const json& p)
         nTotal += o.nValue;
     CScript batch = CtvScript(TemplateHashFor(vout));
     string strBatch = Hash160ToScriptAddress(Hash160(batch));
+    CheckCtvSpendPolicy(batch, vout, nFee, "expansion transaction");
     CheckV4ContractsWritable();
     CWalletTx wtx = FundScript(batch, nTotal + nFee);
     json rec;
@@ -2220,6 +2426,7 @@ static json rpc_ctvbatch(const json& p)
     json j = rec;
     KeepNewV4Contract(strBatch, rec, j);
     j["batchAddress"] = strBatch;
+    j["depositWarning"] = V4_DEPOSIT_WARNING;
     return j;
 }
 
@@ -2747,6 +2954,42 @@ static json rpc_inheritclaim(const json& p)
     }
     return json();
 }
+
+// The renewer needs the wallet unlocked. While this wallet owns an open
+// inheritance that renews itself, it does not lock (walletlock, the unlock
+// timeout): locking would stop the renewals without a word, and once the
+// period ran out the heir could claim -- not what the owner chose.
+static bool InheritanceNeedsUnlockedWallet(string& strWhyRet)
+{
+    json all;
+    try
+    {
+        CRITICAL_BLOCK(cs_v4contracts)
+            all = LoadV4Contracts();
+    }
+    catch (std::exception&)
+    {
+        return false;   // unreadable: the renewer cannot act on it either
+    }
+    for (json::iterator it = all.begin(); it != all.end(); ++it)
+    {
+        const json& rec = it.value();
+        if (rec.value("type", "") == "inheritance" && rec.value("role", "") == "owner" &&
+            !rec.contains("closedTxid") && rec.value("autoRenew", true))
+        {
+            strWhyRet = "this wallet renews the inheritance at " + it.key() +
+                        " by itself, which needs the wallet unlocked; locked, the renewals would stop "
+                        "and the heir's period would run out";
+            return true;
+        }
+    }
+    return false;
+}
+
+static struct CInheritanceLockHook
+{
+    CInheritanceLockHook() { pfnWalletLockRefusedExtra = InheritanceNeedsUnlockedWallet; }
+} inheritanceLockHook;
 
 // The renewer: a few minutes after start and every five minutes after that,
 // every inheritance this wallet owns that is half way to opening is spent back
@@ -3729,7 +3972,7 @@ static json rpc_coinfindsecret(const json& p)          { return CoinDispatch(Coi
 static json rpc_help(const json&)
 {
     return "getinfo getblockcount getblockhash getblock getnewaddress validateaddress "
-           "getbalance sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
+           "getbalance walletlock sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
            "gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
@@ -3752,6 +3995,7 @@ static const RpcEntry kMethods[] = {
     { "getnewaddress",    rpc_getnewaddress },
     { "validateaddress",  rpc_validateaddress },
     { "getbalance",       rpc_getbalance },
+    { "walletlock",       rpc_walletlock },
     { "sendtoaddress",    rpc_sendtoaddress },
     { "estimatefee",      rpc_estimatefee },
     { "createinvoice",    rpc_createinvoice },
@@ -4038,4 +4282,394 @@ void ThreadJsonRpcServer(void* parg)
     }
     rpc_close(lsock);
     printf("JSON-RPC stopped\n");
+}
+
+// ---- -selftest=wallet-rpc-v4 ------------------------------------------------
+//
+// Runs in a temporary data directory (selftest.cpp sets it up and removes it).
+int WalletRpcV4SelfTest()
+{
+    int nFail = 0;
+    struct T
+    {
+        static int Check(bool f, const char* psz)
+        {
+            fprintf(stdout, "  %s %s\n", f ? "ok  " : "FAIL", psz);
+            return f ? 0 : 1;
+        }
+        // True when the CTV policy check refuses (with pszNeedle in the reason,
+        // when one is given).
+        static bool Refused(const CScript& redeem, const vector<CTxOut>& vout, int64 nFee, const char* pszNeedle)
+        {
+            try
+            {
+                CheckCtvSpendPolicy(redeem, vout, nFee, "test spend");
+            }
+            catch (std::exception& e)
+            {
+                return pszNeedle == NULL || string(e.what()).find(pszNeedle) != string::npos;
+            }
+            return false;
+        }
+        static CTransaction From(const CScript& redeem, int n)
+        {
+            CTransaction tx;
+            tx.vin.resize(1);
+            tx.vin[0].prevout = COutPoint(Hash(BEGIN(n), END(n)), 0);
+            CScript p2sh;
+            p2sh.SetPayToScriptHash(redeem);
+            tx.vout.push_back(CTxOut(10 * COIN, p2sh));
+            return tx;
+        }
+        static CTransaction Spend(const CTransaction& from, const CScript& redeem, const CScript& pushes,
+                                  const CScript& scriptTo)
+        {
+            CTransaction tx;
+            tx.nVersion = 2;
+            tx.vin.resize(1);
+            tx.vin[0].prevout = COutPoint(from.GetHash(), 0);
+            tx.vin[0].nSequence = 0xffffffff;
+            tx.vout.push_back(CTxOut(10 * COIN - CENT, scriptTo));
+            CScript sig = pushes;
+            sig << vector<unsigned char>(redeem.begin(), redeem.end());
+            tx.vin[0].scriptSig = sig;
+            return tx;
+        }
+        static void AddToPool(const CTransaction& tx)
+        {
+            CRITICAL_BLOCK(cs_mapTransactions)
+            {
+                uint256 h = tx.GetHash();
+                mapTransactions[h] = tx;
+                for (unsigned int i = 0; i < tx.vin.size(); i++)
+                    mapNextTx[tx.vin[i].prevout] = CInPoint(&mapTransactions[h], i);
+            }
+        }
+        static void ClearPool()
+        {
+            CRITICAL_BLOCK(cs_mapTransactions)
+            {
+                mapTransactions.clear();
+                mapNextTx.clear();
+            }
+        }
+    };
+
+    fprintf(stdout, "  -- CTV templates against mining policy\n");
+    CKey keyPay;
+    keyPay.MakeNewKey();
+    CScript scriptPay;
+    scriptPay << OP_DUP << OP_HASH160 << Hash160(keyPay.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+    {
+        vector<CTxOut> vSmall(3, CTxOut(COIN, scriptPay));
+        CScript small = CtvScript(TemplateHashFor(vSmall));
+        nFail += T::Check(!T::Refused(small, vSmall, CENT, NULL),
+                          "a three-payment batch with the default fee passes");
+        vector<CTxOut> vBig(320, CTxOut(COIN, scriptPay));
+        CScript big = CtvScript(TemplateHashFor(vBig));
+        nFail += T::Check(T::Refused(big, vBig, CENT, "miners need at least"),
+                          "a 320-payment batch with the default fee is refused before funding (its expansion is over 10 kB)");
+        nFail += T::Check(!T::Refused(big, vBig, 20 * CENT, NULL), "with the fee its size asks for, it passes");
+        vector<CTxOut> vHuge(3000, CTxOut(COIN, scriptPay));
+        CScript huge = CtvScript(TemplateHashFor(vHuge));
+        nFail += T::Check(T::Refused(huge, vHuge, 50 * COIN, "nodes relay at most"),
+                          "a 3000-payment batch is refused whatever the fee: no node would relay its expansion");
+        CScript p2shOut;
+        p2shOut.SetPayToScriptHash(CScript() << OP_TRUE);
+        vector<CTxOut> vUnv(1, CTxOut(COIN, p2shOut));
+        CScript vaultScript = CtvScript(TemplateHashFor(vUnv));
+        nFail += T::Check(!T::Refused(vaultScript, vUnv, CENT, NULL) &&
+                          T::Refused(vaultScript, vUnv, CENT / 10, "miners need at least"),
+                          "a vault's unvault: the default 0.01 passes, 0.001 is refused");
+    }
+
+    fprintf(stdout, "  -- the rules-v4 upgrade hooks: valid, not relayed\n");
+    vector<unsigned char> vchKey33(33, 0x55);
+    vchKey33[0] = 0x02;
+    CScript csfs33;
+    csfs33 << vchKey33 << OP_CHECKSIGFROMSTACK;
+    CScript pushesCsfs;
+    pushesCsfs << vector<unsigned char>(64, 0x11) << vector<unsigned char>(5, 0x22);
+    CTransaction fromCsfs = T::From(csfs33, 1);
+    CTransaction spendCsfs = T::Spend(fromCsfs, csfs33, pushesCsfs, scriptPay);
+    nFail += T::Check(VerifySignature(fromCsfs, spendCsfs, 0, 0, true, true, true),
+                      "by consensus, any signature satisfies CSFS with a 33-byte key (an upgrade hook)");
+    nFail += T::Check(!VerifySignature(fromCsfs, spendCsfs, 0, 0, true, true, true,
+                                       SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4),
+                      "the relay policy refuses that spend");
+    nFail += T::Check(ScriptHasUpgradableCsfsKey(csfs33) &&
+                      !ScriptHasUpgradableCsfsKey(CScript() << vector<unsigned char>(32, 0x55) << OP_CHECKSIGFROMSTACK),
+                      "spendscript's check spots the 33-byte key and lets a 32-byte one through");
+    {
+        CScript ctv33;
+        ctv33 << vector<unsigned char>(33, 0x07) << OP_CHECKTEMPLATEVERIFY << OP_DROP << OP_TRUE;
+        CTransaction from = T::From(ctv33, 2);
+        CTransaction spend = T::Spend(from, ctv33, CScript(), scriptPay);
+        nFail += T::Check(VerifySignature(from, spend, 0, 0, true, true, true) &&
+                          !VerifySignature(from, spend, 0, 0, true, true, true, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4),
+                          "CTV with a 33-byte argument: valid, refused by policy");
+        CScript csvOff;
+        csvOff << (int64)0x80000000LL << OP_CHECKSEQUENCEVERIFY << OP_DROP << OP_TRUE;
+        CTransaction from2 = T::From(csvOff, 3);
+        CTransaction spend2 = T::Spend(from2, csvOff, CScript(), scriptPay);
+        nFail += T::Check(VerifySignature(from2, spend2, 0, 0, true, true, true) &&
+                          !VerifySignature(from2, spend2, 0, 0, true, true, true, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4),
+                          "CSV with bit 31 set in its number: valid, refused by policy");
+        nFail += T::Check(!VerifySignature(from2, spend2, 0, 0, true, true, false),
+                          "and before rules v4 the same spend fails outright (the byte is unknown)");
+    }
+    vector<CTxOut> vReal(1, CTxOut(10 * COIN - CENT, scriptPay));
+    CScript ctvReal = CtvScript(TemplateHashFor(vReal));
+    CTransaction fromReal = T::From(ctvReal, 4);
+    CTransaction spendReal = T::Spend(fromReal, ctvReal, CScript(), scriptPay);
+    nFail += T::Check(VerifySignature(fromReal, spendReal, 0, 0, true, true, true, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4),
+                      "a real CTV spend passes the policy");
+    {
+        bool fWasTestNet = IsTestNet();
+        SelectNetworkParams(true);
+        // The bench switch, an hour before now: rules v4 are then in force on
+        // the adjusted clock whatever the date (testnet rules v3 are older).
+        nBenchRulesV4Time = std::max((unsigned int)GetAdjustedTime() - 3600, RulesV3Time());
+        bool fV4Now = RulesV4Active((unsigned int)GetAdjustedTime());
+        nFail += T::Check(fV4Now, "rules v4 are in force on the testnet bench clock, so the memory-pool check runs");
+        if (fV4Now)
+        {
+            CTxDB txdb("cr+");
+            T::AddToPool(fromCsfs);
+            T::AddToPool(fromReal);
+            bool fCsfsIn = spendCsfs.AcceptTransaction(txdb, true);
+            bool fRealIn = spendReal.AcceptTransaction(txdb, true);
+            nFail += T::Check(!fCsfsIn && fRealIn,
+                              "the memory pool refuses the 33-byte-key CSFS spend and takes the real CTV spend");
+            T::ClearPool();
+        }
+        nBenchRulesV4Time = 0;
+        SelectNetworkParams(fWasTestNet);
+    }
+
+    fprintf(stdout, "  -- a vault follows the chain, not its record\n");
+    // On testnet, where script addresses are already in force (on mainnet
+    // they open with rules v3, and this test must not depend on the date).
+    bool fWasTestNetVault = IsTestNet();
+    SelectNetworkParams(true);
+    // Script addresses need rules v3 locked in by the tip's median time
+    // (RulesV3LockedIn): a stand-in tip dated now, which is past the testnet
+    // switch. Restored below.
+    CBlockIndex fakeTipVault;
+    fakeTipVault.nTime = (unsigned int)GetAdjustedTime();
+    CBlockIndex* pSavedBestVault = pindexBest;
+    struct CRestoreBest
+    {
+        CBlockIndex* p;
+        ~CRestoreBest() { pindexBest = p; }   // also on an exception
+    } restoreBest = { pSavedBestVault };
+    pindexBest = &fakeTipVault;
+    nFail += T::Check(RulesV3LockedIn(), "rules v3 are locked in on the stand-in testnet tip");
+    {
+        CKey keyHot, keyRec;
+        keyHot.MakeNewKey();
+        keyRec.MakeNewKey();
+        vector<unsigned char> vchHot = keyHot.GetPubKey();
+        CScript unvault;
+        unvault << OP_IF << (int64)3 << OP_CHECKSEQUENCEVERIFY << OP_DROP
+                << OP_DUP << OP_HASH160 << Hash160(vchHot) << OP_EQUALVERIFY << OP_CHECKSIG
+                << OP_ELSE
+                << OP_DUP << OP_HASH160 << Hash160(keyRec.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG
+                << OP_ENDIF;
+        string strUnvault = Hash160ToScriptAddress(Hash160(unvault));
+        int64 nAmount = 5 * COIN;
+        vector<CTxOut> vUnvault(1, CTxOut(nAmount - CENT, ScriptForAddress(strUnvault)));
+        CScript vault = CtvScript(TemplateHashFor(vUnvault));
+        string strVault = Hash160ToScriptAddress(Hash160(vault));
+        CTransaction txFund;
+        txFund.vin.resize(1);
+        txFund.vin[0].prevout = COutPoint(uint256(99), 0);
+        CScript p2shVault;
+        p2shVault.SetPayToScriptHash(vault);
+        txFund.vout.push_back(CTxOut(nAmount, p2shVault));
+        CTransaction txA;
+        txA.nVersion = 2;
+        txA.vin.resize(1);
+        txA.vin[0].prevout = COutPoint(txFund.GetHash(), 0);
+        txA.vin[0].nSequence = 0xffffffff;
+        txA.vout = vUnvault;
+        CTransaction txA2 = txA;
+        txA.vin[0].scriptSig << vector<unsigned char>(vault.begin(), vault.end());
+        txA2.vin[0].scriptSig << OP_0 << vector<unsigned char>(vault.begin(), vault.end());
+        nFail += T::Check(txA.GetHash() != txA2.GetHash() &&
+                          VerifySignature(txFund, txA, 0, 0, true, true, true) &&
+                          VerifySignature(txFund, txA2, 0, 0, true, true, true),
+                          "an unvault and a copy with one more push in its scriptSig both verify, with different txids");
+
+        // The copy is mined: a block on disk, and the transaction index says
+        // the vault output was spent by it.
+        CBlock blk;
+        blk.vtx.push_back(txFund);
+        blk.vtx.push_back(txA2);
+        unsigned int nFile = 0, nBlockPos = 0;
+        bool fWrote = blk.WriteToDisk(true, nFile, nBlockPos);
+        unsigned int nTxPos = nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 +
+                              GetSizeOfCompactSize(blk.vtx.size());
+        CDiskTxPos posFund(nFile, nBlockPos, nTxPos);
+        nTxPos += ::GetSerializeSize(txFund, SER_DISK);
+        CDiskTxPos posA2(nFile, nBlockPos, nTxPos);
+        bool fIndexed = false;
+        {
+            CTxDB txdb("cr+");
+            CTxIndex ti;
+            fIndexed = txdb.AddTxIndex(txFund, posFund, 1) && txdb.AddTxIndex(txA2, posA2, 1) &&
+                       txdb.ReadTxIndex(txFund.GetHash(), ti) && ti.vSpent.size() == 1;
+            if (fIndexed)
+            {
+                ti.vSpent[0] = posA2;
+                fIndexed = txdb.UpdateTxIndex(txFund.GetHash(), ti);
+            }
+        }
+        CTransaction txCheck;
+        nFail += T::Check(fWrote && fIndexed && ChainSpenderOf(COutPoint(txFund.GetHash(), 0), txCheck) &&
+                          txCheck.GetHash() == txA2.GetHash(),
+                          "the copy is mined: the chain says it spent the vault");
+
+        // Our own broadcast is still in this node's pool, stale.
+        T::AddToPool(txA);
+        json rec;
+        rec["type"] = "vault";
+        rec["vaultRedeem"] = HexStr(vault.begin(), vault.end(), false);
+        rec["unvaultAddress"] = strUnvault;
+        rec["unvaultRedeem"] = HexStr(unvault.begin(), unvault.end(), false);
+        rec["hotPubKey"] = HexStr(vchHot.begin(), vchHot.end(), false);
+        rec["recoveryAddress"] = Hash160ToAddress(Hash160(keyRec.GetPubKey()));
+        rec["delay"] = 3;
+        rec["amount"] = ValueFromAmount(nAmount);
+        rec["unvaultAmount"] = ValueFromAmount(nAmount - CENT);
+        rec["fundTxid"] = txFund.GetHash().GetHex();
+        rec["unvaultTxid"] = txA.GetHash().GetHex();
+        CDataStream ssA(SER_NETWORK);
+        ssA << txA;
+        rec["unvaultHex"] = HexStr(ssA.begin(), ssA.end(), false);
+        SetV4Contract(strVault, rec);
+
+        json r = rec;
+        bool fFound = FindUnvault(strVault, r);
+        nFail += T::Check(fFound && r["unvaultTxid"].get<string>() == txA2.GetHash().GetHex() &&
+                          !r.contains("unvaultHex") &&
+                          r.value("unvaultTxidBroadcast", "") == txA.GetHash().GetHex(),
+                          "the vault's spender is read from the chain, not from the record or the stale pool copy");
+        nFail += T::Check(V4Contract(strVault, "vault")["unvaultTxid"].get<string>() == txA2.GetHash().GetHex(),
+                          "and the record on disk is corrected");
+        bool fLive = true;
+        try { RequireLiveUnvault(r); }
+        catch (std::exception&) { fLive = false; }
+        nFail += T::Check(fLive, "a recovery builds on the mined copy");
+        bool fRefused = false;
+        string strWhy;
+        try { RequireLiveUnvault(rec); }
+        catch (std::exception& e) { fRefused = true; strWhy = e.what(); }
+        nFail += T::Check(fRefused && strWhy.find("conflicts") != string::npos && !PoolTxConflictFree(txA),
+                          "the stale pool copy, which the chain replaced, is refused as a base");
+        T::ClearPool();
+        bool fGone = false;
+        json rGone = rec;
+        rGone["unvaultTxid"] = uint256(12345).GetHex();
+        try { RequireLiveUnvault(rGone); }
+        catch (std::exception& e) { fGone = string(e.what()).find("neither in the chain") != string::npos; }
+        nFail += T::Check(fGone, "an unvault in neither the chain nor the pool is refused, pointing to vaultunvault");
+    }
+    pindexBest = pSavedBestVault;
+    SelectNetworkParams(fWasTestNetVault);
+
+    fprintf(stdout, "  -- signrawtransaction's temporary keys\n");
+    if (!LoadWallet())
+        nFail += T::Check(false, "the wallet loads");
+    {
+        vector<unsigned char> vchSecret(32);
+        GetStrongRandBytes(&vchSecret[0], 32);
+        vchSecret[0] &= 0x7f;
+        CKey keyOwn;
+        keyOwn.SetSecret(vchSecret);
+        vector<unsigned char> vchOwn = keyOwn.GetPubKey();
+        CKeyingMaterial vMaster(32, 0x42);
+        CPrivKey vchPriv = keyOwn.GetPrivKey();
+        vector<unsigned char> vchPlain(vchPriv.begin(), vchPriv.end()), vchCrypt;
+        bool fSetup = EncryptSecret(vMaster, vchPlain, WalletKeyIV(vchOwn), vchCrypt);
+        bool fWasEncrypted = fWalletEncrypted, fWasLocked = fWalletLocked;
+        CRITICAL_BLOCK(cs_mapKeys)
+            vWalletMasterKey = vMaster;
+        fSetup = fSetup && AddCryptedKey(vchOwn, vchCrypt);
+        fWalletLocked = false;
+        CScript scriptOwn;
+        scriptOwn << OP_DUP << OP_HASH160 << Hash160(vchOwn) << OP_EQUALVERIFY << OP_CHECKSIG;
+        CScript redeemX;
+        redeemX << OP_2 << OP_DROP << OP_TRUE;
+        CTransaction t;
+        t.vin.push_back(CTxIn(COutPoint(uint256(7), 0)));
+        t.vout.push_back(CTxOut(COIN, scriptPay));
+        CDataStream ssT(SER_NETWORK);
+        ssT << t;
+        json prev = json::array();
+        json one;
+        one["txid"] = uint256(7).GetHex();
+        one["vout"] = 0;
+        one["scriptPubKey"] = HexStr(scriptOwn.begin(), scriptOwn.end(), false);
+        one["redeemScript"] = HexStr(redeemX.begin(), redeemX.end(), false);
+        prev.push_back(one);
+        bool fCalled = true;
+        try
+        {
+            rpc_signrawtransaction(json::array({ HexStr(ssT.begin(), ssT.end(), false), prev,
+                                                 json::array({ HexStr(vchSecret.begin(), vchSecret.end(), false) }) }));
+        }
+        catch (std::exception& e)
+        {
+            fprintf(stdout, "       (%s)\n", e.what());
+            fCalled = false;
+        }
+        bool fKept = false, fScriptGone = false;
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            fKept = mapPubKeys.count(Hash160(vchOwn)) > 0 && mapCryptedKeys.count(vchOwn) > 0 &&
+                    mapKeys.count(vchOwn) == 0;
+            fScriptGone = mapScripts.count(Hash160(redeemX)) == 0;
+        }
+        nFail += T::Check(fSetup && fCalled && fKept,
+                          "an encrypted wallet's own key passed to signrawtransaction is still the wallet's afterwards");
+        nFail += T::Check(fScriptGone, "and a redeem script passed for the call is gone after it");
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            mapCryptedKeys.erase(vchOwn);
+            mapPubKeys.erase(Hash160(vchOwn));
+            vWalletMasterKey.clear();
+            fWalletEncrypted = fWasEncrypted;
+            fWalletLocked = fWasLocked;
+        }
+    }
+
+    fprintf(stdout, "  -- getbalance minconf 1\n");
+    {
+        CKey keyMe;
+        keyMe.MakeNewKey();
+        bool fAdded = AddKey(keyMe);
+        CScript scriptMe;
+        scriptMe << keyMe.GetPubKey() << OP_CHECKSIG;
+        CTransaction tx0, tx1, tx2;
+        tx0.vin.push_back(CTxIn(COutPoint(uint256(501), 0)));
+        tx0.vout.push_back(CTxOut(10 * COIN, scriptMe));
+        tx1.vin.push_back(CTxIn(COutPoint(tx0.GetHash(), 0)));
+        tx1.vout.push_back(CTxOut(9 * COIN, scriptMe));
+        tx2.vin.push_back(CTxIn(COutPoint(uint256(502), 0)));
+        tx2.vout.push_back(CTxOut(5 * COIN, scriptMe));
+        AddToWallet(CWalletTx(tx0));
+        AddToWallet(CWalletTx(tx1));
+        AddToWallet(CWalletTx(tx2));
+        CRITICAL_BLOCK(cs_mapWallet)
+            mapWallet[tx0.GetHash()].fSpent = true;
+        int64 n1 = AmountFromValue(rpc_getbalance(json::array()));
+        int64 n0 = AmountFromValue(rpc_getbalance(json::array({ 0 })));
+        nFail += T::Check(fAdded && n1 == 9 * COIN && n0 == 14 * COIN,
+                          strprintf("minconf 1 counts our own change (9) but not somebody's unconfirmed payment (5); "
+                                    "minconf 0 counts both (got %s and %s)",
+                                    FormatMoney(n1).c_str(), FormatMoney(n0).c_str()).c_str());
+    }
+
+    return nFail;
 }

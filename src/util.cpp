@@ -429,6 +429,39 @@ FILE* OpenPrivateFile(const char* psz, bool fExclusive, bool fText)
 #endif
 }
 
+bool RestrictFileToOwner(const string& strPath)
+{
+#ifdef WIN32
+    (void)strPath;
+    return true;
+#else
+    struct stat st;
+    if (lstat(strPath.c_str(), &st) != 0)
+        return true;            // nothing there to restrict
+    if (!S_ISREG(st.st_mode))
+        return true;            // never follow a link or touch a device
+    if ((st.st_mode & 0777) == (S_IRUSR | S_IWUSR))
+        return true;
+    return chmod(strPath.c_str(), S_IRUSR | S_IWUSR) == 0;
+#endif
+}
+
+void GetStrongRandBytes(unsigned char* pbuf, int nSize)
+{
+    if (nSize <= 0)
+        return;
+    if (RAND_bytes(pbuf, nSize) != 1)
+    {
+        // Nothing sensible can continue: every key, nonce and secret made from
+        // here on would be guessable. Say why, then stop.
+        fprintf(stderr, "Fatal: the system random number generator failed (RAND_bytes); "
+                        "stopping rather than create guessable secrets.\n");
+        printf("GetStrongRandBytes() : RAND_bytes failed -- aborting\n");
+        fflush(stderr);
+        abort();
+    }
+}
+
 int GetFilesize(FILE* file)
 {
     int nSavePos = ftell(file);
@@ -456,7 +489,7 @@ uint64 GetRand(uint64 nMax)
     uint64 nRange = (_UI64_MAX / nMax) * nMax;
     uint64 nRand = 0;
     do
-        RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
+        GetStrongRandBytes((unsigned char*)&nRand, sizeof(nRand));
     while (nRand >= nRange);
     return (nRand % nMax);
 }

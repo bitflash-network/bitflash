@@ -69,6 +69,13 @@ static const int64_t FRAME_MAX_AGE = 24 * 60 * 60;
 // happens when it fills, and why it fails closed.
 static const size_t MAX_SEEN_FRAMES = 4096;
 
+// Of those, the most that invites from strangers may hold. Identities cost
+// nothing to make, so invites from fresh ones could otherwise fill the whole
+// table and, since it fails closed, stop every frame -- from accepted
+// contacts and swap steps too -- for a day. Strangers get this share and no
+// more; the rest is kept for the people this address talks to.
+static const size_t MAX_SEEN_STRANGER_FRAMES = 512;
+
 struct Frame
 {
     int         version;
@@ -136,13 +143,19 @@ public:
     // because the alternative is evicting an id and accepting the replay it was
     // protecting against. A chat that stops is a bug; a chat that replays a
     // message as if it were new is a lie.
-    bool Accept(const Frame& f, int64_t nNow, std::string& errOut);
+    //
+    // fStranger: an invite from somebody we have not accepted. It is counted
+    // against MAX_SEEN_STRANGER_FRAMES, kept apart, so strangers can fill only
+    // their own share and never the slots accepted contacts use.
+    bool Accept(const Frame& f, int64_t nNow, std::string& errOut, bool fStranger = false);
 
-    size_t Size() const { return mapSeen.size(); }
+    size_t Size() const { return mapSeen.size() + mapSeenStranger.size(); }
+    size_t StrangerSize() const { return mapSeenStranger.size(); }
     void   Prune(int64_t nNow);
 
 private:
-    std::map<std::string, int64_t> mapSeen; // frame id -> sent
+    std::map<std::string, int64_t> mapSeen;         // frame id -> sent
+    std::map<std::string, int64_t> mapSeenStranger; // the same, strangers' invites
 };
 
 } // namespace btfchat

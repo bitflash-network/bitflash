@@ -163,7 +163,10 @@ inline int _heapchk() { return _HEAPOK; }
 #define _vsnprintf vsnprintf
 inline char* strlwr(char* s) { for (char* p = s; *p; ++p) *p = (char)tolower((unsigned char)*p); return s; }
 #define _strlwr strlwr
-inline int _mkdir(const char* p) { return ::mkdir(p, 0755); }
+// Owner-only: every directory this program makes for itself (the data
+// directory, testnet/, database/) holds keys, wallet files or Berkeley DB logs
+// that carry plaintext keys. 0755 let every local account read them.
+inline int _mkdir(const char* p) { return ::mkdir(p, 0700); }
 
 // Thread priority is a Windows nicety; on Linux the message-handler thread just
 // runs at normal priority (harmless no-op).

@@ -723,9 +723,23 @@ public:
 
 // fRulesV3 turns on what rules v3 adds inside a script: OP_CHECKLOCKTIMEVERIFY.
 // fRulesV4: OP_CHECKSEQUENCEVERIFY, OP_CHECKTEMPLATEVERIFY, OP_CHECKSIGFROMSTACK.
+//
+// nPolicyFlags: relay policy, never consensus. Zero (the default, and what
+// every block-validation path passes) evaluates exactly by the rules.
+//
+// SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4 makes a script fail when it executes
+// one of rules v4's upgrade hooks -- what consensus lets pass so a later rule
+// can give it a meaning: OP_CHECKSIGFROMSTACK with a non-empty key that is not
+// 32 bytes, OP_CHECKTEMPLATEVERIFY with an argument that is not 32 bytes,
+// OP_CHECKSEQUENCEVERIFY with bit 31 set in its number. Bitcoin pairs the same
+// hooks with SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS/_PUBKEYTYPE. Without it,
+// such spends were relayed and mined -- a CSFS output written by hand with an
+// ordinary 33-byte key is satisfied by any signature at all -- and a later
+// soft fork giving the hooks a meaning would meet miners still mining them.
+static const unsigned int SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4 = (1U << 0);
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
                 vector<vector<unsigned char> >* pvStackRet=NULL, bool fStrictSigs=false,
-                bool fRulesV3=false, bool fRulesV4=false);
+                bool fRulesV3=false, bool fRulesV4=false, unsigned int nPolicyFlags=0);
 // nLockTime below this is a block height; at or above, a unix time (Bitcoin's
 // split, so a lock means the same on both chains).
 static const unsigned int LOCKTIME_THRESHOLD = 500000000;
@@ -767,7 +781,8 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
 // scriptPubKey; if the scriptPubKey is pay-to-script-hash, the last push is
 // the redeem script, hashes to it, and the pushes before it satisfy it.
 bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                      bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false);
+                      bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false,
+                      unsigned int nPolicyFlags=0);
 // Signature operations inside the redeem script a P2SH scriptSig carries
 // (BIP16): counted against the block's limit once rules v3 make them run.
 // fRulesV4 counts OP_CHECKSIGFROMSTACK among them.
@@ -809,4 +824,9 @@ bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int 
 // whoever presents a script that hashes right (BIP16), and OP_CHECKLOCKTIMEVERIFY
 // is live. fRulesV4: the opcodes of rules v4 are live.
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
-                     bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false);
+                     bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false,
+                     unsigned int nPolicyFlags=0);
+// A redeem script that pushes a non-empty key other than 32 bytes right before
+// OP_CHECKSIGFROMSTACK: satisfiable by any signature under rules v4. spendscript
+// refuses such a script outright.
+bool ScriptHasUpgradableCsfsKey(const CScript& script);

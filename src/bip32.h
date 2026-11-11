@@ -22,6 +22,14 @@ struct BIP32PrivateNode
 {
     std::vector<unsigned char> privateKey; // 32-byte scalar
     std::vector<unsigned char> chainCode;  // 32 bytes
+
+    BIP32PrivateNode() {}
+    BIP32PrivateNode(const BIP32PrivateNode& o) : privateKey(o.privateKey), chainCode(o.chainCode) {}
+    BIP32PrivateNode& operator=(const BIP32PrivateNode& o);
+    // Every node is secret, the intermediate ones of a path included: each
+    // wipes its bytes when it goes, instead of leaving them in freed heap.
+    ~BIP32PrivateNode();
+    void Wipe();
 };
 
 bool BIP39EntropyToMnemonic(const std::vector<unsigned char>& entropy,

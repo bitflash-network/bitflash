@@ -18,6 +18,10 @@
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
 #include <atomic>
+#include <random>       // coin selection's coin flips
+#ifndef WIN32
+#include <dirent.h>     // RestrictWalletFileModes: the encryption backups
+#endif
 #include <mutex>
 #include <thread>
 #include "bip32.h"
@@ -104,9 +108,19 @@ CKeyingMaterial vWalletMasterKey;
 vector<unsigned char> vchCryptedHDMaster;
 vector<unsigned char> vchCryptedHDChainCode;
 bool fWalletEncrypted = false;
-bool fWalletLocked = true;
+std::atomic<bool> fWalletLocked(true);   // read without a lock by IsWalletLocked
 CCriticalSection cs_mapKeys;
 CKey keyUser;
+// A plaintext seed found in an encrypted wallet at load (see
+// QuarantinePlainSeedInEncryptedWallet). Held aside, never used for
+// derivation while the wallet is locked, and resolved at the next unlock.
+vector<unsigned char> vchPlainSeedPendingMaster;
+vector<unsigned char> vchPlainSeedPendingChainCode;
+string strWalletSeedNotice;
+// Largest fee CreateTransaction will pay without being told otherwise
+// (/maxtxfee). A sanity limit, like Bitcoin's -maxtxfee: it catches a unit
+// mistake in the fee setting before it is paid on every send.
+int64 nMaxTxFee = COIN;
 
 string strSetDataDir;
 int nDropMessagesTest = 0;
@@ -445,17 +459,22 @@ bool AddKey(const CKey& key)
         string strError;
         CPrivKey vchPrivKey = key.GetPrivKey();
         vector<unsigned char> vchCryptedSecret;
-        if (IsWalletLocked())
-            return error("AddKey() : wallet is locked\n");
-        vector<unsigned char> vchPlainSecret(vchPrivKey.begin(), vchPrivKey.end());
-        if (!EncryptSecret(vWalletMasterKey, vchPlainSecret, WalletKeyIV(key.GetPubKey()), vchCryptedSecret))
+        // The master key is read under cs_mapKeys, the lock LockWallet clears
+        // it under: a relock (timeout or walletlock) can come from another
+        // thread at any moment now.
+        CRITICAL_BLOCK(cs_mapKeys)
         {
+            if (IsWalletLocked())
+                return error("AddKey() : wallet is locked\n");
+            vector<unsigned char> vchPlainSecret(vchPrivKey.begin(), vchPrivKey.end());
+            bool fEncrypted = EncryptSecret(vWalletMasterKey, vchPlainSecret,
+                                            WalletKeyIV(key.GetPubKey()), vchCryptedSecret);
             SecureClearBytes(vchPlainSecret);
-            return error("AddKey() : encrypting key failed\n");
+            if (!fEncrypted)
+                return error("AddKey() : encrypting key failed\n");
+            if (!AddCryptedKey(key.GetPubKey(), vchCryptedSecret))
+                return false;
         }
-        SecureClearBytes(vchPlainSecret);
-        if (!AddCryptedKey(key.GetPubKey(), vchCryptedSecret))
-            return false;
         return CWalletDB().WriteCryptedKey(key.GetPubKey(), vchCryptedSecret);
     }
 
@@ -491,10 +510,24 @@ static void SecureClearKeyingMaterial(CKeyingMaterial& vch)
     vch.clear();
 }
 
+// When the wallet locks itself again (0: it does not). Set by an unlock with a
+// timeout, cleared by any lock.
+static std::atomic<int64> nWalletRelockTime(0);
+static std::atomic<bool> fWalletRelockThreadStarted(false);
+
 void LockWallet()
 {
     if (!fWalletEncrypted)
         return;
+    nWalletRelockTime.store(0);
+    // Every lock in the wallet's order (cs_main, cs_mapWallet, cs_keyPool,
+    // cs_mapKeys): a send, a key derivation or a key-pool draw that is under
+    // way finishes with the keys it started with, and the next one sees the
+    // wallet locked. The seed copy is read under cs_keyPool, the master key
+    // under cs_mapKeys, so both are cleared with those held.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_keyPool)
     CRITICAL_BLOCK(cs_mapKeys)
     {
         SecureClearKeyingMaterial(vWalletMasterKey);
@@ -502,8 +535,76 @@ void LockWallet()
             SecureClearBytes(vchHDMaster);
         if (!vchCryptedHDChainCode.empty())
             SecureClearBytes(vchHDChainCode);
+        // The default key's secret too: a phrase install in this session
+        // left a full key in keyUser.
+        keyUser.ForgetPrivKey();
         fWalletLocked = true;
     }
+}
+
+int64 GetWalletRelockTime()
+{
+    return nWalletRelockTime.load();
+}
+
+// A node that mines or runs a pool draws a wallet key for every coinbase, and
+// a locked wallet has none to give: the miner stops, and the pool's template
+// builder would pay its blocks to an empty key. So such a node does not lock.
+bool (*pfnWalletLockRefusedExtra)(string& strWhyRet) = NULL;
+
+bool WalletLockRefusedWhy(string& strWhyRet)
+{
+    strWhyRet.clear();
+    if (fGenerateBitcoins || nMineMode == MINE_OPERATOR || fP2PoolMode)
+    {
+        strWhyRet = "this node mines or runs a pool, and every block it makes needs a wallet key; "
+                    "stop mining first";
+        return true;
+    }
+    if (pfnWalletLockRefusedExtra && pfnWalletLockRefusedExtra(strWhyRet))
+        return true;
+    strWhyRet.clear();
+    return false;
+}
+
+static void ThreadWalletRelock()
+{
+    while (!fShutdown)
+    {
+        Sleep(250);
+        int64 nWhen = nWalletRelockTime.load();
+        if (nWhen != 0 && GetTime() >= nWhen && !IsWalletLocked())
+        {
+            // Asked again now, not only when the timeout was set: mining or a
+            // pool can have been switched on since, and a locked wallet would
+            // leave them no key for the next block.
+            string strWhy;
+            if (WalletLockRefusedWhy(strWhy))
+            {
+                nWalletRelockTime.store(0);
+                printf("wallet: the unlock timeout ran out, but the wallet stays unlocked: %s\n",
+                       strWhy.c_str());
+                continue;
+            }
+            LockWallet();
+            printf("wallet: the unlock timeout ran out; the wallet is locked again\n");
+        }
+    }
+}
+
+// 0 keeps the wallet unlocked until LockWallet; a positive number locks it
+// that many seconds from now, whatever unlock came before.
+void SetWalletRelockTimeout(int64 nSeconds)
+{
+    if (nSeconds <= 0)
+    {
+        nWalletRelockTime.store(0);
+        return;
+    }
+    nWalletRelockTime.store(GetTime() + nSeconds);
+    bool fExpected = false;
+    if (fWalletRelockThreadStarted.compare_exchange_strong(fExpected, true))
+        std::thread(ThreadWalletRelock).detach();
 }
 
 bool DeriveWalletPassphraseKey(const string& strPassphrase,
@@ -747,6 +848,7 @@ bool UnlockWallet(const string& strPassphrase, string& strErrorRet)
     if (!IsWalletEncrypted())
         return true;
 
+    bool fUnlocked = false;
     CRITICAL_BLOCK(cs_mapKeys)
     {
         for (map<unsigned int, CWalletMasterKey>::iterator mi = mapMasterKeys.begin();
@@ -777,7 +879,12 @@ bool UnlockWallet(const string& strPassphrase, string& strErrorRet)
             CKeyingMaterial vchCandidate(vchMasterPlain.begin(), vchMasterPlain.end());
             SecureClearBytes(vchMasterPlain);
             SecureClearBytes(vchPassIV);
-            bool fValid = mapCryptedKeys.empty();
+            // A candidate master key is accepted only when it decrypts a key
+            // whose public half it must match. An encrypted wallet with no
+            // encrypted key gives nothing to check it against -- EncryptWallet
+            // never writes one, so only a damaged or crafted file looks like
+            // that -- and is refused rather than trusted.
+            bool fValid = false;
             for (map<vector<unsigned char>, vector<unsigned char> >::iterator mci = mapCryptedKeys.begin();
                  mci != mapCryptedKeys.end(); ++mci)
             {
@@ -823,13 +930,35 @@ bool UnlockWallet(const string& strPassphrase, string& strErrorRet)
                     SecureClearBytes(vchPlainHDChainCode);
                 }
                 fWalletLocked = false;
-                return true;
+                fUnlocked = true;
+                break;
             }
         }
+    }
+    if (fUnlocked)
+    {
+        // Outside cs_mapKeys: the repair takes cs_keyPool first, as every
+        // other path does.
+        RepairPlainSeedAfterUnlock();
+        RepairReissuedPool();
+        return true;
+    }
+    if (mapCryptedKeys.empty() && !mapMasterKeys.empty())
+    {
+        strErrorRet = "this encrypted wallet holds no encrypted key to check the passphrase against";
+        return false;
     }
 
     strErrorRet = "passphrase did not unlock the wallet";
     return false;
+}
+
+bool UnlockWalletFor(const string& strPassphrase, int64 nSeconds, string& strErrorRet)
+{
+    if (!UnlockWallet(strPassphrase, strErrorRet))
+        return false;
+    SetWalletRelockTimeout(nSeconds);
+    return true;
 }
 
 static bool WalletAlreadyHasKey(const vector<unsigned char>& vchPubKey)
@@ -1014,7 +1143,50 @@ static bool ClearKeyPoolRecords(string& strErrorRet)
     return true;
 }
 
-bool DeriveHDKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
+bool ResetKeyPoolRecords(string& strErrorRet)
+{
+    CRITICAL_BLOCK(cs_keyPool)
+        return ClearKeyPoolRecords(strErrorRet);
+    return false;
+}
+
+// One key from an explicit seed and path. Everything else derives through
+// here, so the seed copies and the intermediate nodes are wiped in one place
+// (BIP32PrivateNode wipes itself when it goes out of scope).
+static bool DeriveKeyFromSeed(const vector<unsigned char>& vchMaster,
+                              const vector<unsigned char>& vchChainCode,
+                              const std::vector<unsigned int>& path,
+                              CKey& keyRet, string& strErrorRet)
+{
+    if (vchMaster.size() != 32 || vchChainCode.size() != 32)
+    {
+        strErrorRet = "no seed";
+        return false;
+    }
+    bitflash::BIP32PrivateNode parent;
+    parent.privateKey = vchMaster;
+    parent.chainCode  = vchChainCode;
+
+    bitflash::BIP32PrivateNode child;
+    if (!bitflash::BIP32DerivePath(parent, path, child, strErrorRet))
+        return false;
+
+    if (!keyRet.SetSecret(child.privateKey))
+    {
+        strErrorRet = "derived scalar is not a usable key";
+        return false;
+    }
+    return true;
+}
+
+static std::vector<unsigned int> HDReceivePathFor(int nSchema, unsigned int nCoinType, unsigned int nIndex)
+{
+    return nSchema == HD_SCHEMA_BIP44
+        ? HDBIP44Path(nCoinType, HD_BIP44_ACCOUNT, HD_BIP44_CHAIN_RECEIVE, nIndex)
+        : HDLegacyPath(nIndex);
+}
+
+bool DeriveHDKeyForSchema(int nSchema, unsigned int nIndex, CKey& keyRet, string& strErrorRet)
 {
     if (!HaveHDSeed())
     {
@@ -1026,24 +1198,14 @@ bool DeriveHDKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
         strErrorRet = "child index must be non-hardened; hardening is applied here";
         return false;
     }
+    return DeriveKeyFromSeed(vchHDMaster, vchHDChainCode,
+                             HDReceivePathFor(nSchema, nHDCoinType, nIndex),
+                             keyRet, strErrorRet);
+}
 
-    bitflash::BIP32PrivateNode parent;
-    parent.privateKey = vchHDMaster;
-    parent.chainCode  = vchHDChainCode;
-
-    bitflash::BIP32PrivateNode child;
-    std::vector<unsigned int> path = nHDKeySchema == HD_SCHEMA_BIP44
-        ? HDBIP44Path(nHDCoinType, HD_BIP44_ACCOUNT, HD_BIP44_CHAIN_RECEIVE, nIndex)
-        : HDLegacyPath(nIndex);
-    if (!bitflash::BIP32DerivePath(parent, path, child, strErrorRet))
-        return false;
-
-    if (!keyRet.SetSecret(child.privateKey))
-    {
-        strErrorRet = "derived scalar is not a usable key";
-        return false;
-    }
-    return true;
+bool DeriveHDKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
+{
+    return DeriveHDKeyForSchema(nHDKeySchema, nIndex, keyRet, strErrorRet);
 }
 
 bool DeriveHDChangeKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
@@ -1062,26 +1224,335 @@ bool DeriveHDChangeKey(unsigned int nIndex, CKey& keyRet, string& strErrorRet)
     if (nHDKeySchema != HD_SCHEMA_BIP44)
         return DeriveHDKey(nIndex, keyRet, strErrorRet);
 
-    bitflash::BIP32PrivateNode parent;
-    parent.privateKey = vchHDMaster;
-    parent.chainCode  = vchHDChainCode;
+    return DeriveKeyFromSeed(vchHDMaster, vchHDChainCode,
+                             HDBIP44Path(nHDCoinType, HD_BIP44_ACCOUNT,
+                                         HD_BIP44_CHAIN_CHANGE, nIndex),
+                             keyRet, strErrorRet);
+}
 
-    bitflash::BIP32PrivateNode child;
-    if (!bitflash::BIP32DerivePath(parent,
-                                   HDBIP44Path(nHDCoinType,
-                                               HD_BIP44_ACCOUNT,
-                                               HD_BIP44_CHAIN_CHANGE,
-                                               nIndex),
-                                   child,
-                                   strErrorRet))
-        return false;
+bool WalletAddKeyIfMissing(const CKey& key)
+{
+    return AddKeyIfMissing(key);
+}
 
-    if (!keyRet.SetSecret(child.privateKey))
+// Move the derivation counters past keys the wallet already holds. A counter
+// that went backwards (an interrupted phrase install reset it to 1/0) would
+// hand out addresses that were handed out before. Keys are derived and stored
+// in order, so what the wallet holds is a run from the start of each chain.
+// Hold cs_keyPool.
+static void AdvanceHDCountersPastHeldKeys()
+{
+    if (!HaveHDSeed())
+        return;
+    static const unsigned int nMaxScan = 1000000;
+    string strError;
+    if (nHDKeySchema == HD_SCHEMA_BIP44)
     {
-        strErrorRet = "derived scalar is not a usable key";
-        return false;
+        unsigned int n = nHDReceiveNext;
+        for (unsigned int i = 0; i < nMaxScan; i++, n++)
+        {
+            CKey key;
+            if (!DeriveHDKey(n, key, strError) || !WalletAlreadyHasKey(key.GetPubKey()))
+                break;
+        }
+        if (n != nHDReceiveNext && CWalletDB().WriteHDReceiveNext(n))
+        {
+            printf("wallet: receive counter moved from %u to %u, past keys already handed out\n",
+                   nHDReceiveNext, n);
+            nHDReceiveNext = n;
+        }
+        n = nHDChangeNext;
+        for (unsigned int i = 0; i < nMaxScan; i++, n++)
+        {
+            CKey key;
+            if (!DeriveHDChangeKey(n, key, strError) || !WalletAlreadyHasKey(key.GetPubKey()))
+                break;
+        }
+        if (n != nHDChangeNext && CWalletDB().WriteHDChangeNext(n))
+        {
+            printf("wallet: change counter moved from %u to %u, past keys already used\n",
+                   nHDChangeNext, n);
+            nHDChangeNext = n;
+        }
     }
-    return true;
+    else
+    {
+        unsigned int n = nHDNext;
+        for (unsigned int i = 0; i < nMaxScan; i++, n++)
+        {
+            CKey key;
+            if (!DeriveHDKey(n, key, strError) || !WalletAlreadyHasKey(key.GetPubKey()))
+                break;
+        }
+        if (n != nHDNext && CWalletDB().WriteHDNext(n))
+            nHDNext = n;
+    }
+}
+
+// Called by both loaders once every record is read. An encrypted wallet must
+// never hold its seed in the clear; one that does was written by the phrase
+// install of an older build (it wrote "hdmaster" whatever the wallet's
+// encryption). The plaintext copy is taken out of use at once -- nothing
+// derives from it, and the chat identity cannot be computed from it, while the
+// wallet is locked -- and settled at the next unlock, when the master key is
+// there to encrypt it with (RepairPlainSeedAfterUnlock).
+void QuarantinePlainSeedInEncryptedWallet()
+{
+    if (!fWalletEncrypted || (vchHDMaster.empty() && vchHDChainCode.empty()))
+        return;
+    vchPlainSeedPendingMaster = vchHDMaster;
+    vchPlainSeedPendingChainCode = vchHDChainCode;
+    SecureClearBytes(vchHDMaster);
+    SecureClearBytes(vchHDChainCode);
+    strWalletSeedNotice =
+        "This encrypted wallet also holds a copy of a recovery seed in plaintext, "
+        "left by a phrase install or restore of an older version. That copy is not "
+        "used. The next time the wallet is unlocked it is encrypted (if it is the "
+        "wallet's seed) or removed (if the encrypted seed is the one in use), and the "
+        "address counters are moved past every key already in the wallet. Earlier "
+        "copies of this wallet file, and Berkeley DB log files, may still hold the "
+        "plaintext seed: if any of those left this machine, move the coins to a new "
+        "wallet.";
+    printf("LoadWallet: %s\n", strWalletSeedNotice.c_str());
+}
+
+// The other half of QuarantinePlainSeedInEncryptedWallet, with the master key
+// in hand. Which seed stays:
+//   - no encrypted seed: the plaintext one is the wallet's only seed -- it is
+//     encrypted and the plaintext records removed;
+//   - both, equal: the plaintext copy is redundant -- it is removed;
+//   - both, different: an install that wrote the plaintext seed and then
+//     finished set the default key to its first receive key. If it did, the
+//     plaintext seed is the one the user holds the words for and it replaces
+//     the encrypted one; if not, the install failed half way (the wallet was
+//     locked) and the encrypted seed stays. Every key either seed derived is a
+//     stored key of its own, so no coin depends on the seed that goes.
+// Either way the counters are moved past the keys the wallet already holds,
+// because the interrupted install had reset them.
+void RepairPlainSeedAfterUnlock()
+{
+    if (vchPlainSeedPendingMaster.empty() && vchPlainSeedPendingChainCode.empty())
+        return;
+    // cs_main and cs_mapWallet first, as everywhere: under SQLite the bracket
+    // below is one transaction on the shared connection, and holding the
+    // wallet writers out keeps their writes from joining (and rolling back
+    // with) it.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_keyPool)
+    {
+        if (vchPlainSeedPendingMaster.size() != 32 || vchPlainSeedPendingChainCode.size() != 32)
+        {
+            strWalletSeedNotice = "the plaintext seed copy in this encrypted wallet is incomplete; "
+                                  "it was left in place untouched -- run /walletstoragecheck";
+            printf("wallet: %s\n", strWalletSeedNotice.c_str());
+            return;
+        }
+        bool fHaveCrypted = !vchCryptedHDMaster.empty();
+        bool fUsePlain = false;
+        if (!fHaveCrypted)
+            fUsePlain = true;
+        else if (vchPlainSeedPendingMaster == vchHDMaster &&
+                 vchPlainSeedPendingChainCode == vchHDChainCode)
+            fUsePlain = false;
+        else
+        {
+            CKey key0;
+            string strError;
+            if (DeriveKeyFromSeed(vchPlainSeedPendingMaster, vchPlainSeedPendingChainCode,
+                                  HDReceivePathFor(nHDKeySchema, nHDCoinType, 0), key0, strError) &&
+                key0.GetPubKey() == keyUser.GetPubKey())
+                fUsePlain = true;
+        }
+
+        vector<unsigned char> vchCryptMaster, vchCryptChain;
+        if (fUsePlain)
+        {
+            bool fOk = false;
+            CRITICAL_BLOCK(cs_mapKeys)
+                fOk = !IsWalletLocked() &&
+                      EncryptSecret(vWalletMasterKey, vchPlainSeedPendingMaster,
+                                    WalletSecretIV("hdmaster"), vchCryptMaster) &&
+                      EncryptSecret(vWalletMasterKey, vchPlainSeedPendingChainCode,
+                                    WalletSecretIV("hdchaincode"), vchCryptChain);
+            if (!fOk)
+            {
+                strWalletSeedNotice = "could not encrypt the plaintext seed copy; it was left in place";
+                printf("wallet: %s\n", strWalletSeedNotice.c_str());
+                return;
+            }
+        }
+
+        bool fWritten = WalletSQLiteRuntimeBeginTxn();
+        if (fWritten && fUsePlain)
+            fWritten = CWalletDB().WriteCryptedHDMaster(vchCryptMaster, vchCryptChain);
+        if (fWritten)
+            fWritten = CWalletDB().EraseHDMaster();
+        if (fWritten)
+            fWritten = WalletSQLiteRuntimeCommitTxn();
+        else
+            WalletSQLiteRuntimeRollbackTxn();
+        if (!fWritten)
+        {
+            strWalletSeedNotice = "could not rewrite the seed records; the plaintext copy is still in "
+                                  "the wallet file -- check free disk space and unlock again";
+            printf("wallet: %s\n", strWalletSeedNotice.c_str());
+            return;
+        }
+
+        if (fUsePlain)
+        {
+            CRITICAL_BLOCK(cs_mapKeys)
+            {
+                vchCryptedHDMaster = vchCryptMaster;
+                vchCryptedHDChainCode = vchCryptChain;
+            }
+            vchHDMaster = vchPlainSeedPendingMaster;
+            vchHDChainCode = vchPlainSeedPendingChainCode;
+            if (nHDKeySchema == HD_SCHEMA_NONE)
+                nHDKeySchema = HD_SCHEMA_LEGACY;
+        }
+        SecureClearBytes(vchPlainSeedPendingMaster);
+        SecureClearBytes(vchPlainSeedPendingChainCode);
+        AdvanceHDCountersPastHeldKeys();
+
+        strWalletSeedNotice = !fHaveCrypted
+            ? "The plaintext recovery seed in this encrypted wallet was encrypted, and the plaintext records removed."
+            : fUsePlain
+                ? "This wallet held two recovery seeds: the encrypted one and, in plaintext, the one its last "
+                  "phrase install finished with. The latter is now the wallet's seed, encrypted; the plaintext "
+                  "records were removed. Keys from the older seed stay in the wallet."
+                : "This wallet held a plaintext copy of a recovery seed from a phrase install that did not "
+                  "finish. The encrypted seed stays in use, the plaintext copy was removed, and the address "
+                  "counters were moved past every key already handed out. Words written down during that "
+                  "failed install do not cover this wallet.";
+        strWalletSeedNotice += " Earlier copies of this wallet file, and Berkeley DB log files, may still hold "
+                               "the plaintext seed: if any of those left this machine, move the coins to a new wallet.";
+        printf("wallet: %s\n", strWalletSeedNotice.c_str());
+    }
+}
+
+// Releases up to 1.2.32 rebuilt the key pool of an encrypted BIP44 wallet
+// from the legacy counter -- 0 in such a wallet -- so its pool came to hold
+// receive/0..99: the default address and addresses already handed out, to be
+// handed out again (a merchant would credit one payer's coins to another).
+// Such a pool is recognised by holding a key certainly issued already: the
+// default key, receive/0, a key with an address-book label, a key some wallet
+// transaction pays, or the same key twice. Which of the other pool keys were
+// also handed out cannot be known, so the whole pool goes; the counters move
+// past every key the wallet holds and the pool is refilled from there. The
+// gap this leaves (at most a pool's worth) is within what a restore scans
+// past. Runs at unlock, when the seed is there to derive with.
+bool RepairReissuedPool()
+{
+    bool fRepaired = false;
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_keyPool)
+    {
+        if (!HaveHDSeed() || nHDKeySchema != HD_SCHEMA_BIP44 || mapKeyPool.empty())
+            return false;
+        set<vector<unsigned char> > setIssued;
+        try { setIssued.insert(keyUser.GetPubKey()); } catch (...) { }
+        CKey key0;
+        string strError;
+        if (DeriveHDKey(0, key0, strError))
+            setIssued.insert(key0.GetPubKey());
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<string, string>::const_iterator it = mapAddressBook.begin(); it != mapAddressBook.end(); ++it)
+            {
+                uint160 hash;
+                if (!AddressToHash160(it->first, hash))
+                    continue;
+                map<uint160, vector<unsigned char> >::const_iterator mi = mapPubKeys.find(hash);
+                if (mi != mapPubKeys.end())
+                    setIssued.insert(mi->second);
+            }
+        }
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            for (size_t i = 0; i < it->second.vout.size(); i++)
+            {
+                vector<unsigned char> vchPubKey;
+                if (ExtractPubKey(it->second.vout[i].scriptPubKey, true, vchPubKey))
+                    setIssued.insert(vchPubKey);
+            }
+        set<vector<unsigned char> > setSeen;
+        int nIssuedInPool = 0, nTwice = 0;
+        for (map<int64, vector<unsigned char> >::const_iterator it = mapKeyPool.begin(); it != mapKeyPool.end(); ++it)
+        {
+            if (setIssued.count(it->second))
+                nIssuedInPool++;
+            if (!setSeen.insert(it->second).second)
+                nTwice++;
+        }
+        if (nIssuedInPool == 0 && nTwice == 0)
+            return false;
+
+        if (!ClearKeyPoolRecords(strError))
+        {
+            printf("RepairReissuedPool() : %s\n", strError.c_str());
+            return false;
+        }
+        AdvanceHDCountersPastHeldKeys();
+        TopUpKeyPool();
+        fRepaired = true;
+        string strNotice = strprintf(
+            "The key pool of this wallet held %d address(es) already handed out (left by the encryption of "
+            "an older version). The pool was rebuilt from receive index %u; addresses handed out before "
+            "will not be handed out again.", nIssuedInPool + nTwice, nHDReceiveNext);
+        printf("wallet: %s\n", strNotice.c_str());
+        strWalletSeedNotice = strWalletSeedNotice.empty() ? strNotice : strWalletSeedNotice + " " + strNotice;
+    }
+    return fRepaired;
+}
+
+bool WalletHasHDSeed()
+{
+    return HaveHDSeed() || !vchCryptedHDMaster.empty() || !vchPlainSeedPendingMaster.empty();
+}
+
+void RestrictWalletFileModes()
+{
+#ifndef WIN32
+    // New directories are made 0700 (compat.h) and new secret files 0600.
+    // Files an older build made keep whatever mode they were given -- SQLite
+    // and Berkeley DB create theirs readable by the group or everyone -- so
+    // the ones that hold keys are tightened here, on every start.
+    string strDir = GetAppDir();
+    const char* apszFiles[] = { "wallet.dat", "wallet.sqlite", "wallet.sqlite-wal",
+                                "wallet.sqlite-shm", "wallet.sqlite-journal", "nostr.key" };
+    for (size_t i = 0; i < sizeof(apszFiles) / sizeof(apszFiles[0]); i++)
+        if (!RestrictFileToOwner(strDir + "/" + apszFiles[i]))
+            printf("RestrictWalletFileModes() : could not make %s owner-only\n", apszFiles[i]);
+    // The plaintext originals EncryptWallet leaves as backups.
+    DIR* pdir = opendir(strDir.c_str());
+    if (pdir)
+    {
+        struct dirent* pent;
+        while ((pent = readdir(pdir)) != NULL)
+        {
+            string strName = pent->d_name;
+            if (strName.find(".before-encrypt.") != string::npos ||
+                strName.compare(0, 24, "wallet.sqlite.encrypting") == 0 ||
+                strName.compare(0, 18, "wallet.encrypting.") == 0)
+                RestrictFileToOwner(strDir + "/" + strName);
+        }
+        closedir(pdir);
+    }
+    // Berkeley DB's logs carry every record ever written, plaintext keys of an
+    // unencrypted wallet included.
+    struct stat st;
+    string strLogDir = strDir + "/database";
+    if (lstat(strLogDir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 077))
+        chmod(strLogDir.c_str(), S_IRWXU);
+    // The data directory itself is the user's to set (another program may be
+    // meant to read it), so it is only reported.
+    if (stat(strDir.c_str(), &st) == 0 && (st.st_mode & 077))
+        printf("RestrictWalletFileModes() : the data directory %s is open to other accounts "
+               "(mode %03o); the wallet files in it are owner-only, but consider chmod 700\n",
+               strDir.c_str(), (unsigned int)(st.st_mode & 0777));
+#endif
 }
 
 // strPassphrase is BIP39's optional extra word. It is NOT a lock on the file:
@@ -1098,84 +1569,155 @@ bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphras
     if (!bitflash::BIP39ValidateMnemonic(strMnemonic, strNormalized, strErrorRet))
         return false;
 
+    // An encrypted wallet takes a new seed only while it is unlocked, because
+    // the seed is stored encrypted under the wallet's master key. Refused here,
+    // before anything is written: an older build went on, cleared the pool,
+    // reset the counters and wrote the seed in plaintext, and then reported
+    // that nothing had changed.
+    if (IsWalletLocked())
+    {
+        strErrorRet = "the wallet is encrypted and locked; unlock it first (nothing was changed)";
+        return false;
+    }
+
     vector<unsigned char> vchSeed;
-    if (!bitflash::BIP39MnemonicToSeed(strNormalized, strPassphrase, vchSeed, strErrorRet))
+    bool fSeedOk = bitflash::BIP39MnemonicToSeed(strNormalized, strPassphrase, vchSeed, strErrorRet);
+    if (!strNormalized.empty())
+        OPENSSL_cleanse(&strNormalized[0], strNormalized.size());
+    if (!fSeedOk)
         return false;
 
     bitflash::BIP32PrivateNode master;
-    if (!bitflash::BIP32MasterFromSeed(vchSeed, master, strErrorRet))
+    bool fMasterOk = bitflash::BIP32MasterFromSeed(vchSeed, master, strErrorRet);
+    SecureClearBytes(vchSeed);
+    if (!fMasterOk)
         return false;
 
+    // The default key: receive/0 on the BIP44 path, derived from the new seed
+    // directly, before the wallet's own seed changes.
+    CKey key;
+    if (!DeriveKeyFromSeed(master.privateKey, master.chainCode,
+                           HDBIP44Path(HD_BIP44_COIN_TYPE_BITFLASH, HD_BIP44_ACCOUNT,
+                                       HD_BIP44_CHAIN_RECEIVE, 0),
+                           key, strErrorRet))
+        return false;
+
+    // cs_main and cs_mapWallet before cs_keyPool (the wallet's order): the
+    // install is one SQLite transaction on the shared connection, and the
+    // wallet writers (AddToWallet from the message thread, settings) are kept
+    // out of it while it is open.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
     CRITICAL_BLOCK(cs_keyPool)
     {
-        // The pool is cleared before the seed is written, and the order is the
-        // safe one of the two. Old private keys stay in wallet.dat either way;
-        // what is at stake is which half-finished state a failure can leave.
-        //
-        //   clear, then write -- a failed write leaves the old seed and an
-        //   empty pool. TopUpKeyPool refills it, and nothing was promised to
-        //   anybody.
-        //
-        //   write, then clear -- a failed clear leaves a seed installed and the
-        //   old random pool intact. The user has just been shown twelve words
-        //   and the wallet goes on handing out addresses those words cannot
-        //   reproduce. That is the bug this function exists to prevent.
-        //
-        // An earlier comment here said the seed was written first so a failure
-        // left the wallet untouched. That was true of the seed alone and stops
-        // being true once the pool has to move with it.
-        if (!ClearKeyPoolRecords(strErrorRet))
-            return false;
-
-        if (!CWalletDB().WriteHDMaster(master.privateKey, master.chainCode) ||
-            !CWalletDB().WriteHDSchema(HD_SCHEMA_BIP44) ||
-            !CWalletDB().WriteHDCoinType(HD_BIP44_COIN_TYPE_BITFLASH) ||
-            !CWalletDB().WriteHDNext(0) ||
-            !CWalletDB().WriteHDReceiveNext(1) ||
-            !CWalletDB().WriteHDChangeNext(0))
+        const bool fEncrypted = IsWalletEncrypted();
+        vector<unsigned char> vchCryptMaster, vchCryptChain;
+        if (fEncrypted)
         {
-            strErrorRet = "could not write the seed metadata to wallet.dat";
+            bool fOk = false;
+            CRITICAL_BLOCK(cs_mapKeys)
+                fOk = !IsWalletLocked() &&
+                      EncryptSecret(vWalletMasterKey, master.privateKey,
+                                    WalletSecretIV("hdmaster"), vchCryptMaster) &&
+                      EncryptSecret(vWalletMasterKey, master.chainCode,
+                                    WalletSecretIV("hdchaincode"), vchCryptChain);
+            if (!fOk)
+            {
+                strErrorRet = IsWalletLocked()
+                    ? "the wallet is encrypted and locked; unlock it first (nothing was changed)"
+                    : "could not encrypt the new seed (nothing was changed)";
+                return false;
+            }
+        }
+
+        // Every check that can fail on its own comes before the first write
+        // that changes what the wallet is: the default key is stored first (an
+        // extra key in the wallet is harmless if anything below fails).
+        if (!AddKeyIfMissing(key))
+        {
+            strErrorRet = "could not write the default derived key to the wallet (nothing else was changed)";
             return false;
         }
-        vchHDMaster    = master.privateKey;
-        vchHDChainCode = master.chainCode;
-        nHDKeySchema   = HD_SCHEMA_BIP44;
-        nHDReceiveNext = 1;
-        nHDChangeNext  = 0;
-        nHDCoinType    = HD_BIP44_COIN_TYPE_BITFLASH;
-
-        // Index 0 is spoken for before it is derived, so a failure below cannot
-        // leave the pool free to hand it out as an ordinary key. The cost of
-        // the counter being ahead of the derivation is one unused index; the
-        // cost of the reverse is the default address and a pool key sharing a
-        // derivation path.
-        nHDNext = 0;
 
         // Remember which address stops being the default, so it can be named
         // for what it is. Two entries reading "Your Address" -- one covered by
         // the phrase and one not -- is the wrong thing to find at the moment a
         // person has just written twelve words down.
         vector<unsigned char> vchOldDefault = keyUser.GetPubKey();
-
-        CKey key;
-        if (!DeriveHDKey(0, key, strErrorRet))
-            return false;
-        if (!AddKeyIfMissing(key))
-        {
-            strErrorRet = "could not write the default derived key to wallet.dat";
-            return false;
-        }
         vector<unsigned char> vchPubKey = key.GetPubKey();
-        if (!CWalletDB().WriteDefaultKey(vchPubKey) ||
-            !SetAddressBookName(PubKeyToAddress(vchPubKey), "Your Address"))
+
+        // The pool is cleared with the seed, never apart from it: a seed
+        // installed beside the old random pool would go on handing out
+        // addresses the words cannot reproduce. Under SQLite all of this is
+        // one transaction; Berkeley DB writes record by record, in this order
+        // (a failure part way leaves an empty pool, which TopUpKeyPool refills).
+        //
+        // The seed is written encrypted in an encrypted wallet, and any
+        // plaintext seed records an older build left there are erased with it.
+        if (!WalletSQLiteRuntimeBeginTxn())
         {
-            strErrorRet = "could not set the default derived receiving key";
+            strErrorRet = "could not start a wallet transaction (nothing was changed)";
             return false;
         }
+        bool fWritten =
+            ClearKeyPoolRecords(strErrorRet) &&
+            (fEncrypted
+                ? (CWalletDB().WriteCryptedHDMaster(vchCryptMaster, vchCryptChain) &&
+                   CWalletDB().EraseHDMaster())
+                : CWalletDB().WriteHDMaster(master.privateKey, master.chainCode)) &&
+            CWalletDB().WriteHDSchema(HD_SCHEMA_BIP44) &&
+            CWalletDB().WriteHDCoinType(HD_BIP44_COIN_TYPE_BITFLASH) &&
+            CWalletDB().WriteHDNext(0) &&
+            CWalletDB().WriteHDReceiveNext(1) &&
+            CWalletDB().WriteHDChangeNext(0) &&
+            CWalletDB().WriteDefaultKey(vchPubKey) &&
+            SetAddressBookName(PubKeyToAddress(vchPubKey), "Your Address");
+        if (!fWritten)
+        {
+            WalletSQLiteRuntimeRollbackTxn();
+            if (strErrorRet.empty())
+                strErrorRet = "could not write the seed records to the wallet";
+            return false;
+        }
+        if (!WalletSQLiteRuntimeCommitTxn())
+        {
+            strErrorRet = "could not commit the seed records to the wallet";
+            return false;
+        }
+
+        // In memory only once the records are written.
+        if (fEncrypted)
+        {
+            CRITICAL_BLOCK(cs_mapKeys)
+            {
+                vchCryptedHDMaster    = vchCryptMaster;
+                vchCryptedHDChainCode = vchCryptChain;
+            }
+        }
+        SecureClearBytes(vchPlainSeedPendingMaster);
+        SecureClearBytes(vchPlainSeedPendingChainCode);
+        vchHDMaster    = master.privateKey;
+        vchHDChainCode = master.chainCode;
+        nHDKeySchema   = HD_SCHEMA_BIP44;
+        // Index 0 is the default key, so the pool starts at 1.
+        nHDReceiveNext = 1;
+        nHDChangeNext  = 0;
+        nHDCoinType    = HD_BIP44_COIN_TYPE_BITFLASH;
+        nHDNext = 0;
+
         if (!vchOldDefault.empty() && vchOldDefault != vchPubKey)
             SetAddressBookName(PubKeyToAddress(vchOldDefault),
                                "Your Address (created before the recovery phrase)");
         keyUser = key;
+        // In an encrypted wallet the private half lives encrypted only; the
+        // loader never keeps it in keyUser either.
+        if (fEncrypted)
+            keyUser.ForgetPrivKey();
+
+        // The same phrase installed again (a restore of the wallet's own
+        // words) finds its keys already here: start past them, so addresses
+        // handed out before are not handed out again.
+        AdvanceHDCountersPastHeldKeys();
     }
     return true;
 }
@@ -1202,25 +1744,26 @@ void TopUpKeyPool()
             if (HaveHDSeed())
             {
                 // Derived, so a recovery phrase can reproduce this exact key.
-                // A derivation that fails is not a reason to stop filling the
-                // pool -- fall back to a random key, which is what a wallet
-                // without a seed uses anyway. It will not come back from the
-                // phrase, and that is better than a node that cannot mine.
+                //
+                // A derivation that fails stops the top-up. It used to fall
+                // back to a random key, which the phrase cannot bring back --
+                // and the user learnt that only from debug.log, after being
+                // told the phrase was the backup. The failure is nearly always
+                // a write that did not happen (disk full), which a random key
+                // would not survive either. The pool keeps what it has; a key
+                // handed out from it is still covered.
                 string strError;
                 vector<unsigned char> vchPubKey;
-                if (DeriveNextHDReceiveKey(vchPubKey, strError))
+                if (!DeriveNextHDReceiveKey(vchPubKey, strError))
                 {
-                    if (!CWalletDB().WritePool(nIndex, vchPubKey))
-                        return;
-                    mapKeyPool[nIndex] = vchPubKey;
-                    continue;
+                    printf("TopUpKeyPool() : receive derivation failed (%s); the key pool "
+                           "was not topped up\n", strError.c_str());
+                    return;
                 }
-                else
-                {
-                    printf("TopUpKeyPool() : receive derivation failed (%s), "
-                           "falling back to a random key\n", strError.c_str());
-                    key.MakeNewKey();
-                }
+                if (!CWalletDB().WritePool(nIndex, vchPubKey))
+                    return;
+                mapKeyPool[nIndex] = vchPubKey;
+                continue;
             }
             else
             {
@@ -1255,8 +1798,15 @@ vector<unsigned char> GetKeyFromPool()
             map<int64, vector<unsigned char> >::iterator mi = mapKeyPool.begin();
             int64 nIndex = mi->first;
             vector<unsigned char> vchPubKey = mi->second;
+            // The record goes first. A key handed out while its pool record
+            // stays on disk is handed out again after a restart.
+            if (!CWalletDB().ErasePool(nIndex))
+            {
+                printf("GetKeyFromPool() : could not erase key-pool record %lld (disk full?); "
+                       "no key handed out\n", (long long)nIndex);
+                return vector<unsigned char>();
+            }
             mapKeyPool.erase(mi);
-            CWalletDB().ErasePool(nIndex);
             // Leave the wallet with a full backup window after each draw too,
             // not only immediately before a draw. If topping up fails, the key
             // already chosen is still safe to use -- its private half was
@@ -1266,8 +1816,15 @@ vector<unsigned char> GetKeyFromPool()
         }
     }
     // Nothing in the pool and nothing could be added -- disk full, wallet
-    // locked open elsewhere. Generating on demand is what this code did for
-    // its whole life, so fall back to it rather than refuse to mine.
+    // locked open elsewhere. A wallet with a recovery phrase does not fall
+    // back to a random key: the phrase could never bring it back, and the
+    // user would not know. Without a phrase, generating on demand is what
+    // this code did for its whole life, so it still does.
+    if (HaveHDSeed())
+    {
+        printf("GetKeyFromPool() : pool empty and no key could be derived; no key handed out\n");
+        return vector<unsigned char>();
+    }
     printf("GetKeyFromPool() : pool empty, generating a key on demand\n");
     try
     {
@@ -2598,8 +3155,12 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                 return fMiner ? false : error("ConnectInputs() : %s input %d is under a relative lock",
                                               GetHash().ToString().substr(0,6).c_str(), i);
 
-            // Verify signature
-            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3, fRulesV4))
+            // Verify signature. On the memory-pool path only (neither a block
+            // nor the miner), relay policy also refuses the upgrade hooks of
+            // rules v4 (SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4). Blocks are
+            // checked with no policy at all: what is valid does not change.
+            const unsigned int nPolicyFlags = (!fBlock && !fMiner) ? SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4 : 0;
+            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
 
             // Rules v3 runs the redeem script, so its signature operations cost
@@ -5479,7 +6040,8 @@ WalletRecoveryAudit GetWalletRecoveryAudit()
         audit.fHaveSeed = HaveHDSeed();
         audit.fSeedEncryptedLocked = !audit.fHaveSeed &&
                                      (!vchCryptedHDMaster.empty() ||
-                                      !vchCryptedHDChainCode.empty());
+                                      !vchCryptedHDChainCode.empty() ||
+                                      !vchPlainSeedPendingMaster.empty());
         audit.nSchema = nHDKeySchema;
         audit.nDerivedKnown = nHDNext;
         audit.nReceiveNext = nHDReceiveNext;
@@ -5713,7 +6275,10 @@ static bool SelectCoinsMinConf(int64 nTargetValue, int nConfMine, int nConfTheir
         return true;
     }
 
-    // Solve subset sum by stochastic approximation
+    // Solve subset sum by stochastic approximation. The coin flips come from
+    // a generator seeded from the system's RNG on each call: std::rand() was
+    // never seeded, so every process start made the same choices.
+    std::mt19937 rng((std::mt19937::result_type)GetRand(0xffffffffULL));
     sort(vValue.rbegin(), vValue.rend());
     vector<char> vfIncluded;
     vector<char> vfBest(vValue.size(), true);
@@ -5728,7 +6293,7 @@ static bool SelectCoinsMinConf(int64 nTargetValue, int nConfMine, int nConfTheir
         {
             for (int i = 0; i < vValue.size(); i++)
             {
-                if (nPass == 0 ? rand() % 2 : !vfIncluded[i])
+                if (nPass == 0 ? (rng() & 1) : !vfIncluded[i])
                 {
                     nTotal += vValue[i].first;
                     vfIncluded[i] = true;
@@ -5778,9 +6343,41 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 
 
 
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64& nFeeRequiredRet)
+static thread_local string tlsCreateTransactionError;
+
+string LastCreateTransactionError()
+{
+    return tlsCreateTransactionError;
+}
+
+void ClampLoadedFeeSettings()
+{
+    if (!IsAcceptableTxFeeSetting(nTransactionFee))
+    {
+        printf("LoadWallet: the stored flat fee %s is outside 0..%s; using the minimum fee instead\n",
+               FormatMoney(nTransactionFee).c_str(), FormatMoney(MAX_TX_FEE_SETTING).c_str());
+        // Where an operator who set it on purpose will see it, not only debug.log.
+        fprintf(stderr, "Wallet: the stored fee per transaction (%s) is above %s and is not used; "
+                        "the minimum fee applies. Set it again (at most %s) if needed.\n",
+                FormatMoney(nTransactionFee).c_str(), FormatMoney(MAX_TX_FEE_SETTING).c_str(),
+                FormatMoney(MAX_TX_FEE_SETTING).c_str());
+        nTransactionFee = 0;
+    }
+    if (nPayTxFeePerKB < 0 || nPayTxFeePerKB > COIN)
+    {
+        printf("LoadWallet: the stored fee rate %s per kB is outside 0..1 per kB; using the minimum instead\n",
+               FormatMoney(nPayTxFeePerKB).c_str());
+        nPayTxFeePerKB = 0;
+    }
+}
+
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64& nFeeRequiredRet,
+                       int64 nFeeLimit, bool fDryRun)
 {
     nFeeRequiredRet = 0;
+    tlsCreateTransactionError.clear();
+    if (nFeeLimit < 0)
+        nFeeLimit = nMaxTxFee;
     CRITICAL_BLOCK(cs_main)
     {
         // txdb must be opened before the mapWallet lock
@@ -5814,7 +6411,11 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                 // Choose coins to use
                 set<CWalletTx*> setCoins;
                 if (!SelectCoins(nTotalValue, setCoins))
+                {
+                    tlsCreateTransactionError = strprintf("insufficient funds for %s plus a fee of %s",
+                                                          FormatMoney(nValue).c_str(), FormatMoney(nFee).c_str());
                     return false;
+                }
                 int64 nValueIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     nValueIn += pcoin->GetCredit();
@@ -5826,34 +6427,57 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                 if (nValueIn > nTotalValue)
                 {
                     vector<unsigned char> vchPubKey;
-                    if (HaveHDSeed())
+                    if (fDryRun)
+                    {
+                        // Same size as a real change key, and nothing drawn.
+                        vchPubKey = keyUser.GetPubKey();
+                    }
+                    else if (HaveHDSeed())
                     {
                         string strError;
                         if (!DeriveNextHDChangeKey(vchPubKey, strError))
                         {
                             printf("CreateTransaction() : could not derive a phrase-backed change key: %s\n",
                                    strError.c_str());
+                            tlsCreateTransactionError = "could not derive a change key: " + strError;
                             return false;
                         }
                     }
                     else
                     {
-                        // Legacy wallets have no deterministic seed. Preserve
-                        // the 0.1.0 behaviour for them: return change to a key
-                        // already proven to belong to this wallet.
-                        CTransaction& txFirst = *(*setCoins.begin());
-                        foreach(const CTxOut& txout, txFirst.vout)
-                            if (txout.IsMine())
-                                if (ExtractPubKey(txout.scriptPubKey, true, vchPubKey))
-                                    break;
+                        // A wallet without a seed takes change to a fresh key
+                        // from its pool. 0.1.0 sent it back to a key of the
+                        // first input, which told every observer which output
+                        // was the change and tied the payer's addresses
+                        // together. The pool key is in the wallet before it is
+                        // used, so a backup taken since the last top-up covers
+                        // it. If the pool cannot give one, the old way stays.
+                        vchPubKey = GetKeyFromPool();
+                        if (vchPubKey.empty())
+                        {
+                            CTransaction& txFirst = *(*setCoins.begin());
+                            foreach(const CTxOut& txout, txFirst.vout)
+                                if (txout.IsMine())
+                                    if (ExtractPubKey(txout.scriptPubKey, true, vchPubKey))
+                                        break;
+                        }
                     }
                     if (vchPubKey.empty())
+                    {
+                        tlsCreateTransactionError = "no key for the change";
                         return false;
+                    }
 
-                    // Fill vout[1] to ourself
+                    // The change goes in at a random position, not always
+                    // second: a fixed place marks it as the change for anyone
+                    // reading the chain. (BumpFee finds change by IsMine.)
                     CScript scriptPubKey;
                     scriptPubKey << vchPubKey << OP_CHECKSIG;
-                    wtxNew.vout.push_back(CTxOut(nValueIn - nTotalValue, scriptPubKey));
+                    CTxOut change(nValueIn - nTotalValue, scriptPubKey);
+                    if (GetRand(2) == 0)
+                        wtxNew.vout.insert(wtxNew.vout.begin(), change);
+                    else
+                        wtxNew.vout.push_back(change);
                 }
 
                 // Fill vin. Replaceable (BIP125), so it can be sped up later
@@ -5879,6 +6503,18 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                 {
                     nFee = nFeeRequiredRet = nNeed;
                     continue;
+                }
+                nFeeRequiredRet = nFee;
+
+                // A sanity limit, not a policy: a fee this large is a mistake
+                // in the settings far more often than a choice.
+                if (nFee > nFeeLimit)
+                {
+                    tlsCreateTransactionError = strprintf(
+                        "the fee would be %s, above the limit of %s (/maxtxfee, or the fee you confirmed); "
+                        "nothing was sent", FormatMoney(nFee).c_str(), FormatMoney(nFeeLimit).c_str());
+                    printf("CreateTransaction() : %s\n", tlsCreateTransactionError.c_str());
+                    return false;
                 }
 
                 // Fill vtxPrev by copying from previous transactions vtxPrev
@@ -5931,7 +6567,12 @@ bool CommitTransactionSpent(const CWalletTx& wtxNew)
 
         // Add tx to wallet, because if it has change it's also ours,
         // otherwise just for transaction history.
-        AddToWallet(wtxNew);
+        //
+        // Every write is checked, and a failed one stops the send before it
+        // is broadcast: a payment on the network that the wallet file does
+        // not record is change the wallet cannot see after a restart, and
+        // pool payouts are de-duplicated by exactly this record.
+        bool fOk = AddToWallet(wtxNew);
 
         // Mark old coins as spent
         set<CWalletTx*> setCoins;
@@ -5940,8 +6581,16 @@ bool CommitTransactionSpent(const CWalletTx& wtxNew)
         foreach(CWalletTx* pcoin, setCoins)
         {
             pcoin->fSpent = true;
-            pcoin->WriteToDisk();
+            if (!pcoin->WriteToDisk())
+                fOk = false;
             vWalletUpdated.push_back(make_pair(pcoin->GetHash(), false));
+        }
+        if (!fOk)
+        {
+            printf("CommitTransactionSpent() : could not write the transaction to the wallet "
+                   "(disk full?); it was not sent\n");
+            RollbackTransactionSpent(wtxNew);
+            return false;
         }
     }
     MainFrameRepaint();
@@ -5951,15 +6600,39 @@ bool CommitTransactionSpent(const CWalletTx& wtxNew)
 
 
 
-bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
+bool PreviewSendFee(const CScript& scriptPubKey, int64 nValue, int64& nFeeRet, string& strWhyRet)
+{
+    nFeeRet = 0;
+    strWhyRet.clear();
+    if (IsWalletLocked())
+    {
+        strWhyRet = "The wallet is locked.";
+        return false;
+    }
+    CWalletTx wtx;
+    int64 nFee = 0;
+    if (!CreateTransaction(scriptPubKey, nValue, wtx, nFee, -1, true))
+    {
+        strWhyRet = LastCreateTransactionError();
+        if (strWhyRet.empty())
+            strWhyRet = "Transaction failed.";
+        return false;
+    }
+    nFeeRet = nFee;
+    return true;
+}
+
+bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit)
 {
     CRITICAL_BLOCK(cs_main)
     {
         int64 nFeeRequired;
-        if (!CreateTransaction(scriptPubKey, nValue, wtxNew, nFeeRequired))
+        if (!CreateTransaction(scriptPubKey, nValue, wtxNew, nFeeRequired, nFeeLimit))
         {
             string strError;
-            if (nValue + nFeeRequired > GetBalance())
+            if (!LastCreateTransactionError().empty())
+                strError = "Error: " + LastCreateTransactionError();
+            else if (nValue + nFeeRequired > GetBalance())
                 strError = strprintf("Error: This is an oversized transaction that requires a transaction fee of %s ", FormatMoney(nFeeRequired).c_str());
             else
                 strError = "Error: Transaction creation failed ";

@@ -144,6 +144,16 @@ bool FileExists(const char* psz);
 // existing file; otherwise one is replaced. fText: text mode on Windows
 // (CRLF), for files people read. NULL on failure, errno set.
 FILE* OpenPrivateFile(const char* psz, bool fExclusive, bool fText=false);
+// An existing file, made owner-only (0600) on POSIX. For files whose mode an
+// older build, or a library (SQLite, Berkeley DB), chose. No-op on Windows,
+// where the data directory's ACL already keeps other accounts out, and for a
+// path that does not exist. False only when chmod itself failed.
+bool RestrictFileToOwner(const string& strPath);
+// Random bytes for secrets. Aborts the process when the system's generator
+// cannot supply them, rather than handing back a buffer that may be zeros or
+// predictable (OpenSSL's RAND_bytes reports that by its return value, which
+// is easy to ignore -- Bitcoin Core's GetStrongRandBytes does the same).
+void GetStrongRandBytes(unsigned char* pbuf, int nSize);
 int GetFilesize(FILE* file);
 uint64 GetRand(uint64 nMax);
 int64 GetTime();

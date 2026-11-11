@@ -61,7 +61,8 @@ null.
 | `getblock` | `hash` | height, confirmations, time, merkle root, `tx` (txids), prev/next hash |
 | `getnewaddress` | — | a fresh receiving address, one per call |
 | `validateaddress` | `address` | `isvalid`, and `ismine` when it is |
-| `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards |
+| `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards. With `minconf` 1 (the default) a payment from somebody else counts once it is in a block; this wallet's own change counts at once. `minconf` 0 counts everything not yet spent |
+| `walletlock` | — | locks an encrypted wallet now: the master key and the decrypted seed leave memory. Spending, new addresses and mining stop until the node is started again with `/walletpassphrase`. Refused while this node mines or runs a pool, or renews an inheritance by itself, all of which need wallet keys; the same applies to `/walletunlocktimeout` when it runs out (it then leaves the wallet unlocked and says so in debug.log) |
 | `sendtoaddress` | `address`, `amount` | txid of the transaction it created and broadcast |
 | `gettransaction` | `txid` | amount, confirmations, block, `details` per output, `bip125-replaceable` |
 | `createinvoice` | `amount`, [`description`], [`expirysecs`], [`orderid`] | an invoice for the shop's own gateway: fresh address, payment link, QR as SVG -- `docs/invoices.md` |
@@ -96,11 +97,11 @@ null.
 | `coinswapinfo`, `coinnewaddress`, `coinvalidatedestination`, `coininitiate`, `coinparticipate`, `coinauditcontract`, `coinredeem`, `coinrefund`, `coinfindsecret` | `chain`, then what the `btc` call of the same name takes | the same calls on any chain the wallet swaps with: `chain` is `btc`, `ltc`, `doge`, `bch`, `xec`, `dgb` or `rvn` (`coininitiate ltc address amount`). Each goes to that chain's own node when one is configured (`-ltcrpcport`...), else to the embedded light client; `docs/atomic-swaps.md` |
 | `templatehash` | `{address: amount}`, [`version`=2], [`sequence`], [`locktime`=0] | the hash `OP_CHECKTEMPLATEVERIFY` compares with, for a one-input transaction with these outputs (rules v4, `docs/rules-v4.md`) |
 | `spendscript` | `redeemhex`, `txid`, `[items]`, `{address: amount}`, [`version`=2], [`sequence`], [`locktime`=0], [`maxfee`=1] | spends the P2SH output of `txid` paying that redeem script; `items` go on the stack below it, bottom first: hex data, `true`, `false`, or `"sig:<pubkey>"` for a signature by a key this wallet holds; what the outputs leave over is the fee, refused over `maxfee`; outputs go in address order, the same order `templatehash` uses |
-| `vaultcreate` | `amount`, `delay` (blocks, 1-65535), [`recoveryaddress`], [`fee`=0.01] | locks `amount` in a vault (rules v4): it can leave only by one transaction fixed now, to an unvault output; from there the hot key (a fresh key of this wallet) can take it `delay` blocks later and the recovery key at once. Without `recoveryaddress` the recovery key is a fresh key of this wallet too, and the result warns. `fee` is what the unvault prepays. Refused while rules v4 are not in force. Returns both addresses and both redeem scripts |
+| `vaultcreate` | `amount`, `delay` (blocks, 1-65535), [`recoveryaddress`], [`fee`=0.01] | locks `amount` in a vault (rules v4): it can leave only by one transaction fixed now, to an unvault output; from there the hot key (a fresh key of this wallet) can take it `delay` blocks later and the recovery key at once. Without `recoveryaddress` the recovery key is a fresh key of this wallet too, and the result warns. `fee` is what the unvault prepays. Refused while rules v4 are not in force. Refused, before any coin moves, when the unvault transaction would pay less than miners ask of its size. Returns both addresses and both redeem scripts. Send nothing else to `vaultAddress`: the vault releases exactly one deposit, and any other coin sent there is locked for good or lost to fees (`depositWarning` in the result) |
 | `vaultunvault` | `vaultaddress` | broadcasts the one way out of the vault; no key is needed, and anybody holding the redeem script could. If somebody already did, says so (`unvaultedElsewhere`) and gives its txid |
 | `vaultwithdraw` | `vaultaddress`, `toaddress`, [`fee`=0.01] | the hot key takes the unvault output, once `delay` blocks have passed since the unvault confirmed |
 | `vaultrecover` | `vaultaddress`, `toaddress`, [`fee`=0.01] | the recovery key takes the unvault output, at once, whoever broadcast the unvault (a thief holding the hot key, say); if that key is not in this wallet, says how to sign it elsewhere with `spendscript` |
-| `ctvbatch` | `{address: amount}`, [`fee`=0.01] | one output now, which unfolds later into exactly these payments (rules v4); the fee of the unfolding is paid now. Refused while rules v4 are not in force |
+| `ctvbatch` | `{address: amount}`, [`fee`=0.01] | one output now, which unfolds later into exactly these payments (rules v4); the fee of the unfolding is paid now and fixed. Refused while rules v4 are not in force, and refused before any coin moves when the unfolding would be larger than nodes relay or pay less than miners ask of its size. Send nothing else to `batchAddress` (`depositWarning`) |
 | `ctvexpand` | `batchaddress` | broadcasts the payments a batch fixed; no key is needed |
 | `listv4contracts` | | the vaults, batches and inheritances this wallet made or imports, as kept in `v4contracts.json` beside the wallet (the version before the last change is `v4contracts.json.bak`; if a save fails after coins were locked, the call's answer carries `saveError` and is the only copy of the script) |
 | `inheritcreate` | `amount`, `heiraddress`, `days`, [`renewalfee`=0.01] | locks `amount` so the owner (a fresh key of this wallet) can spend it at any time and the heir only once it has sat untouched for `days` (rules v4; `docs/inheritance.md`). The wallet renews it by itself. `days` is 30 to 388 on mainnet; on testnet any length down to one 512-second unit. `heiraddress` must be an ordinary address. Returns the address, the script and the `heirPackage` to hand over |
@@ -156,6 +157,9 @@ minutes; that is a reasonable floor for a young network. Coinbase maturity is
 ## What it does not do
 
 No `walletpassphrase` — if the wallet is encrypted, start the node with the
-passphrase and the RPC spends from the unlocked wallet. No `listunspent`, no raw
+passphrase (`/walletpassphrase`, from stdin or `@FILE`) and the RPC spends from
+the unlocked wallet; `/walletunlocktimeout=SECS` locks it again by itself after
+that many seconds, and `walletlock` locks it at once. The passphrase never
+travels over RPC. No `listunspent`, no raw
 transaction building, no `importprivkey`. Those can be added when somebody
 needs them; the set above is what every exchange integration actually calls.
