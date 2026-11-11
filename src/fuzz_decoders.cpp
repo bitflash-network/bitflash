@@ -100,15 +100,11 @@ static string BtfNormal(const string& in)
 
 // ---- base58 and Bitflash addresses -------------------------------------------
 
-// The base58 readers take C strings: they see the input up to its first NUL.
-static string CStr(const string& s)
-{
-    return s.substr(0, s.find('\0'));
-}
-
+// The string overloads must refuse a NUL: the round trips below compare the
+// whole input, so one that read only up to the NUL fails them.
 static void Base58(const string& sIn)
 {
-    string s = CStr(sIn);
+    const string& s = sIn;
     vector<unsigned char> v;
     if (!DecodeBase58(s, v))
         return;
@@ -131,7 +127,7 @@ static void Base58Bytes(const string& s)
 
 static void Base58Check(const string& sIn)
 {
-    string s = CStr(sIn);
+    const string& s = sIn;
     vector<unsigned char> v;
     if (!DecodeBase58Check(s, v))
         return;
@@ -141,7 +137,7 @@ static void Base58Check(const string& sIn)
 
 static void BitflashAddress(const string& sIn)
 {
-    string s = CStr(sIn);
+    const string& s = sIn;
     uint160 h1, h2;
     bool fScript = false;
     bool fKey = AddressToHash160(s, h1);

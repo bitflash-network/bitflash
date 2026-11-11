@@ -4277,6 +4277,18 @@ static int RunDecoderCanonicalSelfTest()
     // EncodeBase58 of nothing is nothing (it indexed an empty vector).
     nFail += Check(EncodeBase58(std::vector<unsigned char>()) == "", "base58 of no bytes is the empty string") ? 0 : 1;
 
+    // An address followed by a NUL and more is not that address (the string
+    // overloads read up to the NUL and ignored the rest).
+    std::string strAddr = Hash160ToAddress(uint160(4242));
+    std::string strTail = strAddr + std::string("\0junk", 5);
+    uint160 hAddr;
+    bool fScriptAddr = false;
+    std::vector<unsigned char> vAddr;
+    nFail += Check(AddressToHash160(strAddr, hAddr) && hAddr == uint160(4242), "an address reads") ? 0 : 1;
+    nFail += Check(!AddressToHash160(strTail, hAddr) && !DecodeAnyAddress(strTail, hAddr, fScriptAddr) &&
+                   !IsValidBitcoinAddress(strTail) && !DecodeBase58Check(strTail, vAddr) && !DecodeBase58(strTail, vAddr),
+                   "the same address with a NUL and more after it is refused") ? 0 : 1;
+
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
