@@ -3820,9 +3820,6 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
         return DoS(pnDoS, 100, error("CheckBlock() : nBits is not a positive target"));
     if (bnTarget > bnProofOfWorkLimit)
         return DoS(pnDoS, 100, error("CheckBlock() : nBits below minimum work"));
-#ifdef BITFLASH_FUZZ
-    if (!fFuzzSkipPoW)
-#endif
     if (tl_fPoWBudgetGate)
     {
         tl_fPoWBudgetGate = false;
@@ -3832,6 +3829,9 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
             return false;
         }
     }
+#ifdef BITFLASH_FUZZ
+    if (!fFuzzSkipPoW)
+#endif
     if (GetPoWHash() > CBigNum().SetCompact(nBits).getuint256())
         return DoS(pnDoS, 50, error("CheckBlock() : RandomX proof-of-work does not match nBits"));
 
@@ -4616,6 +4616,8 @@ static void ProcessGetData(CNode* pfrom)
 {
     CRITICAL_BLOCK(cs_main)
     {
+        bool fServedBlock = false;
+        uint256 hashLastServed = 0;
         while (!pfrom->vRecvGetData.empty() && !fShutdown)
         {
             unsigned int nQueued;
@@ -4638,19 +4640,8 @@ static void ProcessGetData(CNode* pfrom)
                     CBlock block;
                     block.ReadFromDisk((*mi).second, !pfrom->fClient);
                     pfrom->PushMessage("block", block);
-
-                    // The last block of a getblocks answer that was cut short:
-                    // tell the peer about our tip right after it, so it asks
-                    // for the next part. It does not have the tip, asks for
-                    // it, finds it an orphan and sends getblocks from where it
-                    // is -- what every 1.2.x node already does.
-                    if (inv.hash == pfrom->hashContinue)
-                    {
-                        vector<CInv> vInv;
-                        vInv.push_back(CInv(MSG_BLOCK, hashBestChain));
-                        pfrom->PushMessage("inv", vInv);
-                        pfrom->hashContinue = 0;
-                    }
+                    fServedBlock = true;
+                    hashLastServed = inv.hash;
                 }
             }
             else if (inv.type == MSG_CHATREC)
@@ -4669,6 +4660,22 @@ static void ProcessGetData(CNode* pfrom)
                         pfrom->PushMessage(inv.GetCommand(), (*mi).second);
                 }
             }
+        }
+
+        // A batch of blocks that did not end at our tip ends with an inv of
+        // the tip. A 1.2.x node does not have it, or holds it as an orphan,
+        // and either way sends getblocks from where it now is: that is how a
+        // getblocks answer cut at MAX_GETBLOCKS_RESULTS continues. This used
+        // to be sent only after one block (the 500th of the last answer), and
+        // a sync whose connection was replaced mid-round could lose it for
+        // good: the old node asks nothing on its own. Every batch end comes
+        // after the peer has the batch, so the getblocks it answers with is a
+        // new question (a repeat is dropped by the peer itself). A peer in
+        // step asks for our tip, which is the last block, and gets no inv.
+        if (fServedBlock && pfrom->vRecvGetData.empty() && hashLastServed != hashBestChain)
+        {
+            vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
+            pfrom->PushMessage("inv", vTip);
         }
     }
 }
@@ -4708,10 +4715,9 @@ static void ServeGetBlocks(CNode* pfrom, CBlockLocator& locator, const uint256& 
         }
         if (--nLimit <= 0)
         {
-            // When this one is asked for, the peer is told to come back for
-            // more: see hashContinue in ProcessGetData.
+            // The peer comes back for the rest after the tip inv that ends
+            // the batch it fetches (ProcessGetData).
             if (LogAcceptsCategory("net")) printf("  getblocks stopping at limit %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
-            pfrom->hashContinue = pindex->GetBlockHash();
             break;
         }
     }
@@ -5022,10 +5028,24 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         bool fOnlyPeer = false;
         CRITICAL_BLOCK(cs_vNodes)
             fOnlyPeer = (vNodes.size() <= 1);
-        if ((!fAskedForBlocks || fOnlyPeer) && !pfrom->fClient)
+        // Also ask a peer that says it is ahead of us, whoever else we
+        // have: a node behind its peers used to wait for the next block to
+        // be announced before it asked anybody.
+        if ((!fAskedForBlocks || fOnlyPeer || pfrom->nStartingHeight > nBestHeight) && !pfrom->fClient)
         {
             fAskedForBlocks = true;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
+        }
+
+        // A peer behind us gets our tip. A 1.2.x node turns it into a
+        // getblocks on this connection (orphan path, or ask, receive, then
+        // orphan path), which restarts a sync whose continuation went down
+        // with an earlier connection: its own version-time getblocks is
+        // skipped while the old connection is still draining.
+        if (!pfrom->fClient && pfrom->nStartingHeight >= 0 && pfrom->nStartingHeight < nBestHeight)
+        {
+            vector<CInv> vTip(1, CInv(MSG_BLOCK, hashBestChain));
+            pfrom->PushMessage("inv", vTip);
         }
 
         // Introduce ourselves and hand over the .btf peers that answered us.

@@ -150,8 +150,10 @@ static const int          BTF_INCOMPLETE_MESSAGE_TIMEOUT_SECS = 2 * 60;
 #define BTF_MAX_INV_SZ 50000   // a bench build may lower it to exercise the cut
 #endif
 static const unsigned int MAX_INV_SZ = BTF_MAX_INV_SZ;
-// Block hashes one getblocks answer offers. The rest of the chain follows when
-// the peer asks for the last of them: see hashContinue.
+// Block hashes one getblocks answer offers. The rest of the chain follows
+// because every batch of blocks we serve ends with an inv of our tip when the
+// last block was not the tip (ProcessGetData), which a 1.2.x node turns into
+// its next getblocks.
 static const int          MAX_GETBLOCKS_RESULTS = 500;
 // Hashes in a block locator. One built by CBlockLocator::Set has about 10 +
 // log2(height) of them, so 101 is far past any real chain.
@@ -839,10 +841,6 @@ public:
     // from the front as it drains (ProcessGetData in main.cpp). Message thread
     // only, under cs_vRecv.
     deque<CInv> vRecvGetData;
-    // The last block of a getblocks answer cut at MAX_GETBLOCKS_RESULTS. When
-    // the peer asks for it, it is told of our tip as well, which makes it ask
-    // for the next part. Bitcoin's continuation, understood by every 1.2.x node.
-    uint256 hashContinue;
     // A getblocks that arrived while the send buffer was full, answered once it
     // has room. Only the latest is kept: a newer locator supersedes the older.
     bool fGetBlocksPending;
@@ -923,7 +921,6 @@ public:
     CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
         : setInventoryKnown(MAX_INVENTORY_KNOWN)
     {
-        hashContinue = 0;
         fGetBlocksPending = false;
         hashGetBlocksStop = 0;
         fRecvMorePending = false;

@@ -12876,16 +12876,85 @@ static int RunP2PDoSSelfTest()
             CRITICAL_BLOCK(cs_mapRelay)
                 mapRelay.erase(invBig);
 
-            // The block that ends a cut getblocks answer brings an inv of our tip.
-            CNode* r = P2PDoSPeer();
-            r->hashContinue = hashGenesisBlock;
-            CDataStream ssBlock(SER_NETWORK);
-            ssBlock << std::vector<CInv>(1, CInv(MSG_BLOCK, hashGenesisBlock));
-            P2PDoSProcess(r, "getdata", ssBlock);
-            std::vector<std::string> vCmd = P2PDoSSent(*r);
-            nFail += Check(vCmd.size() == 2 && vCmd[0] == "block" && vCmd[1] == "inv" && r->hashContinue == 0,
-                           "the hashContinue block is followed by an inv of the tip") ? 0 : 1;
-            delete r;
+            // A batch of blocks that does not end at our tip ends with an inv
+            // of the tip; one that does, does not. The only block on disk
+            // here is genesis, so the tip is pretended for the first case.
+            {
+                uint256 hashBestSaved = hashBestChain;
+                hashBestChain = uint256(0xbe57);
+                CNode* r = P2PDoSPeer();
+                CDataStream ssBlock(SER_NETWORK);
+                ssBlock << std::vector<CInv>(1, CInv(MSG_BLOCK, hashGenesisBlock));
+                P2PDoSProcess(r, "getdata", ssBlock);
+                std::vector<std::string> vCmd = P2PDoSSent(*r);
+                bool fInvOfTip = false;
+                if (vCmd.size() == 2 && vCmd[1] == "inv")
+                {
+                    unsigned int nHdr = CMessageHeader::SizeOnWire(r->vSend.GetVersion());
+                    std::vector<unsigned int> vSizes;
+                    P2PDoSSent(*r, &vSizes);
+                    size_t nInvAt = nHdr + vSizes[0] + nHdr;
+                    CDataStream ssInv(r->vSend.begin() + nInvAt, r->vSend.end(), SER_NETWORK, r->vSend.GetVersion());
+                    std::vector<CInv> vInv;
+                    ssInv >> vInv;
+                    fInvOfTip = vInv.size() == 1 && vInv[0].hash == uint256(0xbe57);
+                }
+                nFail += Check(vCmd.size() == 2 && vCmd[0] == "block" && fInvOfTip,
+                               "a batch of blocks that does not end at our tip is followed by an inv of the tip") ? 0 : 1;
+                delete r;
+                hashBestChain = hashBestSaved;
+
+                CNode* t = P2PDoSPeer();
+                CDataStream ssTip(SER_NETWORK);
+                ssTip << std::vector<CInv>(1, CInv(MSG_BLOCK, hashGenesisBlock));
+                P2PDoSProcess(t, "getdata", ssTip);
+                vCmd = P2PDoSSent(*t);
+                nFail += Check(vCmd.size() == 1 && vCmd[0] == "block",
+                               "a peer that asks for our tip gets the block and no inv") ? 0 : 1;
+                delete t;
+            }
+
+            // At version time: a peer behind us is told our tip, and a peer
+            // ahead of us is asked for blocks even when we have other peers.
+            {
+                std::vector<CNode*> vSavedNodes;
+                CRITICAL_BLOCK(cs_vNodes)
+                    vSavedNodes.swap(vNodes);
+                CNode* other1 = P2PDoSPeer();
+                CNode* other2 = P2PDoSPeer();
+                CRITICAL_BLOCK(cs_vNodes)
+                {
+                    vNodes.push_back(other1);
+                    vNodes.push_back(other2);
+                }
+                int nBestHeightSaved = nBestHeight;
+                nBestHeight = 100;
+                int nHeights[3] = { 40, 100, 200 };
+                bool fTipInv[3], fGetBlocks[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    CNode* v = new CNode(INVALID_SOCKET, CAddress("127.0.0.1"), true);
+                    v->vSend.clear();
+                    CDataStream ssVer(SER_NETWORK);
+                    ssVer << (int)VERSION << (uint64)NODE_NETWORK << (int64)GetAdjustedTime()
+                          << CAddress("127.0.0.1") << nHeights[i] << std::string("1.2.32");
+                    P2PDoSProcess(v, "version", ssVer);
+                    v->vSend.SetVersion(VERSION);
+                    std::vector<std::string> vCmd = P2PDoSSent(*v);
+                    fTipInv[i] = std::find(vCmd.begin(), vCmd.end(), "inv") != vCmd.end();
+                    fGetBlocks[i] = std::find(vCmd.begin(), vCmd.end(), "getblocks") != vCmd.end();
+                    delete v;
+                }
+                nBestHeight = nBestHeightSaved;
+                CRITICAL_BLOCK(cs_vNodes)
+                    vNodes.swap(vSavedNodes);
+                delete other1;
+                delete other2;
+                nFail += Check(fTipInv[0] && !fTipInv[1] && !fTipInv[2],
+                               "at version time a peer behind us, and only that peer, is sent an inv of our tip") ? 0 : 1;
+                nFail += Check(fGetBlocks[2] && !fGetBlocks[1],
+                               "a peer ahead of us is asked for blocks though we have other peers") ? 0 : 1;
+            }
         }
 
         // ---- H2: getblocks answers at most 500 and says where to continue
@@ -12916,15 +12985,15 @@ static int RunP2PDoSSelfTest()
             P2PDoSProcess(p, "getblocks", ss);
             nFail += Check(p->vInventoryToSend.size() == (size_t)MAX_GETBLOCKS_RESULTS,
                            "a getblocks from far behind gets 500 hashes, not the whole chain") ? 0 : 1;
-            nFail += Check(p->hashContinue == p500->GetBlockHash(),
-                           "and the 500th is remembered as where to continue") ? 0 : 1;
+            nFail += Check(p->vInventoryToSend.back().hash == p500->GetBlockHash(),
+                           "and they are the 500 after the locator, in order") ? 0 : 1;
 
             CDataStream ssStop(SER_NETWORK);
             ssStop << CBlockLocator(vHave) << vMade[11]->GetBlockHash();
             CNode* s = P2PDoSPeer();
             P2PDoSProcess(s, "getblocks", ssStop);
-            nFail += Check(s->vInventoryToSend.size() == 10 && s->hashContinue == 0,
-                           "hashStop still ends the answer early, with nothing to continue") ? 0 : 1;
+            nFail += Check(s->vInventoryToSend.size() == 10,
+                           "hashStop still ends the answer early") ? 0 : 1;
             delete s;
 
             CNode* q = P2PDoSPeer();
