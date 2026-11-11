@@ -87,10 +87,13 @@ int nCheckBlocksOnLoad = 288;
 // The repair runs in LoadBlockIndex() below, once that read-only handle and its
 // cursor are closed.
 CBlockIndex* pindexBadChainFork = NULL;
+CBlockIndex* pindexBadChainFirst = NULL;
 CBlockIndex* pindexBest = NULL;
 
 map<uint256, CBlock*> mapOrphanBlocks;
 multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
+// What the blocks in mapOrphanBlocks take, as serialized.
+unsigned int nOrphanBlockBytes = 0;
 
 map<uint256, CDataStream*> mapOrphanTransactions;
 multimap<uint256, CDataStream*> mapOrphanTransactionsByPrev;
@@ -225,10 +228,12 @@ void SetChainWork(CBlockIndex* pindex)
 {
     pindex->nChainWork = GetBlockWork(pindex->nBits);
     pindex->fOffCheckpoint = false;
+    pindex->fFailed = false;
     if (pindex->pprev)
     {
         pindex->nChainWork += pindex->pprev->nChainWork;
         pindex->fOffCheckpoint = pindex->pprev->fOffCheckpoint;
+        pindex->fFailed = pindex->pprev->fFailed;
     }
     MapCheckpoints::const_iterator mi = mapCheckpoints.find(pindex->nHeight);
     if (mi != mapCheckpoints.end() && pindex->phashBlock && (*mi).second != pindex->GetBlockHash())
@@ -245,11 +250,54 @@ std::string ChainWorkToString(const uint256& nWork)
 // Whether pindexNew should replace pindexOld as the best chain.
 bool IsBetterChain(const CBlockIndex* pindexNew, const CBlockIndex* pindexOld)
 {
-    if (pindexNew == NULL || pindexNew->fOffCheckpoint)
+    if (pindexNew == NULL || pindexNew->fOffCheckpoint || pindexNew->fFailed)
         return false;
-    if (pindexOld == NULL || pindexOld->fOffCheckpoint)
+    if (pindexOld == NULL || pindexOld->fOffCheckpoint || pindexOld->fFailed)
         return true;
     return pindexNew->nChainWork > pindexOld->nChainWork;
+}
+
+std::vector<CBlockIndex*> MarkBlockFailed(CBlockIndex* pindexBad)
+{
+    std::vector<CBlockIndex*> vMarked;
+    if (pindexBad == NULL)
+        return vMarked;
+    if (!pindexBad->fFailed)
+    {
+        pindexBad->fFailed = true;
+        vMarked.push_back(pindexBad);
+    }
+    // Every descendant, whichever branch it is on: parents before children,
+    // so one pass in height order carries the mark all the way down.
+    vector<pair<int, CBlockIndex*> > vByHeight;
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        if ((*mi).second->nHeight > pindexBad->nHeight)
+            vByHeight.push_back(make_pair((*mi).second->nHeight, (*mi).second));
+    sort(vByHeight.begin(), vByHeight.end());
+    for (unsigned int i = 0; i < vByHeight.size(); i++)
+    {
+        CBlockIndex* pindex = vByHeight[i].second;
+        if (!pindex->fFailed && pindex->pprev && pindex->pprev->fFailed)
+        {
+            pindex->fFailed = true;
+            vMarked.push_back(pindex);
+        }
+    }
+    printf("MarkBlockFailed() : block %s at height %d failed, %d block(s) marked\n",
+           pindexBad->GetBlockHash().ToString().substr(0,14).c_str(), pindexBad->nHeight, (int)vMarked.size());
+    return vMarked;
+}
+
+// Take the records of marked blocks off the disk index, with no transaction
+// open on txdb. A record that stays (a failed erase) only means the block is
+// read back at the next start, unmarked, and has to fail again. No record left
+// on disk names one of them as its parent or its next block: every descendant
+// is marked too, and none of them is on the best chain (a block that was is
+// disconnected first, which clears its parent's next).
+static void EraseFailedFromDiskIndex(CTxDB& txdb, const std::vector<CBlockIndex*>& vMarked)
+{
+    for (unsigned int i = 0; i < vMarked.size(); i++)
+        txdb.EraseBlockIndex(vMarked[i]->GetBlockHash());
 }
 
 // The highest checkpoint whose block this node has.
@@ -308,10 +356,10 @@ bool fCheckpointWalkBack = false;
 bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew);
 
 // Only after a checkpoint walk back: a walk back for a tail that failed
-// verification leaves those blocks in the index, and they must come back
-// from peers, not from here. Every block in the index is on disk (AcceptBlock
-// writes it first), and Reorganize connects each one, so a candidate that
-// does not connect is dropped by Reorganize and the next one is tried.
+// verification marks those blocks failed, and they are never candidates.
+// Every block in the index is on disk (AcceptBlock writes it first), and
+// Reorganize connects each one, so a candidate that does not connect is
+// marked failed by Reorganize and the next one is tried.
 bool ActivateBestKnownChain()
 {
     if (!fCheckpointWalkBack)
@@ -330,15 +378,14 @@ bool ActivateBestKnownChain()
                 break;
             printf("ActivateBestKnownChain() : the index already has a better chain, height %d work %s\n",
                    pindexBestKnown->nHeight, ChainWorkToString(pindexBestKnown->nChainWork).c_str());
-            size_t nIndexBefore = mapBlockIndex.size();
             CTxDB txdb;
             txdb.TxnBegin();
             if (!Reorganize(txdb, pindexBestKnown))
             {
                 txdb.TxnAbort();
                 fRet = error("ActivateBestKnownChain() : Reorganize failed");
-                if (mapBlockIndex.size() == nIndexBefore)
-                    break;   // nothing was dropped, so the same candidate would come back
+                if (!pindexBestKnown->fFailed)
+                    break;   // nothing was marked, so the same candidate would come back
                 continue;
             }
             hashBestChain = pindexBestKnown->GetBlockHash();
@@ -2082,9 +2129,20 @@ void AddOrphanTx(const CDataStream& vMsg)
 //
 // Both maps have to be kept in step, and the CBlock itself has to be deleted:
 // mapOrphanBlocks owns it.
+void AddOrphanBlock(CBlock* pblock)
+{
+    if (!mapOrphanBlocks.insert(make_pair(pblock->GetHash(), pblock)).second)
+        return;
+    mapOrphanBlocksByPrev.insert(make_pair(pblock->hashPrevBlock, pblock));
+    nOrphanBlockBytes += ::GetSerializeSize(*pblock, SER_NETWORK);
+}
+
+// By bytes as well as by count: 200 blocks of up to 1 MB each was 200 MB held
+// for any peer that cared to send them.
 void LimitOrphanBlocks(unsigned int nMaxOrphans)
 {
-    while (mapOrphanBlocks.size() > nMaxOrphans)
+    while (mapOrphanBlocks.size() > nMaxOrphans ||
+           (nOrphanBlockBytes > MAX_ORPHAN_BLOCK_BYTES && !mapOrphanBlocks.empty()))
     {
         uint256 randomhash;
         for (int i = 0; i < 4; i++)
@@ -2106,8 +2164,11 @@ void LimitOrphanBlocks(unsigned int nMaxOrphans)
         }
 
         mapOrphanBlocks.erase(it);
+        nOrphanBlockBytes -= min(nOrphanBlockBytes, (unsigned int)::GetSerializeSize(*pblock, SER_NETWORK));
         delete pblock;
     }
+    if (mapOrphanBlocks.empty())
+        nOrphanBlockBytes = 0;
 }
 
 void LimitOrphanTx(unsigned int nMaxOrphans)
@@ -2350,6 +2411,13 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     if (!IsStandard())
         return error("AcceptTransaction() : non-standard transaction %s", GetHash().ToString().substr(0,6).c_str());
 
+    // Relay policy: only what could go in the next block. A transaction locked
+    // for later took a pool slot until then, and no miner would take it (they
+    // ask the same question). Not on the way back from a reorganization
+    // (fCheckInputs false): those were in a block already.
+    if (fCheckInputs && !IsFinalForNextBlock(*this))
+        return error("AcceptTransaction() : %s is not final", GetHash().ToString().substr(0,6).c_str());
+
     // Do we already have it?
     uint256 hash = GetHash();
     CRITICAL_BLOCK(cs_mapTransactions)
@@ -2513,7 +2581,9 @@ bool ReplacementPaysEnough(int64 nNewFee, unsigned int nNewSize,
     {
         nOldFees += vOld[i].first;
         // Per byte, compared without division: new/newsize > old/oldsize.
-        if (nNewFee * (int64)vOld[i].second <= vOld[i].first * (int64)nNewSize)
+        // In big numbers: a fee near MAX_MONEY times a size past about
+        // 4,400 bytes is beyond int64.
+        if (CBigNum(nNewFee) * CBigNum(vOld[i].second) <= CBigNum(vOld[i].first) * CBigNum(nNewSize))
         {
             whyOut = "the replacement pays no more per byte than what it replaces";
             return false;
@@ -2578,12 +2648,63 @@ bool CTransaction::RemoveFromMemoryPool()
     // Remove transaction from memory pool
     CRITICAL_BLOCK(cs_mapTransactions)
     {
-        foreach(const CTxIn& txin, vin)
-            mapNextTx.erase(txin.prevout);
-        mapTransactions.erase(GetHash());
+        // Only the spends that are this transaction's. Called for every
+        // transaction of a block, most of them never in this pool, it erased
+        // whatever spend of the same outpoint the pool held: the conflicting
+        // transaction stayed in mapTransactions with nothing in mapNextTx to
+        // say what it spent.
+        map<uint256, CTransaction>::iterator mt = mapTransactions.find(GetHash());
+        if (mt != mapTransactions.end())
+        {
+            foreach(const CTxIn& txin, vin)
+            {
+                map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(txin.prevout);
+                if (mi != mapNextTx.end() && mi->second.ptx == &mt->second)
+                    mapNextTx.erase(mi);
+            }
+            mapTransactions.erase(mt);
+        }
         nTransactionsUpdated++;
     }
     return true;
+}
+
+void RemoveConflictsFromMemoryPool(const CTransaction& tx)
+{
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        uint256 hash = tx.GetHash();
+        vector<uint256> vQueue;
+        foreach(const CTxIn& txin, tx.vin)
+        {
+            map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(txin.prevout);
+            if (mi != mapNextTx.end() && mi->second.ptx && mi->second.ptx->GetHash() != hash)
+                vQueue.push_back(mi->second.ptx->GetHash());
+        }
+        // What spends a conflict's outputs goes with it: those outputs will
+        // never exist. Breadth first, each child found before its parent goes.
+        set<uint256> setSeen;
+        for (unsigned int i = 0; i < vQueue.size(); i++)
+        {
+            if (!setSeen.insert(vQueue[i]).second)
+                continue;
+            map<uint256, CTransaction>::iterator mt = mapTransactions.find(vQueue[i]);
+            if (mt == mapTransactions.end())
+                continue;
+            for (unsigned int n = 0; n < mt->second.vout.size(); n++)
+            {
+                map<COutPoint, CInPoint>::iterator mi = mapNextTx.find(COutPoint(vQueue[i], n));
+                if (mi != mapNextTx.end() && mi->second.ptx)
+                    vQueue.push_back(mi->second.ptx->GetHash());
+            }
+            if (LogAcceptsCategory("net"))
+                printf("RemoveConflictsFromMemoryPool(): %s conflicts with %s in a block, removed\n",
+                       vQueue[i].ToString().substr(0,6).c_str(), hash.ToString().substr(0,6).c_str());
+            // A copy: RemoveFromMemoryPool erases the entry it is called on.
+            CTransaction txOld = mt->second;
+            txOld.RemoveFromMemoryPool();
+        }
+    }
 }
 
 
@@ -2864,11 +2985,22 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
     // neither window -- the gap the time-warp attack drives through.
     // Bitcoin never fixed this on mainnet; here the window is 30 blocks,
     // which makes it a proportionally larger lever, so it is fixed.
+    //
+    // The walk stops at the first block, which has no parent. At the first
+    // retarget (height 29) a v2 window is one block longer than the chain, and
+    // this asserted: a branch from genesis with v2 timestamps, which anyone can
+    // send to a node without the newest checkpoint, aborted the process at its
+    // 30th block. No live chain has a v2-timestamped block 29, so stopping at
+    // genesis changes no block's validity; everywhere else the walk ends where
+    // it always did.
     int nWindow = RulesV2Active(pindexLast->nTime) ? nInterval : nInterval-1;
     const CBlockIndex* pindexFirst = pindexLast;
-    for (int i = 0; pindexFirst && i < nWindow; i++)
+    for (int i = 0; pindexFirst->pprev && i < nWindow; i++)
         pindexFirst = pindexFirst->pprev;
-    assert(pindexFirst);
+    // Cannot happen any more; if it ever does, no block meets this (AcceptBlock
+    // refuses a required nBits of 0) rather than the process stopping.
+    if (pindexFirst == NULL)
+        return 0;
 
     // Limit adjustment step
     unsigned int nActualTimespan = pindexLast->nTime - pindexFirst->nTime;
@@ -3062,8 +3194,14 @@ static bool CoinCountedUnderRulesV4(const CTxIndex& txindex, bool fUnmined)
 }
 
 bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee, unsigned int nBlockTime,
-                                 unsigned int* pnP2SHSigOps, const CBlockIndex* pindexPrev)
+                                 unsigned int* pnP2SHSigOps, const CBlockIndex* pindexPrev, bool* pfLocalError)
 {
+    // A failure that is this node's (a read or write that did not work), not
+    // the transaction's: the block it is in must not be marked failed.
+    struct LocalFailure
+    {
+        static bool Set(bool* pf, bool fRet) { if (pf) *pf = true; return fRet; }
+    };
     unsigned int nRulesTime = nBlockTime ? nBlockTime : (unsigned int)GetAdjustedTime();
     bool fStrictSigs = RulesV2Active(nRulesTime);
     bool fRulesV3 = RulesV3Active(nRulesTime);
@@ -3095,6 +3233,9 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                 // Read txindex from txdb
                 fFound = txdb.ReadTxIndex(prevout.hash, txindex);
             }
+            if (!fFound && fBlock && !txdb.LastReadNotFound())
+                return LocalFailure::Set(pfLocalError, error("ConnectInputs() : %s could not read the index entry of prev tx %s",
+                                                             GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()));
             if (!fFound && (fBlock || fMiner))
                 return fMiner ? false : error("ConnectInputs() : %s prev tx %s index entry not found", GetHash().ToString().substr(0,6).c_str(),  prevout.hash.ToString().substr(0,6).c_str());
 
@@ -3116,7 +3257,8 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             {
                 // Get prev tx from disk
                 if (!txPrev.ReadFromDisk(txindex.pos))
-                    return error("ConnectInputs() : %s ReadFromDisk prev tx %s failed", GetHash().ToString().substr(0,6).c_str(),  prevout.hash.ToString().substr(0,6).c_str());
+                    return LocalFailure::Set(pfLocalError, error("ConnectInputs() : %s ReadFromDisk prev tx %s failed",
+                                                                 GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()));
             }
 
             if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.vSpent.size())
@@ -3217,7 +3359,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
     {
         // Add transaction to disk index
         if (!txdb.AddTxIndex(*this, posThisTx, nHeight))
-            return error("ConnectInputs() : AddTxPos failed");
+            return LocalFailure::Set(pfLocalError, error("ConnectInputs() : AddTxPos failed"));
     }
     else if (fMiner)
     {
@@ -3293,8 +3435,10 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     return true;
 }
 
-bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool* pfLocalError)
 {
+    if (pfLocalError)
+        *pfLocalError = false;
     //// issue here: it doesn't know the version
     unsigned int nTxPos = pindex->nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size());
 
@@ -3326,7 +3470,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
         }
 
         if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false, 0, nTime, &nSigOps,
-                              pindex->pprev))
+                              pindex->pprev, pfLocalError))
             return false;
         if (nSigOps > MAX_BLOCK_SIGOPS)
             return error("ConnectBlock() : too many signature operations once redeem scripts are counted");
@@ -3404,18 +3548,22 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         CBlock block;
         if (!block.ReadFromDisk(pindex->nFile, pindex->nBlockPos, true))
             return error("Reorganize() : ReadFromDisk for connect failed");
-        if (!block.ConnectBlock(txdb, pindex))
+        bool fLocalError = false;
+        if (!block.ConnectBlock(txdb, pindex, &fLocalError))
         {
-            // Invalid block, delete the rest of this branch
             txdb.TxnAbort();
-            for (int j = i; j < vConnect.size(); j++)
-            {
-                CBlockIndex* pindex = vConnect[j];
-                pindex->EraseBlockFromDisk();
-                txdb.EraseBlockIndex(pindex->GetBlockHash());
-                mapBlockIndex.erase(pindex->GetBlockHash());
-                delete pindex;
-            }
+            // This node could not read or write something: nothing is known
+            // about the block. Nothing is marked, and the next block on this
+            // branch tries again.
+            if (fLocalError)
+                return error("Reorganize() : ConnectBlock failed on a local error, will retry");
+            // The block breaks a rule: mark it and everything built on it, on
+            // this branch or any other. 0.1.0 deleted the index entries from
+            // here to pindexNew, and any other child of a deleted block -- a
+            // side branch that forked at or after it -- kept a pprev into
+            // freed memory, which the next block on it, or the next
+            // reorganization, walked.
+            EraseFailedFromDiskIndex(txdb, MarkBlockFailed(pindex));
             return error("Reorganize() : ConnectBlock failed");
         }
 
@@ -3443,9 +3591,13 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     foreach(CTransaction& tx, vResurrect)
         tx.AcceptTransaction(txdb, false);
 
-    // Delete redundant memory transactions that are in the connected branch
+    // Delete redundant memory transactions that are in the connected branch,
+    // and whatever spends the same coins as they do, resurrected or not.
     foreach(CTransaction& tx, vDelete)
+    {
         tx.RemoveFromMemoryPool();
+        RemoveConflictsFromMemoryPool(tx);
+    }
 
     return true;
 }
@@ -3488,20 +3640,44 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
         else if (hashPrevBlock == hashBestChain)
         {
             // Adding to current best branch
-            if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
+            bool fLocalError = false;
+            bool fConnected = ConnectBlock(txdb, pindexNew, &fLocalError);
+            if (fConnected && !txdb.WriteHashBestChain(hash))
+            {
+                fConnected = false;
+                fLocalError = true;   // a write that failed says nothing about the block
+            }
+            if (!fConnected)
             {
                 txdb.TxnAbort();
-                pindexNew->EraseBlockFromDisk();
-                mapBlockIndex.erase(pindexNew->GetBlockHash());
-                delete pindexNew;
+                if (fLocalError)
+                {
+                    // As 0.1.0 did: forget the block, so the next copy a peer
+                    // sends is connected again. It was indexed a moment ago
+                    // and nothing can be built on it yet, so deleting the
+                    // entry leaves no pointer to it.
+                    pindexNew->EraseBlockFromDisk();
+                    mapBlockIndex.erase(hash);
+                    delete pindexNew;
+                    return error("AddToBlockIndex() : ConnectBlock failed on a local error, the block can come again");
+                }
+                // The block breaks a rule. Kept in the index, marked, like a
+                // block that fails in Reorganize: nothing is accepted on top
+                // of it, and a copy sent again is "already have" instead of
+                // connected again. Its record was in the transaction just
+                // aborted, so a restart forgets it.
+                MarkBlockFailed(pindexNew);
                 return error("AddToBlockIndex() : ConnectBlock failed");
             }
             txdb.TxnCommit();
             pindexNew->pprev->pnext = pindexNew;
 
-            // Delete redundant memory transactions
+            // Delete redundant memory transactions, and what conflicts with them
             foreach(CTransaction& tx, vtx)
+            {
                 tx.RemoveFromMemoryPool();
+                RemoveConflictsFromMemoryPool(tx);
+            }
         }
         else
         {
@@ -3509,6 +3685,14 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
             if (!Reorganize(txdb, pindexNew))
             {
                 txdb.TxnAbort();
+                // Not marked (a local error, or a block before it that could
+                // not be read): it stays a candidate and the next block on
+                // this branch tries again. Its own record went with the
+                // aborted transaction; write it again, or a later successful
+                // reorganization would leave the disk index naming a block it
+                // has no record of.
+                if (!pindexNew->fFailed)
+                    txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
                 return error("AddToBlockIndex() : Reorganize failed");
             }
         }
@@ -3552,7 +3736,7 @@ static bool DoS(int* pnDoS, int nScore, bool fRet)
 bool fFuzzSkipPoW = false;
 #endif
 
-bool CBlock::CheckBlock(int* pnDoS) const
+bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
 {
     if (pnDoS)
         *pnDoS = 0;
@@ -3564,7 +3748,7 @@ bool CBlock::CheckBlock(int* pnDoS) const
         return DoS(pnDoS, 100, error("CheckBlock() : size limits failed"));
 
     // Check timestamp
-    if (nTime > GetAdjustedTime() + 2 * 60 * 60)
+    if (fCheckTime && nTime > GetAdjustedTime() + 2 * 60 * 60)
         return error("CheckBlock() : block timestamp too far in the future");
 
     // First transaction must be coinbase, the rest must not be
@@ -3605,8 +3789,17 @@ bool CBlock::CheckBlock(int* pnDoS) const
         setTxHashes.insert(hashTx);
     }
 
-    // Check proof of work matches claimed amount (memory-hard RandomX PoW)
-    if (CBigNum().SetCompact(nBits) > bnProofOfWorkLimit)
+    // Check proof of work matches claimed amount (memory-hard RandomX PoW).
+    // A zero or negative target (the sign bit of the compact form) is no
+    // target: getuint256() drops the sign, so the hash was compared with its
+    // magnitude. AcceptBlock's exact nBits match already refused such a block,
+    // since GetCompact never makes one; here it is refused before anything
+    // else looks at it, orphans included.
+    CBigNum bnTarget;
+    bnTarget.SetCompact(nBits);
+    if (bnTarget <= 0)
+        return DoS(pnDoS, 100, error("CheckBlock() : nBits is not a positive target"));
+    if (bnTarget > bnProofOfWorkLimit)
         return DoS(pnDoS, 100, error("CheckBlock() : nBits below minimum work"));
 #ifdef BITFLASH_FUZZ
     if (!fFuzzSkipPoW)
@@ -3644,6 +3837,64 @@ bool IsFinalAfter(const CTransaction& tx, const CBlockIndex* pindexPrev)
     return tx.IsFinalAt(pindexPrev->nHeight + 1, pindexPrev->GetMedianTimePast(), RulesV5Active(pindexPrev));
 }
 
+bool IsFinalForBlock(const CTransaction& tx, const CBlockIndex* pindexPrev, unsigned int nBlockTime)
+{
+    // v3 by the template's own time, as AcceptBlock; v5's unsigned nLockTime
+    // follows pindexPrev's median time past (IsFinalAfter), which no template
+    // time moves.
+    if (!pindexPrev || !RulesV3Active(nBlockTime))
+        return tx.IsFinal();
+    return IsFinalAfter(tx, pindexPrev);
+}
+
+int RuleSetAt(unsigned int nTime)
+{
+    return (RulesV2Active(nTime) ? 1 : 0) | (RulesV3Active(nTime) ? 2 : 0) | (RulesV4Active(nTime) ? 4 : 0);
+}
+
+// Orphan blocks (their parent is not here) only have to meet their own nBits
+// to be held, so one at the floor cost next to nothing to make. Once this node
+// is synced, an orphan whose target is more than ORPHAN_WORK_SLACK times
+// easier than the tip's is not held, with more room the later it is dated than
+// the tip (a stale tip while the network's difficulty fell). The allowance is
+// generous on purpose -- four times per two hours, faster than the clamped
+// retarget eases an honest chain -- and it is not a bound anyone relies on: a
+// refused orphan only costs a re-request, because the request that continues
+// the sync is sent either way (ProcessBlock), and its parent's blocks then
+// arrive in order and are judged as any other. Not used while syncing, nor
+// while the best chain lacks the newest checkpoint: the tip is then whatever
+// the node was handed, and must not be the yardstick.
+static const int64 ORPHAN_EASE_SECONDS = 2 * 3600;
+
+bool OrphanTargetWithinReach(unsigned int nBits, unsigned int nTime, unsigned int nRefBits, unsigned int nRefTime)
+{
+    CBigNum bnTarget;
+    bnTarget.SetCompact(nBits);
+    CBigNum bnEasiest;
+    bnEasiest.SetCompact(nRefBits);
+    if (bnTarget <= 0 || bnEasiest <= 0)
+        return false;
+    bnEasiest *= ORPHAN_WORK_SLACK;
+    for (int64 n = ((int64)nTime - (int64)nRefTime) / ORPHAN_EASE_SECONDS; n > 0 && bnEasiest < bnProofOfWorkLimit; n--)
+        bnEasiest *= 4;
+    if (bnEasiest > bnProofOfWorkLimit)
+        bnEasiest = bnProofOfWorkLimit;
+    return bnTarget <= bnEasiest;
+}
+
+bool OrphanBlockWorthKeeping(const CBlock& block)
+{
+    if (pindexBest == NULL || pindexBest->fOffCheckpoint || IsInitialBlockDownload())
+        return true;
+    if (!mapCheckpoints.empty())
+    {
+        map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(mapCheckpoints.rbegin()->second);
+        if (mi == mapBlockIndex.end() || !(*mi).second->IsInMainChain())
+            return true;
+    }
+    return OrphanTargetWithinReach(block.nBits, block.nTime, pindexBest->nBits, pindexBest->nTime);
+}
+
 bool CBlock::AcceptBlock(int* pnDoS)
 {
     if (pnDoS)
@@ -3658,6 +3909,11 @@ bool CBlock::AcceptBlock(int* pnDoS)
     if (mi == mapBlockIndex.end())
         return error("AcceptBlock() : prev block not found");
     CBlockIndex* pindexPrev = (*mi).second;
+
+    // Nothing on top of a block that failed to connect (MarkBlockFailed).
+    if (pindexPrev->fFailed)
+        return error("AcceptBlock() : block %s builds on a block that failed to connect",
+                     hash.ToString().substr(0,14).c_str());
 
     // Checkpoints (see main.h): not on a chain that contradicts one, and not
     // a fork from below the newest one this node has.
@@ -3679,7 +3935,8 @@ bool CBlock::AcceptBlock(int* pnDoS)
                                     pindexPrev->nHeight + 1));
 
     // Check proof of work
-    if (nBits != GetNextWorkRequired(pindexPrev))
+    unsigned int nBitsRequired = GetNextWorkRequired(pindexPrev);
+    if (nBitsRequired == 0 || nBits != nBitsRequired)
         return DoS(pnDoS, 100, error("AcceptBlock() : incorrect proof of work"));
 
     // Rules v2: the coinbase scriptSig starts with the block height (BIP34).
@@ -3707,6 +3964,24 @@ bool CBlock::AcceptBlock(int* pnDoS)
                 return DoS(pnDoS, 10, error("AcceptBlock() : transaction %s is not final at height %d",
                                             tx.GetHash().ToString().substr(0,10).c_str(), nHeight));
     }
+
+    // Side branches (consensus review 5, DoS review M9) are stored whatever
+    // their work, deliberately. A block that does not become the best chain is
+    // written to disk after only the checks above; its transactions are
+    // checked when its branch takes over. A rule refusing such blocks by work
+    // was tried and taken out: without headers it judges a block by the work
+    // before it, never by what follows, so it could refuse a block of a branch
+    // that later carries more work and leave this node on the lighter chain
+    // for good -- a reorganization limit by another name, and there is none.
+    // The real fix is headers-first sync: take a branch's headers, and
+    // download a body only once its header chain has more work than ours.
+    // Until then the disk a weak branch can take is bounded by elapsed time:
+    // no branch runs its difficulty down faster than its timestamps allow,
+    // and rules v5 removes the unsigned-timespan wrap that lets a window ease
+    // when a boundary block's time goes backwards (consensus review 2).
+    if (LogAcceptsCategory("net") && pindexPrev != pindexBest)
+        printf("AcceptBlock() : block %s at height %d does not build on the tip, nBits %08x (tip %08x), stored\n",
+               hash.ToString().substr(0,14).c_str(), pindexPrev->nHeight + 1, nBits, pindexBest ? pindexBest->nBits : 0);
 
     // Write block to history file
     unsigned int nFile;
@@ -3759,6 +4034,22 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,14).c_str());
     }
 
+    // An orphan only has to meet its own nBits, so one at the floor costs next
+    // to nothing; once synced, held only when its target is within reach of
+    // the tip's (OrphanBlockWorthKeeping). Before CheckBlock: that is a
+    // RandomX hash, this is not. Not held is not ignored: the request that
+    // continues the sync (below, for a held orphan) goes out all the same, so
+    // a real chain this filter misjudges still arrives, in order.
+    if (!mapBlockIndex.count(pblock->hashPrevBlock) && !OrphanBlockWorthKeeping(*pblock))
+    {
+        uint256 hashOrphanRoot = GetOrphanRoot(pblock);
+        delete pblock;
+        if (pfrom)
+            pfrom->PushGetBlocks(pindexBest, hashOrphanRoot);
+        return error("ProcessBlock() : orphan block %s has a target far easier than the tip's, not held",
+                     hash.ToString().substr(0,14).c_str());
+    }
+
     // Preliminary checks
     if (!pblock->CheckBlock(pnDoS))
     {
@@ -3772,8 +4063,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
         printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,14).c_str());
         if (pfrom)
             nBlocksWithoutParent++;
-        mapOrphanBlocks.insert(make_pair(hash, pblock));
-        mapOrphanBlocksByPrev.insert(make_pair(pblock->hashPrevBlock, pblock));
+        AddOrphanBlock(pblock);
 
         // Read what we need out of pblock before trimming: eviction picks at
         // random and is perfectly entitled to pick the block just inserted,
@@ -3809,7 +4099,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
             CBlock* pblockOrphan = (*mi).second;
             if (pblockOrphan->AcceptBlock())
                 vWorkQueue.push_back(pblockOrphan->GetHash());
-            mapOrphanBlocks.erase(pblockOrphan->GetHash());
+            if (mapOrphanBlocks.erase(pblockOrphan->GetHash()))
+                nOrphanBlockBytes -= min(nOrphanBlockBytes, (unsigned int)::GetSerializeSize(*pblockOrphan, SER_NETWORK));
             delete pblockOrphan;
         }
         mapOrphanBlocksByPrev.erase(hashPrev);
@@ -4018,7 +4309,9 @@ bool LoadBlockIndex(bool fAllowNew)
     if (pindexBadChainFork)
     {
         CBlockIndex* pindexFork = pindexBadChainFork;
+        CBlockIndex* pindexFirstBad = pindexBadChainFirst;
         pindexBadChainFork = NULL;
+        pindexBadChainFirst = NULL;
 
         printf("LoadBlockIndex() : *** moving best chain back to height %d, discarding %d block(s)\n",
                pindexFork->nHeight, nBestHeight - pindexFork->nHeight);
@@ -4065,6 +4358,26 @@ bool LoadBlockIndex(bool fAllowNew)
             hashBestChain = pindexBest->GetBlockHash();
             nBestHeight   = pindexBest->nHeight;
             printf("LoadBlockIndex() : now at height %d, will re-download from peers\n", nBestHeight);
+
+            // The blocks that failed the check, and all on top of them, are
+            // still in the index with all their work: mark them, or the next
+            // block a peer sends on top makes that branch the best again and
+            // Reorganize connects them without the check they just failed.
+            // Their records come off the disk index, so the next start does
+            // not read them back unmarked.
+            if (pindexFirstBad)
+            {
+                try
+                {
+                    CTxDB txdbErase;
+                    EraseFailedFromDiskIndex(txdbErase, MarkBlockFailed(pindexFirstBad));
+                    txdbErase.Close();
+                }
+                catch (const std::exception& e)
+                {
+                    printf("LoadBlockIndex() : could not take the failed blocks off the disk index: %s\n", e.what());
+                }
+            }
         }
         else
         {
@@ -5760,7 +6073,7 @@ bool BitcoinMiner(int nThreadId)
 
         // Collect the latest transactions into the block
         int64 nFees = 0;
-        bool fSelectedV4 = false;   // the rules the transactions were chosen under
+        int nSelectedRules = 0;     // the rules the transactions were chosen under (RuleSetAt)
         CRITICAL_BLOCK(cs_main)
         CRITICAL_BLOCK(cs_mapTransactions)
         {
@@ -5793,7 +6106,7 @@ bool BitcoinMiner(int nThreadId)
             // count at all, and one transaction over the cap in the pool made
             // every block it built one the network rejects.
             bool fSigOpsV4 = RulesV4Active(pblock->nTime);
-            fSelectedV4 = fSigOpsV4;
+            nSelectedRules = RuleSetAt(pblock->nTime);
             unsigned int nBlockSigOps = pblock->vtx[0].GetSigOpCount(fSigOpsV4);
             while (fFoundSomething && nBlockSize < MAX_BLOCK_SIZE)
             {
@@ -5803,7 +6116,9 @@ bool BitcoinMiner(int nThreadId)
                     if (vfAlreadyAdded[n])
                         continue;
                     CTransaction& tx = *vOrder[n];
-                    if (tx.IsCoinBase() || !IsFinalForNextBlock(tx))
+                    // Final as the block will be judged: by its own time, not
+                    // the clock's (they differ right at the v3 switch).
+                    if (tx.IsCoinBase() || !IsFinalForBlock(tx, pindexPrev, pblock->nTime))
                         continue;
                     unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
                     if (nBlockSize + nTxSize > MAX_BLOCK_SIZE)
@@ -5858,10 +6173,11 @@ bool BitcoinMiner(int nThreadId)
         pblock->hashMerkleRoot = pblock->BuildMerkleTree();
         // A later time, unless it would put the block under other rules than
         // its transactions were chosen under: it keeps the time it was built
-        // at then, which is still after the median time past.
+        // at then, which is still after the median time past. All the rule
+        // sets, not only v4: P2SH spends and finality change at v3.
         {
             unsigned int nNow = max(BlockTimeFloor(pindexPrev), GetAdjustedTime());
-            if (RulesV4Active(nNow) == fSelectedV4)
+            if (RuleSetAt(nNow) == nSelectedRules)
                 pblock->nTime = nNow;
         }
         pblock->nBits          = nBits;
@@ -5874,7 +6190,6 @@ bool BitcoinMiner(int nThreadId)
         // Keyed for the version this block's nTime selects. The first block
         // after the switch pays for the other dataset once.
         int nPoWVersion = PoWVersionAt(pblock->nTime);
-        bool fRulesV4Built = fSelectedV4;
         if (!RandomXFastReady(nPoWVersion))
         {
             unsigned int nThreads = std::thread::hardware_concurrency();
@@ -5971,8 +6286,8 @@ bool BitcoinMiner(int nThreadId)
                 pblock->nTime = max(BlockTimeFloor(pindexPrev), GetAdjustedTime());
                 if (PoWVersionAt(pblock->nTime) != nPoWVersion)
                     break;          // the switch happened under us: rebuild, keyed for v2
-                if (RulesV4Active(pblock->nTime) != fRulesV4Built)
-                    break;          // rules v4 switched on under us: rebuild under them
+                if (RuleSetAt(pblock->nTime) != nSelectedRules)
+                    break;          // a rule set (v2, v3, v4) switched on under us: rebuild under it
             }
         }
         RandomXDestroyMinerVM(rxvm);

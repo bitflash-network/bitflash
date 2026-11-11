@@ -123,6 +123,32 @@ bool AddBenchCheckpoint(const std::string& strArg);
 extern bool fCheckpointWalkBack;
 bool ActivateBestKnownChain();
 
+// A block that breaks a consensus rule when it is connected, or in the check
+// at load, is marked (CBlockIndex::fFailed) together with every block in the
+// index that descends from it; later ones inherit the mark in SetChainWork.
+// Never one that failed because this node could not read or write something
+// (ConnectBlock's pfLocalError), and never for the clock-dependent
+// future-time test. The entries stay in
+// mapBlockIndex -- deleting them left their other children pointing at freed
+// memory -- and their records come off the disk index, so a restart forgets
+// them and a peer can offer them again. Returns the entries newly marked.
+std::vector<CBlockIndex*> MarkBlockFailed(CBlockIndex* pindexBad);
+// Set at load: the oldest block of the best chain's tail that failed the
+// check there (CTxDB::LoadBlockIndex). The repair marks it once rolled back.
+extern CBlockIndex* pindexBadChainFirst;
+
+// Orphan blocks are held in memory, up to MAX_ORPHAN_BLOCKS of them and
+// MAX_ORPHAN_BLOCK_BYTES in all. Once the node is synced, an orphan whose
+// target is far easier than the tip's is not held (OrphanBlockWorthKeeping);
+// the request that continues the sync is sent either way.
+static const unsigned int MAX_ORPHAN_BLOCK_BYTES = 32 * 1000 * 1000;
+static const int ORPHAN_WORK_SLACK = 16;
+extern unsigned int nOrphanBlockBytes;
+class CBlock;
+bool OrphanTargetWithinReach(unsigned int nBits, unsigned int nTime, unsigned int nRefBits, unsigned int nRefTime);
+bool OrphanBlockWorthKeeping(const CBlock& block);
+void AddOrphanBlock(CBlock* pblock);
+
 
 
 
@@ -440,6 +466,18 @@ bool RetargetTimeAllowed(const CBlockIndex* pindexPrev, unsigned int nTime);
 // output is spent by its script alone, without signatures. The wallet and
 // relay go by this, not by the clock (see main.cpp).
 bool RulesV3LockedIn();
+// The same question for a block template: the block after pindexPrev, with
+// time nBlockTime. The rule follows the template's time, as AcceptBlock's
+// does, not the clock.
+bool IsFinalForBlock(const CTransaction& tx, const CBlockIndex* pindexPrev, unsigned int nBlockTime);
+// The rule sets a block with time nTime runs under, one bit each for v2, v3
+// and v4. A template whose time moves to another value has to be rebuilt:
+// its transactions were chosen under the old one.
+int RuleSetAt(unsigned int nTime);
+// Take out of the memory pool everything that spends an outpoint tx spends,
+// other than tx itself, and everything that builds on what is taken out.
+// Called for each transaction of a block that connects.
+void RemoveConflictsFromMemoryPool(const CTransaction& tx);
 // Rules v4 (BIP68): whether one input's relative lock is over in the block
 // after pindexPrev. fUnmined: the coin it spends is not in a block yet.
 class CTxIndex;
@@ -1212,7 +1250,8 @@ public:
     // pindexPrev: the block the one being built or connected follows (NULL:
     // the tip). Rules v4 measure relative locks against it.
     bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0, unsigned int nBlockTime=0,
-                       unsigned int* pnP2SHSigOps=NULL, const CBlockIndex* pindexPrev=NULL);
+                       unsigned int* pnP2SHSigOps=NULL, const CBlockIndex* pindexPrev=NULL,
+                       bool* pfLocalError=NULL);
     bool ClientConnectInputs();
 
     bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL);
@@ -1672,10 +1711,17 @@ public:
 
     int64 GetBlockValue(int nHeight, int64 nFees) const;
     bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex);
-    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex);
+    // pfLocalError, when given, is set when the failure came from this node
+    // (a database or block file that could not be read or written), not
+    // from the block breaking a rule. Only a rule violation marks a block
+    // failed (MarkBlockFailed); a local error leaves it to be tried again.
+    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool* pfLocalError=NULL);
     bool ReadFromDisk(const CBlockIndex* blockindex, bool fReadTransactions);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos);
-    bool CheckBlock(int* pnDoS=NULL) const;
+    // fCheckTime false skips the "too far in the future" test, which depends
+    // on the local clock: the check at load, with no peers yet, uses it so a
+    // machine that boots with a slow clock does not throw its tail away.
+    bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true) const;
     bool AcceptBlock(int* pnDoS=NULL);
 };
 
@@ -1714,6 +1760,11 @@ public:
     // contradicts a checkpoint.
     uint256 nChainWork;
     bool fOffCheckpoint;
+    // In memory only: this block, or one before it, broke a consensus rule --
+    // when connecting, or in the check at load (see MarkBlockFailed). A
+    // local error (a read or write that failed) never sets it. Never chosen
+    // as the best chain, and nothing is accepted on top of it.
+    bool fFailed;
 
 
     CBlockIndex()
@@ -1732,6 +1783,7 @@ public:
         nNonce         = 0;
         nChainWork     = 0;
         fOffCheckpoint = false;
+        fFailed        = false;
     }
 
     CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn, CBlock& block)
@@ -1750,6 +1802,7 @@ public:
         nNonce         = block.nNonce;
         nChainWork     = 0;
         fOffCheckpoint = false;
+        fFailed        = false;
     }
 
     uint256 GetBlockHash() const

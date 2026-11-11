@@ -305,6 +305,7 @@ static bool RebuildJob()
         // of this code and described it exactly. The fork has since been
         // deleted, so this carries it back rather than losing it.
         bool fSelectedV4 = false;   // the rules the transactions were chosen under
+        int nSelectedRules = 0;     // all of them (RuleSetAt): v3 changes P2SH and finality
         int64 nFees = 0;
         {
             CTxDB txdb("r");
@@ -326,6 +327,7 @@ static bool RebuildJob()
                 // are mined and submitted for real.
                 bool fSigOpsV4 = RulesV4Active(block.nTime);
                 fSelectedV4 = fSigOpsV4;
+                nSelectedRules = RuleSetAt(block.nTime);
                 unsigned int nBlockSigOps = block.vtx[0].GetSigOpCount(fSigOpsV4);
                 // Under MAX_BLOCK_SIZE, which CheckBlock holds every block
                 // to; this was MAX_SIZE / 2 (16 MB), and a memory pool past
@@ -349,7 +351,7 @@ static bool RebuildJob()
                         if (vfAlreadyAdded[n])
                             continue;
                         CTransaction& tx = *vOrder[n];
-                        if (tx.IsCoinBase() || !IsFinalForNextBlock(tx)) continue;
+                        if (tx.IsCoinBase() || !IsFinalForBlock(tx, pindexPrev, block.nTime)) continue;
                         map<uint256, CTxIndex> tmp(pool);
                         int64 nFeesTmp = nFees;
                         unsigned int nTxSigOps = tx.GetSigOpCount(fSigOpsV4);
@@ -412,14 +414,14 @@ static bool RebuildJob()
         {
             unsigned int nNow = max((unsigned int)BlockTimeFloor(pindexPrev),
                                     (unsigned int)GetAdjustedTime());
-            if (RulesV4Active(nNow) == fSelectedV4)
+            if (RuleSetAt(nNow) == nSelectedRules)
                 block.nTime = nNow;
         }
         // And after the share chain's median: a share timed before it is
         // refused, after the miner had been told it was accepted.
         if (fP2PoolMode && block.nTime < nShareMinTime)
         {
-            if (RulesV4Active(nShareMinTime) != fSelectedV4)
+            if (RuleSetAt(nShareMinTime) != nSelectedRules)
                 return false;
             block.nTime = nShareMinTime;
         }

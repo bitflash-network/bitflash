@@ -1709,6 +1709,13 @@ static json SpendContract(const CScript& contract, const swap::Contract& c, cons
     if (!VerifySignature(txFrom, tx, 0, 0, true, true))
         throw runtime_error(pSecret ? "the redeem does not verify -- is that the right secret?"
                                     : "the refund does not verify");
+    // The pool takes only what could go in the next block, by the rule in
+    // force (before rules v3 the old one: the lock height below the best
+    // height, one block later than the check above). Say so, rather than
+    // "the network refused it".
+    if (!pSecret && !IsFinalForNextBlock(tx))
+        throw runtime_error(strprintf("the refund is not final for the next block yet (lock %lld, chain at %d); try again after the next block",
+                                      (long long)c.nLockTime, nBestHeight));
 
     uint256 hash = tx.GetHash();
     CDataStream ssTx(SER_NETWORK);

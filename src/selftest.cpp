@@ -9413,6 +9413,21 @@ static CBlockIndex* V5IndexOf(const CBlock& b)
     return mi == mapBlockIndex.end() ? NULL : mi->second;
 }
 
+// A block that breaks a rule when connected stays in the index, marked failed
+// (MarkBlockFailed), and a copy sent again is "already have". This bench
+// switches the rules off within one process to offer the same block again,
+// which no node does; it forgets the refused entry first. Safe: the block was
+// refused on the direct-connect path, so nothing was built on it.
+static void V5ForgetRefused(const CBlock& b)
+{
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(b.GetHash());
+    if (mi == mapBlockIndex.end() || !mi->second->fFailed)
+        return;
+    CBlockIndex* pindex = mi->second;
+    mapBlockIndex.erase(mi);
+    delete pindex;
+}
+
 // -selftest=rules-v5: every rule of rules v5, each one with the rules off
 // (what this chain does today, unchanged) and on (through -benchrulesv5's
 // switch on testnet), and the switch itself.
@@ -9693,8 +9708,9 @@ static int RunRulesV5SelfTest()
             b.vtx.push_back(self);
             b.hashMerkleRoot = b.BuildMerkleTree();
             nBenchRulesV5Time = TV4;
-            nFail += Check(!b.AcceptBlock(&nDoS) && nBestHeight == 139 && V5IndexOf(b) == NULL,
+            nFail += Check(!b.AcceptBlock(&nDoS) && nBestHeight == 139 && (V5IndexOf(b) == NULL || V5IndexOf(b)->fFailed),
                            "v5 on: a block spending its own coinbase is refused") ? 0 : 1;
+            V5ForgetRefused(b);
             nBenchRulesV5Time = 0;
             nFail += Check(b.AcceptBlock() && nBestHeight == 140 && pindexBest == V5IndexOf(b),
                            "v5 off: the same block is accepted, as it always was") ? 0 : 1;
@@ -9712,6 +9728,7 @@ static int RunRulesV5SelfTest()
             nBenchRulesV5Time = TV4;
             nFail += Check(!b.AcceptBlock() && nBestHeight == 140,
                            "v5 on: spending pre-v4 CSFS outputs counts them, and 20085 is over the block's 20000") ? 0 : 1;
+            V5ForgetRefused(b);
             nBenchRulesV5Time = 0;
             nFail += Check(b.AcceptBlock() && nBestHeight == 141,
                            "v5 off: the same block is accepted, as it always was") ? 0 : 1;
@@ -10812,6 +10829,755 @@ static int WfSQLiteRollback(const std::string&, const std::string&)
     return nFail;
 }
 
+extern map<uint256, CBlock*> mapOrphanBlocks;
+extern multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
+
+// GetNextWorkRequired as it was before the walk stopped at genesis, with the
+// assert turned into fPastGenesis: the reference every real chain must still
+// match.
+static unsigned int OldGetNextWorkRequired(const CBlockIndex* pindexLast, bool& fPastGenesis)
+{
+    const unsigned int nTargetSpacing  = 2 * 60;
+    const unsigned int nInterval       = 30;
+    const unsigned int nTargetTimespan = nInterval * nTargetSpacing;
+    fPastGenesis = false;
+    if (pindexLast == NULL)
+        return bnProofOfWorkLimit.GetCompact();
+    if ((pindexLast->nHeight+1) % nInterval != 0)
+        return pindexLast->nBits;
+    int nWindow = RulesV2Active(pindexLast->nTime) ? nInterval : nInterval-1;
+    const CBlockIndex* pindexFirst = pindexLast;
+    for (int i = 0; pindexFirst && i < nWindow; i++)
+        pindexFirst = pindexFirst->pprev;
+    if (!pindexFirst)
+    {
+        fPastGenesis = true;
+        return 0;
+    }
+    unsigned int nActualTimespan = pindexLast->nTime - pindexFirst->nTime;
+    if (nActualTimespan < nTargetTimespan/4)
+        nActualTimespan = nTargetTimespan/4;
+    if (nActualTimespan > nTargetTimespan*4)
+        nActualTimespan = nTargetTimespan*4;
+    CBigNum bnNew;
+    bnNew.SetCompact(pindexLast->nBits);
+    bnNew *= nActualTimespan;
+    bnNew /= nTargetTimespan;
+    if (bnNew > bnProofOfWorkLimit)
+        bnNew = bnProofOfWorkLimit;
+    return bnNew.GetCompact();
+}
+
+// A chain of nLength made-up index entries (not in mapBlockIndex), times and
+// nBits as given.
+static void FakeChain(std::vector<CBlockIndex>& v, int nLength)
+{
+    v.clear();
+    v.resize(nLength);
+    for (int h = 0; h < nLength; h++)
+    {
+        v[h].nHeight = h;
+        v[h].pprev = h ? &v[h - 1] : NULL;
+    }
+}
+
+static unsigned int CompactOf(const CBigNum& bn)
+{
+    return bn.GetCompact();
+}
+
+// Consensus-adjacent safety fixes that need no data directory: the retarget
+// walk at genesis, the block template's rules, nBits in CheckBlock, the
+// replacement fee overflow, the failed-block mark, which side blocks and
+// orphans are kept, and the orphan pool's byte ceiling.
+static int RunConsensusSafetySelfTest()
+{
+    fflush(stdout);
+    printf("consensus-safety self-test\n");
+    int nFail = 0;
+    // The node's own log lines (CheckBlock's errors, MarkBlockFailed) go to a
+    // throwaway data directory, not the developer's.
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    std::vector<CBlockIndex*> vMade;
+    MapCheckpoints mapSaved = mapCheckpoints;
+    CBlockIndex* pindexBestSaved = pindexBest;
+    int nBestHeightSaved = nBestHeight;
+    const unsigned int nFloor  = bnProofOfWorkLimit.GetCompact();
+    const unsigned int nHard4  = CompactOf(bnProofOfWorkLimit / 4);
+    const unsigned int nHard16 = CompactOf(bnProofOfWorkLimit / 16);
+    const unsigned int nHard64 = CompactOf(bnProofOfWorkLimit / 64);
+    try
+    {
+        // ---- 1. GetNextWorkRequired at the first retarget
+        {
+            std::vector<CBlockIndex> v;
+            FakeChain(v, 30);
+            for (int h = 0; h < 30; h++)
+            {
+                v[h].nTime = RulesV2Time() + 1000 + 120 * h;
+                v[h].nBits = nFloor;
+            }
+            bool fPast = false;
+            OldGetNextWorkRequired(&v[29], fPast);
+            nFail += Check(fPast, "a v2-timestamped branch from genesis: block 29's window reaches past genesis (the old assert)") ? 0 : 1;
+            unsigned int nBits = GetNextWorkRequired(&v[29]);
+            CBigNum bn;
+            bn.SetCompact(nBits);
+            nFail += Check(nBits != 0 && bn > 0 && bn <= bnProofOfWorkLimit,
+                           "the new walk stops at genesis and gives a real target, no abort") ? 0 : 1;
+            CBigNum bnExpect;
+            bnExpect.SetCompact(nFloor);
+            bnExpect *= 29 * 120;
+            bnExpect /= 3600;
+            nFail += Check(nBits == bnExpect.GetCompact(), "measured over the 29 blocks there are") ? 0 : 1;
+
+            for (int h = 0; h < 30; h++)
+                v[h].nTime = RulesV2Time() - 100000 + 120 * h;
+            unsigned int nOld = OldGetNextWorkRequired(&v[29], fPast);
+            nFail += Check(!fPast && GetNextWorkRequired(&v[29]) == nOld,
+                           "a pre-v2 block 29 lands on genesis, as it always did, with the same answer") ? 0 : 1;
+        }
+        {
+            // Every height of many made-up chains whose window does not pass
+            // genesis: the same answer as before, timestamps going backwards,
+            // across the v2 switch, at several difficulties.
+            unsigned int nSeed = 12345;
+            int nCompared = 0, nDiffer = 0, nRetargets = 0;
+            const unsigned int vBits[4] = { nFloor, nHard4, nHard16, CompactOf(bnProofOfWorkLimit / 3) };
+            for (int nChain = 0; nChain < 40; nChain++)
+            {
+                std::vector<CBlockIndex> v;
+                FakeChain(v, 300);
+                unsigned int nTime = RulesV2Time() - 120 * 30 * (nChain % 8);
+                for (int h = 0; h < 300; h++)
+                {
+                    nSeed = nSeed * 1103515245 + 12345;
+                    int nStep = (int)((nSeed >> 8) % 1800) - 300;
+                    nTime = (unsigned int)((int64)nTime + nStep);
+                    v[h].nTime = nTime;
+                    v[h].nBits = vBits[(nSeed >> 20) % 4];
+                }
+                for (int h = 0; h < 300; h++)
+                {
+                    bool fPast = false;
+                    unsigned int nOld = OldGetNextWorkRequired(&v[h], fPast);
+                    if (fPast)
+                        continue;
+                    nCompared++;
+                    if ((h + 1) % 30 == 0)
+                        nRetargets++;
+                    if (GetNextWorkRequired(&v[h]) != nOld)
+                        nDiffer++;
+                }
+            }
+            printf("  info compared %d heights (%d retargets) on 40 chains\n", nCompared, nRetargets);
+            nFail += Check(nCompared > 11000 && nRetargets > 350 && nDiffer == 0,
+                           "every height whose window stays on the chain: the same nBits as before") ? 0 : 1;
+        }
+
+        // ---- 7. The block template's rules follow its own time
+        {
+            nFail += Check(!(RuleSetAt(RulesV3Time() - 1) & 2) && (RuleSetAt(RulesV3Time()) & 2) &&
+                           RuleSetAt(RulesV3Time() - 1) != RuleSetAt(RulesV3Time()),
+                           "a template moved across the v3 switch sees another rule set, and is rebuilt") ? 0 : 1;
+            nFail += Check(!(RuleSetAt(RulesV2Time() - 1) & 1) && (RuleSetAt(RulesV2Time()) & 1),
+                           "and across the v2 switch") ? 0 : 1;
+            nFail += Check(RuleSetAt(RulesV4Time() - 1) != RuleSetAt(RulesV4Time()),
+                           "and across the v4 switch, as before") ? 0 : 1;
+
+            std::vector<CBlockIndex> v;
+            FakeChain(v, 20);
+            for (int h = 0; h < 20; h++)
+                v[h].nTime = RulesV3Time() - 5000 + 120 * h;
+            CTransaction tx;
+            tx.vin.resize(1);
+            tx.vin[0].prevout = COutPoint(uint256(77), 0);
+            tx.vin[0].nSequence = 0;
+            tx.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+            tx.nLockTime = 19;   // the height of the template's parent
+            nBestHeight = 19;
+            nFail += Check(!IsFinalForBlock(tx, &v[19], RulesV3Time() - 1),
+                           "a template timed before v3: the old rule (lock time below the best height), not final") ? 0 : 1;
+            nFail += Check(IsFinalForBlock(tx, &v[19], RulesV3Time()),
+                           "the same template timed at v3: IsFinalAt(next height), final -- the template's time decides") ? 0 : 1;
+            nBestHeight = nBestHeightSaved;
+        }
+
+        // ---- 14. Zero and negative nBits
+        {
+            CBlock block;
+            CTransaction cb;
+            cb.vin.resize(1);
+            cb.vin[0].prevout.SetNull();
+            cb.vin[0].scriptSig = CScript() << 1 << 2;
+            cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+            block.vtx.push_back(cb);
+            block.nVersion = 1;
+            block.nTime = (unsigned int)GetAdjustedTime();
+            block.hashMerkleRoot = block.BuildMerkleTree();
+            int nDoS = 0;
+            block.nBits = 0;
+            bool fZero = block.CheckBlock(&nDoS);
+            nFail += Check(!fZero && nDoS == 100, "a block with nBits 0 is refused outright") ? 0 : 1;
+            nDoS = 0;
+            block.nBits = nFloor | 0x00800000;   // the floor with the sign bit set
+            bool fNeg = block.CheckBlock(&nDoS);
+            nFail += Check(!fNeg && nDoS == 100, "a block with a negative target is refused outright, not hashed against its magnitude") ? 0 : 1;
+            nDoS = 0;
+            block.nBits = 0x00123456;            // zero size: the value is 0
+            bool fEmpty = block.CheckBlock(&nDoS);
+            nFail += Check(!fEmpty && nDoS == 100, "and so is a compact form whose value is zero") ? 0 : 1;
+        }
+
+        // ---- 15. ReplacementPaysEnough at the money limit
+        {
+            std::string strWhy;
+            vector<pair<int64, unsigned int> > vOld;
+            vOld.push_back(make_pair((int64)(MAX_MONEY / 2), (unsigned int)90000));
+            nFail += Check(ReplacementPaysEnough(MAX_MONEY, 90000, vOld, strWhy),
+                           "a replacement paying more per byte at fees near MAX_MONEY passes (the products pass 2^63)") ? 0 : 1;
+            vOld.clear();
+            vOld.push_back(make_pair((int64)MAX_MONEY, (unsigned int)90000));
+            nFail += Check(!ReplacementPaysEnough(MAX_MONEY / 2, 90000, vOld, strWhy),
+                           "and one paying less per byte there fails") ? 0 : 1;
+            vOld.clear();
+            vOld.push_back(make_pair((int64)1000, (unsigned int)200));
+            nFail += Check(!ReplacementPaysEnough(1000, 200, vOld, strWhy) &&
+                           ReplacementPaysEnough(1000 + FeeForSize(MIN_RELAY_FEE_PER_KB, 200), 200, vOld, strWhy),
+                           "ordinary amounts behave as before") ? 0 : 1;
+        }
+
+        // ---- 3. The failed mark
+        mapCheckpoints.clear();
+        {
+            CBlockIndex* pr  = ChainWorkTestBlock(NULL, nFloor, 50000, vMade);
+            CBlockIndex* pa1 = ChainWorkTestBlock(pr,  nFloor, 50001, vMade);
+            CBlockIndex* pa2 = ChainWorkTestBlock(pa1, nFloor, 50002, vMade);
+            CBlockIndex* pb3 = ChainWorkTestBlock(pa2, nFloor, 50003, vMade);
+            CBlockIndex* pc3 = ChainWorkTestBlock(pa2, nFloor, 50013, vMade);
+            CBlockIndex* pc4 = ChainWorkTestBlock(pc3, nHard64, 50014, vMade);
+            CBlockIndex* pd2 = ChainWorkTestBlock(pa1, nFloor, 50022, vMade);
+            std::vector<CBlockIndex*> vMarked = MarkBlockFailed(pa2);
+            nFail += Check(vMarked.size() == 4 && pa2->fFailed && pb3->fFailed && pc3->fFailed && pc4->fFailed,
+                           "a failed block and every descendant, on both of its branches, are marked") ? 0 : 1;
+            nFail += Check(!pr->fFailed && !pa1->fFailed && !pd2->fFailed,
+                           "its ancestors and its sibling are not") ? 0 : 1;
+            nFail += Check(MarkBlockFailed(pa2).empty(), "marking it again marks nothing new") ? 0 : 1;
+            CBlockIndex* pc5 = ChainWorkTestBlock(pc4, nFloor, 50015, vMade);
+            nFail += Check(pc5->fFailed, "a block added later on top of a marked one is marked as it is indexed") ? 0 : 1;
+            nFail += Check(pc5->nChainWork > pd2->nChainWork && !IsBetterChain(pc5, pd2) && IsBetterChain(pd2, pc5),
+                           "more work does not make a failed branch the better chain") ? 0 : 1;
+        }
+
+        // ---- 11. Which orphans are held, against a best chain M of ten
+        // blocks at 64 times the floor's difficulty on a floor root. (Side
+        // blocks with a parent here are stored whatever their work: see
+        // reorg-safety.)
+        {
+            CBlockIndex* pm = ChainWorkTestBlock(NULL, nFloor, 60000, vMade);
+            pm->nTime = 1800000000;
+            std::vector<CBlockIndex*> vm(1, pm);
+            for (int i = 1; i <= 10; i++)
+            {
+                CBlockIndex* p = ChainWorkTestBlock(pm, nHard64, 60000 + i, vMade);
+                p->nTime = 1800000000 + 120 * i;
+                pm->pnext = p;
+                pm = p;
+                vm.push_back(p);
+            }
+            pindexBest = pm;
+            nBestHeight = pm->nHeight;
+            unsigned int nTip = pm->nTime;
+            CBlock orphan;
+            orphan.nBits = nFloor;
+            orphan.nTime = nTip;
+            nFail += Check(!OrphanBlockWorthKeeping(orphan), "synced, no checkpoints: an orphan 64 times easier than the tip is not held") ? 0 : 1;
+            orphan.nBits = nHard16;
+            nFail += Check(OrphanBlockWorthKeeping(orphan), "one within the slack is") ? 0 : 1;
+            orphan.nBits = nFloor;
+            orphan.nTime = nTip + 2 * 3600 - 1;
+            nFail += Check(!OrphanBlockWorthKeeping(orphan), "a floor one dated just under two hours after the tip is not") ? 0 : 1;
+            orphan.nTime = nTip + 4 * 3600;
+            nFail += Check(OrphanBlockWorthKeeping(orphan), "four hours after a stale tip it is (four times per two hours)") ? 0 : 1;
+            orphan.nBits = 0;
+            nFail += Check(!OrphanBlockWorthKeeping(orphan), "a zero target is not") ? 0 : 1;
+            orphan.nBits = nFloor;
+            orphan.nTime = nTip;
+            mapCheckpoints[50] = uint256(424242);
+            nFail += Check(OrphanBlockWorthKeeping(orphan),
+                           "while the best chain lacks the newest checkpoint (still syncing), nothing is refused") ? 0 : 1;
+            mapCheckpoints.clear();
+            mapCheckpoints[5] = vm[5]->GetBlockHash();
+            nFail += Check(!OrphanBlockWorthKeeping(orphan), "once it holds the checkpoint, the filter applies") ? 0 : 1;
+            mapCheckpoints.clear();
+            pindexBest = pindexBestSaved;
+            nBestHeight = nBestHeightSaved;
+        }
+
+        // ---- The check at load does not use the clock
+        {
+            CBlock block;
+            CTransaction cb;
+            cb.vin.resize(1);
+            cb.vin[0].prevout.SetNull();
+            cb.vin[0].scriptSig = CScript() << 1 << 3;
+            cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+            block.vtx.push_back(cb);
+            block.nVersion = 1;
+            block.nTime = (unsigned int)GetAdjustedTime() + 3 * 3600;
+            block.nBits = 0;   // refused further on, with score 100
+            block.hashMerkleRoot = block.BuildMerkleTree();
+            int nDoS = -1;
+            bool fTimed = block.CheckBlock(&nDoS, true);
+            nFail += Check(!fTimed && nDoS == 0, "a block three hours ahead of the clock fails the time test (score 0)") ? 0 : 1;
+            nDoS = -1;
+            bool fUntimed = block.CheckBlock(&nDoS, false);
+            nFail += Check(!fUntimed && nDoS == 100, "without the time test (the load check) it gets past it, to the next rule") ? 0 : 1;
+        }
+
+        // ---- 11. The orphan pool by bytes
+        {
+            nFail += Check(mapOrphanBlocks.empty() && nOrphanBlockBytes == 0, "the orphan pool starts empty") ? 0 : 1;
+            unsigned int nMaxSeen = 0;
+            for (int i = 0; i < 40; i++)
+            {
+                CBlock* pblock = new CBlock();
+                CTransaction cb;
+                cb.vin.resize(1);
+                cb.vin[0].prevout.SetNull();
+                cb.vin[0].scriptSig = CScript() << 1 << i;
+                cb.vout.push_back(CTxOut(0, CScript() << std::vector<unsigned char>(900000, (unsigned char)i)));
+                pblock->vtx.push_back(cb);
+                pblock->hashPrevBlock = uint256(900 + i);
+                pblock->nNonce = i;
+                pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+                AddOrphanBlock(pblock);
+                LimitOrphanBlocks(MAX_ORPHAN_BLOCKS);
+                nMaxSeen = max(nMaxSeen, nOrphanBlockBytes);
+            }
+            unsigned int nSum = 0;
+            for (map<uint256, CBlock*>::iterator mi = mapOrphanBlocks.begin(); mi != mapOrphanBlocks.end(); ++mi)
+                nSum += ::GetSerializeSize(*(*mi).second, SER_NETWORK);
+            printf("  info %d orphans of ~900 kB held, %u bytes\n", (int)mapOrphanBlocks.size(), nOrphanBlockBytes);
+            nFail += Check(nMaxSeen <= MAX_ORPHAN_BLOCK_BYTES && mapOrphanBlocks.size() < 40 && mapOrphanBlocks.size() >= 30,
+                           "40 orphans of 900 kB: the pool stays under its byte ceiling, below the count ceiling") ? 0 : 1;
+            nFail += Check(nSum == nOrphanBlockBytes && mapOrphanBlocksByPrev.size() == mapOrphanBlocks.size(),
+                           "the byte count matches what is held, and both maps agree") ? 0 : 1;
+            LimitOrphanBlocks(0);
+            nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0,
+                           "emptied, nothing is counted") ? 0 : 1;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+
+    pindexBest = pindexBestSaved;
+    nBestHeight = nBestHeightSaved;
+    for (size_t i = 0; i < vMade.size(); i++)
+    {
+        mapBlockIndex.erase(vMade[i]->GetBlockHash());
+        delete vMade[i];
+    }
+    mapCheckpoints = mapSaved;
+    RemoveTree(tmp);
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- reorg-safety: a real data directory, real blocks (no proof of work:
+// AcceptBlock does not check it, CheckBlock does), real reorganizations.
+
+static unsigned int nReorgTestSalt = 1;
+static unsigned int nReorgTestStart = 0;
+
+static CBlock ReorgTestBlock(const CBlockIndex* pindexPrev, const std::vector<CTransaction>& vtxExtra,
+                             int64 nCoinbase = 50 * COIN, unsigned int nSpacing = 120)
+{
+    CBlock block;
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << (pindexPrev->nHeight + 1) << (int64)(nReorgTestSalt++);
+    cb.vout.push_back(CTxOut(nCoinbase, CScript() << OP_TRUE));
+    block.vtx.push_back(cb);
+    block.vtx.insert(block.vtx.end(), vtxExtra.begin(), vtxExtra.end());
+    block.nVersion = 1;
+    block.hashPrevBlock = pindexPrev->GetBlockHash();
+    block.nTime = max(pindexPrev->nTime, nReorgTestStart) + nSpacing;
+    block.nBits = GetNextWorkRequired(pindexPrev);
+    block.nNonce = nReorgTestSalt;
+    block.hashMerkleRoot = block.BuildMerkleTree();
+    return block;
+}
+
+// Accept a block as AcceptBlock does for a peer's; its index entry, or NULL.
+static CBlockIndex* ReorgTestAccept(const CBlock& blockIn, bool* pfAccepted = NULL)
+{
+    CBlock block = blockIn;
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_main)
+        fOk = block.AcceptBlock();
+    if (pfAccepted)
+        *pfAccepted = fOk;
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(block.GetHash());
+    return mi == mapBlockIndex.end() ? NULL : (*mi).second;
+}
+
+static CBlockIndex* ReorgTestExtend(CBlockIndex* pindexPrev, const std::vector<CTransaction>& vtx = std::vector<CTransaction>(),
+                                    int64 nCoinbase = 50 * COIN)
+{
+    bool fOk = false;
+    CBlockIndex* p = ReorgTestAccept(ReorgTestBlock(pindexPrev, vtx, nCoinbase), &fOk);
+    return fOk ? p : NULL;
+}
+
+static CTransaction ReorgTestSpend(const uint256& hashPrev, unsigned int n, int64 nValue, bool fStandardOut,
+                                   unsigned int nLockTime = 0, unsigned int nSequence = SEQUENCE_FINAL)
+{
+    CTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(hashPrev, n);
+    tx.vin[0].nSequence = nSequence;
+    tx.nLockTime = nLockTime;
+    CScript out;
+    if (fStandardOut)
+        out << OP_DUP << OP_HASH160 << uint160(nReorgTestSalt++) << OP_EQUALVERIFY << OP_CHECKSIG;
+    else
+        out << OP_TRUE;
+    tx.vout.push_back(CTxOut(nValue, out));
+    return tx;
+}
+
+// Every pprev in the index is NULL or an entry of the index. Compares pointer
+// values only: nothing is read through them.
+static bool IndexHasNoDanglingParent()
+{
+    set<const CBlockIndex*> setEntries;
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        setEntries.insert((*mi).second);
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        if ((*mi).second->pprev && !setEntries.count((*mi).second->pprev))
+            return false;
+    return true;
+}
+
+// Forget the in-memory chain and read the index again, as a restart does.
+static bool ReorgTestReload()
+{
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        delete (*mi).second;
+    mapBlockIndex.clear();
+    pindexGenesisBlock = NULL;
+    pindexBest = NULL;
+    hashBestChain = 0;
+    nBestHeight = -1;
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        mapTransactions.clear();
+        mapNextTx.clear();
+    }
+    DBFlush(false);
+    return LoadBlockIndex();
+}
+
+// Where the check at load will roll a best chain ending at ptip back to when
+// it looks at nCheck blocks: the parent of the oldest one that fails
+// CheckBlock (without the clock test), as CTxDB::LoadBlockIndex does.
+static int ReorgTestExpectedRollback(const CBlockIndex* ptip, int nCheck, uint256* phFirstBad)
+{
+    int nFork = ptip->nHeight;
+    int nChecked = 0;
+    for (const CBlockIndex* p = ptip; p && p->pprev && nChecked < nCheck; p = p->pprev, nChecked++)
+    {
+        CBlock block;
+        if (block.ReadFromDisk(p, true) && !block.CheckBlock(NULL, false))
+        {
+            nFork = p->nHeight - 1;
+            if (phFirstBad)
+                *phFirstBad = p->GetBlockHash();
+        }
+    }
+    return nFork;
+}
+
+static int RunReorgSafetySelfTest()
+{
+    printf("reorg-safety self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    try
+    {
+        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        // Recent v2 timestamps, so the chain from genesis meets rules v2
+        // (BIP34) -- and its block 29 is exactly the one that used to abort.
+        nReorgTestStart = (unsigned int)GetAdjustedTime() - 400 * 120;
+        nFail += Check(RulesV2Active(nReorgTestStart), "the test chain runs under rules v2") ? 0 : 1;
+
+        std::vector<CBlockIndex*> vMain(1, pindexBest);
+        for (int h = 1; h <= 110; h++)
+        {
+            CBlockIndex* p = ReorgTestExtend(vMain.back());
+            if (!p)
+                throw std::runtime_error(strprintf("block %d not accepted", h));
+            vMain.push_back(p);
+        }
+        nFail += Check(pindexBest == vMain[110] && nBestHeight == 110,
+                       "110 blocks from genesis with v2 timestamps, through the first retarget, no abort") ? 0 : 1;
+
+        CBlock blockM1, blockM2, blockM3;
+        blockM1.ReadFromDisk(vMain[1], true);
+        blockM2.ReadFromDisk(vMain[2], true);
+        blockM3.ReadFromDisk(vMain[3], true);
+        uint256 hCb1 = blockM1.vtx[0].GetHash(), hCb2 = blockM2.vtx[0].GetHash(), hCb3 = blockM3.vtx[0].GetHash();
+
+        // ---- 9. Only final transactions enter the pool
+        {
+            CTransaction txLocked = ReorgTestSpend(hCb1, 0, 49 * COIN, true, 1000000, 0);
+            nFail += Check(!txLocked.AcceptTransaction(true),
+                           "a transaction locked to a height far ahead is not accepted into the pool") ? 0 : 1;
+            CRITICAL_BLOCK(cs_mapTransactions)
+                nFail += Check(mapTransactions.empty(), "and is not there") ? 0 : 1;
+        }
+
+        // ---- Pool hygiene: a block that spends what a pool transaction spends
+        CTransaction txC = ReorgTestSpend(hCb1, 0, 49 * COIN, true);
+        CTransaction txE = ReorgTestSpend(hCb2, 0, 49 * COIN, true);
+        nFail += Check(txC.AcceptTransaction(true) && txE.AcceptTransaction(true),
+                       "two final transactions spending mature coinbases are accepted") ? 0 : 1;
+        CTransaction txD = ReorgTestSpend(txC.GetHash(), 0, 48 * COIN, true);
+        // Its child, unsigned, so straight into the pool as AddToMemoryPool would.
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            mapTransactions[txD.GetHash()] = txD;
+            mapNextTx[txD.vin[0].prevout] = CInPoint(&mapTransactions[txD.GetHash()], 0);
+        }
+        {
+            CTransaction txT = ReorgTestSpend(hCb1, 0, 49 * COIN + COIN / 2, false);
+            CBlockIndex* p111 = ReorgTestExtend(vMain[110], std::vector<CTransaction>(1, txT));
+            nFail += Check(p111 && pindexBest == p111, "a block spending the same coin as the pool's transaction connects") ? 0 : 1;
+            CRITICAL_BLOCK(cs_mapTransactions)
+            {
+                nFail += Check(!mapTransactions.count(txC.GetHash()) && !mapTransactions.count(txD.GetHash()),
+                               "the conflicting pool transaction and its child are gone") ? 0 : 1;
+                nFail += Check(mapTransactions.count(txE.GetHash()) && mapTransactions.size() == 1,
+                               "an unrelated one stays") ? 0 : 1;
+                nFail += Check(!mapNextTx.count(COutPoint(hCb1, 0)) && !mapNextTx.count(COutPoint(txC.GetHash(), 0)) &&
+                               mapNextTx.count(COutPoint(hCb2, 0)) && mapNextTx.size() == 1,
+                               "and the spends index matches the pool") ? 0 : 1;
+            }
+        }
+
+        // The same through a reorganization: S111, S112 off block 110, S111
+        // spending what pool transaction C2 spends.
+        CBlockIndex* pS112 = NULL;
+        CBlockIndex* pS111 = NULL;
+        {
+            CTransaction txC2 = ReorgTestSpend(hCb3, 0, 49 * COIN, true);
+            nFail += Check(txC2.AcceptTransaction(true), "another pool transaction is accepted") ? 0 : 1;
+            CTransaction txT2 = ReorgTestSpend(hCb3, 0, 49 * COIN + COIN / 2, false);
+            pS111 = ReorgTestExtend(vMain[110], std::vector<CTransaction>(1, txT2));
+            nFail += Check(pS111 && pindexBest != pS111, "a rival block 111 spending the same coin is kept on the side") ? 0 : 1;
+            pS112 = pS111 ? ReorgTestExtend(pS111) : NULL;
+            nFail += Check(pS112 && pindexBest == pS112, "its child makes that branch the best: reorganized") ? 0 : 1;
+            CRITICAL_BLOCK(cs_mapTransactions)
+                nFail += Check(!mapTransactions.count(txC2.GetHash()) && !mapNextTx.count(COutPoint(hCb3, 0)) &&
+                               mapTransactions.count(txE.GetHash()),
+                               "the pool transaction it conflicts with is gone after the reorganization") ? 0 : 1;
+        }
+        if (!pS112)
+            throw std::runtime_error("the reorganization did not happen");
+
+        // ---- 3. A block that fails to connect, with two children
+        CBlockIndex* pTip = pS112;
+        for (int i = 0; i < 3; i++)
+            pTip = ReorgTestExtend(pTip);
+        nFail += Check(pTip && pindexBest == pTip && nBestHeight == 115, "the best chain is at 115") ? 0 : 1;
+        if (!pTip)
+            throw std::runtime_error("could not extend the best chain");
+        CBlockIndex* pX112 = ReorgTestExtend(pS111);
+        CBlockIndex* pX113 = pX112 ? ReorgTestExtend(pX112, std::vector<CTransaction>(), 51 * COIN) : NULL;   // pays itself too much
+        CBlockIndex* pY114 = pX113 ? ReorgTestExtend(pX113) : NULL;
+        CBlockIndex* pZ114 = pX113 ? ReorgTestExtend(pX113) : NULL;
+        CBlockIndex* pY115 = pY114 ? ReorgTestExtend(pY114) : NULL;
+        nFail += Check(pX112 && pX113 && pY114 && pZ114 && pY115 && pindexBest == pTip,
+                       "a side branch whose block 113 overpays, with two children, is stored, not yet the best") ? 0 : 1;
+        if (!pY115 || !pZ114)
+            throw std::runtime_error("could not build the failing branch");
+        uint256 hX113 = pX113->GetBlockHash(), hY114 = pY114->GetBlockHash(), hZ114 = pZ114->GetBlockHash();
+        CBlock blockY116 = ReorgTestBlock(pY115, std::vector<CTransaction>());
+        bool fY116 = true;
+        CBlockIndex* pY116 = ReorgTestAccept(blockY116, &fY116);
+        nFail += Check(!fY116 && pindexBest == pTip && nBestHeight == 115,
+                       "the block that would make it the best fails in Reorganize, and the best chain stays") ? 0 : 1;
+        nFail += Check(IndexHasNoDanglingParent(), "no index entry points at a deleted parent") ? 0 : 1;
+        nFail += Check(mapBlockIndex.count(hX113) && mapBlockIndex.count(hY114) && mapBlockIndex.count(hZ114) &&
+                       pY116 != NULL && pZ114->pprev == pX113,
+                       "the failed block and its children stay in the index") ? 0 : 1;
+        nFail += Check(pX113->fFailed && pY114->fFailed && pZ114->fFailed && pY115->fFailed && pY116 && pY116->fFailed &&
+                       !pX112->fFailed && !pTip->fFailed,
+                       "marked failed: it and every descendant, on the branch that was tried and the other") ? 0 : 1;
+        nFail += Check(pY116 && pY116->nChainWork > pTip->nChainWork && !IsBetterChain(pY116, pTip),
+                       "more work, never the better chain") ? 0 : 1;
+        {
+            bool fOk = true;
+            ReorgTestAccept(ReorgTestBlock(pZ114, std::vector<CTransaction>()), &fOk);
+            nFail += Check(!fOk, "a block on the other child is refused (the old code walked freed memory here)") ? 0 : 1;
+            CBlock blockAgain;
+            blockAgain.ReadFromDisk(pX113, true);
+            ReorgTestAccept(blockAgain, &fOk);
+            nFail += Check(!fOk && pindexBest == pTip, "the failed block sent again changes nothing") ? 0 : 1;
+        }
+        fCheckpointWalkBack = true;
+        nFail += Check(ActivateBestKnownChain() && pindexBest == pTip,
+                       "ActivateBestKnownChain does not pick the failed branch") ? 0 : 1;
+        CBlockIndex* p116 = ReorgTestExtend(pTip);
+        nFail += Check(p116 && pindexBest == p116 && nBestHeight == 116, "the best chain goes on") ? 0 : 1;
+        if (!p116)
+            throw std::runtime_error("could not extend the best chain after the failure");
+        uint256 hTip = p116->GetBlockHash();
+        uint256 hS111 = pS111->GetBlockHash(), hS112 = pS112->GetBlockHash(), hX112 = pX112->GetBlockHash();
+
+        // ---- A failure that is this node's, not the block's, marks nothing.
+        // The index places this coin in a block file that does not exist, so
+        // reading it fails here -- a stand-in for a file another program
+        // holds open, or a database that cannot answer.
+        {
+            CTransaction txGhost;
+            txGhost.vin.resize(1);
+            txGhost.vin[0].prevout = COutPoint(uint256(31337), 0);
+            txGhost.vout.push_back(CTxOut(10 * COIN, CScript() << OP_TRUE));
+            {
+                CTxDB txdb;
+                txdb.AddTxIndex(txGhost, CDiskTxPos(99, 0, 0), 1);
+                txdb.Close();
+            }
+            std::vector<CTransaction> vUse(1, ReorgTestSpend(txGhost.GetHash(), 0, 9 * COIN, false));
+            CBlock blockL = ReorgTestBlock(p116, vUse);
+            bool fOk = true;
+            CBlockIndex* pL = ReorgTestAccept(blockL, &fOk);
+            nFail += Check(!fOk && pL == NULL && pindexBest == p116,
+                           "a block that fails on a local read error is not marked: it is forgotten (extending the tip)") ? 0 : 1;
+            pL = ReorgTestAccept(blockL, &fOk);
+            nFail += Check(!fOk && pL == NULL, "and the same block sent again is tried again, not \"already have\"") ? 0 : 1;
+
+            CBlockIndex* pQ116 = ReorgTestExtend(pTip);
+            CBlock blockQ117 = ReorgTestBlock(pQ116 ? pQ116 : pTip, vUse);
+            CBlockIndex* pQ117 = pQ116 ? ReorgTestAccept(blockQ117, &fOk) : NULL;
+            nFail += Check(pQ116 && pQ117 && !fOk && pindexBest == p116 && !pQ117->fFailed && !pQ116->fFailed &&
+                           IsBetterChain(pQ117, p116),
+                           "in a reorganization: not marked, and still the better candidate, to be tried again") ? 0 : 1;
+            CBlockIndex* pQ118 = pQ117 ? ReorgTestAccept(ReorgTestBlock(pQ117, std::vector<CTransaction>()), &fOk) : NULL;
+            nFail += Check(pQ118 && !fOk && !pQ118->fFailed && pindexBest == p116,
+                           "the next block on that branch tries again (and fails again, unmarked)") ? 0 : 1;
+        }
+
+        // ---- 10. The check at load fails these blocks (they carry no proof of
+        // work; one may pass the floor by chance, so the expected answer is
+        // worked out first, the way the load check does it). Only the last
+        // five are checked, so the repair rolls back to about 111 and marks
+        // from the first bad block up -- not everything.
+        int nCheckSaved = nCheckBlocksOnLoad;
+        nCheckBlocksOnLoad = 5;
+        uint256 hFirstBad = 0;
+        int nExpect = ReorgTestExpectedRollback(p116, 5, &hFirstBad);
+        printf("  info the load check should roll back to %d\n", nExpect);
+        if (!ReorgTestReload())
+            throw std::runtime_error("reload failed");
+        nFail += Check(!mapBlockIndex.count(hX113) && !mapBlockIndex.count(hZ114),
+                       "blocks marked in Reorganize are off the disk index after a restart") ? 0 : 1;
+        nFail += Check(nExpect < 116 && nExpect >= 111 && nBestHeight == nExpect,
+                       "the load check of the last five blocks rolled back to just below the first bad one") ? 0 : 1;
+        if (mapBlockIndex.count(hTip) && mapBlockIndex.count(hFirstBad) && mapBlockIndex.count(hX112) && pindexBest)
+        {
+            CBlockIndex* pOldTip = mapBlockIndex[hTip];
+            nFail += Check(pOldTip->fFailed && mapBlockIndex[hFirstBad]->fFailed && !pindexBest->fFailed &&
+                           !pindexBest->pprev->fFailed && !IsBetterChain(pOldTip, pindexBest),
+                           "the first bad block and everything above it are marked; below it, nothing") ? 0 : 1;
+            nFail += Check(!mapBlockIndex[hX112]->fFailed,
+                           "a side block off 111, not built on the first bad block, is not marked") ? 0 : 1;
+            bool fOk = true;
+            ReorgTestAccept(ReorgTestBlock(pOldTip, std::vector<CTransaction>()), &fOk);
+            nFail += Check(!fOk && nBestHeight == nExpect,
+                           "a new block on the old tip is refused: the repair is not undone") ? 0 : 1;
+            nFail += Check(IndexHasNoDanglingParent(), "and the index has no dangling parent") ? 0 : 1;
+        }
+        else
+        {
+            printf("  FAIL the old tip, the first bad block or the side block off 111 is missing after the restart\n");
+            nFail++;
+        }
+        uint256 hFirstBad2 = 0;
+        int nExpect2 = pindexBest ? ReorgTestExpectedRollback(pindexBest, 5, &hFirstBad2) : -1;
+        if (!ReorgTestReload())
+            throw std::runtime_error("second reload failed");
+        nFail += Check(!mapBlockIndex.count(hTip) && !mapBlockIndex.count(hFirstBad),
+                       "a second restart does not read the marked blocks back") ? 0 : 1;
+        nFail += Check(nBestHeight == nExpect2 && mapBlockIndex.count(hS111),
+                       "and checks its own last five again, with the same rule") ? 0 : 1;
+        nCheckBlocksOnLoad = nCheckSaved;
+        CBlockIndex* pNext = ReorgTestExtend(pindexBest);
+        nFail += Check(pNext && pindexBest == pNext, "the chain grows again from where the repair left it") ? 0 : 1;
+        if (!pNext)
+            throw std::runtime_error("could not extend after the second restart");
+
+        // ---- 5. A side block far weaker than the tip is stored: no admission
+        // rule by work (it could strand a node on the lighter chain). Seconds
+        // between blocks make each retarget four times harder; three of them
+        // put the tip at 64 times the floor's difficulty.
+        CBlockIndex* pHard = pNext;
+        for (int i = 0; i < 103 && pHard; i++)
+            pHard = ReorgTestAccept(ReorgTestBlock(pHard, std::vector<CTransaction>(), 50 * COIN, 1));
+        if (!pHard || pindexBest != pHard)
+            throw std::runtime_error("could not build the hard chain");
+        CBigNum bnTip, bnFloor;
+        bnTip.SetCompact(pHard->nBits);
+        bnFloor.SetCompact(GetNextWorkRequired(pNext));
+        nFail += Check(bnTip * 32 <= bnFloor, "the tip's target is more than 16 times harder than the fork's") ? 0 : 1;
+        bool fWeak = false;
+        CBlockIndex* pWeak = ReorgTestAccept(ReorgTestBlock(pNext, std::vector<CTransaction>()), &fWeak);
+        nFail += Check(fWeak && pWeak && pindexBest == pHard && !pWeak->fFailed,
+                       "a side block 64 times easier than the tip is stored, not the best") ? 0 : 1;
+        CBlockIndex* pWeak2 = pWeak ? ReorgTestExtend(pWeak) : NULL;
+        nFail += Check(pWeak2 != NULL && pindexBest == pHard, "and so is the next block on it") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    fCheckpointWalkBack = false;
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -10856,6 +11622,10 @@ int RunSelfTest(const std::string& name)
         return RunConsensusLimitsSelfTest();
     if (name == "chain-work")
         return RunChainWorkSelfTest();
+    if (name == "consensus-safety")
+        return RunConsensusSafetySelfTest();
+    if (name == "reorg-safety")
+        return RunReorgSafetySelfTest();
     if (name == "pool-stratum")
         return RunPoolStratumSelfTest();
     if (name == "parse-money")
@@ -10964,6 +11734,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

@@ -878,6 +878,7 @@ bool CTxDB::LoadBlockIndex()
     // so only the tail is checked by default. /checkblocks=0 does the lot.
     int nCheckBlocks = nCheckBlocksOnLoad;
     CBlockIndex* pindexFork = NULL;
+    CBlockIndex* pindexFirstBad = NULL;
     int nChecked = 0;
     for (CBlockIndex* pindex = pindexBest; pindex && pindex->pprev; pindex = pindex->pprev)
     {
@@ -887,13 +888,17 @@ bool CTxDB::LoadBlockIndex()
         CBlock block;
         if (!block.ReadFromDisk(pindex->nFile, pindex->nBlockPos, true))
             return error("LoadBlockIndex() : ReadFromDisk failed at height %d", pindex->nHeight);
-        if (!block.CheckBlock())
+        // Not the "too far in the future" test: it is against the local
+        // clock, and with no peers yet a machine that booted with a slow
+        // clock would roll back, and mark failed, a good tail.
+        if (!block.CheckBlock(NULL, false))
         {
             printf("LoadBlockIndex() : *** bad block at height %d, hash=%s\n",
                    pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
             // Keep going: an older bad block further back wins, because
             // everything after it has to come off too.
             pindexFork = pindex->pprev;
+            pindexFirstBad = pindex;
         }
     }
     printf("LoadBlockIndex(): verified %d block(s)\n", nChecked);
@@ -917,6 +922,11 @@ bool CTxDB::LoadBlockIndex()
     // transaction opened here waits on it forever -- measured: the node came
     // up, printed the diagnosis, and hung with no error anywhere.
     pindexBadChainFork = pindexFork;
+    // The repair marks this one, and everything on top of it, failed: they
+    // stay in the index with their work, and without the mark the next block
+    // any peer sent on top of them made that branch the best again and
+    // Reorganize connected them, unchecked.
+    pindexBadChainFirst = pindexFirstBad;
 
     return true;
 }
