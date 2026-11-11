@@ -265,12 +265,14 @@ bool PeerNeedsBlockBudget(const CNode* pnode)
            GetTime() - pnode->nTimeConnected < INBOUND_BLOCK_BUDGET_EXEMPT_SECS;
 }
 
-void InboundBlockBudgetResetForTest(int nTokens)
+void InboundBlockBudgetResetForTest(int nTokens, bool fFreeze)
 {
     CRITICAL_BLOCK(cs_inboundBlockBudget)
     {
         nInboundBlockTokens = nTokens;
-        nInboundBlockRefilled = GetTime();
+        // Frozen: no refill until reset again, so a slow machine (the first
+        // RandomX hash builds a 256 MB cache) cannot change what a test counts.
+        nInboundBlockRefilled = fFreeze ? GetTime() + 365 * 24 * 60 * 60 : GetTime();
     }
 }
 

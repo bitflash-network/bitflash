@@ -13107,7 +13107,7 @@ static int RunP2PDoSSelfTest()
 
             // The inbound block budget: a token is spent only by a block that
             // passed every cheap check and is about to be hashed.
-            InboundBlockBudgetResetForTest(3);
+            InboundBlockBudgetResetForTest(3, true);
             {
                 CNode* in = P2PDoSPeer(true);
                 CBlock bFuture = P2PDoSBlock(500, 24 * 60 * 60);
@@ -13165,7 +13165,7 @@ static int RunP2PDoSSelfTest()
                 delete r;
             }
 
-            InboundBlockBudgetResetForTest(0);
+            InboundBlockBudgetResetForTest(0, true);
             nRefusedBefore = nInboundBlocksRefused;
             nBefore = nBlocksReceived;
             CNode* old = P2PDoSPeer(true);

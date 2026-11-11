@@ -1373,7 +1373,7 @@ bool InboundBlockBudgetTake();
 bool InboundBlockBudgetAvailable();
 bool PeerNeedsBlockBudget(const CNode* pnode);
 extern int64 nInboundBlocksRefused;
-void InboundBlockBudgetResetForTest(int nTokens);
+void InboundBlockBudgetResetForTest(int nTokens, bool fFreeze = false);
 int  InboundBlockBudgetTokensForTest();
 
 // Drop a peer whose send buffer is past MAX_SEND_BUFFER_HARD. Caller holds
