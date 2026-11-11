@@ -1552,6 +1552,12 @@ static json BtfLockFromJournal(const json& prior)
 // restart -- answers with the lock already made instead of making a second.
 static json BtfLock(const json& p, bool fInitiator)
 {
+    // The contract output is pay-to-script-hash, which only protects coins
+    // once rules v3 are locked in; swaps open later than that, but the
+    // contract must not depend on the two dates staying in that order.
+    // Checked first: nothing is drawn, made or journaled before it.
+    if (!RulesV3LockedIn())
+        throw runtime_error("swap contracts need rules v3 locked in on this chain (pay-to-script-hash)");
     size_t iLock = fInitiator ? 2 : 3;
     RequireSwapsOpen();
     if (IsWalletLocked())
@@ -4225,14 +4231,17 @@ static json CoinFindSecret(const string& coin, const json& p)
     // 3000 of Dogecoin's, 13000 of DigiByte's.
     int nBack = coin == "dgb" ? 13000 : coin == "doge" || coin == "rvn" ? 3000 : coin == "ltc" ? 1728 : 400;
     int nFrom = p.size() >= 3 && p[2].is_number_integer() ? p[2].get<int>() : std::max(0, chain.nBlocks - nBack);
-    // That is minutes of calls on DigiByte, with this RPC waiting, and a swap
-    // asks every round: what was searched is not searched again, but for a
-    // reorganization, and nothing older than the contract's window is read.
+    // That is minutes of calls on DigiByte, seconds on the others, with this
+    // RPC waiting under the node's lock -- and a swap asks every round, for as
+    // long as a taker watches its refund settle. What was searched is not
+    // searched again, but for a reorganization (the last 200 blocks), and on
+    // DigiByte nothing older than the contract's window is read.
     static std::mutex mutexSearched;
     static std::map<string, int> mapSearched;
-    const string strSearched = strTxid + ":" + std::to_string(n);
-    const bool fDgbWindow = coin == "dgb" && p.size() < 3;
-    if (fDgbWindow)
+    const string strSearched = coin + ":" + strTxid + ":" + std::to_string(n);
+    const bool fCacheWindow = p.size() < 3;
+    const bool fDgbWindow = coin == "dgb" && fCacheWindow;
+    if (fCacheWindow)
     {
         std::lock_guard<std::mutex> lock(mutexSearched);
         std::map<string, int>::const_iterator it = mapSearched.find(strSearched);
@@ -4274,6 +4283,11 @@ static json CoinFindSecret(const string& coin, const json& p)
                 }
             }
         }
+        if (fCacheWindow)
+        {
+            std::lock_guard<std::mutex> lock(mutexSearched);
+            mapSearched[strSearched] = chain.nBlocks;
+        }
         j["found"] = false;
         return j;
     }
@@ -4312,7 +4326,7 @@ static json CoinFindSecret(const string& coin, const json& p)
     }
     if (vCandidates.empty())
     {
-        if (fDgbWindow)
+        if (fCacheWindow)
         {
             std::lock_guard<std::mutex> lock(mutexSearched);
             mapSearched[strSearched] = chain.nBlocks;

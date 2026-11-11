@@ -10022,6 +10022,23 @@ static int RunSwapRpcSelfTest()
     call("getnewaddress", nlohmann::json::array(), addr, err);
     nFail += Check(addr.is_string(), "a Bitflash address of the wallet") ? 0 : 1;
 
+    // No chain yet, so rules v3 are not locked in: refused before anything
+    // is made or written.
+    bool fGuard = call("swapinitiate", nlohmann::json::array({ addr, "1", nullptr, "rpc-guard" }), r, err);
+    std::vector<nlohmann::json> v0;
+    std::string e0;
+    swap::JournalRead(v0, e0);
+    nFail += Check(!fGuard && err.find("rules v3 locked in") != std::string::npos && v0.empty(),
+                   "before rules v3 are locked in by median time, no lock and no journal line") ? 0 : 1;
+    // A tip whose median time is now: past the test network's switch.
+    CBlockIndex* pTip = new CBlockIndex();
+    std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.insert(std::make_pair(uint256(888888), pTip)).first;
+    pTip->phashBlock = &miTip->first;
+    pTip->nHeight = 1;
+    pTip->nTime = (unsigned int)GetTime();
+    pindexBest = pTip;
+    nBestHeight = 1;
+
     int64_t nNow = GetTime();
     bool fOk = call("swapinitiate", nlohmann::json::array({ addr, "1", nullptr, "rpc-t1" }), r, err);
     nFail += Check(!fOk && err.find("send failed") != std::string::npos, "an empty wallet cannot pay the lock") ? 0 : 1;
