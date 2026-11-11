@@ -281,6 +281,7 @@ against the code as it was, then against the fixes below.
 | the round-trip check written for `fuzz-decoders` (`.btf` names) | A version-1 `.btf` name is 34 bytes in 55 base32 characters; the last character's low three bits are padding, which the decoder dropped whatever they were, so each key answered to eight names. Only the encoder's, with those bits zero, is the address now. | `btfaddr.cpp`, self-test `decoder-canonical` |
 | the hex check written for `fuzz-decoders` (descriptors) | A service descriptor's key and signatures were read with `sscanf("%2x")`, which also takes white space, a sign and `0x`. Plain hex digits only now. | `btfaddr.cpp`, self-test `decoder-canonical` |
 | review while writing `fuzz-decoders` | `EncodeBase58` of an empty vector indexed it; `DecodeBase58` passed a possibly negative `char` to `isspace`. | `base58.h` |
+| honggfuzz (`fuzz-decoders`, on GitHub), through a payment link | The `std::string` overloads of `DecodeBase58`, `DecodeBase58Check`, `AddressToHash160`, `DecodeAnyAddress` and `IsValidBitcoinAddress` handed `c_str()` on, so an address followed by a NUL and anything else read as the address while the caller kept, and could show, the whole string. They refuse a NUL now. | `base58.h`, self-test `decoder-canonical` |
 
 ### Not canonical, by design
 
@@ -338,5 +339,9 @@ Line coverage of the corpora replayed through a coverage build:
 | `btcswap::CashDecode` / `CashEncode` / `btclight::Destination` | 96.3% / 100% / 89.7% |
 | `invoice::ParseHttpUrl` | 100% |
 
-The AFL++ and honggfuzz runs of both harnesses are on GitHub ("Audit
-campaign", 20 minutes per engine).
+On GitHub ("Audit campaign", 20 minutes per harness per engine, corpora
+kept): libFuzzer, AFL++ and honggfuzz on both harnesses. The first round
+found the NUL in a string address above (honggfuzz, `fuzz-decoders`); the
+other five jobs found nothing, and the campaign's own coverage of the
+corpora matched the table above (`serialize.h` 61.4%, `base58.h` 94.2%,
+`btfaddr.cpp` 85.9%, `bip32.cpp` 77.3%, `bip21.cpp` 100%, whole files).
