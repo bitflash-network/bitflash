@@ -305,3 +305,38 @@ the bytes read. These types are exempt, and why:
 The node has no parser for BIP32 extended keys (xprv/xpub) or for
 derivation paths written as text; keys come from a seed and a path of
 numbers, which `fuzz-decoders` exercises.
+
+### Runs and coverage
+
+Before the fixes, two minutes of libFuzzer per harness reproduced every
+finding above that names a harness (62 crash files for `fuzz-deserialize`,
+every one the length prefix, on 13 entries; 30 for `fuzz-decoders`: 28 the
+`SetHex` index, one the onion port, one a harness artefact, fixed). After the fixes, 20 minutes of libFuzzer per
+harness with AddressSanitizer + UndefinedBehaviorSanitizer (Debian 13,
+clang 19), no crash, leak or sanitizer report:
+
+| target | executions | corpus | crashes |
+|---|---|---|---|
+| `fuzz-deserialize` | 2.1 M | 2647 | 0 |
+| `fuzz-decoders` | 1.65 M | 3335 | 0 |
+
+Line coverage of the corpora replayed through a coverage build:
+
+| what | lines covered |
+|---|---|
+| `Unserialize` of every type in the table above (each `IMPLEMENT_SERIALIZE`) | 100% |
+| `ReadCompactSize`, `CDataStream::read`, string/vector/map readers | 100%, 100%, 93-100% |
+| `btcswap::ParseTxAt` / `ParseTx` / `ParseBlockTxs` / `ParseAuxPow` | 98.3% / 100% / 100% / 100% |
+| `DecodeBase58` / `EncodeBase58` / `DecodeBase58Check` | 97.1% / 96.0% / 100% |
+| `AddressToHash160` / `DecodeAnyAddress` | 83.3% / 83.3% (the misses: a checksum-valid payload of the wrong length) |
+| `btf::ParseAddressVersion` / `Base32Decode` / `NormalizeOnionEndpoint` / `VerifyDescriptor` | 100% each |
+| `BIP39ValidateMnemonic` / `BIP39EntropyToMnemonic` | 100% / 85.7% |
+| `BIP32DeriveChild` / `BIP32MasterFromSeed` | 76.8% / 64.3% (the misses: keys at or above the curve order, odds 2^-127, and OpenSSL failures) |
+| `ParsePaymentLink` / `MakePaymentLink` / its amount parser | 100% each |
+| `ParseMoney` / `ParseCoinAmount` / `ParseHex` | 97.6% / 100% / 100% |
+| `uint256::SetHex`, `uint160::SetHex` | 100% |
+| `btcswap::CashDecode` / `CashEncode` / `btclight::Destination` | 96.3% / 100% / 89.7% |
+| `invoice::ParseHttpUrl` | 100% |
+
+The AFL++ and honggfuzz runs of both harnesses are on GitHub ("Audit
+campaign", 20 minutes per engine).
