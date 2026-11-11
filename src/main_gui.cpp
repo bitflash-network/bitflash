@@ -148,7 +148,7 @@ static void PrintUsage()
     printf("            db-env-reopen, db-locks, wallet-sqlite, wallet-sqlite-migration,\n");
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
-    printf("            consensus-limits, chain-work, pool-stratum,\n");
+    printf("            consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum,\n");
     printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, rules-v2, rules-v5, net-hardening, multisig, network-params, socks5-proxy,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
     // suites that exist were not named here, so nobody could find them without

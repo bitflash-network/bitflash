@@ -77,10 +77,20 @@ private:
     CDB(const CDB&);
     void operator=(const CDB&);
 
+public:
+    // Whether the last Read failed because the key is not there, as opposed
+    // to the database failing (a lock, memory, I/O). Read returns false for
+    // both; validation needs to tell "no such transaction" from "could not
+    // look".
+    bool LastReadNotFound() const { return nLastReadRet == DB_NOTFOUND || nLastReadRet == DB_KEYEMPTY; }
+
 protected:
+    int nLastReadRet = 0;
+
     template<typename K, typename T>
     bool Read(const K& key, T& value)
     {
+        nLastReadRet = -1;
         if (!pdb)
             return false;
 
@@ -94,6 +104,7 @@ protected:
         Dbt datValue;
         datValue.set_flags(DB_DBT_MALLOC);
         int ret = pdb->get(GetTxn(), &datKey, &datValue, 0);
+        nLastReadRet = ret;
         memset(datKey.get_data(), 0, datKey.get_size());
         if (datValue.get_data() == NULL)
             return false;
