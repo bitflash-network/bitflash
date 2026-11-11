@@ -108,7 +108,7 @@ CKeyingMaterial vWalletMasterKey;
 vector<unsigned char> vchCryptedHDMaster;
 vector<unsigned char> vchCryptedHDChainCode;
 bool fWalletEncrypted = false;
-bool fWalletLocked = true;
+std::atomic<bool> fWalletLocked(true);   // read without a lock by IsWalletLocked
 CCriticalSection cs_mapKeys;
 CKey keyUser;
 // A plaintext seed found in an encrypted wallet at load (see
@@ -535,6 +535,9 @@ void LockWallet()
             SecureClearBytes(vchHDMaster);
         if (!vchCryptedHDChainCode.empty())
             SecureClearBytes(vchHDChainCode);
+        // The default key's secret too: a phrase install in this session
+        // left a full key in keyUser.
+        keyUser.ForgetPrivKey();
         fWalletLocked = true;
     }
 }
@@ -547,6 +550,8 @@ int64 GetWalletRelockTime()
 // A node that mines or runs a pool draws a wallet key for every coinbase, and
 // a locked wallet has none to give: the miner stops, and the pool's template
 // builder would pay its blocks to an empty key. So such a node does not lock.
+bool (*pfnWalletLockRefusedExtra)(string& strWhyRet) = NULL;
+
 bool WalletLockRefusedWhy(string& strWhyRet)
 {
     strWhyRet.clear();
@@ -556,6 +561,9 @@ bool WalletLockRefusedWhy(string& strWhyRet)
                     "stop mining first";
         return true;
     }
+    if (pfnWalletLockRefusedExtra && pfnWalletLockRefusedExtra(strWhyRet))
+        return true;
+    strWhyRet.clear();
     return false;
 }
 
@@ -567,6 +575,17 @@ static void ThreadWalletRelock()
         int64 nWhen = nWalletRelockTime.load();
         if (nWhen != 0 && GetTime() >= nWhen && !IsWalletLocked())
         {
+            // Asked again now, not only when the timeout was set: mining or a
+            // pool can have been switched on since, and a locked wallet would
+            // leave them no key for the next block.
+            string strWhy;
+            if (WalletLockRefusedWhy(strWhy))
+            {
+                nWalletRelockTime.store(0);
+                printf("wallet: the unlock timeout ran out, but the wallet stays unlocked: %s\n",
+                       strWhy.c_str());
+                continue;
+            }
             LockWallet();
             printf("wallet: the unlock timeout ran out; the wallet is locked again\n");
         }
@@ -921,6 +940,7 @@ bool UnlockWallet(const string& strPassphrase, string& strErrorRet)
         // Outside cs_mapKeys: the repair takes cs_keyPool first, as every
         // other path does.
         RepairPlainSeedAfterUnlock();
+        RepairReissuedPool();
         return true;
     }
     if (mapCryptedKeys.empty() && !mapMasterKeys.empty())
@@ -1313,6 +1333,12 @@ void RepairPlainSeedAfterUnlock()
 {
     if (vchPlainSeedPendingMaster.empty() && vchPlainSeedPendingChainCode.empty())
         return;
+    // cs_main and cs_mapWallet first, as everywhere: under SQLite the bracket
+    // below is one transaction on the shared connection, and holding the
+    // wallet writers out keeps their writes from joining (and rolling back
+    // with) it.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
     CRITICAL_BLOCK(cs_keyPool)
     {
         if (vchPlainSeedPendingMaster.size() != 32 || vchPlainSeedPendingChainCode.size() != 32)
@@ -1406,6 +1432,81 @@ void RepairPlainSeedAfterUnlock()
     }
 }
 
+// Releases up to 1.2.32 rebuilt the key pool of an encrypted BIP44 wallet
+// from the legacy counter -- 0 in such a wallet -- so its pool came to hold
+// receive/0..99: the default address and addresses already handed out, to be
+// handed out again (a merchant would credit one payer's coins to another).
+// Such a pool is recognised by holding a key certainly issued already: the
+// default key, receive/0, a key with an address-book label, a key some wallet
+// transaction pays, or the same key twice. Which of the other pool keys were
+// also handed out cannot be known, so the whole pool goes; the counters move
+// past every key the wallet holds and the pool is refilled from there. The
+// gap this leaves (at most a pool's worth) is within what a restore scans
+// past. Runs at unlock, when the seed is there to derive with.
+bool RepairReissuedPool()
+{
+    bool fRepaired = false;
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    CRITICAL_BLOCK(cs_keyPool)
+    {
+        if (!HaveHDSeed() || nHDKeySchema != HD_SCHEMA_BIP44 || mapKeyPool.empty())
+            return false;
+        set<vector<unsigned char> > setIssued;
+        try { setIssued.insert(keyUser.GetPubKey()); } catch (...) { }
+        CKey key0;
+        string strError;
+        if (DeriveHDKey(0, key0, strError))
+            setIssued.insert(key0.GetPubKey());
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<string, string>::const_iterator it = mapAddressBook.begin(); it != mapAddressBook.end(); ++it)
+            {
+                uint160 hash;
+                if (!AddressToHash160(it->first, hash))
+                    continue;
+                map<uint160, vector<unsigned char> >::const_iterator mi = mapPubKeys.find(hash);
+                if (mi != mapPubKeys.end())
+                    setIssued.insert(mi->second);
+            }
+        }
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            for (size_t i = 0; i < it->second.vout.size(); i++)
+            {
+                vector<unsigned char> vchPubKey;
+                if (ExtractPubKey(it->second.vout[i].scriptPubKey, true, vchPubKey))
+                    setIssued.insert(vchPubKey);
+            }
+        set<vector<unsigned char> > setSeen;
+        int nIssuedInPool = 0, nTwice = 0;
+        for (map<int64, vector<unsigned char> >::const_iterator it = mapKeyPool.begin(); it != mapKeyPool.end(); ++it)
+        {
+            if (setIssued.count(it->second))
+                nIssuedInPool++;
+            if (!setSeen.insert(it->second).second)
+                nTwice++;
+        }
+        if (nIssuedInPool == 0 && nTwice == 0)
+            return false;
+
+        if (!ClearKeyPoolRecords(strError))
+        {
+            printf("RepairReissuedPool() : %s\n", strError.c_str());
+            return false;
+        }
+        AdvanceHDCountersPastHeldKeys();
+        TopUpKeyPool();
+        fRepaired = true;
+        string strNotice = strprintf(
+            "The key pool of this wallet held %d address(es) already handed out (left by the encryption of "
+            "an older version). The pool was rebuilt from receive index %u; addresses handed out before "
+            "will not be handed out again.", nIssuedInPool + nTwice, nHDReceiveNext);
+        printf("wallet: %s\n", strNotice.c_str());
+        strWalletSeedNotice = strWalletSeedNotice.empty() ? strNotice : strWalletSeedNotice + " " + strNotice;
+    }
+    return fRepaired;
+}
+
 bool WalletHasHDSeed()
 {
     return HaveHDSeed() || !vchCryptedHDMaster.empty() || !vchPlainSeedPendingMaster.empty();
@@ -1433,7 +1534,8 @@ void RestrictWalletFileModes()
         {
             string strName = pent->d_name;
             if (strName.find(".before-encrypt.") != string::npos ||
-                strName.compare(0, 23, "wallet.sqlite.encrypting") == 0)
+                strName.compare(0, 24, "wallet.sqlite.encrypting") == 0 ||
+                strName.compare(0, 18, "wallet.encrypting.") == 0)
                 RestrictFileToOwner(strDir + "/" + strName);
         }
         closedir(pdir);
@@ -1500,6 +1602,12 @@ bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphras
                            key, strErrorRet))
         return false;
 
+    // cs_main and cs_mapWallet before cs_keyPool (the wallet's order): the
+    // install is one SQLite transaction on the shared connection, and the
+    // wallet writers (AddToWallet from the message thread, settings) are kept
+    // out of it while it is open.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
     CRITICAL_BLOCK(cs_keyPool)
     {
         const bool fEncrypted = IsWalletEncrypted();
@@ -1601,6 +1709,10 @@ bool SetHDSeedFromMnemonic(const string& strMnemonic, const string& strPassphras
             SetAddressBookName(PubKeyToAddress(vchOldDefault),
                                "Your Address (created before the recovery phrase)");
         keyUser = key;
+        // In an encrypted wallet the private half lives encrypted only; the
+        // loader never keeps it in keyUser either.
+        if (fEncrypted)
+            keyUser.ForgetPrivKey();
 
         // The same phrase installed again (a restore of the wallet's own
         // words) finds its keys already here: start past them, so addresses
@@ -6244,6 +6356,11 @@ void ClampLoadedFeeSettings()
     {
         printf("LoadWallet: the stored flat fee %s is outside 0..%s; using the minimum fee instead\n",
                FormatMoney(nTransactionFee).c_str(), FormatMoney(MAX_TX_FEE_SETTING).c_str());
+        // Where an operator who set it on purpose will see it, not only debug.log.
+        fprintf(stderr, "Wallet: the stored fee per transaction (%s) is above %s and is not used; "
+                        "the minimum fee applies. Set it again (at most %s) if needed.\n",
+                FormatMoney(nTransactionFee).c_str(), FormatMoney(MAX_TX_FEE_SETTING).c_str(),
+                FormatMoney(MAX_TX_FEE_SETTING).c_str());
         nTransactionFee = 0;
     }
     if (nPayTxFeePerKB < 0 || nPayTxFeePerKB > COIN)

@@ -9889,24 +9889,43 @@ static std::map<std::string, int> WfCountRecords()
     return c.m;
 }
 
+// The backend the Wf* scenarios run on: Berkeley DB (wallet.dat), or the
+// SQLite runtime (wallet.sqlite, the default for new installs).
+static bool gWfSQLite = false;
+
+static std::string WfSQLitePath()
+{
+    return GetAppDir() + "/wallet.sqlite";
+}
+
+static bool WfLoadWallet()
+{
+    if (!gWfSQLite)
+        return LoadWallet();
+    if (!FileExists(WfSQLitePath().c_str()))
+        return CreateNewSQLiteWallet(WfSQLitePath());
+    return LoadWalletFromSQLiteRuntime(WfSQLitePath());
+}
+
 // Close everything and read the wallet back from disk in this process, as a
 // restart would.
 static bool WfReloadWallet()
 {
     DBFlush(true);
+    WalletSQLiteRuntimeClose();
     ClearWalletRuntimeForTest();
     vchPlainSeedPendingMaster.clear();
     vchPlainSeedPendingChainCode.clear();
     strWalletSeedNotice.clear();
     SetWalletRelockTimeout(0);
-    return LoadWallet();
+    return WfLoadWallet();
 }
 
 // A wallet with phrase A and a full pool, encrypted by EncryptWallet, then
 // loaded again (locked).
 static bool WfMakeEncryptedHDWallet(std::string& err)
 {
-    if (!LoadWallet())
+    if (!WfLoadWallet())
     {
         err = "LoadWallet failed";
         return false;
@@ -9953,6 +9972,11 @@ static int WfRunInTempDir(const char* pszName, int (*fn)(const std::string&, con
         nFail++;
     }
     SetWalletRelockTimeout(0);
+    nWalletSQLiteWritesBeforeFailForTest = -1;
+    if (gWfSQLite && WalletSQLiteRuntimeActive())
+        printf("  (ran on the SQLite backend)\n");
+    WalletSQLiteRuntimeClose();
+    gWfSQLite = false;
     DBFlush(true);
     SetCurrentDir(cwd);
     RemoveTree(tmp);
@@ -9975,6 +9999,8 @@ static int WfEncryptedSeed(const std::string&, const std::string&)
         printf("  FAIL setup: %s\n", err.c_str());
         return nFail + 1;
     }
+    if (gWfSQLite)
+        nFail += Check(WalletSQLiteRuntimeActive(), "the wallet runs on the SQLite backend") ? 0 : 1;
     nFail += Check(IsWalletEncrypted() && IsWalletLocked(), "the encrypted wallet loads locked") ? 0 : 1;
     nFail += Check(!HaveHDSeed() && WalletHasHDSeed(),
                    "a locked wallet has a seed, though not one in memory") ? 0 : 1;
@@ -10005,6 +10031,8 @@ static int WfEncryptedSeed(const std::string&, const std::string&)
                    "it is stored encrypted only: no plaintext seed record") ? 0 : 1;
     nFail += Check(keyUser.GetPubKey() == WfDerivePub(mB, 0, 0) && vchHDMaster == mB.privateKey,
                    "and the wallet derives from it, its first receive key the default") ? 0 : 1;
+    nFail += Check(!keyUser.HasPrivKey(),
+                   "the default key's secret is not kept in memory (it lives encrypted only)") ? 0 : 1;
     TopUpKeyPool();
     unsigned int nRecvB = nHDReceiveNext;
 
@@ -10086,7 +10114,7 @@ static int WfEncryptPool(const std::string&, const std::string&)
     int nFail = 0;
     std::string err;
     bitflash::BIP32PrivateNode mA;
-    if (!WfMaster(WF_PHRASE_A, mA) || !LoadWallet() || !SetHDSeedFromMnemonic(WF_PHRASE_A, "", err))
+    if (!WfMaster(WF_PHRASE_A, mA) || !WfLoadWallet() || !SetHDSeedFromMnemonic(WF_PHRASE_A, "", err))
     {
         printf("  FAIL setup: %s\n", err.c_str());
         return 1;
@@ -10132,6 +10160,36 @@ static int WfEncryptPool(const std::string&, const std::string&)
             nBad++;
     }
     nFail += Check(nBad == 0, "120 new addresses after encryption: none handed out before, none twice") ? 0 : 1;
+
+    // M-2: a wallet an older release encrypted holds receive/0..99 in its pool
+    // (and hdnext 100). The unlock repairs it.
+    std::set<std::vector<unsigned char> > setHanded = setIssued;
+    setHanded.insert(setDrawn.begin(), setDrawn.end());
+    unsigned int nRecvBeforeDamage = nHDReceiveNext;
+    bool fDamaged = ResetKeyPoolRecords(err) && CWalletDB().WriteHDNext(100);
+    for (int i = 0; i < KEYPOOL_SIZE && fDamaged; i++)
+        fDamaged = CWalletDB().WritePool(i + 1, WfDerivePub(mA, 0, i));
+    nFail += Check(fDamaged, "the pool an older release left (receive/0..99) can be written back") ? 0 : 1;
+    nFail += Check(WfReloadWallet() && UnlockWallet(WF_PASS, err), "that wallet loads and unlocks") ? 0 : 1;
+    int nStillIssued = 0;
+    CRITICAL_BLOCK(cs_keyPool)
+        for (map<int64, vector<unsigned char> >::iterator it = mapKeyPool.begin(); it != mapKeyPool.end(); ++it)
+            if (setHanded.count(it->second))
+                nStillIssued++;
+    nFail += Check(nStillIssued == 0 && !strWalletSeedNotice.empty() && nHDReceiveNext >= nRecvBeforeDamage,
+                   strprintf("the unlock rebuilt the pool: no address handed out before is in it (%d), the user is told",
+                             nStillIssued).c_str()) ? 0 : 1;
+    int nAgain = 0;
+    for (int i = 0; i < 20; i++)
+    {
+        std::vector<unsigned char> v = GetKeyFromPool();
+        if (v.empty() || setHanded.count(v))
+            nAgain++;
+        setHanded.insert(v);
+    }
+    nFail += Check(nAgain == 0, "and the next 20 addresses are all new") ? 0 : 1;
+    nFail += Check(WfReloadWallet() && UnlockWallet(WF_PASS, err) && strWalletSeedNotice.empty(),
+                   "a healthy pool is left alone at the next unlock") ? 0 : 1;
 
     // L6: when the phrase cannot derive the next key, the wallet hands out
     // what its pool holds and then nothing -- never a random key the phrase
@@ -10235,6 +10293,45 @@ static int WfRelock(const std::string&, const std::string&)
     std::string strWhy2;
     nFail += Check(fRefused && !strWhy.empty() && !WalletLockRefusedWhy(strWhy2),
                    "a mining node does not lock its wallet (its blocks need keys); a plain node does") ? 0 : 1;
+
+    // M-1: mining switched on AFTER a timed unlock. The timer asks again when
+    // it fires, and leaves the wallet unlocked.
+    nFail += Check(UnlockWalletFor(WF_PASS, 1, err) && GetWalletRelockTime() > 0,
+                   "unlocked with a one-second timeout, mining off") ? 0 : 1;
+    fGenerateBitcoins = 1;
+    for (int i = 0; i < 30 && GetWalletRelockTime() != 0; i++)
+        Sleep(100);
+    Sleep(500);
+    bool fStillUnlocked = !IsWalletLocked() && HaveHDSeed() && GetWalletRelockTime() == 0;
+    std::vector<unsigned char> vchMinerKey = GetKeyFromPool();
+    fGenerateBitcoins = fWasGenerate;
+    nFail += Check(fStillUnlocked && !vchMinerKey.empty(),
+                   "mining turned on after the unlock: the timeout does not lock the wallet, and the miner still gets keys") ? 0 : 1;
+
+    // L-4: an inheritance this wallet renews by itself keeps the wallet unlocked.
+    std::string strContracts = GetAppDir() + "/v4contracts.json";
+    nFail += Check(WriteTextFile(strContracts,
+                                 "{\"Cinheritance\": {\"type\": \"inheritance\", \"role\": \"owner\", \"autoRenew\": true}}"),
+                   "an owner inheritance with autoRenew is on record") ? 0 : 1;
+    std::string strWhyInherit;
+    bool fInheritRefuses = WalletLockRefusedWhy(strWhyInherit) &&
+                           strWhyInherit.find("inheritance") != std::string::npos;
+    WriteTextFile(strContracts,
+                  "{\"Cinheritance\": {\"type\": \"inheritance\", \"role\": \"owner\", \"autoRenew\": true, \"closedTxid\": \"00\"}}");
+    std::string strWhyClosed;
+    bool fClosedAllows = !WalletLockRefusedWhy(strWhyClosed);
+    remove(strContracts.c_str());
+    nFail += Check(fInheritRefuses && fClosedAllows,
+                   "the wallet does not lock while it renews an inheritance by itself; once that is closed, it may") ? 0 : 1;
+
+    // L-3: locking forgets the default key's secret.
+    CKey keyFull;
+    keyFull.MakeNewKey();
+    keyUser = keyFull;
+    bool fHadSecret = keyUser.HasPrivKey();
+    LockWallet();
+    nFail += Check(fHadSecret && !keyUser.HasPrivKey() && keyUser.GetPubKey() == keyFull.GetPubKey(),
+                   "LockWallet keeps the default key's public half and forgets its secret") ? 0 : 1;
     return nFail;
 }
 
@@ -10398,9 +10495,11 @@ static int WfFileModes(const std::string& tmp, const std::string&)
     }
     {
         // Files an older build left readable: tightened at start.
-        const char* apsz[] = { "wallet.dat", "wallet.sqlite", "nostr.key", "wallet.dat.before-encrypt.1.bak" };
+        const char* apsz[] = { "wallet.dat", "wallet.sqlite", "nostr.key", "wallet.dat.before-encrypt.1.bak",
+                               "wallet.sqlite.encrypting.1700000000", "wallet.encrypting.1700000000.dat" };
+        const size_t nFiles = sizeof(apsz) / sizeof(apsz[0]);
         bool fMade = true;
-        for (size_t i = 0; i < 4; i++)
+        for (size_t i = 0; i < nFiles; i++)
         {
             std::string p = tmp + "/" + apsz[i];
             fMade = fMade && WriteTextFile(p, "x") && chmod(p.c_str(), 0644) == 0;
@@ -10409,11 +10508,11 @@ static int WfFileModes(const std::string& tmp, const std::string&)
         fMade = fMade && mkdir(strLogDir.c_str(), 0755) == 0 && chmod(strLogDir.c_str(), 0755) == 0;
         RestrictWalletFileModes();
         bool fAll = true;
-        for (size_t i = 0; i < 4; i++)
+        for (size_t i = 0; i < nFiles; i++)
             fAll = fAll && stat((tmp + "/" + apsz[i]).c_str(), &st) == 0 && (st.st_mode & 0777) == 0600;
         fAll = fAll && stat(strLogDir.c_str(), &st) == 0 && (st.st_mode & 077) == 0;
         nFail += Check(fMade && fAll,
-                       "wallet.dat, wallet.sqlite, nostr.key, an encryption backup and database/ are made owner-only at start") ? 0 : 1;
+                       "wallet.dat, wallet.sqlite, nostr.key, encryption backups and leftover encryption temp files (both backends), and database/ are made owner-only at start") ? 0 : 1;
     }
     {
         std::string p = tmp + "/private.out";
@@ -10649,6 +10748,70 @@ static int WfRpcAndV4(const std::string&, const std::string&)
     return WalletRpcV4SelfTest();
 }
 
+// The same scenarios on the SQLite backend, the default for new installs.
+static int WfEncryptedSeedSQLite(const std::string& tmp, const std::string& cwd)
+{
+    gWfSQLite = true;
+    return WfEncryptedSeed(tmp, cwd);
+}
+
+static int WfEncryptPoolSQLite(const std::string& tmp, const std::string& cwd)
+{
+    gWfSQLite = true;
+    return WfEncryptPool(tmp, cwd);
+}
+
+// SQLite brackets: nesting, a rollback dooming the whole transaction, and a
+// seed install that fails part way leaving the disk as it was.
+static int WfSQLiteRollback(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    gWfSQLite = true;
+    bitflash::BIP32PrivateNode mA;
+    if (!WfMaster(WF_PHRASE_A, mA) || !WfLoadWallet() || !WalletSQLiteRuntimeActive() ||
+        !SetHDSeedFromMnemonic(WF_PHRASE_A, "", err))
+    {
+        printf("  FAIL setup: %s\n", err.c_str());
+        return 1;
+    }
+    TopUpKeyPool();
+
+    {
+        int64 n = 0;
+        bool fBegun = WalletSQLiteRuntimeBeginTxn() && CWalletDB().WriteSetting("wf-outer", (int64)1) &&
+                      WalletSQLiteRuntimeBeginTxn() && CWalletDB().WriteSetting("wf-inner", (int64)2);
+        WalletSQLiteRuntimeRollbackTxn();
+        bool fCommitted = WalletSQLiteRuntimeCommitTxn();
+        nFail += Check(fBegun && !fCommitted && !CWalletDB().ReadSetting("wf-outer", n) &&
+                       !CWalletDB().ReadSetting("wf-inner", n),
+                       "an inner rollback dooms the outer transaction: its commit fails and neither write stays") ? 0 : 1;
+        bool fNested = WalletSQLiteRuntimeBeginTxn() && CWalletDB().WriteSetting("wf-outer", (int64)3) &&
+                       WalletSQLiteRuntimeBeginTxn() && CWalletDB().WriteSetting("wf-inner", (int64)4) &&
+                       WalletSQLiteRuntimeCommitTxn() && WalletSQLiteRuntimeCommitTxn();
+        int64 a = 0, b = 0;
+        nFail += Check(fNested && CWalletDB().ReadSetting("wf-outer", a) && a == 3 &&
+                       CWalletDB().ReadSetting("wf-inner", b) && b == 4,
+                       "nested brackets that both commit keep both writes") ? 0 : 1;
+    }
+
+    std::map<std::string, int> before = WfCountRecords();
+    unsigned int nRecv = nHDReceiveNext, nChange = nHDChangeNext;
+    // Three writes succeed (the default key, then the two seed halves), the
+    // fourth -- the schema -- fails, inside the install's transaction.
+    nWalletSQLiteWritesBeforeFailForTest = 3;
+    bool fInstalled = SetHDSeedFromMnemonic(WF_PHRASE_B, "", err);
+    nWalletSQLiteWritesBeforeFailForTest = -1;
+    nFail += Check(!fInstalled, strprintf("a seed install whose fourth write fails is refused (%s)", err.c_str()).c_str()) ? 0 : 1;
+    nFail += Check(WfReloadWallet() && WalletSQLiteRuntimeActive(), "the wallet loads again from SQLite") ? 0 : 1;
+    std::map<std::string, int> after = WfCountRecords();
+    after["key"] -= 1;   // the new default key, stored before the transaction on purpose
+    nFail += Check(vchHDMaster == mA.privateKey && nHDReceiveNext == nRecv && nHDChangeNext == nChange &&
+                   after == before && after["pool"] == KEYPOOL_SIZE,
+                   "on disk the old seed, counters and full pool are all still there: the transaction rolled back") ? 0 : 1;
+    return nFail;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -10791,10 +10954,16 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-fee-limit", WfFeeLimit);
     if (name == "chat-replay-quota")
         return RunChatReplayQuotaSelfTest();
+    if (name == "wallet-encrypted-seed-sqlite")
+        return WfRunInTempDir("wallet-encrypted-seed-sqlite", WfEncryptedSeedSQLite);
+    if (name == "wallet-encrypt-pool-sqlite")
+        return WfRunInTempDir("wallet-encrypt-pool-sqlite", WfEncryptPoolSQLite);
+    if (name == "wallet-sqlite-rollback")
+        return WfRunInTempDir("wallet-sqlite-rollback", WfSQLiteRollback);
     if (name == "wallet-rpc-v4")
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

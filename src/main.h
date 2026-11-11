@@ -237,7 +237,7 @@ extern CKeyingMaterial vWalletMasterKey;
 extern vector<unsigned char> vchCryptedHDMaster;
 extern vector<unsigned char> vchCryptedHDChainCode;
 extern bool fWalletEncrypted;
-extern bool fWalletLocked;
+extern std::atomic<bool> fWalletLocked;
 bool IsWalletEncrypted();
 bool IsWalletLocked();
 // Clears the master key and the decrypted seed, under every wallet lock in
@@ -251,6 +251,9 @@ int64 GetWalletRelockTime();      // unix time of the automatic relock, 0 for no
 // True (with the reason) when this node must not lock its wallet: it mines or
 // runs a pool, which take a wallet key for every block.
 bool WalletLockRefusedWhy(string& strWhyRet);
+// Another reason, registered by a part of the node that needs the keys
+// (jsonrpc.cpp: an inheritance that renews itself). NULL: none.
+extern bool (*pfnWalletLockRefusedExtra)(string& strWhyRet);
 // A plaintext seed in an encrypted wallet (left there by older builds): set
 // aside at load, settled at the next unlock. strWalletSeedNotice says what was
 // found and what was done; empty when there was nothing.
@@ -259,6 +262,9 @@ extern vector<unsigned char> vchPlainSeedPendingChainCode;
 extern string strWalletSeedNotice;
 void QuarantinePlainSeedInEncryptedWallet();
 void RepairPlainSeedAfterUnlock();
+// At unlock: a BIP44 pool holding addresses already handed out (encrypted by
+// a release up to 1.2.32) is rebuilt past every held key. True if it was.
+bool RepairReissuedPool();
 // Wallet files owner-only on POSIX (wallet.dat, wallet.sqlite and its
 // sidecars, nostr.key, encryption backups, database/); warns when the data
 // directory itself is open to other accounts. No-op on Windows.

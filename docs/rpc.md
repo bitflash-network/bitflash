@@ -62,7 +62,7 @@ null.
 | `getnewaddress` | — | a fresh receiving address, one per call |
 | `validateaddress` | `address` | `isvalid`, and `ismine` when it is |
 | `getbalance` | `[minconf=1]` | spendable balance, excluding immature mining rewards. With `minconf` 1 (the default) a payment from somebody else counts once it is in a block; this wallet's own change counts at once. `minconf` 0 counts everything not yet spent |
-| `walletlock` | — | locks an encrypted wallet now: the master key and the decrypted seed leave memory. Spending, new addresses and mining stop until the node is started again with `/walletpassphrase`. Refused while this node mines or runs a pool, which need wallet keys |
+| `walletlock` | — | locks an encrypted wallet now: the master key and the decrypted seed leave memory. Spending, new addresses and mining stop until the node is started again with `/walletpassphrase`. Refused while this node mines or runs a pool, or renews an inheritance by itself, all of which need wallet keys; the same applies to `/walletunlocktimeout` when it runs out (it then leaves the wallet unlocked and says so in debug.log) |
 | `sendtoaddress` | `address`, `amount` | txid of the transaction it created and broadcast |
 | `gettransaction` | `txid` | amount, confirmations, block, `details` per output, `bip125-replaceable` |
 | `createinvoice` | `amount`, [`description`], [`expirysecs`], [`orderid`] | an invoice for the shop's own gateway: fresh address, payment link, QR as SVG -- `docs/invoices.md` |

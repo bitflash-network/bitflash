@@ -313,6 +313,7 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
 
     if (!SetHDSeedFromMnemonic(strMnemonic, strPassphrase, strErrorRet))
         return false;
+    strErrorRet.clear();   // from here on, set only when the restore stops early
 
     // Derive forward in batches, scanning after each, until a whole batch turns
     // up nothing. Every derived key is written to the wallet before the scan,
@@ -497,6 +498,15 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
     nRecoveredRet = (int)(nWalletEnd > nWalletStart ?
                           nWalletEnd - nWalletStart : 0);
     nDerivedRet = nTotalDerived;
+    // A restore that had to stop early (the wallet locked, a full disk) did
+    // not look as far as it should have. Reporting it as finished would read
+    // "no transactions found -- check the words" for coins that are there.
+    if (!strErrorRet.empty())
+    {
+        strErrorRet = "the restore stopped before it was done (" + strErrorRet +
+                      "); the coins found so far are in the wallet -- run the restore again";
+        return false;
+    }
     return true;
 }
 

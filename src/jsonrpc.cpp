@@ -2955,6 +2955,42 @@ static json rpc_inheritclaim(const json& p)
     return json();
 }
 
+// The renewer needs the wallet unlocked. While this wallet owns an open
+// inheritance that renews itself, it does not lock (walletlock, the unlock
+// timeout): locking would stop the renewals without a word, and once the
+// period ran out the heir could claim -- not what the owner chose.
+static bool InheritanceNeedsUnlockedWallet(string& strWhyRet)
+{
+    json all;
+    try
+    {
+        CRITICAL_BLOCK(cs_v4contracts)
+            all = LoadV4Contracts();
+    }
+    catch (std::exception&)
+    {
+        return false;   // unreadable: the renewer cannot act on it either
+    }
+    for (json::iterator it = all.begin(); it != all.end(); ++it)
+    {
+        const json& rec = it.value();
+        if (rec.value("type", "") == "inheritance" && rec.value("role", "") == "owner" &&
+            !rec.contains("closedTxid") && rec.value("autoRenew", true))
+        {
+            strWhyRet = "this wallet renews the inheritance at " + it.key() +
+                        " by itself, which needs the wallet unlocked; locked, the renewals would stop "
+                        "and the heir's period would run out";
+            return true;
+        }
+    }
+    return false;
+}
+
+static struct CInheritanceLockHook
+{
+    CInheritanceLockHook() { pfnWalletLockRefusedExtra = InheritanceNeedsUnlockedWallet; }
+} inheritanceLockHook;
+
 // The renewer: a few minutes after start and every five minutes after that,
 // every inheritance this wallet owns that is half way to opening is spent back
 // to its own address.
@@ -4391,8 +4427,12 @@ int WalletRpcV4SelfTest()
     {
         bool fWasTestNet = IsTestNet();
         SelectNetworkParams(true);
-        nBenchRulesV4Time = 1792500000;
-        if (RulesV4Active((unsigned int)GetAdjustedTime()))
+        // The bench switch, an hour before now: rules v4 are then in force on
+        // the adjusted clock whatever the date (testnet rules v3 are older).
+        nBenchRulesV4Time = std::max((unsigned int)GetAdjustedTime() - 3600, RulesV3Time());
+        bool fV4Now = RulesV4Active((unsigned int)GetAdjustedTime());
+        nFail += T::Check(fV4Now, "rules v4 are in force on the testnet bench clock, so the memory-pool check runs");
+        if (fV4Now)
         {
             CTxDB txdb("cr+");
             T::AddToPool(fromCsfs);
@@ -4403,8 +4443,6 @@ int WalletRpcV4SelfTest()
                               "the memory pool refuses the 33-byte-key CSFS spend and takes the real CTV spend");
             T::ClearPool();
         }
-        else
-            fprintf(stdout, "  skip the memory-pool check (rules v4 not active on the testnet bench clock)\n");
         nBenchRulesV4Time = 0;
         SelectNetworkParams(fWasTestNet);
     }

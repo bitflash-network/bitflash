@@ -152,7 +152,9 @@ relay or mine a transaction whose scripts execute one of them (policy only,
 like Bitcoin's `DISCOURAGE_UPGRADABLE_NOPS` and `_PUBKEYTYPE`); a block that
 contains one is still valid. The CSFS case matters most: a script written by
 hand with an ordinary 33-byte key passes with any signature at all, so
-`spendscript` refuses such a redeem script outright.
+`spendscript` refuses such a redeem script outright. The CSFS policy refuses
+such a key even with an empty signature (where consensus pushes false), which
+is stricter than Bitcoin's `_PUBKEYTYPE`; it is policy only.
 
 ## What old nodes see
 

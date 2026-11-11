@@ -484,6 +484,9 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=wallet-fee-limit
 	./bitflash-node -selftest=wallet-rpc-v4
 	./bitflash-node -selftest=chat-replay-quota
+	./bitflash-node -selftest=wallet-encrypted-seed-sqlite
+	./bitflash-node -selftest=wallet-encrypt-pool-sqlite
+	./bitflash-node -selftest=wallet-sqlite-rollback
 	./bitflash-node -selftest=net-message
 	./bitflash-node -selftest=network-params
 	./bitflash-node -selftest=consensus-limits

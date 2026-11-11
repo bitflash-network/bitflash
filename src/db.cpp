@@ -151,12 +151,23 @@ bool WalletSQLiteRuntimeReadRecord(const vector<unsigned char>& vchKey,
     return pWalletSQLiteRuntime->ReadRecord(vchKey, vchValueRet, strError);
 }
 
+// Selftests only (wallet-sqlite-rollback): when >= 0, that many more writes
+// succeed and the next ones fail, so a failure part way through a bracket can
+// be tested. -1 (always, outside that test): no effect.
+int nWalletSQLiteWritesBeforeFailForTest = -1;
+
 bool WalletSQLiteRuntimeWriteRecord(const vector<unsigned char>& vchKey,
                                     const vector<unsigned char>& vchValue,
                                     bool fOverwrite)
 {
     if (!pWalletSQLiteRuntime)
         return false;
+    if (nWalletSQLiteWritesBeforeFailForTest >= 0)
+    {
+        if (nWalletSQLiteWritesBeforeFailForTest == 0)
+            return false;
+        nWalletSQLiteWritesBeforeFailForTest--;
+    }
     string strError;
     return pWalletSQLiteRuntime->WriteRecord(vchKey, vchValue, strError,
                                              fOverwrite);

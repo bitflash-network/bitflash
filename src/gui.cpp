@@ -1211,6 +1211,12 @@ static void DrawOptionsDialog()
                 fGenerateBitcoins = 0;
             } else {
                 fGenerateBitcoins = 1;
+                // Every block mined needs a wallet key: a pending automatic
+                // relock (/walletunlocktimeout) is cancelled, and said so.
+                if (GetWalletRelockTime() != 0) {
+                    SetWalletRelockTimeout(0);
+                    g_torActionMsg = "Mining is on, so the wallet stays unlocked: the unlock timeout was cancelled.";
+                }
                 if (!vfThreadRunning[3]) StartMinerThreads();
             }
 
