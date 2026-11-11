@@ -343,6 +343,8 @@ Line coverage of the corpora replayed through a coverage build:
 On GitHub ("Audit campaign", 20 minutes per harness per engine, corpora
 kept): libFuzzer, AFL++ and honggfuzz on both harnesses. The first round
 found the NUL in a string address above (honggfuzz, `fuzz-decoders`); the
-other five jobs found nothing, and the campaign's own coverage of the
+other five jobs found nothing. The round after every fix above found nothing
+in any of the six jobs (corpora 6.0k and 9.2k inputs for `fuzz-deserialize`,
+8.0k and 11.4k for `fuzz-decoders`, libFuzzer and honggfuzz), and the campaign's own coverage of the
 corpora matched the table above (`serialize.h` 61.4%, `base58.h` 94.2%,
 `btfaddr.cpp` 85.9%, `bip32.cpp` 77.3%, `bip21.cpp` 100%, whole files).
