@@ -394,6 +394,8 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=db-locks
 	./bitflash.exe -selftest=db-open-failure
 	./bitflash.exe -selftest=private-file
+	./bitflash.exe -selftest=serialize-canonical
+	./bitflash.exe -selftest=decoder-canonical
 	./bitflash.exe -selftest=swap-wait-payment
 	./bitflash.exe -selftest=swap-timelock
 	./bitflash.exe -selftest=swap-journal

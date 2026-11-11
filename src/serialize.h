@@ -194,33 +194,60 @@ void WriteCompactSize(Stream& os, uint64 nSize)
     return;
 }
 
+// Only the shortest form of each length is read, and nothing above MAX_SIZE.
+//
+// 0.1.0 took any width (5 as fd 05 00, or fe 05 00 00 00, ...), and every
+// caller stored the 64-bit result in an unsigned int, so ff followed by a
+// value with any of its high 32 bits set read as just its low half. The
+// object read was the same either way -- a transaction's id, a block's merkle
+// root and everything written to disk come from re-encoding it, and every
+// release has always written the shortest form -- but one transaction had
+// many encodings on the wire, and a "tx" message is relayed and held as an
+// orphan as the bytes that arrived. Bitcoin made the same change in 0.9.
+// Validity is untouched: the shortest encoding of every transaction and block
+// reads exactly as before; only a longer spelling of one, which no node ever
+// writes, is refused as a malformed message.
 template<typename Stream>
 uint64 ReadCompactSize(Stream& is)
 {
     unsigned char chSize;
     READDATA(is, chSize);
+    uint64 nSizeRet = 0;
     if (chSize < UCHAR_MAX-2)
     {
-        return chSize;
+        nSizeRet = chSize;
     }
     else if (chSize == UCHAR_MAX-2)
     {
         unsigned short nSize;
         READDATA(is, nSize);
-        return nSize;
+        nSizeRet = nSize;
+        if (nSizeRet < UCHAR_MAX-2)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
     }
     else if (chSize == UCHAR_MAX-1)
     {
         unsigned int nSize;
         READDATA(is, nSize);
-        return nSize;
+        nSizeRet = nSize;
+        if (nSizeRet <= USHRT_MAX)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
     }
     else
     {
         uint64 nSize;
         READDATA(is, nSize);
-        return nSize;
+        nSizeRet = nSize;
+        if (nSizeRet <= UINT_MAX)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
     }
+    // Every length is a count of bytes or of objects in one message or
+    // record, none of which may exceed MAX_SIZE; checking here, before any
+    // caller narrows the value to an unsigned int, is what keeps a 64-bit
+    // length from being read as its low half.
+    if (nSizeRet > (uint64)MAX_SIZE)
+        throw std::ios_base::failure("ReadCompactSize() : size too large");
+    return nSizeRet;
 }
 
 
@@ -770,7 +797,10 @@ public:
         Init(nTypeIn, nVersionIn);
     }
 
-    CDataStream(const vector<unsigned char>& vchIn, int nTypeIn=0, int nVersionIn=VERSION) : vch((char*)&vchIn.begin()[0], (char*)&vchIn.end()[0])
+    // data(), not &begin()[0]: on an empty vector that dereferences a null
+    // iterator (UndefinedBehaviorSanitizer, fuzz-deserialize).
+    CDataStream(const vector<unsigned char>& vchIn, int nTypeIn=0, int nVersionIn=VERSION)
+        : vch((const char*)vchIn.data(), (const char*)vchIn.data() + vchIn.size())
     {
         Init(nTypeIn, nVersionIn);
     }

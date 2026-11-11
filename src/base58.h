@@ -56,7 +56,8 @@ inline string EncodeBase58(const unsigned char* pbegin, const unsigned char* pen
 
 inline string EncodeBase58(const vector<unsigned char>& vch)
 {
-    return EncodeBase58(&vch[0], &vch[0] + vch.size());
+    // data(), not &vch[0]: indexing an empty vector is undefined.
+    return EncodeBase58(vch.data(), vch.data() + vch.size());
 }
 
 inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
@@ -66,7 +67,9 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
     CBigNum bn58 = 58;
     CBigNum bn = 0;
     CBigNum bnChar;
-    while (isspace(*psz))
+    // isspace takes an unsigned char's value: a byte from 0x80 up in a plain
+    // (signed) char is a negative argument, which is undefined.
+    while (isspace((unsigned char)*psz))
         psz++;
 
     // Convert big endian string to bignum
@@ -75,7 +78,7 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
         const char* p1 = strchr(pszBase58, *p);
         if (p1 == NULL)
         {
-            while (isspace(*p))
+            while (isspace((unsigned char)*p))
                 p++;
             if (*p != '\0')
                 return false;

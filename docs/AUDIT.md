@@ -8,7 +8,7 @@ and none of it needs an account.
 
 | when | what | where |
 |---|---|---|
-| every push and pull request | Linux and Windows self-test suites, Python tool regressions, short fuzz runs of three targets | `.github/workflows/ci.yml` |
+| every push and pull request | Linux and Windows self-test suites, Python tool regressions, short fuzz runs of six targets | `.github/workflows/ci.yml` |
 | every pull request into `main` | CodeQL (C++, Python, workflows); ClusterFuzzLite, ten minutes on the code the change touches | `.github/workflows/codeql.yml`, `.github/workflows/cflite.yml` |
 | every night (GitHub) | ClusterFuzzLite, one hour per sanitizer, corpus kept between runs | `.github/workflows/cflite.yml` |
 | every Monday (GitHub) | CodeQL over `main` | `.github/workflows/codeql.yml` |
@@ -99,7 +99,7 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Five harnesses in `src/`:
+Seven harnesses in `src/`:
 
 | target | what it feeds |
 |---|---|
@@ -108,6 +108,8 @@ Five harnesses in `src/`:
 | `fuzz-sigcheck` | signatures and keys into OpenSSL and libsecp256k1 side by side; any disagreement is a crash |
 | `fuzz-light-pow` | headers and histories into the DigiByte and Ravencoin difficulty and proof-of-work checks |
 | `fuzz-p2p-payload` | one message and its payload straight into `ProcessMessage()`, as from a peer past the version handshake: `block`, `tx`, `inv`, `getdata`, `getblocks`, the chat and P2Pool messages. The envelope checksum no fuzzer can forge is behind it, and a flag recomputes a block's merkle root. The node keeps its chain between inputs, and in this binary alone (`-DBITFLASH_FUZZ`, `fFuzzSkipPoW`) the RandomX comparison is skipped, so block acceptance, connection and reorganisation are reached; every other check runs as released |
+| `fuzz-deserialize` | raw bytes into every record the node reads from a peer or from its own files, through the `CDataStream >>` the node uses: `CTransaction`, `CBlock` (full, header only, from disk), `CBlockLocator`, `CInv`, `CAddress`, `CMessageHeader`, the transaction parts, `CDiskBlockIndex`, `CTxIndex`, `CDiskTxPos`, `CMerkleTx`, `CWalletTx`, `CWalletMasterKey`, the P2Pool share, chat and marketplace records, and the length prefix on its own. Whatever reads must re-encode to bytes that read back to themselves, `GetSerializeSize` must match, and on every canonical type (all of the wire ones) the re-encoding must be the input byte for byte. Two differentials: a block's id against the hash of its first 80 bytes, and the light client's `btcswap::ParseTx` against the node's reader |
+| `fuzz-decoders` | text into the decoders, each with its encoder where there is one: base58 and base58check, Bitflash key and script addresses (`AddressToHash160`, `DecodeAnyAddress`, which must agree), `.btf` names and onion endpoints, signed service descriptors (`VerifyDescriptor`), BIP39 phrases (checksum recomputed independently) and seeds, BIP32 derivation (path against step by step), payment links (`ParsePaymentLink`/`MakePaymentLink`), the three amount parsers against each other (`ParseMoney`, `ParseCoinAmount`, the payment link's), `ParseHex` and `uint256::SetHex`, the invoice webhook URL, cashaddr, and other chains' addresses (`btclight::Destination`) |
 
 Each runs under **libFuzzer**, **AFL++** and **honggfuzz** in turn, all three
 with AddressSanitizer and UndefinedBehaviorSanitizer. They share one corpus
@@ -261,3 +263,45 @@ On the last commit of this branch, every self-test (65) under
 AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer, under
 ThreadSanitizer and under Valgrind: **0 failures, 0 reports**. The Windows
 suite passes as well.
+
+## Deserializers and decoders (`fuzz-deserialize`, `fuzz-decoders`)
+
+November 2026, on `main` at `fa5b5db`. The two harnesses were first run
+against the code as it was, then against the fixes below.
+
+### What they found
+
+| found by | what | where |
+|---|---|---|
+| `fuzz-deserialize`, within seconds, on most types | `ReadCompactSize` took any width for a length (5 as `fd 05 00`, `fe 05 00 00 00`, ...) and every caller kept the 64-bit result in an `unsigned int`, so a nine-byte length with any of its high 32 bits set read as its low half. The object read was the same either way -- ids, merkle roots and the disk copy all come from re-encoding it, and every release writes the shortest form -- but one transaction had many encodings on the wire. Now only the shortest form is read, and nothing above `MAX_SIZE` (Bitcoin made the same change in 0.9). Which blocks and transactions are valid is unchanged: the shortest encoding of each reads exactly as before, and a longer spelling, which no node writes, is refused as a malformed message. | `serialize.h`, self-test `serialize-canonical` |
+| (the question the first finding raised: what does a node do with the bytes as they arrived?) | A `tx` message was relayed, and held if it was an orphan, as the whole payload, including any bytes after the transaction, which the reader leaves unread: what a node held per orphan and served per relayed transaction was bounded by the message size, not by the transaction's (which `IsStandard` limits). It now holds and relays the transaction re-encoded. | `main.cpp`, self-test `serialize-canonical` |
+| `fuzz-deserialize`, UndefinedBehaviorSanitizer | `CDataStream` built from an empty `vector<unsigned char>` dereferenced its null `begin()`; `HexStr` did the same on an empty range. | `serialize.h`, `util.h` |
+| `fuzz-decoders`, UndefinedBehaviorSanitizer, within seconds | `uint256::SetHex` indexed its digit table with a plain `char`: any byte from 0x80 up (an explorer search, a txid argument) read up to 128 bytes before the table. | `uint256.h`, self-test `decoder-canonical` |
+| `fuzz-decoders` | `NormalizeOnionEndpoint` kept a port's leading zeros, so `:080` and `:80` were two normal forms of one endpoint. | `btfaddr.cpp`, self-test `decoder-canonical` |
+| the round-trip check written for `fuzz-decoders` (`.btf` names) | A version-1 `.btf` name is 34 bytes in 55 base32 characters; the last character's low three bits are padding, which the decoder dropped whatever they were, so each key answered to eight names. Only the encoder's, with those bits zero, is the address now. | `btfaddr.cpp`, self-test `decoder-canonical` |
+| the hex check written for `fuzz-decoders` (descriptors) | A service descriptor's key and signatures were read with `sscanf("%2x")`, which also takes white space, a sign and `0x`. Plain hex digits only now. | `btfaddr.cpp`, self-test `decoder-canonical` |
+| review while writing `fuzz-decoders` | `EncodeBase58` of an empty vector indexed it; `DecodeBase58` passed a possibly negative `char` to `isspace`. | `base58.h` |
+
+### Not canonical, by design
+
+The harness checks that every input a type accepts re-encodes to exactly
+the bytes read. These types are exempt, and why:
+
+- `CWalletTx`, `CReview`, `CProduct` and any other record holding a `map`:
+  the reader takes keys in any order and keeps the first of a duplicate.
+  Wallet records are only ever written by the node; the marketplace
+  messages are relayed as received on purpose (0.1.0 design).
+- `CTxIndex`, `CDiskBlockIndex`, `CBlockLocator`, `CAddress` on disk and
+  `CUser` start with a version the reader puts in the stream, not the
+  object; written back with that version, they are canonical.
+- Base32 in general drops partial bits at the end (only a `.btf` name is
+  checked for them); `uint256::SetHex` takes `0x`, white space, short and
+  long strings; `ParsePaymentLink` carries the address as written and leaves
+  checking it to the wallet; `ParseMoney` takes `,` thousands separators,
+  white space, and reads an empty string or `.` as zero (every caller that
+  needs a positive amount checks for one). The three amount parsers agree
+  wherever two of them accept.
+
+The node has no parser for BIP32 extended keys (xprv/xpub) or for
+derivation paths written as text; keys come from a seed and a path of
+numbers, which `fuzz-decoders` exercises.

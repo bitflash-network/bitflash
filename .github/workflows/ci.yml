@@ -40,6 +40,12 @@ jobs:
       - name: Run P2P payload fuzz smoke (block, tx, inv past the handshake)
         run: make fuzz-p2p-payload-smoke
 
+      - name: Run deserializer fuzz smoke (every wire and disk record, round trip)
+        run: make fuzz-deserialize-smoke
+
+      - name: Run decoder fuzz smoke (addresses, base58, BIP39/32, payment links, amounts, hex)
+        run: make fuzz-decoders-smoke
+
   windows-ucrt64:
     name: Windows UCRT64 selftests
     runs-on: windows-latest

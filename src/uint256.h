@@ -305,18 +305,24 @@ public:
             pn[i] = 0;
 
         // skip 0x
+        //
+        // Every character goes through unsigned char before it is used as an
+        // index or handed to isspace: a plain char is signed on x86, and a
+        // byte from 0x80 up read phexdigit[] at a negative index -- 128 bytes
+        // before the table -- for any string with such a byte in it (an
+        // explorer search, a txid argument).
         const char* psz = str.c_str();
-        while (isspace(*psz))
+        while (isspace((unsigned char)*psz))
             psz++;
-        if (psz[0] == '0' && tolower(psz[1]) == 'x')
+        if (psz[0] == '0' && tolower((unsigned char)psz[1]) == 'x')
             psz += 2;
-        while (isspace(*psz))
+        while (isspace((unsigned char)*psz))
             psz++;
 
         // hex string to uint
         static char phexdigit[256] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0 };
         const char* pbegin = psz;
-        while (phexdigit[*psz] || *psz == '0')
+        while (phexdigit[(unsigned char)*psz] || *psz == '0')
             psz++;
         psz--;
         unsigned char* p1 = (unsigned char*)pn;

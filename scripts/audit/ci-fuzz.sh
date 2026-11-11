@@ -50,10 +50,10 @@ if ! make -j "$J" RANDOMX_DIR="$RANDOMX_DIR" FUZZ_CXX="$fcxx" \
 fi
 bin=$SRC/src/$t
 
-# An empty corpus gets a starting point: the payload harness writes structured
-# seeds of its own, the others start from one byte.
+# An empty corpus gets a starting point: the payload, deserializer and decoder
+# harnesses write structured seeds of their own, the others start from one byte.
 if [ -z "$(ls -A "$CORPUS")" ]; then
-    if [ "$t" = fuzz-p2p-payload ]; then
+    if [ "$t" = fuzz-p2p-payload ] || [ "$t" = fuzz-deserialize ] || [ "$t" = fuzz-decoders ]; then
         BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true
     fi
     [ -n "$(ls -A "$CORPUS")" ] || printf '\000' > "$CORPUS/seed0"

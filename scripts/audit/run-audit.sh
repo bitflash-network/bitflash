@@ -13,7 +13,7 @@
 #   tsan     every self-test, built with ThreadSanitizer
 #   valgrind memcheck over the self-tests that do not need a sanitizer runtime
 #   heap     heaptrack over the heaviest self-tests (peak memory, leaks)
-#   fuzz     the four fuzz targets under libFuzzer, AFL++ and honggfuzz, one
+#   fuzz     every fuzz target under libFuzzer, AFL++ and honggfuzz, one
 #            corpus per target shared by the three engines
 #   cov      line coverage of the self-tests and of every fuzz corpus (llvm-cov)
 #   repro    reprotest: build twice under different time, locale, umask and
@@ -38,7 +38,7 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -245,12 +245,15 @@ phase_fuzz() {
     mkdir -p "$OUT/fuzz-work"
     for t in $TARGETS; do fuzz_seed "$t"; done
     LF=$(fuzz_build libfuzzer)
-    # The payload harness writes structured seeds of its own (a block on
-    # genesis, a transaction, inv, ...); an empty corpus gets them first.
-    t=fuzz-p2p-payload
-    if [ -x "$LF/$t" ] && [ "$(ls -A "$CORPUS/$t")" = "seed0" ]; then
-        (cd "$OUT" && BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS/$t" "$LF/$t" -runs=0 > "$OUT/fuzz-seeds-$t.log" 2>&1)             || say "fuzz seeds for $t FAILED, see fuzz-seeds-$t.log"
-    fi
+    # Some harnesses write structured seeds of their own (the payload one a
+    # block on genesis, a transaction, inv, ...; the deserializer one every
+    # type; the decoder one a sample of every format); an empty corpus gets
+    # them first.
+    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders; do
+        if [ -x "$LF/$t" ] && [ "$(ls -A "$CORPUS/$t")" = "seed0" ]; then
+            (cd "$OUT" && BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS/$t" "$LF/$t" -runs=0 > "$OUT/fuzz-seeds-$t.log" 2>&1)                 || say "fuzz seeds for $t FAILED, see fuzz-seeds-$t.log"
+        fi
+    done
     have afl-clang-fast++ && AF=$(fuzz_build afl) || AF=""
     have hfuzz-clang++ && HF=$(fuzz_build hfuzz) || HF=""
     for engine in libfuzzer afl hfuzz; do
