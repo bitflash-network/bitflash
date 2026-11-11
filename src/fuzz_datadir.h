@@ -32,6 +32,11 @@ extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv)
         abort();   // never fall back to the real data directory
     }
     strSetDataDir = &buf[0];
+#ifdef BITFLASH_FUZZ_INIT_EXTRA
+    // A harness that needs node state (a block index, say) sets this up once
+    // the data directory is in place.
+    BITFLASH_FUZZ_INIT_EXTRA();
+#endif
     return 0;
 }
 

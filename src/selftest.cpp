@@ -7,6 +7,7 @@
 
 #include "headers_core.h"
 #include <atomic>
+#include <limits>
 #include "btfaddr.h"
 #include "bip32.h"
 #include "proxy.h"
@@ -4657,6 +4658,8 @@ static unsigned int FirstFourOfHash(CDataStream::iterator begin, CDataStream::it
     return n;
 }
 
+extern map<uint256, CBlock*> mapOrphanBlocks;   // main.cpp
+
 static int RunNetHardeningSelfTest()
 {
     printf("net-hardening self-test\n");
@@ -4805,11 +4808,30 @@ static int RunNetHardeningSelfTest()
         uint256 hash = block.GetHash();
         CBlockIndex* pindexFake = new CBlockIndex();
         mapBlockIndex[hash] = pindexFake;
-        CBlock* pblock = new CBlock(block);
-        bool fDup = ProcessBlock(NULL, pblock, &nDoS);
+        // ProcessBlock takes the block and frees it on this path too.
+        bool fDup = ProcessBlock(NULL, new CBlock(block), &nDoS);
         mapBlockIndex.erase(hash);
         delete pindexFake;
-        delete pblock;
+        // Same for a block already held as an orphan (under the sanitizers a
+        // leak or a double free here fails the run).
+        CBlock* pheld = new CBlock(block);
+        mapOrphanBlocks.insert(make_pair(hash, pheld));
+        int nDoSOrphan = -1;
+        bool fDupOrphan = ProcessBlock(NULL, new CBlock(block), &nDoSOrphan);
+        mapOrphanBlocks.erase(hash);
+        delete pheld;
+        nFail += Check(!fDupOrphan && nDoSOrphan == 0, "a block we hold as an orphan: refused, no points, freed") ? 0 : 1;
+
+        // A peer's version time at either end of int64 (the difference used
+        // to overflow): the adjusted clock stays within the cap.
+        const int64 vExtreme[] = { std::numeric_limits<int64>::min(), std::numeric_limits<int64>::max(),
+                                   std::numeric_limits<int64>::min() + 1, std::numeric_limits<int64>::max() - 1,
+                                   std::numeric_limits<int64>::min() };
+        for (int i = 0; i < 5; i++)
+            AddTimeData(0x0a0b0c00 + i, vExtreme[i]);
+        int64 nSkew = GetAdjustedTime() - GetTime();
+        nFail += Check(nSkew <= MAX_TIME_ADJUSTMENT && nSkew >= -MAX_TIME_ADJUSTMENT,
+                       "peer times at the ends of int64: no overflow, the clock moves no more than the cap") ? 0 : 1;
         nFail += Check(!fDup && nDoS == 0, "a block we already have: refused, no points") ? 0 : 1;
     }
 

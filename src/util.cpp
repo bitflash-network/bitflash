@@ -545,7 +545,20 @@ int64 GetAdjustedTime()
 
 void AddTimeData(unsigned int ip, int64 nTime)
 {
-    int64 nOffsetSample = nTime - GetTime();
+    // nTime is a peer's claim and can be anything an int64 holds; the plain
+    // difference overflowed for times near its ends (undefined behaviour,
+    // found by fuzz-net-message). Any offset past ~31,700 years is clamped
+    // there: it is far beyond MAX_TIME_ADJUSTMENT either way, so the outcome
+    // for a sane clock is unchanged.
+    const int64 nFar = 1000000000000LL;
+    int64 nNow = GetTime();
+    int64 nOffsetSample;
+    if (nTime < nNow - nFar)
+        nOffsetSample = -nFar;
+    else if (nTime > nNow + nFar)
+        nOffsetSample = nFar;
+    else
+        nOffsetSample = nTime - nNow;
 
     // Ignore duplicates
     static set<unsigned int> setKnown;

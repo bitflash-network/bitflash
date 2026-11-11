@@ -38,7 +38,7 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -245,6 +245,12 @@ phase_fuzz() {
     mkdir -p "$OUT/fuzz-work"
     for t in $TARGETS; do fuzz_seed "$t"; done
     LF=$(fuzz_build libfuzzer)
+    # The payload harness writes structured seeds of its own (a block on
+    # genesis, a transaction, inv, ...); an empty corpus gets them first.
+    t=fuzz-p2p-payload
+    if [ -x "$LF/$t" ] && [ "$(ls -A "$CORPUS/$t")" = "seed0" ]; then
+        (cd "$OUT" && BITFLASH_FUZZ_WRITE_SEEDS="$CORPUS/$t" "$LF/$t" -runs=0 > "$OUT/fuzz-seeds-$t.log" 2>&1)             || say "fuzz seeds for $t FAILED, see fuzz-seeds-$t.log"
+    fi
     have afl-clang-fast++ && AF=$(fuzz_build afl) || AF=""
     have hfuzz-clang++ && HF=$(fuzz_build hfuzz) || HF=""
     for engine in libfuzzer afl hfuzz; do
