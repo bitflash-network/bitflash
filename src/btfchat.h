@@ -255,6 +255,10 @@ public:
     bool MayDeliverGroup(const std::string& groupId, const std::string& fromAddr,
                          std::string& errOut) const;
 
+    // No room for another pending invite (MAX_PENDING_INVITES). Inbox asks
+    // this before a stranger's invite takes a replay slot.
+    bool PendingInvitesFull() const { return TotalPending() >= MAX_PENDING_INVITES; }
+
     // ---- persistence (see SealStore/OpenStore for the sealed form)
     std::string ToJson() const;
     bool        FromJson(const std::string& jsonStr, std::string& errOut);

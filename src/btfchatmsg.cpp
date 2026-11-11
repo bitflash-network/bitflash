@@ -480,18 +480,24 @@ bool VerifyGroupInvite(void* secpctx, const std::string& adminAddr,
 
 // ---- replay ----------------------------------------------------------------
 
-void ReplayGuard::Prune(int64_t nNow)
+static void PruneSeen(std::map<std::string, int64_t>& m, int64_t nNow)
 {
-    for (std::map<std::string, int64_t>::iterator it = mapSeen.begin(); it != mapSeen.end(); )
+    for (std::map<std::string, int64_t>::iterator it = m.begin(); it != m.end(); )
     {
         if (nNow - it->second > FRAME_MAX_AGE)
-            mapSeen.erase(it++);
+            m.erase(it++);
         else
             ++it;
     }
 }
 
-bool ReplayGuard::Accept(const Frame& f, int64_t nNow, std::string& errOut)
+void ReplayGuard::Prune(int64_t nNow)
+{
+    PruneSeen(mapSeen, nNow);
+    PruneSeen(mapSeenStranger, nNow);
+}
+
+bool ReplayGuard::Accept(const Frame& f, int64_t nNow, std::string& errOut, bool fStranger)
 {
     errOut.clear();
     if (f.id.size() != 32) { errOut = "the frame id is malformed"; return false; }
@@ -509,10 +515,22 @@ bool ReplayGuard::Accept(const Frame& f, int64_t nNow, std::string& errOut)
 
     Prune(nNow);
 
-    if (mapSeen.count(f.id))
+    if (mapSeen.count(f.id) || mapSeenStranger.count(f.id))
     {
         errOut = "this frame was already delivered";
         return false;
+    }
+    if (fStranger)
+    {
+        // Fail closed here too, but only for strangers' invites: their share
+        // is full, everybody else's is untouched.
+        if (mapSeenStranger.size() >= MAX_SEEN_STRANGER_FRAMES)
+        {
+            errOut = "too many invites from strangers in the last day; try again later";
+            return false;
+        }
+        mapSeenStranger[f.id] = f.sent;
+        return true;
     }
     if (mapSeen.size() >= MAX_SEEN_FRAMES)
     {
