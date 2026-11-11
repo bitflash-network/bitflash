@@ -589,6 +589,14 @@ public:
             && WriteWalletRecord(string("cryptedhdchaincode"), vchCryptedChainCode);
     }
 
+    // Drop the plaintext seed records. Used where the seed must exist only
+    // encrypted; a record that is not there counts as erased.
+    bool EraseHDMaster()
+    {
+        return EraseWalletRecord(string("hdmaster"))
+            && EraseWalletRecord(string("hdchaincode"));
+    }
+
     bool WriteHDNext(unsigned int nNext)
     {
         return WriteWalletRecord(string("hdnext"), nNext);

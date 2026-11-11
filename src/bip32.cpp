@@ -22,6 +22,38 @@
 namespace bitflash
 {
 
+void BIP32PrivateNode::Wipe()
+{
+    if (!privateKey.empty())
+        OPENSSL_cleanse(&privateKey[0], privateKey.size());
+    if (!chainCode.empty())
+        OPENSSL_cleanse(&chainCode[0], chainCode.size());
+    privateKey.clear();
+    chainCode.clear();
+}
+
+BIP32PrivateNode& BIP32PrivateNode::operator=(const BIP32PrivateNode& o)
+{
+    if (this != &o)
+    {
+        Wipe();
+        privateKey = o.privateKey;
+        chainCode = o.chainCode;
+    }
+    return *this;
+}
+
+BIP32PrivateNode::~BIP32PrivateNode()
+{
+    Wipe();
+}
+
+static void CleanseString(std::string& s)
+{
+    if (!s.empty())
+        OPENSSL_cleanse(&s[0], s.size());
+}
+
 static bool IsSupportedEntropySize(size_t n)
 {
     return n == 16 || n == 20 || n == 24 || n == 28 || n == 32;
@@ -99,7 +131,7 @@ static bool IsValidPrivateKey(const std::vector<unsigned char>& key)
     EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp256k1);
     if (bn && order && group && EC_GROUP_get_order(group, order, NULL))
         ok = BN_cmp(bn, order) < 0;
-    BN_free(bn);
+    BN_clear_free(bn);
     BN_free(order);
     EC_GROUP_free(group);
     return ok;
@@ -138,7 +170,7 @@ static bool PrivateKeyToCompressedPubKey(const std::vector<unsigned char>& priva
         ok = n == 33;
     }
 
-    BN_free(bn);
+    BN_clear_free(bn);
     BN_CTX_free(ctx);
     EC_POINT_free(pub);
     EC_GROUP_free(group);
@@ -274,10 +306,14 @@ bool BIP39MnemonicToSeed(const std::string& mnemonic,
         return false;
     }
 
-    const std::string salt = "mnemonic" + passphrase;
-    if (!PKCS5_PBKDF2_HMAC(normalized.c_str(), normalized.size(),
-                           (const unsigned char*)salt.data(), salt.size(),
-                           2048, EVP_sha512(), 64, &seedOut[0]))
+    // The salt carries the BIP39 passphrase; both strings are wiped after.
+    std::string salt = "mnemonic" + passphrase;
+    bool ok = PKCS5_PBKDF2_HMAC(normalized.c_str(), normalized.size(),
+                                (const unsigned char*)salt.data(), salt.size(),
+                                2048, EVP_sha512(), 64, &seedOut[0]) != 0;
+    CleanseString(normalized);
+    CleanseString(salt);
+    if (!ok)
     {
         seedOut.clear();
         errorOut = "PBKDF2-HMAC-SHA512 failed";
@@ -383,10 +419,10 @@ bool BIP32DeriveChild(const BIP32PrivateNode& parent,
         ok = true;
     }
 
-    BN_free(bnIL);
-    BN_free(bnParent);
+    BN_clear_free(bnIL);
+    BN_clear_free(bnParent);
     BN_free(bnOrder);
-    BN_free(bnChild);
+    BN_clear_free(bnChild);
     BN_CTX_free(ctx);
     EC_GROUP_free(group);
     OPENSSL_cleanse(&IL[0], IL.size());

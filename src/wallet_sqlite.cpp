@@ -26,6 +26,23 @@ bool CWalletDBSQLite::Open(const string& strPath, string& strError)
 {
     Close();
 
+#ifndef WIN32
+    // SQLite creates a new database file 0644 (less the umask), and its -wal
+    // and -shm sidecars take the database file's mode. In an unencrypted
+    // wallet those hold private keys in the clear, so the file is made here,
+    // owner-only, before SQLite ever opens it -- and an existing one from an
+    // older build is tightened.
+    {
+        int fd = open(strPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+        if (fd >= 0)
+            close(fd);
+        RestrictFileToOwner(strPath);
+        RestrictFileToOwner(strPath + "-wal");
+        RestrictFileToOwner(strPath + "-shm");
+        RestrictFileToOwner(strPath + "-journal");
+    }
+#endif
+
     int ret = sqlite3_open_v2(strPath.c_str(), &pdb,
                               SQLITE_OPEN_READWRITE |
                               SQLITE_OPEN_CREATE |

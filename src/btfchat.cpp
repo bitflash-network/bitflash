@@ -889,6 +889,7 @@ bool OpenStore(const Identity& id, const unsigned char* in, size_t n,
         return false;
 
     out.assign(reinterpret_cast<const char*>(pt.data()), (size_t)nPt);
+    sodium_memzero(pt.data(), pt.size());   // the caller holds the only copy now
     return true;
 }
 

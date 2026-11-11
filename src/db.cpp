@@ -174,13 +174,30 @@ bool WalletSQLiteRuntimeEraseRecord(const vector<unsigned char>& vchKey)
 // active these are no-ops that succeed, so a caller can wrap a group of related
 // writes and Berkeley DB keeps its existing per-write behaviour unchanged while
 // SQLite gets all-or-nothing.
+//
+// The brackets nest: a group of writes that itself contains a bracketed write
+// (the seed install contains WriteHDMaster) runs as one SQLite transaction,
+// committed by the outermost Commit. A Rollback at any depth dooms the whole
+// transaction -- the outer Commit then rolls back and reports failure.
+static int nWalletSQLiteTxnDepth = 0;
+static bool fWalletSQLiteTxnDoomed = false;
+
 bool WalletSQLiteRuntimeBeginTxn()
 {
     if (!pWalletSQLiteRuntime)
         return true;
+    if (nWalletSQLiteTxnDepth > 0)
+    {
+        nWalletSQLiteTxnDepth++;
+        return true;
+    }
     string strError;
     if (pWalletSQLiteRuntime->BeginTransaction(strError))
+    {
+        nWalletSQLiteTxnDepth = 1;
+        fWalletSQLiteTxnDoomed = false;
         return true;
+    }
     printf("WalletSQLiteRuntimeBeginTxn() : %s\n", strError.c_str());
     return false;
 }
@@ -189,10 +206,21 @@ bool WalletSQLiteRuntimeCommitTxn()
 {
     if (!pWalletSQLiteRuntime)
         return true;
+    if (nWalletSQLiteTxnDepth <= 0)
+        return false;
+    if (--nWalletSQLiteTxnDepth > 0)
+        return !fWalletSQLiteTxnDoomed;
     string strError;
+    if (fWalletSQLiteTxnDoomed)
+    {
+        pWalletSQLiteRuntime->RollbackTransaction(strError);
+        fWalletSQLiteTxnDoomed = false;
+        return false;
+    }
     if (pWalletSQLiteRuntime->CommitTransaction(strError))
         return true;
     printf("WalletSQLiteRuntimeCommitTxn() : %s\n", strError.c_str());
+    pWalletSQLiteRuntime->RollbackTransaction(strError);
     return false;
 }
 
@@ -200,6 +228,14 @@ void WalletSQLiteRuntimeRollbackTxn()
 {
     if (!pWalletSQLiteRuntime)
         return;
+    if (nWalletSQLiteTxnDepth <= 0)
+        return;
+    if (--nWalletSQLiteTxnDepth > 0)
+    {
+        fWalletSQLiteTxnDoomed = true;
+        return;
+    }
+    fWalletSQLiteTxnDoomed = false;
     string strError;
     pWalletSQLiteRuntime->RollbackTransaction(strError);
 }
@@ -1135,6 +1171,9 @@ static bool FinishLoadedWallet(const vector<unsigned char>& vchDefaultKey,
 static bool ReconcileLoadedWalletMetadata(bool fHaveStoredMineMode,
                                           bool fHaveStoredHDCoinType)
 {
+    QuarantinePlainSeedInEncryptedWallet();
+    ClampLoadedFeeSettings();
+
     // An encrypted wallet has a seed; it just has not been decrypted yet.
     //
     // The reset in the else branch was written when "no seed in memory after
@@ -1145,7 +1184,7 @@ static bool ReconcileLoadedWalletMetadata(bool fHaveStoredMineMode,
     // BIP44 wallet came back deriving legacy addresses -- different addresses
     // from the ones its own recovery phrase produces, while the audit reported
     // the phrase as covering nothing.
-    if (HaveHDSeed() || !vchCryptedHDMaster.empty())
+    if (WalletHasHDSeed())
     {
         if (nHDKeySchema == HD_SCHEMA_NONE)
         {
@@ -1457,7 +1496,9 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
     // BIP44 wallet came back deriving legacy addresses -- different addresses
     // from the ones its own recovery phrase produces, while the audit reported
     // the phrase as covering nothing.
-    if (HaveHDSeed() || !vchCryptedHDMaster.empty())
+    QuarantinePlainSeedInEncryptedWallet();
+    ClampLoadedFeeSettings();
+    if (WalletHasHDSeed())
     {
         if (nHDKeySchema == HD_SCHEMA_NONE)
         {
@@ -1917,7 +1958,8 @@ bool BackupWallet(const string& strDest)
             FILE* pfIn = fopen(strSrc.c_str(), "rb");
             if (!pfIn)
                 return error("BackupWallet() : cannot read %s\n", strSrc.c_str());
-            FILE* pfOut = fopen(strTemp.c_str(), "wb");
+            // Owner-only on POSIX: a wallet backup is the wallet.
+            FILE* pfOut = OpenPrivateFile(strTemp.c_str(), false);
             if (!pfOut)
             {
                 fclose(pfIn);
@@ -2121,21 +2163,39 @@ bool ImportWallet(const string& strSrc, int& nAddedRet, int& nSkippedRet)
     if (!pf)
         return error("ImportWallet() : cannot read %s\n", strSrc.c_str());
 
+    // Every buffer a private key passes through is wiped on the way out of
+    // each line and of the function: the file is plaintext keys.
+    struct CWipe
+    {
+        char* p; size_t n; string* a; string* b; vector<unsigned char>* v;
+        CWipe(char* pIn, size_t nIn, string* aIn, string* bIn, vector<unsigned char>* vIn)
+            : p(pIn), n(nIn), a(aIn), b(bIn), v(vIn) { }
+        ~CWipe()
+        {
+            if (p) OPENSSL_cleanse(p, n);
+            if (a && !a->empty()) OPENSSL_cleanse(&(*a)[0], a->size());
+            if (b && !b->empty()) OPENSSL_cleanse(&(*b)[0], b->size());
+            if (v && !v->empty()) OPENSSL_cleanse(&(*v)[0], v->size());
+        }
+    };
     char buf[8192];
+    CWipe wipeBuf(buf, sizeof(buf), NULL, NULL, NULL);
     int nLine = 0;
     int nBad = 0;
     while (fgets(buf, sizeof(buf), pf))
     {
         nLine++;
         string strLine = buf;
+        string strHex;
+        vector<unsigned char> vchPrivKey;
+        CWipe wipeLine(NULL, 0, &strLine, &strHex, &vchPrivKey);
         while (!strLine.empty() && (strLine[strLine.size()-1] == '\n' ||
                                     strLine[strLine.size()-1] == '\r'))
             strLine.resize(strLine.size() - 1);
         if (strLine.empty() || strLine[0] == '#')
             continue;
 
-        string strHex = strLine.substr(0, strLine.find(' '));
-        vector<unsigned char> vchPrivKey;
+        strHex = strLine.substr(0, strLine.find(' '));
         if (!ParseHexInto(strHex, vchPrivKey))
         {
             printf("ImportWallet() : line %d is not a hex key, skipped\n", nLine);
@@ -2323,9 +2383,11 @@ static bool EncryptPrivateKeyForWallet(const CKeyingMaterial& vchMasterKey,
                                        vector<unsigned char>& vchCryptedRet,
                                        string& strErrorRet)
 {
-    if (!EncryptSecret(vchMasterKey,
-                       vector<unsigned char>(vchPrivKey.begin(), vchPrivKey.end()),
-                       WalletKeyIV(vchPubKey), vchCryptedRet))
+    vector<unsigned char> vchPlain(vchPrivKey.begin(), vchPrivKey.end());
+    bool fOk = EncryptSecret(vchMasterKey, vchPlain, WalletKeyIV(vchPubKey), vchCryptedRet);
+    if (!vchPlain.empty())
+        OPENSSL_cleanse(&vchPlain[0], vchPlain.size());
+    if (!fOk)
     {
         strErrorRet = "could not encrypt a private key";
         return false;
@@ -2405,7 +2467,6 @@ static bool EncryptWalletPersistSQLite(
     const CWalletMasterKey& kMasterKey,
     const vector<unsigned char>& vchCryptedHDMasterNew,
     const vector<unsigned char>& vchCryptedHDChainCodeNew,
-    unsigned int nHDNextNew,
     int& nCopiedRet,
     string& strBackupRet,
     string& strErrorRet)
@@ -2464,8 +2525,6 @@ static bool EncryptWalletPersistSQLite(
                                          vchCryptedHDMasterNew, strErrorRet, true) &&
                   dbTmp.WriteTypedRecord(string("cryptedhdchaincode"),
                                          vchCryptedHDChainCodeNew, strErrorRet, true);
-        if (fOk)
-            fOk = dbTmp.WriteTypedRecord(string("hdnext"), nHDNextNew, strErrorRet, true);
         for (size_t i = 0; fOk && i < vNewPool.size(); i++)
             fOk = dbTmp.WriteTypedRecord(make_pair(string("pool"), vNewPool[i].first),
                                          vNewPool[i].second, strErrorRet, true);
@@ -2507,6 +2566,9 @@ static bool EncryptWalletPersistSQLite(
         remove(strTempPath.c_str());
         return false;
     }
+    // The plaintext original stays behind as the backup the user is told
+    // about: owner-only, whatever mode an older build created it with.
+    RestrictFileToOwner(strBackupPath);
     // The moved-aside wallet owns any leftover write-ahead log or shared-memory
     // sidecar; drop stale ones so they cannot shadow the new wallet.
     remove((strWalletPath + "-wal").c_str());
@@ -2607,7 +2669,7 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
     vector<unsigned char> vchPlainHDMaster;
     vector<unsigned char> vchPlainHDChainCode;
     bool fHadHDSeed = false;
-    unsigned int nHDNextSnapshot = 0;
+    map<int64, vector<unsigned char> > mapPoolSnapshot;
     {
         CRITICAL_BLOCK(cs_mapKeys)
             mapPlainKeys = mapKeys;
@@ -2618,7 +2680,7 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
             vchPlainHDMaster = vchHDMaster;
             vchPlainHDChainCode = vchHDChainCode;
             fHadHDSeed = !vchPlainHDMaster.empty() || !vchPlainHDChainCode.empty();
-            nHDNextSnapshot = nHDNext;
+            mapPoolSnapshot = mapKeyPool;
         }
     }
     if (mapPlainKeys.empty())
@@ -2711,38 +2773,44 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
         SecureClearBytes(vchPlainHDChainCode);
     }
 
+    // The key pool of the encrypted wallet.
+    //
+    // A wallet with a seed keeps the pool it has. Its pool keys come from the
+    // seed, which existed in plaintext until now just as they did, so fresh
+    // ones would protect nothing more -- and deriving fresh ones went wrong:
+    // the pool was rebuilt from the legacy counter, which in a BIP44 wallet is
+    // 0, so receive/0..99 came back into the pool and addresses already handed
+    // out (deposit and invoice addresses among them) were handed out again.
+    // The counters are public records and are copied unchanged.
+    //
+    // A wallet without a seed gets new random keys, as Bitcoin does: its old
+    // pool keys sat in plaintext in a file that may have been copied.
     vector<pair<int64, vector<unsigned char> > > vNewPool;
     vector<pair<vector<unsigned char>, vector<unsigned char> > > vNewPoolKeys;
-    unsigned int nHDNextNew = nHDNextSnapshot;
-    for (int i = 0; i < KEYPOOL_SIZE; i++)
+    if (fHadHDSeed)
     {
-        CKey key;
-        if (fHadHDSeed)
+        for (map<int64, vector<unsigned char> >::const_iterator mi = mapPoolSnapshot.begin();
+             mi != mapPoolSnapshot.end(); ++mi)
+            if (mapPlainKeys.count(mi->second))   // its private key is re-encrypted above
+                vNewPool.push_back(*mi);
+    }
+    else
+    {
+        for (int i = 0; i < KEYPOOL_SIZE; i++)
         {
-            string strDeriveError;
-            if (!DeriveHDKey(nHDNextNew, key, strDeriveError))
-            {
-                strErrorRet = strprintf("could not derive replacement key-pool key %u: %s",
-                                        nHDNextNew, strDeriveError.c_str());
-                return false;
-            }
-            nHDNextNew++;
-        }
-        else
-        {
+            CKey key;
             key.MakeNewKey();
+            vector<unsigned char> vchPubKey = key.GetPubKey();
+            if (!mapPlainKeys.count(vchPubKey))
+            {
+                vector<unsigned char> vchCrypted;
+                if (!EncryptPrivateKeyForWallet(vchMasterKey, vchPubKey, key.GetPrivKey(),
+                                                vchCrypted, strErrorRet))
+                    return false;
+                vNewPoolKeys.push_back(make_pair(vchPubKey, vchCrypted));
+            }
+            vNewPool.push_back(make_pair((int64)i + 1, vchPubKey));
         }
-
-        vector<unsigned char> vchPubKey = key.GetPubKey();
-        if (!mapPlainKeys.count(vchPubKey))
-        {
-            vector<unsigned char> vchCrypted;
-            if (!EncryptPrivateKeyForWallet(vchMasterKey, vchPubKey, key.GetPrivKey(),
-                                            vchCrypted, strErrorRet))
-                return false;
-            vNewPoolKeys.push_back(make_pair(vchPubKey, vchCrypted));
-        }
-        vNewPool.push_back(make_pair((int64)i + 1, vchPubKey));
     }
 
     // Every ciphertext is computed; nothing has touched the store yet. Under
@@ -2753,7 +2821,7 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
         int nCopiedSQLite = 0;
         if (!EncryptWalletPersistSQLite(vCryptedKeys, vNewPoolKeys, vNewPool,
                                         kMasterKey, vchCryptedHDMasterNew,
-                                        vchCryptedHDChainCodeNew, nHDNextNew,
+                                        vchCryptedHDChainCodeNew,
                                         nCopiedSQLite, strBackupRet, strErrorRet))
             return false;
         printf("EncryptWallet() : copied %d public record(s), encrypted %u key(s), "
@@ -2807,12 +2875,6 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
             remove(strTempPath.c_str());
             return false;
         }
-        if (!dbTarget.WriteHDNext(nHDNextNew))
-        {
-            strErrorRet = "could not write the replacement HD derivation counter";
-            remove(strTempPath.c_str());
-            return false;
-        }
         for (size_t i = 0; i < vNewPool.size(); i++)
         {
             if (!dbTarget.WritePool(vNewPool[i].first, vNewPool[i].second))
@@ -2849,6 +2911,7 @@ bool EncryptWallet(const string& strPassphrase, string& strBackupRet, string& st
         remove(strTempPath.c_str());
         return false;
     }
+    RestrictFileToOwner(strBackupPath);
     if (rename(strTempPath.c_str(), strWalletPath.c_str()) != 0)
     {
         rename(strBackupPath.c_str(), strWalletPath.c_str());

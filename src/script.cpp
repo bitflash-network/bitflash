@@ -77,8 +77,9 @@ uint256 CheckTemplateHash(const CTransaction& tx, unsigned int nIn, CtvHashCache
 
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType,
                 vector<vector<unsigned char> >* pvStackRet, bool fStrictSigs, bool fRulesV3,
-                bool fRulesV4)
+                bool fRulesV4, unsigned int nPolicyFlags)
 {
+    const bool fDiscourageUpgradableV4 = (nPolicyFlags & SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4) != 0;
     CAutoBN_CTX pctx;
     CScript::const_iterator pc = script.begin();
     CScript::const_iterator pend = script.end();
@@ -244,9 +245,14 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 for (size_t k = 0; k < vchSeq.size() && k < 4; k++)
                     nScript |= (unsigned int)vchSeq[k] << (8 * k);
                 // Disable flag in the script's number: reserved for later
-                // rules, so it passes, as in Bitcoin.
+                // rules, so it passes, as in Bitcoin -- by consensus. Relay
+                // policy refuses it (see SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4).
                 if (nScript & SEQUENCE_LOCKTIME_DISABLE_FLAG)
+                {
+                    if (fDiscourageUpgradableV4)
+                        return false;
                     break;
+                }
                 // Unsigned, as Bitcoin compares it: a negative version is a
                 // large one there, and must be here.
                 if ((unsigned int)txTo.nVersion < 2)
@@ -280,6 +286,8 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                     if (memcmp(&vch[0], hash.begin(), 32) != 0)
                         return false;
                 }
+                else if (fDiscourageUpgradableV4)
+                    return false;   // policy only: consensus lets it pass
             }
             break;
 
@@ -929,6 +937,10 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
                 const valtype& vchMsg = stacktop(-2);
                 const valtype& vchPubKey = stacktop(-1);
                 if (vchPubKey.empty())
+                    return false;
+                // Policy only (consensus lets it through below): a key type of
+                // a later rule is refused outright, signature or not.
+                if (fDiscourageUpgradableV4 && vchPubKey.size() != 32)
                     return false;
                 bool fSuccess;
                 if (vchSig.empty())
@@ -1671,12 +1683,31 @@ unsigned int GetP2SHSigOpCount(const CScript& scriptSig, bool fRulesV4)
     return CScript(last.begin(), last.end()).GetSigOpCount(fRulesV4);
 }
 
+bool ScriptHasUpgradableCsfsKey(const CScript& script)
+{
+    CScript::const_iterator pc = script.begin();
+    opcodetype opcode;
+    valtype vch, vchPrev;
+    bool fPrevPush = false;
+    while (pc < script.end())
+    {
+        if (!script.GetOp(pc, opcode, vch))
+            return false;
+        if (opcode == OP_CHECKSIGFROMSTACK && fPrevPush && !vchPrev.empty() && vchPrev.size() != 32)
+            return true;
+        fPrevPush = opcode <= OP_PUSHDATA4;
+        vchPrev = vch;
+    }
+    return false;
+}
+
 bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                      bool fStrictSigs, bool fRulesV3, bool fRulesV4)
+                      bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags)
 {
     if (!scriptSig.IsPushOnly())
         return false;
-    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4))
+    if (!EvalScript(scriptSig + CScript(OP_CODESEPARATOR) + scriptPubKey, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4,
+                    nPolicyFlags))
         return false;
     if (!scriptPubKey.IsPayToScriptHash())
         return true;
@@ -1711,7 +1742,8 @@ bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, con
     if (Hash160(subscript) != uint160(valtype(scriptPubKey.begin() + 2, scriptPubKey.begin() + 22)))
         return false;
     CScript inner(scriptSig.begin(), pcLastStart);
-    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4);
+    return EvalScript(inner + CScript(OP_CODESEPARATOR) + subscript, txTo, nIn, 0, NULL, fStrictSigs, fRulesV3, fRulesV4,
+                      nPolicyFlags);
 }
 
 CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn,
@@ -1758,7 +1790,7 @@ CScript CombineMultisig(const CScript& scriptCode, const CTransaction& txTo, uns
 }
 
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType,
-                     bool fStrictSigs, bool fRulesV3, bool fRulesV4)
+                     bool fStrictSigs, bool fRulesV3, bool fRulesV4, unsigned int nPolicyFlags)
 {
     assert(nIn < txTo.vin.size());
     const CTxIn& txin = txTo.vin[nIn];
@@ -1782,8 +1814,9 @@ bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsig
     // spent by anybody who presented a script with the right hash, signatures
     // or not -- which is why the wallet refused to pay to one.
     if (fRulesV3 && txout.scriptPubKey.IsPayToScriptHash())
-        return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true, fRulesV4);
+        return VerifyScriptP2SH(txin.scriptSig, txout.scriptPubKey, txTo, nIn, fStrictSigs, true, fRulesV4,
+                                nPolicyFlags);
 
     return EvalScript(txin.scriptSig + CScript(OP_CODESEPARATOR) + txout.scriptPubKey, txTo, nIn, nHashType, NULL,
-                      fStrictSigs, fRulesV3, fRulesV4);
+                      fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags);
 }

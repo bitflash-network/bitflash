@@ -344,6 +344,15 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=wallet-sqlite-migration
 	./bitflash.exe -selftest=wallet-crypto
 	./bitflash.exe -selftest=wallet-encrypt
+	./bitflash.exe -selftest=wallet-encrypted-seed
+	./bitflash.exe -selftest=wallet-encrypt-pool
+	./bitflash.exe -selftest=wallet-relock
+	./bitflash.exe -selftest=wallet-restore-race
+	./bitflash.exe -selftest=wallet-secret-args
+	./bitflash.exe -selftest=wallet-file-modes
+	./bitflash.exe -selftest=wallet-fee-limit
+	./bitflash.exe -selftest=wallet-rpc-v4
+	./bitflash.exe -selftest=chat-replay-quota
 	./bitflash.exe -selftest=wallet-sqlite-encrypt
 	./bitflash.exe -selftest=wallet-backend-default
 	./bitflash.exe -selftest=wallet-convert

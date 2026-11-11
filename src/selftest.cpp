@@ -9831,6 +9831,824 @@ static int RunRulesV5SelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- wallet fixes: encrypted seed, pool on encryption, restore, relock,
+// ---- secret arguments, file modes, fee limit, chat replay quota
+
+static const char* WF_PHRASE_A =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+static const char* WF_PHRASE_B =
+    "legal winner thank year wave sausage worth useful legal winner thank yellow";
+static const char* WF_PHRASE_C =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+static const char* WF_PASS = "btf-test-passphrase";
+
+static bool WfMaster(const char* pszPhrase, bitflash::BIP32PrivateNode& node)
+{
+    std::vector<unsigned char> seed;
+    std::string err;
+    return bitflash::BIP39MnemonicToSeed(pszPhrase, "", seed, err) &&
+           bitflash::BIP32MasterFromSeed(seed, node, err);
+}
+
+static bool WfDeriveKey(const bitflash::BIP32PrivateNode& m, unsigned int nChain, unsigned int nIndex, CKey& key)
+{
+    bitflash::BIP32PrivateNode child;
+    std::string err;
+    return bitflash::BIP32DerivePath(m, HDBIP44Path(HD_BIP44_COIN_TYPE_BITFLASH, HD_BIP44_ACCOUNT, nChain, nIndex),
+                                     child, err) &&
+           key.SetSecret(child.privateKey);
+}
+
+static std::vector<unsigned char> WfDerivePub(const bitflash::BIP32PrivateNode& m, unsigned int nChain, unsigned int nIndex)
+{
+    CKey key;
+    if (!WfDeriveKey(m, nChain, nIndex, key))
+        return std::vector<unsigned char>();
+    return key.GetPubKey();
+}
+
+class CWfRecordCounter : public CWalletRecordVisitor
+{
+public:
+    std::map<std::string, int> m;
+    bool VisitWalletRecord(const CDataStream& ssKey, const CDataStream&, std::string&)
+    {
+        CDataStream s = ssKey;
+        std::string strType;
+        s >> strType;
+        m[strType]++;
+        return true;
+    }
+};
+
+static std::map<std::string, int> WfCountRecords()
+{
+    CWfRecordCounter c;
+    std::string err;
+    ScanWalletRecords(c, err);
+    return c.m;
+}
+
+// Close everything and read the wallet back from disk in this process, as a
+// restart would.
+static bool WfReloadWallet()
+{
+    DBFlush(true);
+    ClearWalletRuntimeForTest();
+    vchPlainSeedPendingMaster.clear();
+    vchPlainSeedPendingChainCode.clear();
+    strWalletSeedNotice.clear();
+    SetWalletRelockTimeout(0);
+    return LoadWallet();
+}
+
+// A wallet with phrase A and a full pool, encrypted by EncryptWallet, then
+// loaded again (locked).
+static bool WfMakeEncryptedHDWallet(std::string& err)
+{
+    if (!LoadWallet())
+    {
+        err = "LoadWallet failed";
+        return false;
+    }
+    if (!SetHDSeedFromMnemonic(WF_PHRASE_A, "", err))
+        return false;
+    TopUpKeyPool();
+    std::string strBackup;
+    if (!EncryptWallet(WF_PASS, strBackup, err))
+        return false;
+    if (!WfReloadWallet())
+    {
+        err = "the encrypted wallet did not load again";
+        return false;
+    }
+    return true;
+}
+
+static int WfRunInTempDir(const char* pszName, int (*fn)(const std::string&, const std::string&))
+{
+    fflush(stdout);
+    printf("%s self-test\n", pszName);
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    printf("  temp datadir: %s\n", tmp.c_str());
+    int nFail = 0;
+    try
+    {
+        nFail += fn(tmp, cwd);
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+    SetWalletRelockTimeout(0);
+    DBFlush(true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// H1, its repair, and I1.
+static int WfEncryptedSeed(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    bitflash::BIP32PrivateNode mA, mB, mC;
+    nFail += Check(WfMaster(WF_PHRASE_A, mA) && WfMaster(WF_PHRASE_B, mB) && WfMaster(WF_PHRASE_C, mC),
+                   "three test phrases give three seeds") ? 0 : 1;
+    if (!WfMakeEncryptedHDWallet(err))
+    {
+        printf("  FAIL setup: %s\n", err.c_str());
+        return nFail + 1;
+    }
+    nFail += Check(IsWalletEncrypted() && IsWalletLocked(), "the encrypted wallet loads locked") ? 0 : 1;
+    nFail += Check(!HaveHDSeed() && WalletHasHDSeed(),
+                   "a locked wallet has a seed, though not one in memory") ? 0 : 1;
+
+    // A phrase install on the locked wallet: refused before anything is written.
+    std::map<std::string, int> before = WfCountRecords();
+    unsigned int nRecv = nHDReceiveNext, nChange = nHDChangeNext;
+    size_t nPool = mapKeyPool.size();
+    bool fInstalled = SetHDSeedFromMnemonic(WF_PHRASE_B, "", err);
+    std::map<std::string, int> after = WfCountRecords();
+    nFail += Check(!fInstalled && err.find("locked") != std::string::npos,
+                   "a phrase install on a locked encrypted wallet is refused, saying why") ? 0 : 1;
+    nFail += Check(after == before && after["hdmaster"] == 0 && nHDReceiveNext == nRecv &&
+                   nHDChangeNext == nChange && mapKeyPool.size() == nPool,
+                   "and nothing was written: no plaintext seed, pool and counters as they were") ? 0 : 1;
+    nFail += Check(!HaveHDSeed(), "the refused seed is not in memory either") ? 0 : 1;
+
+    // Unlocked: the new seed is stored encrypted, never in plaintext.
+    nFail += Check(UnlockWallet(WF_PASS, err) && vchHDMaster == mA.privateKey,
+                   "unlocked, the wallet's seed decrypts") ? 0 : 1;
+    nFail += Check(SetHDSeedFromMnemonic(WF_PHRASE_B, "", err), "unlocked, a new phrase installs") ? 0 : 1;
+    after = WfCountRecords();
+    std::vector<unsigned char> vchDec;
+    bool fDec = DecryptSecret(vWalletMasterKey, vchCryptedHDMaster, WalletSecretIV("hdmaster"), vchDec) &&
+                vchDec == mB.privateKey;
+    nFail += Check(after["hdmaster"] == 0 && after["hdchaincode"] == 0 &&
+                   after["cryptedhdmaster"] == 1 && fDec,
+                   "it is stored encrypted only: no plaintext seed record") ? 0 : 1;
+    nFail += Check(keyUser.GetPubKey() == WfDerivePub(mB, 0, 0) && vchHDMaster == mB.privateKey,
+                   "and the wallet derives from it, its first receive key the default") ? 0 : 1;
+    TopUpKeyPool();
+    unsigned int nRecvB = nHDReceiveNext;
+
+    nFail += Check(WfReloadWallet() && IsWalletLocked() && !HaveHDSeed() && strWalletSeedNotice.empty(),
+                   "reloaded: locked, no seed in memory, nothing to repair") ? 0 : 1;
+    nFail += Check(UnlockWallet(WF_PASS, err) && vchHDMaster == mB.privateKey,
+                   "and the unlock gives the new seed back") ? 0 : 1;
+
+    // What an older build left after a phrase install on a locked wallet: the
+    // new seed in plaintext, the counters reset to 1/0, the default key not
+    // changed.
+    nFail += Check(CWalletDB().WriteHDMaster(mC.privateKey, mC.chainCode) &&
+                   CWalletDB().WriteHDReceiveNext(1) && CWalletDB().WriteHDChangeNext(0),
+                   "the records an older build left can be written back") ? 0 : 1;
+    nFail += Check(WfReloadWallet(), "that wallet loads") ? 0 : 1;
+    nFail += Check(IsWalletLocked() && !HaveHDSeed() && !vchPlainSeedPendingMaster.empty() &&
+                   !strWalletSeedNotice.empty(),
+                   "locked, its plaintext seed is set aside, not used, and the user is told") ? 0 : 1;
+    std::vector<unsigned char> vchChat;
+    std::string strChatErr;
+    nFail += Check(!btfchat::ChatSeedFromWallet(vchChat, strChatErr),
+                   "the chat identity cannot be computed from it while locked") ? 0 : 1;
+    nFail += Check(UnlockWallet(WF_PASS, err), "the wallet unlocks") ? 0 : 1;
+    after = WfCountRecords();
+    nFail += Check(after["hdmaster"] == 0 && after["hdchaincode"] == 0 && vchPlainSeedPendingMaster.empty(),
+                   "and the plaintext seed records are gone") ? 0 : 1;
+    nFail += Check(vchHDMaster == mB.privateKey,
+                   "the encrypted seed stays: that install never set its default key") ? 0 : 1;
+    nFail += Check(nHDReceiveNext >= nRecvB,
+                   strprintf("the receive counter is back past every key handed out (%u; it had been reset to 1)",
+                             nHDReceiveNext).c_str()) ? 0 : 1;
+    nFail += Check(strWalletSeedNotice.find("did not finish") != std::string::npos,
+                   "and the notice says what was done") ? 0 : 1;
+
+    // What an older build left after a phrase install that finished on an
+    // unlocked wallet: the seed in plaintext and its first key the default.
+    CKey keyC0;
+    nFail += Check(WfDeriveKey(mC, 0, 0, keyC0) && AddKey(keyC0) &&
+                   CWalletDB().WriteDefaultKey(keyC0.GetPubKey()) &&
+                   CWalletDB().WriteHDMaster(mC.privateKey, mC.chainCode),
+                   "a finished install of an older build can be written back") ? 0 : 1;
+    nFail += Check(WfReloadWallet() && !HaveHDSeed() && UnlockWallet(WF_PASS, err),
+                   "that wallet loads locked and unlocks") ? 0 : 1;
+    after = WfCountRecords();
+    vchDec.clear();
+    fDec = DecryptSecret(vWalletMasterKey, vchCryptedHDMaster, WalletSecretIV("hdmaster"), vchDec) &&
+           vchDec == mC.privateKey;
+    nFail += Check(after["hdmaster"] == 0 && vchHDMaster == mC.privateKey && fDec &&
+                   keyUser.GetPubKey() == keyC0.GetPubKey(),
+                   "the seed the install finished with becomes the wallet's seed, encrypted, plaintext gone") ? 0 : 1;
+
+    // A plaintext copy of the very seed that is encrypted: just removed.
+    nFail += Check(CWalletDB().WriteHDMaster(mC.privateKey, mC.chainCode) && WfReloadWallet() &&
+                   UnlockWallet(WF_PASS, err),
+                   "a plaintext copy of the encrypted seed loads and unlocks") ? 0 : 1;
+    after = WfCountRecords();
+    nFail += Check(after["hdmaster"] == 0 && vchHDMaster == mC.privateKey,
+                   "and the copy is removed, the seed unchanged") ? 0 : 1;
+
+    // I1: nothing to check a candidate master key against is not a pass.
+    std::map<unsigned int, CWalletMasterKey> mapMk = mapMasterKeys;
+    ClearWalletRuntimeForTest();
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        mapMasterKeys = mapMk;
+        fWalletEncrypted = true;
+        fWalletLocked = true;
+    }
+    bool fUnlocked = UnlockWallet(WF_PASS, err);
+    nFail += Check(!fUnlocked && err.find("no encrypted key") != std::string::npos,
+                   "an encrypted wallet with no encrypted key to check the passphrase against does not unlock") ? 0 : 1;
+    ClearWalletRuntimeForTest();
+    return nFail;
+}
+
+// M1.
+static int WfEncryptPool(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    bitflash::BIP32PrivateNode mA;
+    if (!WfMaster(WF_PHRASE_A, mA) || !LoadWallet() || !SetHDSeedFromMnemonic(WF_PHRASE_A, "", err))
+    {
+        printf("  FAIL setup: %s\n", err.c_str());
+        return 1;
+    }
+    TopUpKeyPool();
+    std::set<std::vector<unsigned char> > setIssued;
+    setIssued.insert(keyUser.GetPubKey());
+    for (int i = 0; i < 5; i++)
+        setIssued.insert(GetKeyFromPool());
+    unsigned int nRecvBefore = nHDReceiveNext;
+    std::set<std::vector<unsigned char> > setPoolBefore;
+    CRITICAL_BLOCK(cs_keyPool)
+        for (map<int64, vector<unsigned char> >::iterator it = mapKeyPool.begin(); it != mapKeyPool.end(); ++it)
+            setPoolBefore.insert(it->second);
+    nFail += Check(setIssued.size() == 6 && setPoolBefore.size() == (size_t)KEYPOOL_SIZE,
+                   "a phrase wallet has handed out its default and five addresses, with a full pool") ? 0 : 1;
+
+    std::string strBackup;
+    nFail += Check(EncryptWallet(WF_PASS, strBackup, err), "it encrypts") ? 0 : 1;
+    nFail += Check(WfReloadWallet() && UnlockWallet(WF_PASS, err), "and loads and unlocks again") ? 0 : 1;
+
+    std::set<std::vector<unsigned char> > setPoolAfter;
+    int nReissued = 0;
+    CRITICAL_BLOCK(cs_keyPool)
+        for (map<int64, vector<unsigned char> >::iterator it = mapKeyPool.begin(); it != mapKeyPool.end(); ++it)
+        {
+            setPoolAfter.insert(it->second);
+            if (setIssued.count(it->second))
+                nReissued++;
+        }
+    nFail += Check(nReissued == 0,
+                   strprintf("the encrypted wallet's pool holds none of the addresses already handed out (%d did)",
+                             nReissued).c_str()) ? 0 : 1;
+    nFail += Check(setPoolAfter == setPoolBefore, "it keeps the pool it had") ? 0 : 1;
+    nFail += Check(nHDReceiveNext == nRecvBefore, "and its receive counter") ? 0 : 1;
+
+    std::set<std::vector<unsigned char> > setDrawn;
+    int nBad = 0;
+    for (int i = 0; i < KEYPOOL_SIZE + 20; i++)
+    {
+        std::vector<unsigned char> v = GetKeyFromPool();
+        if (v.empty() || setIssued.count(v) || !setDrawn.insert(v).second)
+            nBad++;
+    }
+    nFail += Check(nBad == 0, "120 new addresses after encryption: none handed out before, none twice") ? 0 : 1;
+
+    // L6: when the phrase cannot derive the next key, the wallet hands out
+    // what its pool holds and then nothing -- never a random key the phrase
+    // cannot bring back. (A hardened index is refused by the derivation.)
+    unsigned int nSavedReceive = nHDReceiveNext;
+    CRITICAL_BLOCK(cs_keyPool)
+        nHDReceiveNext = bitflash::BIP32_HARDENED;
+    std::set<std::vector<unsigned char> > setPhrase;
+    for (unsigned int i = 0; i < nSavedReceive + 5; i++)
+        setPhrase.insert(WfDerivePub(mA, 0, i));
+    int nRandom = 0, nEmpty = 0;
+    for (int i = 0; i < KEYPOOL_SIZE + 5; i++)
+    {
+        std::vector<unsigned char> v = GetKeyFromPool();
+        if (v.empty())
+            nEmpty++;
+        else if (!setPhrase.count(v))
+            nRandom++;
+    }
+    CRITICAL_BLOCK(cs_keyPool)
+        nHDReceiveNext = nSavedReceive;
+    nFail += Check(nRandom == 0 && nEmpty > 0,
+                   strprintf("with derivation failing, the pool runs dry instead of filling with random keys "
+                             "(%d random, %d empty draws)", nRandom, nEmpty).c_str()) ? 0 : 1;
+    return nFail;
+}
+
+// M3 and I2.
+static int WfRelock(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    if (!WfMakeEncryptedHDWallet(err))
+    {
+        printf("  FAIL setup: %s\n", err.c_str());
+        return 1;
+    }
+    nFail += Check(UnlockWalletFor(WF_PASS, 1, err) && !IsWalletLocked() && GetWalletRelockTime() > 0,
+                   "unlocked with a one-second timeout") ? 0 : 1;
+    bool fRelocked = false;
+    for (int i = 0; i < 100 && !fRelocked; i++)
+    {
+        Sleep(100);
+        fRelocked = IsWalletLocked();
+    }
+    bool fCleared = false;
+    CRITICAL_BLOCK(cs_mapKeys)
+        fCleared = vWalletMasterKey.empty();
+    nFail += Check(fRelocked && fCleared && !HaveHDSeed() && GetWalletRelockTime() == 0,
+                   "it locks itself when the time runs out: master key and seed out of memory") ? 0 : 1;
+    nFail += Check(GetKeyFromPool().empty(), "locked again, it hands out no key") ? 0 : 1;
+    nFail += Check(UnlockWallet(WF_PASS, err) && !IsWalletLocked() && GetWalletRelockTime() == 0,
+                   "an unlock without a timeout stays unlocked") ? 0 : 1;
+    LockWallet();
+    nFail += Check(IsWalletLocked() && !HaveHDSeed(), "LockWallet locks it at once") ? 0 : 1;
+
+    // Keys added on one thread while another locks and unlocks: each one
+    // that was accepted was encrypted with the whole master key.
+    nFail += Check(UnlockWallet(WF_PASS, err), "unlocked for the concurrency check") ? 0 : 1;
+    std::vector<std::vector<unsigned char> > vAdded;
+    std::mutex mutexAdded;
+    std::atomic<bool> fAdderDone(false);
+    std::thread adder([&]() {
+        for (int i = 0; i < 400; i++)
+        {
+            CKey k;
+            k.MakeNewKey();
+            if (AddKey(k))
+            {
+                std::lock_guard<std::mutex> lock(mutexAdded);
+                vAdded.push_back(k.GetPubKey());
+            }
+        }
+        fAdderDone = true;
+    });
+    for (int i = 0; i < 30 && !fAdderDone; i++)
+    {
+        LockWallet();
+        UnlockWallet(WF_PASS, err);
+    }
+    adder.join();
+    UnlockWallet(WF_PASS, err);
+    int nBad = 0;
+    for (size_t i = 0; i < vAdded.size(); i++)
+    {
+        CPrivKey vchPriv;
+        std::string e;
+        CKey k;
+        if (!GetWalletPrivKey(vAdded[i], vchPriv, e) || !k.SetPrivKey(vchPriv) || k.GetPubKey() != vAdded[i])
+            nBad++;
+    }
+    nFail += Check(!vAdded.empty() && nBad == 0,
+                   strprintf("%u key(s) added while the wallet locked and unlocked: every one decrypts",
+                             (unsigned int)vAdded.size()).c_str()) ? 0 : 1;
+
+    int fWasGenerate = fGenerateBitcoins;
+    fGenerateBitcoins = 1;
+    std::string strWhy;
+    bool fRefused = WalletLockRefusedWhy(strWhy);
+    fGenerateBitcoins = fWasGenerate;
+    std::string strWhy2;
+    nFail += Check(fRefused && !strWhy.empty() && !WalletLockRefusedWhy(strWhy2),
+                   "a mining node does not lock its wallet (its blocks need keys); a plain node does") ? 0 : 1;
+    return nFail;
+}
+
+// M2.
+static int WfRestoreRace(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    bitflash::BIP32PrivateNode mA;
+    if (!WfMaster(WF_PHRASE_A, mA) || !LoadWallet())
+    {
+        printf("  FAIL setup\n");
+        return 1;
+    }
+    // A stand-in chain: RestoreFromPhrase insists on one, and the scan finds
+    // no block on disk to read, which is all this test needs.
+    CBlockIndex fakeIndex;
+    CBlockIndex* pSavedGenesis = pindexGenesisBlock;
+    CBlockIndex* pSavedBest = pindexBest;
+    uint256 hashSaved = hashBestChain;
+    int nSavedHeight = nBestHeight;
+    pindexGenesisBlock = &fakeIndex;
+    pindexBest = &fakeIndex;
+    hashBestChain = uint256(1);
+    nBestHeight = 1;
+
+    nFail += Check(SetHDSeedFromMnemonic(WF_PHRASE_A, "", err) && nHDKeySchema == HD_SCHEMA_BIP44,
+                   "a BIP44 phrase wallet") ? 0 : 1;
+    {
+        CKey keyLegacy;
+        bitflash::BIP32PrivateNode child;
+        CKey keyExpect;
+        bool fOk = DeriveHDKeyForSchema(HD_SCHEMA_LEGACY, 3, keyLegacy, err) &&
+                   bitflash::BIP32DerivePath(mA, HDLegacyPath(3), child, err) &&
+                   keyExpect.SetSecret(child.privateKey);
+        nFail += Check(fOk && keyLegacy.GetPubKey() == keyExpect.GetPubKey() && nHDKeySchema == HD_SCHEMA_BIP44,
+                       "the legacy path is derived by name, the wallet's own schema untouched") ? 0 : 1;
+    }
+
+    std::atomic<bool> fDone(false);
+    std::atomic<bool> fSawOtherSchema(false);
+    bool fRestored = false;
+    int nRecovered = 0, nDerived = 0;
+    std::string strRestoreErr;
+    std::thread restorer([&]() {
+        fRestored = RestoreFromPhrase(WF_PHRASE_A, "", 0, NULL, NULL, strRestoreErr, nRecovered, nDerived);
+        fDone = true;
+    });
+    std::vector<std::vector<unsigned char> > vDrawn;
+    while (!fDone)
+    {
+        if (nHDKeySchema != HD_SCHEMA_BIP44)
+            fSawOtherSchema = true;
+        std::vector<unsigned char> v = GetKeyFromPool();
+        if (!v.empty())
+            vDrawn.push_back(v);
+        Sleep(2);
+    }
+    restorer.join();
+
+    nFail += Check(fRestored, "the restore runs to the end while another thread draws keys") ? 0 : 1;
+    nFail += Check(!fSawOtherSchema, "the wallet's derivation schema never changed under the other thread") ? 0 : 1;
+    std::set<std::vector<unsigned char> > setReceive;
+    for (unsigned int i = 0; i < nHDReceiveNext + 10; i++)
+        setReceive.insert(WfDerivePub(mA, 0, i));
+    std::set<std::vector<unsigned char> > setSeen;
+    int nForeign = 0, nTwice = 0;
+    for (size_t i = 0; i < vDrawn.size(); i++)
+    {
+        if (!setReceive.count(vDrawn[i]))
+            nForeign++;
+        if (!setSeen.insert(vDrawn[i]).second)
+            nTwice++;
+    }
+    nFail += Check(!vDrawn.empty() && nForeign == 0 && nTwice == 0,
+                   strprintf("%u key(s) drawn during the restore: all on the phrase's receive path (%d not), none twice (%d)",
+                             (unsigned int)vDrawn.size(), nForeign, nTwice).c_str()) ? 0 : 1;
+    size_t nPoolMem = 0;
+    CRITICAL_BLOCK(cs_keyPool)
+        nPoolMem = mapKeyPool.size();
+    std::map<std::string, int> recs = WfCountRecords();
+    nFail += Check((size_t)recs["pool"] == nPoolMem,
+                   strprintf("the pool on disk is the pool in memory (%d records, %u entries): no stale entry comes back",
+                             recs["pool"], (unsigned int)nPoolMem).c_str()) ? 0 : 1;
+
+    pindexGenesisBlock = pSavedGenesis;
+    pindexBest = pSavedBest;
+    hashBestChain = hashSaved;
+    nBestHeight = nSavedHeight;
+    return nFail;
+}
+
+// M4 (and the echo-off reader behind every secret option).
+static int WfSecretArgs(const std::string& tmp, const std::string& cwd)
+{
+    int nFail = 0;
+    std::string s, err;
+    nFail += Check(!ReadSecretArgument(WF_PHRASE_A, "recovery phrase", s, err) &&
+                   err.find("literal") != std::string::npos && s.empty(),
+                   "a recovery phrase given as a literal is refused") ? 0 : 1;
+    std::string strFile = tmp + "/phrase.txt";
+    nFail += Check(WriteTextFile(strFile, std::string(WF_PHRASE_A) + "\r\n") &&
+                   ReadSecretArgument("@" + strFile, "recovery phrase", s, err) && s == WF_PHRASE_A,
+                   "@FILE reads it, line end stripped") ? 0 : 1;
+    std::string strEmpty = tmp + "/empty.txt";
+    nFail += Check(WriteTextFile(strEmpty, "\n") && !ReadSecretArgument("@" + strEmpty, "recovery phrase", s, err) &&
+                   !ReadSecretArgument("@" + tmp + "/missing.txt", "recovery phrase", s, err),
+                   "an empty or missing file is refused") ? 0 : 1;
+
+#ifdef _WIN32
+    std::string strExe = cwd + "\\bitflash.exe";
+#else
+    std::string strExe = cwd + "/bitflash-node";
+#endif
+    std::string strChildDir = tmp + "/child";
+    MakeDirLocal(strChildDir);
+    std::string strOutLiteral = tmp + "/literal.txt", strOutFile = tmp + "/file.txt";
+    std::vector<std::string> vLiteral;
+    vLiteral.push_back("-datadir=" + strChildDir);
+    vLiteral.push_back(std::string("-restorephrase=") + WF_PHRASE_A);
+    vLiteral.push_back("-nogui");
+    int nRetLiteral = RunBitflashChild(strExe, vLiteral, NULL, &strOutLiteral);
+    nFail += Check(nRetLiteral != 0 && FileContainsText(strOutLiteral, "literal") &&
+                   !FileContainsText(strOutLiteral, "Checking the phrase"),
+                   "the node refuses -restorephrase=WORDS before reading anything") ? 0 : 1;
+    std::vector<std::string> vFile;
+    vFile.push_back("-datadir=" + strChildDir);
+    vFile.push_back("-restorephrase=@" + strFile);
+    vFile.push_back("-nogui");
+    RunBitflashChild(strExe, vFile, NULL, &strOutFile);
+    nFail += Check(FileContainsText(strOutFile, "Checking the phrase") && !FileContainsText(strOutFile, "literal"),
+                   "and takes -restorephrase=@FILE") ? 0 : 1;
+    return nFail;
+}
+
+// M5 and M6.
+static int WfFileModes(const std::string& tmp, const std::string&)
+{
+    int nFail = 0;
+    unsigned char a[32], b[32], zero[32];
+    memset(zero, 0, sizeof(zero));
+    GetStrongRandBytes(a, sizeof(a));
+    GetStrongRandBytes(b, sizeof(b));
+    nFail += Check(memcmp(a, b, 32) != 0 && memcmp(a, zero, 32) != 0,
+                   "GetStrongRandBytes fills buffers with fresh bytes") ? 0 : 1;
+#ifndef _WIN32
+    struct stat st;
+    std::string strSub = tmp + "/made-by-mkdir";
+    nFail += Check(_mkdir(strSub.c_str()) == 0 && stat(strSub.c_str(), &st) == 0 && (st.st_mode & 077) == 0,
+                   "directories the node makes are owner-only") ? 0 : 1;
+    {
+        CWalletDBSQLite db;
+        std::string strDb = tmp + "/fresh.sqlite";
+        std::string err;
+        std::vector<unsigned char> k(4, 0x11), v(4, 0x22);
+        bool fOpen = db.Open(strDb, err) && db.WriteRecord(k, v, err, true);
+        bool fMode = stat(strDb.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600;
+        bool fWal = stat((strDb + "-wal").c_str(), &st) != 0 || (st.st_mode & 077) == 0;
+        db.Close();
+        nFail += Check(fOpen && fMode && fWal, "a new SQLite wallet and its write-ahead log are owner-only") ? 0 : 1;
+    }
+    {
+        // Files an older build left readable: tightened at start.
+        const char* apsz[] = { "wallet.dat", "wallet.sqlite", "nostr.key", "wallet.dat.before-encrypt.1.bak" };
+        bool fMade = true;
+        for (size_t i = 0; i < 4; i++)
+        {
+            std::string p = tmp + "/" + apsz[i];
+            fMade = fMade && WriteTextFile(p, "x") && chmod(p.c_str(), 0644) == 0;
+        }
+        std::string strLogDir = tmp + "/database";
+        fMade = fMade && mkdir(strLogDir.c_str(), 0755) == 0 && chmod(strLogDir.c_str(), 0755) == 0;
+        RestrictWalletFileModes();
+        bool fAll = true;
+        for (size_t i = 0; i < 4; i++)
+            fAll = fAll && stat((tmp + "/" + apsz[i]).c_str(), &st) == 0 && (st.st_mode & 0777) == 0600;
+        fAll = fAll && stat(strLogDir.c_str(), &st) == 0 && (st.st_mode & 077) == 0;
+        nFail += Check(fMade && fAll,
+                       "wallet.dat, wallet.sqlite, nostr.key, an encryption backup and database/ are made owner-only at start") ? 0 : 1;
+    }
+    {
+        std::string p = tmp + "/private.out";
+        FILE* f = OpenPrivateFile(p.c_str(), false);
+        if (f)
+            fclose(f);
+        nFail += Check(f && stat(p.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600,
+                       "OpenPrivateFile (backups, nostr.key, dumps) creates owner-only files") ? 0 : 1;
+    }
+#else
+    printf("  skip   POSIX file modes (Windows: the data directory's ACL keeps other accounts out)\n");
+#endif
+    return nFail;
+}
+
+// Index of the output that is not the payment, or -1.
+static int WfChangeIndex(const CTransaction& tx, const CScript& scriptPay)
+{
+    for (size_t i = 0; i < tx.vout.size(); i++)
+        if (tx.vout[i].scriptPubKey != scriptPay)
+            return (int)i;
+    return -1;
+}
+
+// M7, L7 and I3 (the coin flips are exercised by every build below).
+static int WfFeeLimit(const std::string&, const std::string&)
+{
+    int nFail = 0;
+    std::string err;
+    if (!LoadWallet())
+    {
+        printf("  FAIL setup\n");
+        return 1;
+    }
+    {
+        CTxDB txdb("cr+");   // the transaction index CreateTransaction opens
+    }
+    // Coins: somebody paid us 10, and we sent 9 of it back to ourselves, so
+    // the 9 is our own change, spendable unconfirmed.
+    std::vector<unsigned char> vchMe = keyUser.GetPubKey();
+    CScript scriptMe;
+    scriptMe << vchMe << OP_CHECKSIG;
+    CTransaction tx0;
+    tx0.vin.push_back(CTxIn(COutPoint(uint256(4242), 0)));
+    tx0.vout.push_back(CTxOut(10 * COIN, scriptMe));
+    CTransaction tx1;
+    tx1.vin.push_back(CTxIn(COutPoint(tx0.GetHash(), 0)));
+    tx1.vout.push_back(CTxOut(9 * COIN, scriptMe));
+    AddToWallet(CWalletTx(tx0));
+    AddToWallet(CWalletTx(tx1));
+    CRITICAL_BLOCK(cs_mapWallet)
+        mapWallet[tx0.GetHash()].fSpent = true;
+    CKey keyPayee;
+    keyPayee.MakeNewKey();
+    CScript scriptPay;
+    scriptPay << OP_DUP << OP_HASH160 << Hash160(keyPayee.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+
+    // A flat fee of 0.01, so every build below pays something to compare.
+    nTransactionFee = CENT;
+    CWalletTx wtx;
+    int64 nFee = 0;
+    nFail += Check(CreateTransaction(scriptPay, COIN, wtx, nFee) && nFee == CENT,
+                   "a send of 1 builds, paying the 0.01 flat fee") ? 0 : 1;
+    int nChange = WfChangeIndex(wtx, scriptPay);
+    std::vector<unsigned char> vchChange;
+    bool fFresh = nChange >= 0 && ExtractPubKey(wtx.vout[nChange].scriptPubKey, true, vchChange) &&
+                  vchChange != vchMe;
+    nFail += Check(fFresh, "a wallet without a seed sends its change to a fresh key, not back to the input's") ? 0 : 1;
+
+    int nFirst = 0, nSecond = 0;
+    for (int i = 0; i < 40; i++)
+    {
+        CWalletTx w;
+        int64 f = 0;
+        if (CreateTransaction(scriptPay, COIN, w, f, -1, true))
+        {
+            int n = WfChangeIndex(w, scriptPay);
+            if (n == 0)
+                nFirst++;
+            else if (n == 1)
+                nSecond++;
+        }
+    }
+    nFail += Check(nFirst > 0 && nSecond > 0,
+                   strprintf("the change is not always the second output (%d first, %d second in 40)",
+                             nFirst, nSecond).c_str()) ? 0 : 1;
+
+    // The flat fee: a unit slip (5 BTF) is refused by the 1 BTF limit.
+    nTransactionFee = 5 * COIN;
+    bool fBuilt = CreateTransaction(scriptPay, COIN, wtx, nFee);
+    nFail += Check(!fBuilt && LastCreateTransactionError().find("above the limit") != std::string::npos,
+                   "a 5 BTF flat fee is refused by the 1 BTF /maxtxfee limit, saying why") ? 0 : 1;
+    nMaxTxFee = 10 * COIN;
+    nFail += Check(CreateTransaction(scriptPay, COIN, wtx, nFee) && nFee == 5 * COIN,
+                   "with /maxtxfee raised, the same send builds") ? 0 : 1;
+    nMaxTxFee = COIN;
+    nTransactionFee = 2 * COIN;
+    ClampLoadedFeeSettings();
+    nFail += Check(nTransactionFee == 0, "a stored flat fee above 1 BTF is not used") ? 0 : 1;
+    nFail += Check(IsAcceptableTxFeeSetting(0) && IsAcceptableTxFeeSetting(COIN) &&
+                   !IsAcceptableTxFeeSetting(COIN + 1) && !IsAcceptableTxFeeSetting(-1),
+                   "the fee setting takes 0 to 1 BTF") ? 0 : 1;
+    nTransactionFee = CENT;
+
+    // The GUI's review: the fee shown first, no change key taken; the send
+    // after it never pays noticeably more.
+    nFail += Check(SetHDSeedFromMnemonic(WF_PHRASE_A, "", err), "now with a recovery phrase") ? 0 : 1;
+    unsigned int nChangeNext = nHDChangeNext;
+    size_t nWalletSize = 0;
+    CRITICAL_BLOCK(cs_mapWallet)
+        nWalletSize = mapWallet.size();
+    int64 nPreview = 0;
+    std::string strWhy;
+    bool fPreview = PreviewSendFee(scriptPay, COIN, nPreview, strWhy);
+    size_t nWalletSize2 = 0;
+    CRITICAL_BLOCK(cs_mapWallet)
+        nWalletSize2 = mapWallet.size();
+    nFail += Check(fPreview && nPreview > 0 && nHDChangeNext == nChangeNext && nWalletSize2 == nWalletSize,
+                   "the review shows the fee without taking a change key or writing anything") ? 0 : 1;
+    nFail += Check(SendFeeLimitAfterReview(CENT) == CENT + CENT / 10 + 1 &&
+                   SendFeeLimitAfterReview(5 * COIN) == nMaxTxFee,
+                   "the send after a review may pay a tenth more, never above /maxtxfee") ? 0 : 1;
+    nFail += Check(CreateTransaction(scriptPay, COIN, wtx, nFee, SendFeeLimitAfterReview(nPreview)) &&
+                   nFee <= SendFeeLimitAfterReview(nPreview) && nHDChangeNext == nChangeNext + 1,
+                   "the real build stays within it, and takes its change key") ? 0 : 1;
+    CWalletTx wtxSend;
+    bool fSent = SendMoney(scriptPay, COIN, wtxSend, nPreview - 1);
+    size_t nWalletSize3 = 0;
+    CRITICAL_BLOCK(cs_mapWallet)
+        nWalletSize3 = mapWallet.size();
+    nFail += Check(!fSent && nWalletSize3 == nWalletSize,
+                   "SendMoney refuses a fee above the one confirmed, and records nothing") ? 0 : 1;
+    nTransactionFee = 0;
+    return nFail;
+}
+
+// M8: strangers' invites have their own share of the replay table.
+static int RunChatReplayQuotaSelfTest()
+{
+    printf("chat-replay-quota self-test\n");
+    int nFail = 0;
+    int64 nNow = GetTime();
+    int nCounter = 0;
+    struct F
+    {
+        static btfchat::Frame Make(int64 nSent, int& n)
+        {
+            btfchat::Frame f;
+            f.sent = nSent;
+            f.id = strprintf("%032x", ++n);
+            return f;
+        }
+    };
+    btfchat::ReplayGuard rg;
+    std::string err;
+    bool fAll = true;
+    for (size_t i = 0; i < btfchat::MAX_SEEN_STRANGER_FRAMES; i++)
+        fAll = fAll && rg.Accept(F::Make(nNow, nCounter), nNow, err, true);
+    nFail += Check(fAll && rg.StrangerSize() == btfchat::MAX_SEEN_STRANGER_FRAMES,
+                   "strangers' invites fill their own share of the replay table") ? 0 : 1;
+    nFail += Check(!rg.Accept(F::Make(nNow, nCounter), nNow, err, true) &&
+                   err.find("strangers") != std::string::npos,
+                   "one more is refused, saying why") ? 0 : 1;
+    btfchat::Frame fContact = F::Make(nNow, nCounter);
+    nFail += Check(rg.Accept(fContact, nNow, err, false), "a frame from an accepted contact still gets through") ? 0 : 1;
+    nFail += Check(!rg.Accept(fContact, nNow, err, false) && !rg.Accept(fContact, nNow, err, true),
+                   "and is not taken twice, either way") ? 0 : 1;
+
+    // The inbound path: when the pending-invite list is full, a stranger's
+    // invite is refused before it takes a replay slot.
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    struct Id
+    {
+        static bool Make(secp256k1_context* c, btfchat::Identity& id)
+        {
+            memset(id.sign_sk, 0, sizeof(id.sign_sk));
+            memset(id.sign_pk, 0, sizeof(id.sign_pk));
+            memset(id.chan_sk, 0, sizeof(id.chan_sk));
+            memset(id.chan_pk, 0, sizeof(id.chan_pk));
+            memset(id.store_key, 0, sizeof(id.store_key));
+            secp256k1_keypair kp;
+            secp256k1_xonly_pubkey xpub;
+            for (int tries = 0; tries < 10; tries++)
+            {
+                GetStrongRandBytes(id.sign_sk, 32);
+                if (secp256k1_keypair_create(c, &kp, id.sign_sk))
+                    break;
+            }
+            if (!secp256k1_keypair_xonly_pub(c, &xpub, NULL, &kp) ||
+                !secp256k1_xonly_pubkey_serialize(c, id.sign_pk, &xpub))
+                return false;
+            id.address = btf::Address(id.sign_pk);
+            return true;
+        }
+    };
+    btfchat::Identity me, stranger;
+    bool fIds = ctx && Id::Make(ctx, me) && Id::Make(ctx, stranger);
+    nFail += Check(fIds, "two chat identities") ? 0 : 1;
+    if (fIds)
+    {
+        btfchat::Roster roster;
+        btfchat::ReplayGuard replay;
+        btfchat::History history;
+        btfchat::Inbox inbox;
+        inbox.secpctx = ctx;
+        inbox.myAddress = me.address;
+        inbox.roster = &roster;
+        inbox.replay = &replay;
+        inbox.history = &history;
+        for (size_t i = 0; i < btfchat::MAX_PENDING_INVITES; i++)
+            roster.NoteIncomingInvite(strprintf("filler%u.btf", (unsigned int)i), "", nNow, err);
+        btfchat::Frame inv;
+        inv.kind = btfchat::MSG_INVITE;
+        inv.sent = nNow;
+        inv.text = "oi";
+        std::string js;
+        btfchat::Frame opened;
+        bool fSigned = btfchat::SignFrame(ctx, stranger, inv, js, err);
+        bool fDelivered = fSigned && inbox.Deliver(js, std::string(), nNow, opened, err);
+        nFail += Check(fSigned && roster.PendingInvitesFull() && !fDelivered && replay.Size() == 0,
+                       "with the invite list full, a stranger's invite is refused without taking a replay slot") ? 0 : 1;
+    }
+    if (ctx)
+        secp256k1_context_destroy(ctx);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+static int WfRpcAndV4(const std::string&, const std::string&)
+{
+    return WalletRpcV4SelfTest();
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -9957,8 +10775,26 @@ int RunSelfTest(const std::string& name)
         return RunInvoiceSelfTest();
     if (name == "chat-live")
         return RunChatLiveSelfTest();
+    if (name == "wallet-encrypted-seed")
+        return WfRunInTempDir("wallet-encrypted-seed", WfEncryptedSeed);
+    if (name == "wallet-encrypt-pool")
+        return WfRunInTempDir("wallet-encrypt-pool", WfEncryptPool);
+    if (name == "wallet-relock")
+        return WfRunInTempDir("wallet-relock", WfRelock);
+    if (name == "wallet-restore-race")
+        return WfRunInTempDir("wallet-restore-race", WfRestoreRace);
+    if (name == "wallet-secret-args")
+        return WfRunInTempDir("wallet-secret-args", WfSecretArgs);
+    if (name == "wallet-file-modes")
+        return WfRunInTempDir("wallet-file-modes", WfFileModes);
+    if (name == "wallet-fee-limit")
+        return WfRunInTempDir("wallet-fee-limit", WfFeeLimit);
+    if (name == "chat-replay-quota")
+        return RunChatReplayQuotaSelfTest();
+    if (name == "wallet-rpc-v4")
+        return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, net-message, network-params, consensus-limits, chain-work, pool-stratum, parse-money, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live\n");
     return 1;
 }

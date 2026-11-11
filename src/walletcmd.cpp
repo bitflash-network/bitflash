@@ -13,6 +13,10 @@
 #include "bip32.h"
 #include "walletcmd.h"
 #include "wallet_sqlite.h"
+#ifndef WIN32
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 #undef printf
 
@@ -86,11 +90,140 @@ unsigned int WalletLastUsedPubKeyIndexNext(
     return nNext;
 }
 
+// Echo off for one line of input from a terminal, restored on every way out.
+class CNoEcho
+{
+public:
+    CNoEcho() : fChanged(false)
+    {
+#ifdef WIN32
+        hIn = GetStdHandle(STD_INPUT_HANDLE);
+        if (hIn != INVALID_HANDLE_VALUE && GetConsoleMode(hIn, &dwOld))
+            fChanged = SetConsoleMode(hIn, dwOld & ~ENABLE_ECHO_INPUT) != 0;
+#else
+        if (isatty(fileno(stdin)) && tcgetattr(fileno(stdin), &tOld) == 0)
+        {
+            struct termios t = tOld;
+            t.c_lflag &= ~ECHO;
+            fChanged = tcsetattr(fileno(stdin), TCSAFLUSH, &t) == 0;
+        }
+#endif
+    }
+    ~CNoEcho()
+    {
+        if (!fChanged)
+            return;
+#ifdef WIN32
+        SetConsoleMode(hIn, dwOld);
+#else
+        tcsetattr(fileno(stdin), TCSAFLUSH, &tOld);
+#endif
+        fprintf(stderr, "\n");   // the Enter the user typed was not echoed either
+    }
+private:
+    bool fChanged;
+#ifdef WIN32
+    HANDLE hIn;
+    DWORD dwOld;
+#else
+    struct termios tOld;
+#endif
+};
+
+bool ReadSecretArgument(const std::string& strArg, const char* pszPrompt,
+                        std::string& strSecretRet, std::string& strErrorRet)
+{
+    strSecretRet.clear();
+    strErrorRet.clear();
+    char buf[4096];
+    bool fRead = false;
+    if (strArg.empty())
+    {
+        AttachTerminal();
+        fprintf(stderr, "Enter %s: ", pszPrompt);
+        fflush(stderr);
+        CNoEcho noecho;
+        fRead = fgets(buf, sizeof(buf), stdin) != NULL;
+        if (!fRead)
+            strErrorRet = strprintf("could not read the %s from stdin", pszPrompt);
+    }
+    else if (strArg[0] == '@')
+    {
+        std::string strPath = strArg.substr(1);
+        FILE* pf = fopen(strPath.c_str(), "rb");
+        if (!pf)
+        {
+            strErrorRet = strprintf("could not read the %s file %s", pszPrompt, strPath.c_str());
+            return false;
+        }
+        fRead = fgets(buf, sizeof(buf), pf) != NULL;
+        fclose(pf);
+        if (!fRead)
+            strErrorRet = strprintf("the %s file %s is empty", pszPrompt, strPath.c_str());
+    }
+    else
+    {
+        strErrorRet = strprintf("a %s given as a literal on the command line is unsafe (shell history, "
+                                "process list); give the option without a value to type it on stdin, "
+                                "or =@FILE", pszPrompt);
+        return false;
+    }
+    if (fRead)
+        strSecretRet = buf;
+    OPENSSL_cleanse(buf, sizeof(buf));
+    if (!fRead)
+        return false;
+
+    while (!strSecretRet.empty() &&
+           (strSecretRet[strSecretRet.size() - 1] == '\n' ||
+            strSecretRet[strSecretRet.size() - 1] == '\r'))
+        strSecretRet.resize(strSecretRet.size() - 1);
+    if (strSecretRet.empty())
+    {
+        strErrorRet = strprintf("empty %s", pszPrompt);
+        return false;
+    }
+    return true;
+}
+
+// BIP39 asks for the passphrase in Unicode NFKD. This build passes the bytes as
+// typed, which is the same for plain ASCII and can differ for accented letters:
+// an e-acute typed as one character on one system and as "e" plus a combining
+// accent on another, or in another wallet, gives a different seed -- and a wrong
+// passphrase opens an empty wallet without an error. Said before it matters.
+static void WarnNonAsciiPhrasePassword(const std::string& strPassphrase)
+{
+    for (size_t i = 0; i < strPassphrase.size(); i++)
+    {
+        if ((unsigned char)strPassphrase[i] >= 0x80)
+        {
+            fprintf(stderr,
+                    "Warning: the phrase password contains non-ASCII characters (accents, for\n"
+                    "example). They are used exactly as typed, not normalized, so the same\n"
+                    "password typed on another system or in another wallet may give a\n"
+                    "different, empty wallet. A password of plain ASCII letters, digits and\n"
+                    "punctuation avoids this.\n");
+            return;
+        }
+    }
+}
+
 int CmdNewPhrase(const std::string& strPassphrase)
 {
     AttachTerminal();
 
-    if (HaveHDSeed())
+    if (IsWalletLocked())
+    {
+        // Asked first: a locked wallet's seed is not in memory, so "has it a
+        // seed?" cannot be answered from memory -- and the new seed has to be
+        // encrypted under the wallet's key, which only an unlock provides.
+        fprintf(stderr, "The wallet is encrypted and locked. Start with /walletpassphrase "
+                        "(stdin) or /walletpassphrase=@FILE. Nothing was changed.\n");
+        return 1;
+    }
+
+    // WalletHasHDSeed, not HaveHDSeed: the latter is only the decrypted copy.
+    if (WalletHasHDSeed())
     {
         printf("This wallet already has a recovery phrase.\n");
         printf("Creating another would replace it, and coins on addresses derived from\n");
@@ -99,6 +232,7 @@ int CmdNewPhrase(const std::string& strPassphrase)
         return 1;
     }
 
+    WarnNonAsciiPhrasePassword(strPassphrase);
     std::string strMnemonic, strError;
     if (!bitflash::BIP39GenerateMnemonic(strMnemonic, strError))
     {
@@ -165,6 +299,11 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
     // whose Berkeley DB environment failed to load left the node at height 0,
     // the scan walked one block, and the message said nothing was found across
     // 600 addresses.
+    if (IsWalletLocked())
+    {
+        strErrorRet = "the wallet is encrypted and locked; unlock it first";
+        return false;
+    }
     if (!CanScanWalletTransactions(strErrorRet))
         return false;
 
@@ -178,12 +317,26 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
     // Derive forward in batches, scanning after each, until a whole batch turns
     // up nothing. Every derived key is written to the wallet before the scan,
     // because the scan asks the wallet what belongs to it.
-    const bool fRestoreBIP44 = nHDKeySchema == HD_SCHEMA_BIP44;
-    unsigned int nLegacyScanNext = nHDNext;
+    //
+    // The node runs while this does: the GUI restores on its own thread, and
+    // the miner, RPC and sends draw keys meanwhile. So each batch's
+    // derivations and counter updates happen under cs_keyPool -- the lock
+    // those draws take -- and the scan, which takes cs_main, runs outside it
+    // (cs_main comes before cs_keyPool everywhere). The legacy compatibility
+    // scan names its schema explicitly instead of flipping the global one,
+    // which a concurrent draw could read half way.
+    bool fRestoreBIP44 = false;
+    unsigned int nLegacyScanNext = 0;
+    int nTotalDerived = 0;
+    CRITICAL_BLOCK(cs_keyPool)
+    {
+        fRestoreBIP44 = nHDKeySchema == HD_SCHEMA_BIP44;
+        nLegacyScanNext = nHDNext;
+        nTotalDerived = fRestoreBIP44
+            ? (int)(nHDReceiveNext + nHDChangeNext)
+            : (int)nHDNext;
+    }
     std::map<unsigned int, vector<unsigned char> > mapLegacyScanPubKeys;
-    int nTotalDerived = fRestoreBIP44
-        ? (int)(nHDReceiveNext + nHDChangeNext)
-        : (int)nHDNext;
     int nStopDepth = max(nMinDepth, RESTORE_MIN_SCAN);
     int nQuietBatches = 0;
     while (nTotalDerived < RESTORE_MAX)
@@ -200,60 +353,77 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
             nWalletBefore = mapWallet.size();
 
         std::string strDeriveError;
-        if (fRestoreBIP44)
+        int nDerivedThisBatch = 0;
+        // A key the wallet already holds (the same phrase restored again) is
+        // passed over, not treated as a failure: AddKey refuses to overwrite,
+        // and stopping there left the counters where they were and the loop
+        // deriving nothing, batch after batch.
+        CRITICAL_BLOCK(cs_keyPool)
         {
-            for (int i = 0; i < RESTORE_BATCH; i++)
+            if (IsWalletLocked())
             {
-                CKey key;
-                if (!DeriveHDKey(nHDReceiveNext, key, strDeriveError))
-                    break;
-                if (!AddKey(key))
-                    break;
-                nHDReceiveNext++;
-                nTotalDerived++;
+                strDeriveError = "the wallet was locked during the restore";
             }
-            CWalletDB().WriteHDReceiveNext(nHDReceiveNext);
+            else if (fRestoreBIP44)
+            {
+                for (int i = 0; i < RESTORE_BATCH; i++)
+                {
+                    CKey key;
+                    if (!DeriveHDKey(nHDReceiveNext, key, strDeriveError) ||
+                        !WalletAddKeyIfMissing(key))
+                        break;
+                    nHDReceiveNext++;
+                    nTotalDerived++;
+                    nDerivedThisBatch++;
+                }
+                CWalletDB().WriteHDReceiveNext(nHDReceiveNext);
 
-            for (int i = 0; i < RESTORE_BATCH; i++)
-            {
-                CKey key;
-                if (!DeriveHDChangeKey(nHDChangeNext, key, strDeriveError))
-                    break;
-                if (!AddKey(key))
-                    break;
-                nHDChangeNext++;
-                nTotalDerived++;
-            }
-            CWalletDB().WriteHDChangeNext(nHDChangeNext);
+                for (int i = 0; i < RESTORE_BATCH; i++)
+                {
+                    CKey key;
+                    if (!DeriveHDChangeKey(nHDChangeNext, key, strDeriveError) ||
+                        !WalletAddKeyIfMissing(key))
+                        break;
+                    nHDChangeNext++;
+                    nTotalDerived++;
+                    nDerivedThisBatch++;
+                }
+                CWalletDB().WriteHDChangeNext(nHDChangeNext);
 
-            int nSavedSchema = nHDKeySchema;
-            nHDKeySchema = HD_SCHEMA_LEGACY;
-            for (int i = 0; i < RESTORE_BATCH; i++)
-            {
-                CKey key;
-                if (!DeriveHDKey(nLegacyScanNext, key, strDeriveError))
-                    break;
-                if (!AddKey(key))
-                    break;
-                mapLegacyScanPubKeys[nLegacyScanNext] = key.GetPubKey();
-                nLegacyScanNext++;
-                nTotalDerived++;
+                for (int i = 0; i < RESTORE_BATCH; i++)
+                {
+                    CKey key;
+                    if (!DeriveHDKeyForSchema(HD_SCHEMA_LEGACY, nLegacyScanNext, key, strDeriveError) ||
+                        !WalletAddKeyIfMissing(key))
+                        break;
+                    mapLegacyScanPubKeys[nLegacyScanNext] = key.GetPubKey();
+                    nLegacyScanNext++;
+                    nTotalDerived++;
+                    nDerivedThisBatch++;
+                }
             }
-            nHDKeySchema = nSavedSchema;
+            else
+            {
+                for (int i = 0; i < RESTORE_BATCH; i++)
+                {
+                    CKey key;
+                    if (!DeriveHDKey(nHDNext, key, strDeriveError) ||
+                        !WalletAddKeyIfMissing(key))
+                        break;
+                    nHDNext++;
+                    nTotalDerived++;
+                    nDerivedThisBatch++;
+                }
+                CWalletDB().WriteHDNext(nHDNext);
+            }
         }
-        else
+        if (nDerivedThisBatch == 0)
         {
-            for (int i = 0; i < RESTORE_BATCH; i++)
-            {
-                CKey key;
-                if (!DeriveHDKey(nHDNext, key, strDeriveError))
-                    break;
-                if (!AddKey(key))
-                    break;
-                nHDNext++;
-                nTotalDerived++;
-            }
-            CWalletDB().WriteHDNext(nHDNext);
+            // Nothing more can be derived (a full disk, a lock): stop here
+            // rather than scan the same addresses again forever.
+            strErrorRet = "could not derive further keys" +
+                          (strDeriveError.empty() ? string() : ": " + strDeriveError);
+            break;
         }
 
         ScanForWalletTransactions(pindexGenesisBlock);
@@ -267,10 +437,13 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
             // look exhausted even though no legacy key was ever used.
             unsigned int nLegacyUsedNext =
                 WalletLastUsedPubKeyIndexNext(mapLegacyScanPubKeys);
-            if (nLegacyUsedNext != nHDNext)
+            CRITICAL_BLOCK(cs_keyPool)
             {
-                nHDNext = nLegacyUsedNext;
-                CWalletDB().WriteHDNext(nHDNext);
+                if (nLegacyUsedNext != nHDNext)
+                {
+                    nHDNext = nLegacyUsedNext;
+                    CWalletDB().WriteHDNext(nHDNext);
+                }
             }
         }
 
@@ -310,9 +483,12 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
     }
 
     // The pool is rebuilt from where derivation stopped, so the next address
-    // this wallet hands out is one the phrase can reproduce as well.
-    CRITICAL_BLOCK(cs_keyPool)
-        mapKeyPool.clear();
+    // this wallet hands out is one the phrase can reproduce as well. Its
+    // records go from the disk too: clearing only the map left the entries
+    // above the new top-up on disk, to come back after a restart.
+    std::string strPoolError;
+    if (!ResetKeyPoolRecords(strPoolError))
+        printf("Restore: %s\n", strPoolError.c_str());
     TopUpKeyPool();
 
     size_t nWalletEnd = 0;
@@ -334,6 +510,7 @@ int CmdRestorePhrase(const std::string& strMnemonic, const std::string& strPassp
 {
     AttachTerminal();
 
+    WarnNonAsciiPhrasePassword(strPassphrase);
     printf("Checking the phrase and the chain.\n");
     fflush(stdout);
 
@@ -343,7 +520,6 @@ int CmdRestorePhrase(const std::string& strMnemonic, const std::string& strPassp
                            strError, nRecovered, nDerived))
     {
         fprintf(stderr, "Cannot restore: %s\n", strError.c_str());
-        fprintf(stderr, "Nothing was changed.\n");
         return 1;
     }
 

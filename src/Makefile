@@ -475,6 +475,15 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=wallet-sqlite-migration
 	./bitflash-node -selftest=wallet-crypto
 	./bitflash-node -selftest=wallet-encrypt
+	./bitflash-node -selftest=wallet-encrypted-seed
+	./bitflash-node -selftest=wallet-encrypt-pool
+	./bitflash-node -selftest=wallet-relock
+	./bitflash-node -selftest=wallet-restore-race
+	./bitflash-node -selftest=wallet-secret-args
+	./bitflash-node -selftest=wallet-file-modes
+	./bitflash-node -selftest=wallet-fee-limit
+	./bitflash-node -selftest=wallet-rpc-v4
+	./bitflash-node -selftest=chat-replay-quota
 	./bitflash-node -selftest=net-message
 	./bitflash-node -selftest=network-params
 	./bitflash-node -selftest=consensus-limits

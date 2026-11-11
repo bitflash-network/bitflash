@@ -1,7 +1,7 @@
 # Consensus rules v4 (design)
 
-Status: design, not scheduled on mainnet. Nothing here is live until a release
-sets the switch times below and the founder announces it.
+Status: scheduled. The switch times below are set in the code (`consensus.h`):
+testnet 2026-11-20 12:00 UTC, mainnet 2026-12-25 12:00 UTC.
 
 Rules v4 add three things a script can say, each the way Bitcoin says it or
 has proposed to, so that a contract written for one chain reads the same on
@@ -143,6 +143,17 @@ and, from the switch, in any script.
 libsecp256k1, already linked and verifying every ECDSA signature, has the
 BIP340 module built in.
 
+## Relay policy for the upgrade hooks
+
+Each opcode leaves a hook for a later rule: CSV with bit 31 set in its
+number, CTV with an argument that is not 32 bytes, and CSFS with a non-empty
+key that is not 32 bytes all pass by consensus, as in Bitcoin. Nodes do not
+relay or mine a transaction whose scripts execute one of them (policy only,
+like Bitcoin's `DISCOURAGE_UPGRADABLE_NOPS` and `_PUBKEYTYPE`); a block that
+contains one is still valid. The CSFS case matters most: a script written by
+hand with an ordinary 33-byte key passes with any signature at all, so
+`spendscript` refuses such a redeem script outright.
+
 ## What old nodes see
 
 **Every node must upgrade before the switch, not only miners.** Since rules
@@ -189,14 +200,26 @@ payments later, by a transaction anybody can broadcast and nobody can change.
 What it is for: paying many people when fees are high, with the payments
 already settled.
 
-Both are refused while rules v4 are not in force: before them,
-`OP_CHECKSEQUENCEVERIFY` and `OP_CHECKTEMPLATEVERIFY` do nothing, and coins
-behind them could be taken by anybody. The scripts and keys are kept in
+Both are refused while rules v4 are not in force. Before the switch the
+three bytes are unknown and any script that runs them fails (see above), so
+coins sent to a vault or a batch then could not be spent at all until the
+switch; the wallet does not create one before it. The scripts and keys are kept in
 `v4contracts.json` beside the wallet, and every result carries the redeem
 scripts, with which `spendscript` alone can spend them.
 
 What CTV costs here: the fee of the transaction it fixes is fixed with it. It
-cannot be raised later; pick it generously.
+cannot be raised later; pick it generously. `vaultcreate` and `ctvbatch` build
+that transaction before any coin goes in, and refuse when it is larger than
+nodes relay (100 kB, less a margin) or when the fee is below what every miner
+asks of its size (0.01 per started kB, without the small-transaction
+discount); the error names the fee that would do.
+
+**One deposit only.** A vault address and a batch address take exactly the
+deposit the RPC makes. The template allows one input and fixes the outputs,
+so a second payment to the same address can never be spent if it is smaller
+than the template's outputs, and goes to the miner (all of it above those
+outputs) if it is larger. Never reuse these addresses, and do not give them
+to anybody as a payment address. The RPC results say so too.
 
 ## Order of work
 

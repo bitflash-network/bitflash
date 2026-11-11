@@ -16,6 +16,16 @@
 // wallets. It is not a password on a file and there is no way to check it --
 // the wrong one silently produces a valid, empty wallet. "" means none.
 
+// A secret given on the command line: the wallet passphrase, BIP39's extra
+// word, or the recovery phrase itself. Never a literal value -- it would sit in
+// the shell history and in the process list (/proc/<pid>/cmdline), readable by
+// other local users. An empty strArg reads one line from stdin (echo off when
+// stdin is a terminal), "@FILE" reads the first line of FILE. pszPrompt is what
+// the stdin prompt says ("wallet passphrase"). The line end is stripped; an
+// empty secret is refused. The buffers the secret passed through are wiped.
+bool ReadSecretArgument(const std::string& strArg, const char* pszPrompt,
+                        std::string& strSecretRet, std::string& strErrorRet);
+
 // Create a phrase for a wallet that does not have one, install the seed, and
 // show the words once. Refuses if a phrase already exists. Returns 0 on success.
 int CmdNewPhrase(const std::string& strPassphrase);
