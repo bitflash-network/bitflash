@@ -11107,6 +11107,7 @@ static int RunRulesV5SelfTest()
             nBenchRulesV5Time = TV4;
             nFail += Check(fMade && wide.GetSigOpCount(true) == 20 && !c.AcceptBlock() && nBestHeight == 144,
                            "v5 on: spending a 25-key OP_CHECKMULTISIG (charged 20) is refused") ? 0 : 1;
+            V5ForgetRefused(c);
             nBenchRulesV5Time = 0;
             nFail += Check(c.AcceptBlock() && nBestHeight == 145,
                            "v5 off: the same block is accepted, as it always was") ? 0 : 1;
