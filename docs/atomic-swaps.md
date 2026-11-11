@@ -79,13 +79,16 @@ only with 6 hours left; the taker has at least 12).
 gives BTF: its refund then needs those seven Bitflash blocks between its own
 lock and the maker's. The taker locks only while the maker's contract has at
 least 36 hours left, and a taker's BTF lock is 18 hours, so seven blocks have
-at least 18 hours: about 150 minutes a block, more than 64 times the two-minute
-target, three of the largest retarget steps in a row. Driving the difficulty
-that high takes far more work than reversing the 30 Bitflash confirmations
-both sides already wait for before acting, so the margin is not the weakest
-point of the swap. Before it locks, a taker giving BTF also waits while the
-Bitflash tip's median time is more than an hour behind the clock (normally
-about 12 minutes), which is where such a slowdown would have to begin.
+at least 18 hours: on average about 150 minutes a block, more than 64 times
+the two-minute target, three of the largest retarget steps in a row. That is
+a mean; block times vary, so the slowdown covered with high probability is
+somewhat smaller. Driving the difficulty that high takes far more work than
+reversing the 30 Bitflash confirmations both sides already wait for before
+acting, so the margin is not the weakest point of the swap. Before it locks,
+a taker giving BTF also waits while the Bitflash tip's median time is more
+than an hour behind the clock (normally about 12 minutes). That catches only
+a chain already slow: difficulty can be pushed up while blocks still arrive
+on time, and the slow part begins when that hash rate leaves.
 Dogecoin judges a lock by the next block's own time (BIP113 never activated
 there), which costs up to about two of those hours; the margin covers it.
 
@@ -152,13 +155,17 @@ agreed swap amount. Keep the chat open through completion or refund.
   twice the fee rate (the redeem signals BIP125), up to 0.01 BTC per 1000
   vbytes. With no fee estimate in light mode the first rate is `-btcfeerate`,
   10 sat/vB when unset; set it higher when Bitcoin's fees are high.
-- **A refund is done only when it is in a block.** The maker holds the secret
-  and could still redeem the taker's contract after the taker's refund was
-  sent, outbidding its fee. Until a block has the refund, the chat keeps
-  looking at its own contract: if a redeem appears instead, it takes the
-  maker's coins with the secret it shows. A light-mode refund still in no
-  block after an hour goes out again at twice the fee rate. This holds with
-  Bitcoin Core too, where a refund only in the memory pool is not the end.
+- **A taker's refund is watched to the end.** The maker holds the secret and
+  could still redeem the taker's contract instead of the refund: outbidding
+  its fee before a block has it, or in a block that a reorganisation replaces.
+  So a taker's refund is over only when it has the chain's confirmations
+  (the same count a counterparty contract needs) and the maker's contract is
+  spent or past its lock. Until then the chat keeps looking at its own
+  contract: if a redeem appears instead, it takes the maker's coins with the
+  secret it shows. A light-mode refund still in no block after an hour goes
+  out again at twice the fee rate. A maker's refund is over when a block has
+  it. Refunded BTF counts in the wallet's balance and can be spent as soon as
+  a block holds the refund (a time-locked transaction in a block is final).
 - **A maker whose redeem lost the race refunds its own.** If the taker's
   refund confirms before the maker's redeem, the maker's swap goes on to
   refund the maker's contract at its lock instead of stopping.

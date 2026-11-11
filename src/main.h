@@ -1368,6 +1368,15 @@ public:
         Init();
     }
 
+    // Whether the wallet may count and spend this transaction's outputs.
+    // In a block of the main chain it is final by consensus, whatever its
+    // nLockTime; outside one, it is final if the next block could hold it
+    // (IsFinalForNextBlock: a time lock judged by median time past). The
+    // 0.1.0 rule (CTransaction::IsFinal, nLockTime < nBestHeight) never
+    // counts a unix-time nLockTime as final, which hid every time-locked
+    // refund -- an atomic swap's -- from the balance and from coin selection.
+    bool IsFinalForWallet() const;
+
     void Init()
     {
         fTimeReceivedIsTxTime = false;

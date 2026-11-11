@@ -198,7 +198,9 @@ private:
     bool MyTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& err);
     bool FindSecret(const std::string& coin, const std::string& contract, const std::string& ref,
                     bool& fSpent, std::string& secretOut, bool& fRefunded, std::string& err,
-                    bool* pfConfirmed = NULL);
+                    bool* pfConfirmed = NULL, int* pnSpendConf = NULL, std::string* pSpendTxid = NULL);
+    void RefundSeen(ChatSwap& s, bool fConfirmed, int nConf);
+    bool SaveLockAttempt(ChatSwap& s);
     int  LookupLock(ChatSwap& s, std::string& err);
     bool AdoptLock(ChatSwap& s, const nlohmann::json& r, std::string& err);
     bool StoreSaved(ChatSwap& s);

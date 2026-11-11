@@ -1910,6 +1910,7 @@ json Find(const btcswap::Chain& chain, const CScript& contract, const std::strin
         {
             j["spent"] = true; j["unspent"] = false; j["amount"] = nullptr; j["found"] = true; j["confirmed"] = true;
             j["txid"] = it->first.GetHex(); j["height"] = it->second.height;
+            j["spendConfirmations"] = CountsByWork(s.net) ? ConfirmationsByWork(s.net,s.headers,it->second.height) : s.headers.Tip().height-it->second.height+1;
             if (secret)
             {
                 Bytes value;

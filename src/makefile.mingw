@@ -400,6 +400,8 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=swap-parse
 	./bitflash.exe -selftest=swap-engine
 	./bitflash.exe -selftest=chat-store-save
+	./bitflash.exe -selftest=wallet-final
+	./bitflash.exe -selftest=swap-rpc
 	./bitflash.exe -selftest=fee-policy
 	./bitflash.exe -selftest=invoice
 	./bitflash.exe -selftest=net-hardening

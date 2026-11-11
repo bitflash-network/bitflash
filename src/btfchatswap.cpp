@@ -386,7 +386,7 @@ bool SwapEngine::TheirTimeLeft(const ChatSwap& s, int64_t& nLeft, std::string& e
 // Has a contract been spent, and did the spend show the secret?
 bool SwapEngine::FindSecret(const std::string& coin, const std::string& contract, const std::string& ref,
                             bool& fSpent, std::string& secretOut, bool& fRefunded, std::string& err,
-                            bool* pfConfirmed)
+                            bool* pfConfirmed, int* pnSpendConf, std::string* pSpendTxid)
 {
     json r;
     fSpent = false;
@@ -394,6 +394,10 @@ bool SwapEngine::FindSecret(const std::string& coin, const std::string& contract
     secretOut.clear();
     if (pfConfirmed)
         *pfConfirmed = false;
+    if (pnSpendConf)
+        *pnSpendConf = 0;
+    if (pSpendTxid)
+        pSpendTxid->clear();
     if (!OnChain(coin, "swapfindsecret", "findsecret", json::array({ contract, ref }), r, err) || !r.is_object())
         return false;
     fSpent = r.value("spent", false);
@@ -403,6 +407,10 @@ bool SwapEngine::FindSecret(const std::string& coin, const std::string& contract
     // still take its place.
     if (pfConfirmed)
         *pfConfirmed = fSpent && r.value("confirmed", false);
+    if (pnSpendConf && fSpent && r.contains("spendConfirmations") && r["spendConfirmations"].is_number_integer())
+        *pnSpendConf = r["spendConfirmations"].get<int>();
+    if (pSpendTxid && fSpent)
+        *pSpendTxid = r.value("txid", std::string());
     return true;
 }
 
@@ -489,6 +497,105 @@ bool SwapEngine::StoreSaved(ChatSwap& s)
     return false;
 }
 
+// Written ahead: the store says a lock call is under way before it is made.
+// Stopped during the call or right after it, the swap comes back with
+// fLockTried set, and Tick asks the wallet's journal what happened before
+// anything can lock again or call the swap off.
+bool SwapEngine::SaveLockAttempt(ChatSwap& s)
+{
+    bool fWas = false;
+    CRITICAL_BLOCK(cs)
+    {
+        std::map<std::string, ChatSwap>::iterator it = swaps.find(s.id);
+        if (it != swaps.end())
+        {
+            fWas = it->second.fLockTried;
+            it->second.fLockTried = true;
+        }
+    }
+    s.fLockTried = true;
+    if (StoreSaved(s))
+        return true;
+    CRITICAL_BLOCK(cs)
+    {
+        std::map<std::string, ChatSwap>::iterator it = swaps.find(s.id);
+        if (it != swaps.end())
+            it->second.fLockTried = fWas;
+    }
+    s.fLockTried = fWas;
+    return false;
+}
+
+// Our contract was spent by a refund. When is that the end?
+//
+// A maker with its secret not out has nothing to lose to a reorganisation:
+// the block that has the refund will do. A taker has: the maker holds the
+// secret, and a refund one block deep that a reorganisation replaces with
+// the maker's redeem puts the secret on the chain while the maker's own coins
+// are still locked for us. So a taker's refund is over only once it has the
+// chain's confirmations (MinConfirmations) and the maker's contract is spent
+// or past its lock; until then the refund stage keeps reading our contract
+// for a spend that shows the secret.
+void SwapEngine::RefundSeen(ChatSwap& s, bool fConfirmed, int nConf)
+{
+    s.stage = SW_REFUNDING;
+    if (!fConfirmed)
+    {
+        // In a memory pool: the node relays it; a block will say.
+        s.status = "refund sent; waiting for a block to confirm it";
+        return;
+    }
+    if (!s.fMaker)
+    {
+        int nNeed = MinConfirmations(s.give);
+        if (nConf < nNeed)
+        {
+            s.status = strprintf("our refund has %d of %d confirmations; still watching for the secret", nConf, nNeed);
+            return;
+        }
+        if (!s.theirContract.empty())
+        {
+            int64_t nLeft = 1;
+            std::string err;
+            if (!TheirTimeLeft(s, nLeft, err))
+            {
+                s.lastError = err;
+                s.status = "our refund is confirmed; checking their contract before calling it over";
+                return;
+            }
+            if (nLeft > 0)
+            {
+                s.status = strprintf("our refund is confirmed; watching for the secret until their lock opens, in about %lld minutes",
+                                     (long long)(nLeft / 60 + 1));
+                return;
+            }
+        }
+    }
+    s.refundSince = 0;
+    s.stage = SW_REFUNDED;
+    s.status = "refunded: our " + FormatSwapAmount(s.give, s.giveAmount) + " " + s.give + " came back";
+}
+
+// Our contract was spent with the secret while we waited to refund it. A
+// taker: the maker redeemed ours, so the secret is ours too and theirs is
+// taken with it. A maker: its own redeem lost to their refund and they then
+// took ours -- a loss, and said so, not a swap "done".
+static void OursTakenWithSecret(ChatSwap& s, const std::string& secret)
+{
+    s.refundSince = 0;
+    if (!s.fMaker)
+    {
+        s.secret = secret;
+        s.stage = SW_REDEEMING;
+        s.status = "they took ours with the secret; taking theirs with it";
+    }
+    else
+    {
+        s.stage = SW_FAILED;
+        s.status = "lost: their refund came before our redeem, and they then took ours with the secret";
+    }
+}
+
 // The refund at the end of our lock, and what to make of it failing.
 //
 // A refund is over only once a block has it. Until then the other side, if
@@ -537,42 +644,28 @@ void SwapEngine::TryRefund(ChatSwap& s)
     if (!s.refundTxid.empty())
     {
         bool fSpent = false, fRefunded = false, fConfirmed = false;
+        int nConf = 0;
         std::string secret;
-        if (!FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err, &fConfirmed))
+        if (!FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err, &fConfirmed, &nConf))
         {
             s.lastError = err;
             return;
         }
         if (fSpent && !secret.empty())
         {
-            if (!s.fMaker)
-            {
-                // The maker took ours instead of letting the refund through:
-                // the secret is ours too.
-                s.secret = secret;
-                s.stage = SW_REDEEMING;
-                s.status = "they took ours with the secret; taking theirs with it";
-            }
-            else
-            {
-                s.stage = SW_DONE;
-                s.status = "they took ours with the secret";
-            }
-            s.refundSince = 0;
+            OursTakenWithSecret(s, secret);
             return;
         }
-        if (fSpent && fRefunded && fConfirmed)
+        if (fSpent && fRefunded)
         {
-            s.refundSince = 0;
-            s.stage = SW_REFUNDED;
-            s.status = "refunded: our " + FormatSwapAmount(s.give, s.giveAmount) + " " + s.give + " came back";
+            RefundSeen(s, fConfirmed, nConf);
             return;
         }
         s.stage = SW_REFUNDING;
         if (fSpent)
         {
-            // In a memory pool: the node relays it; a block will say.
-            s.status = "refund sent; waiting for a block to confirm it";
+            // Spent where the node cannot read by what yet.
+            s.status = "ours was spent; waiting for a block to show by what";
             return;
         }
         if (!s.refundSince)
@@ -628,25 +721,22 @@ void SwapEngine::TryRefund(ChatSwap& s)
     // Spent already? With the secret means they redeemed ours -- which they
     // can only do after we showed the secret, i.e. after we took theirs.
     bool fSpent = false, fRefunded = false, fConfirmed = false;
-    std::string secret, err2;
-    if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err2, &fConfirmed) && fSpent)
+    int nConf = 0;
+    std::string secret, err2, spendTxid;
+    if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err2, &fConfirmed,
+                   &nConf, &spendTxid) && fSpent)
     {
-        if (fRefunded && fConfirmed)
+        if (!secret.empty())
+            OursTakenWithSecret(s, secret);
+        else if (fRefunded)
         {
-            s.stage = SW_REFUNDED;
-            s.status = "refunded";
-        }
-        else if (!secret.empty() && !s.fMaker)
-        {
-            // The maker took ours at the last moment: the secret is ours too.
-            s.secret = secret;
-            s.stage = SW_REDEEMING;
-            s.status = "they took ours; taking theirs with the secret";
-        }
-        else if (!secret.empty())
-        {
-            s.stage = SW_DONE;
-            s.status = "they took ours with the secret";
+            // Refunded already (an earlier round, or by hand): watched from
+            // here as our refund.
+            if (s.refundTxid.empty())
+                s.refundTxid = spendTxid;
+            if (!s.refundSince)
+                s.refundSince = nNow;
+            RefundSeen(s, fConfirmed, nConf);
         }
         else
         {
@@ -786,7 +876,7 @@ void SwapEngine::Tick(ChatSwap& s)
             s.fUserOk = false;
             return;
         }
-        if (!StoreSaved(s))
+        if (!SaveLockAttempt(s))
             return;
         // The swap's id names the lock in the wallet's journal (swaps.log),
         // where its secret is written before anything is sent: asked again,
@@ -865,7 +955,7 @@ void SwapEngine::Tick(ChatSwap& s)
                 return;
             }
         }
-        if (!StoreSaved(s))
+        if (!SaveLockAttempt(s))
             return;
         json params = json::array({ s.theirRecv, AmountText(s.give, s.giveAmount), s.secretHash, LockParams(s, false), s.id });
         json r;
@@ -941,9 +1031,11 @@ void SwapEngine::Tick(ChatSwap& s)
         if (!s.fMaker)
         {
             // Waiting for the maker to take ours: the secret will be in that spend.
-            bool fSpent = false, fRefunded = false;
-            std::string secret;
-            if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err))
+            bool fSpent = false, fRefunded = false, fConfirmed = false;
+            int nConf = 0;
+            std::string secret, spendTxid;
+            if (FindSecret(s.give, s.myContract, Ref(s.give, s.myTxid, s.myVout), fSpent, secret, fRefunded, err,
+                           &fConfirmed, &nConf, &spendTxid))
             {
                 if (fSpent && !secret.empty())
                 {
@@ -954,8 +1046,11 @@ void SwapEngine::Tick(ChatSwap& s)
                 }
                 if (fSpent && fRefunded)
                 {
-                    s.stage = SW_REFUNDED;
-                    s.status = "refunded";
+                    if (s.refundTxid.empty())
+                        s.refundTxid = spendTxid;
+                    if (!s.refundSince)
+                        s.refundSince = nNow;
+                    RefundSeen(s, fConfirmed, nConf);
                     return;
                 }
             }
@@ -1161,7 +1256,7 @@ void SwapEngine::OnStep(const std::string& peer, const SwapStep& st, int64_t nNo
     }
     else if (st.step == "cancel")
     {
-        if (s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage))
+        if (!s.fLockTried && s.myContract.empty() && s.myTxid.empty() && !s.fUserOk && !IsFinal(s.stage))
         {
             s.stage = SW_CANCELLED;
             s.status = "they cancelled" + (st.why.empty() ? std::string() : ": " + st.why);
@@ -1366,13 +1461,14 @@ bool SwapEngine::SetBitcoinDestination(const std::string& id, const std::string&
         if (it == swaps.end() || !it->second.myContract.empty() || !it->second.redeemTxid.empty()) return false;
         coin = Other(it->second);
     }
-    // The wallet checks it is an address of that chain and network before it
-    // is kept: every redeem and refund later pays it, and it cannot be
-    // changed once ours is locked.
-    json checked;
-    std::string err;
-    if (!OnChain(coin, "", "validatedestination", json::array({ address }), checked, err))
-        return false;
+    // Called from the screen: no wallet call here (one can wait minutes behind
+    // a long one). Only its shape; the round asks the wallet whether it is an
+    // address of that chain and network before anything is locked, and it
+    // cannot be changed once ours is.
+    (void)coin;
+    for (size_t i = 0; i < address.size(); i++)
+        if (!isalnum((unsigned char)address[i]) && address[i] != ':')
+            return false;
     CRITICAL_BLOCK(cs)
     {
         auto it = swaps.find(id);

@@ -2737,6 +2737,13 @@ int CMerkleTx::GetDepthInMainChain() const
 }
 
 
+bool CWalletTx::IsFinalForWallet() const
+{
+    if (GetDepthInMainChain() > 0)
+        return true;
+    return IsFinalForNextBlock(*this);
+}
+
 int CMerkleTx::GetBlocksToMaturity() const
 {
     if (!IsCoinBase())
@@ -6420,7 +6427,7 @@ WalletRecoveryAudit GetWalletRecoveryAudit()
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
         {
             CWalletTx& wtx = (*it).second;
-            if (!wtx.IsFinal() || wtx.fSpent)
+            if (!wtx.IsFinalForWallet() || wtx.fSpent)
                 continue;
             bool fImmature = wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0;
 
@@ -6521,7 +6528,7 @@ int64 GetBalance()
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
         {
             CWalletTx* pcoin = &(*it).second;
-            if (!pcoin->IsFinal() || pcoin->fSpent)
+            if (!pcoin->IsFinalForWallet() || pcoin->fSpent)
                 continue;
             nTotal += pcoin->GetCredit();
         }
@@ -6556,7 +6563,7 @@ static bool SelectCoinsMinConf(int64 nTargetValue, int nConfMine, int nConfTheir
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
         {
             CWalletTx* pcoin = &(*it).second;
-            if (!pcoin->IsFinal() || pcoin->fSpent)
+            if (!pcoin->IsFinalForWallet() || pcoin->fSpent)
                 continue;
             int nDepth = pcoin->GetDepthInMainChain();
             if (nDepth < (pcoin->GetDebit() > 0 ? nConfMine : nConfTheirs))

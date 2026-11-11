@@ -91,21 +91,22 @@ static const unsigned int SECRET_BYTES = 32;
 // gives BTF: its refund then needs those seven Bitflash blocks between its
 // own lock and the maker's. The taker locks only while the maker's contract
 // has at least 36 hours left, so with an 18 hour lock there are at least 18
-// hours for seven blocks: about 150 minutes a block, more than 64 times the
-// two-minute target, three of the largest retarget steps in a row. Driving the
-// difficulty that high takes far more work than reversing the 30 Bitflash
-// confirmations both sides already wait for before acting, so this margin is
-// not the weakest point of the swap. Before locking, a taker who gives BTF
-// also refuses while the chain is slow at that moment (the tip's median time
-// more than an hour behind the clock), which is where such a slowdown would
-// have to begin. Dogecoin judges a lock by the next block's own time, not the
-// median (BIP113 never activated there), which costs up to about two of
-// those 18 hours; the margin covers it.
+// hours for seven blocks: on average about 150 minutes a block, more than 64
+// times the two-minute target, three of the largest retarget steps in a row.
+// That is a mean; block times vary, so the slowdown the margin covers with
+// high probability is somewhat smaller. Driving the difficulty that high
+// takes far more work than reversing the 30 Bitflash confirmations both
+// sides already wait for before acting, so this margin is not the weakest
+// point of the swap. Before locking, a taker who gives BTF also refuses
+// while the chain is already slow (the tip's median time more than an hour
+// behind the clock, SwapConfig::nBtfMaxMedianLag). That only sees a slowdown
+// under way: difficulty can be pushed up while blocks still come on time,
+// and the slow part starts when that hash rate leaves. Dogecoin judges a
+// lock by the next block's own time, not the median (BIP113 never activated
+// there), which costs up to about two of those 18 hours; the margin covers
+// it.
 static const int64_t BTF_INITIATOR_LOCK_SECS   = 48 * 3600;
 static const int64_t BTF_PARTICIPANT_LOCK_SECS = 18 * 3600;
-// A taker giving BTF does not lock while the Bitflash tip's median time is
-// further than this behind the clock (normally about 12 minutes).
-static const int64_t BTF_MAX_MEDIAN_LAG_TO_LOCK = 3600;
 
 // Seconds until a refund of a contract time-locked at nLockTime can be in the
 // next block, given the tip's median time past (0: it can now). The next

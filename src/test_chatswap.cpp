@@ -161,9 +161,9 @@ int main()
         CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"LTC\",\"ga\":1,\"want\":\"BTC\",\"wa\":1}", back, err),
               "one side of an offer is always BTF");
         CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"RVN\",\"ga\":1,\"want\":\"BTF\",\"wa\":1}", back, err),
-              "a chain this wallet does not know is refused");
+              "a Ravencoin amount under its floor is refused");
         CHECK(!ParseSwapOffer("{\"v\":2,\"give\":\"DOGE\",\"ga\":1999999,\"want\":\"BTF\",\"wa\":1}", back, err) &&
-              !ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":1,\"want\":\"DOGE\",\"wa\":1999999}", back, err) &&
+              !ParseSwapOffer("{\"v\":2,\"give\":\"BTF\",\"ga\":100000000,\"want\":\"DOGE\",\"wa\":1999999}", back, err) &&
               ParseSwapOffer("{\"v\":2,\"give\":\"DOGE\",\"ga\":2000000,\"want\":\"BTF\",\"wa\":100000000}", back, err),
               "a Dogecoin contract under 0.02 DOGE could not be spent");
         SwapStep l, step;

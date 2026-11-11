@@ -599,7 +599,7 @@ static json rpc_getbalance(const json& p)
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
         {
             const CWalletTx& wtx = it->second;
-            if (!wtx.IsFinal() || wtx.GetDepthInMainChain() < nMinConf)
+            if (!wtx.IsFinalForWallet() || wtx.GetDepthInMainChain() < nMinConf)
                 continue;
             if (wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0)
                 continue;
@@ -951,7 +951,7 @@ static json rpc_listunspent(const json& p)
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
         {
             const CWalletTx& wtx = it->second;
-            if (wtx.fSpent || !wtx.IsFinal())
+            if (wtx.fSpent || !wtx.IsFinalForWallet())
                 continue;
             if (wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0)
                 continue;
@@ -1612,7 +1612,15 @@ static json BtfLock(const json& p, bool fInitiator)
     }
     else
         c.secretHash = ParseHex(strHash);
-    c.nLockTime = GetAdjustedTime() + nLockSecs;
+    // From the time the lock is judged by: the tip's median time, normally
+    // about 12 minutes behind the clock, plus that lag. Peers can move the
+    // adjusted time; they cannot move this, and a taker's refund is not
+    // pushed later by an offset nobody chose.
+    {
+        int64 nNow = GetTime(), nMedian = BtfMedianTimePast();
+        int64 nBase = nMedian > 0 ? std::min<int64>(nNow, nMedian + 20 * 60) : nNow;
+        c.nLockTime = nBase + nLockSecs;
+    }
 
     CScript contract = swap::BuildContract(c);
     json j = ContractJson(c, contract);
@@ -3461,6 +3469,8 @@ static json rpc_swapfindsecret(const json& p)
     // In a block of the chain, or only in the memory pool (where a redeem
     // paying more could still take its place).
     j["confirmed"] = fConfirmed;
+    // How deep: a spend one block deep can still be reorganised away.
+    j["spendConfirmations"] = fConfirmed ? ChainConfirmations(spend.GetHash()) : 0;
     j["txid"] = spend.GetHash().GetHex();
     for (size_t k = 0; k < spend.vin.size(); k++)
     {
@@ -3647,13 +3657,22 @@ static void CheckCoinContractFloor(const string& coin, int64 nValue)
 }
 
 // Did the chain's own node pay this contract address? Its wallet's sends.
-static bool CoreWalletPaid(const btcswap::Chain& chain, const string& strAddr, string& txidOut, int& voutOut)
+// Three answers, and only a listing the node gave counts as "not paid": a
+// node that did not answer (busy, warming up, gone) says nothing either way,
+// and paying again on that could pay twice and lose track of the first.
+enum CorePaid { CORE_PAID, CORE_UNPAID, CORE_UNKNOWN };
+static CorePaid CoreWalletPaid(const btcswap::Chain& chain, const string& strAddr, string& txidOut, int& voutOut,
+                               string& errOut)
 {
     json r;
-    string err;
-    // "*": every label, or every account on Dogecoin Core 1.14.
-    if (!btcswap::Call(chain.coin, "listtransactions", json::array({ "*", 1000 }), r, err) || !r.is_array())
-        return false;
+    // "*": every label, or every account on Dogecoin Core 1.14. Deep enough
+    // that a busy wallet's later activity does not push the payment out.
+    if (!btcswap::Call(chain.coin, "listtransactions", json::array({ "*", 20000 }), r, errOut, 64 * 1024 * 1024) || !r.is_array())
+    {
+        if (errOut.empty())
+            errOut = "the node gave no list of its transactions";
+        return CORE_UNKNOWN;
+    }
     for (size_t i = 0; i < r.size(); i++)
     {
         const json& e = r[i];
@@ -3662,10 +3681,10 @@ static bool CoreWalletPaid(const btcswap::Chain& chain, const string& strAddr, s
         {
             txidOut = e["txid"].get<string>();
             voutOut = e.contains("vout") && e["vout"].is_number_integer() ? e["vout"].get<int>() : -1;
-            return true;
+            return CORE_PAID;
         }
     }
-    return false;
+    return CORE_UNPAID;
 }
 
 // A lock from the journal, as coininitiate answers it.
@@ -3747,9 +3766,14 @@ static json CoinLock(const string& coin, const json& p, bool fInitiator)
         {
             // Written, and maybe paid: the node may have taken the payment and
             // then not answered in time, or this node stopped in between.
-            string txid;
+            string txid, errPaid;
             int vout = -1;
-            if (!btcswap::UsingLight(coin) && CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout))
+            CorePaid paid = btcswap::UsingLight(coin) ? CORE_UNPAID
+                          : CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout, errPaid);
+            if (paid == CORE_UNKNOWN)
+                throw runtime_error(btcswap::BackendName(coin) + " cannot say whether it already paid the contract " +
+                                    prior.value("contractAddress", string()) + " (" + errPaid + "); not paying it again until it can");
+            if (paid == CORE_PAID)
             {
                 LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
                              {"contractTxid", txid}, {"vout", vout}, {"recovered", true}});
@@ -3828,10 +3852,14 @@ static json CoinLock(const string& coin, const json& p, bool fInitiator)
     if (!btcswap::Call(coin, "sendtoaddress", json::array({ strAddr, amountText }), txid, err, 4 * 1024 * 1024, &nCode) ||
         !txid.is_string())
     {
-        // An error the node answered with: it refused, nothing went out.
+        // An error the node answered with: it refused, nothing went out --
+        // this time. A contract paid again (fReuse) may have been paid by the
+        // first attempt, so it stays an intent: "failed" would let the next
+        // lock under this tag make a new contract and a new secret.
         if (nCode != 0)
         {
-            LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", strAddr}, {"error", err}});
+            if (!fReuse)
+                LogSwap(json{{"tag", tag}, {"state", "failed"}, {"contractAddress", strAddr}, {"error", err}});
             throw runtime_error(who + ": " + err);
         }
         // No answer at all: the payment may still have gone out.
@@ -3847,17 +3875,39 @@ static json CoinLock(const string& coin, const json& p, bool fInitiator)
         if (!wtx.is_object() || !wtx.contains("hex") || !wtx["hex"].is_string())
             throw runtime_error(who + " did not return the contract transaction");
         CTransaction tx;
-        if (!btcswap::ParseTx(ParseHex(wtx["hex"].get<string>()), tx))
-            throw runtime_error("the contract transaction does not decode");
         CScript p2sh;
         p2sh.SetPayToScriptHash(contract);
         int nOut = -1;
-        for (unsigned int i = 0; i < tx.vout.size(); i++)
-            if (tx.vout[i].scriptPubKey == p2sh && tx.vout[i].nValue == nValue)
-                nOut = (int)i;
+        if (btcswap::ParseTx(ParseHex(wtx["hex"].get<string>()), tx))
+        {
+            for (unsigned int i = 0; i < tx.vout.size(); i++)
+                if (tx.vout[i].scriptPubKey == p2sh && tx.vout[i].nValue == nValue)
+                    nOut = (int)i;
+            if (nOut >= 0)
+                j["contractTx"] = wtx["hex"];
+        }
         if (nOut < 0)
-            throw runtime_error(who + "'s transaction does not pay the contract in an output this wallet can read");
-        j["contractTx"] = wtx["hex"];
+        {
+            // A transaction this wallet cannot read (a Litecoin MWEB peg-out,
+            // say): the node's own account of the send names the output, and
+            // gettxout -- no parsing -- confirms it pays the contract.
+            if (wtx.contains("details") && wtx["details"].is_array())
+                for (const json& d : wtx["details"])
+                    if (d.is_object() && d.value("category", string()) == "send" && d.value("address", string()) == strAddr &&
+                        d.contains("vout") && d["vout"].is_number_integer())
+                        nOut = d["vout"].get<int>();
+            if (nOut >= 0)
+            {
+                json out = CoinCall(coin, "gettxout", json::array({ txid, nOut, true }));
+                string strScript = out.is_object() && out.contains("scriptPubKey") && out["scriptPubKey"].is_object() &&
+                                   out["scriptPubKey"].contains("hex") && out["scriptPubKey"]["hex"].is_string()
+                                       ? out["scriptPubKey"]["hex"].get<string>() : string();
+                if (strScript != HexStr(p2sh.begin(), p2sh.end(), false) || CoinAmountFromValue(coin, out["value"]) != nValue)
+                    nOut = -1;
+            }
+        }
+        if (nOut < 0)
+            throw runtime_error(who + "'s transaction does not pay the contract in an output this wallet can find");
         j["vout"] = nOut;
     }
     catch (std::exception& e)
@@ -4210,6 +4260,7 @@ static json CoinFindSecret(const string& coin, const json& p)
                         continue;
                     j["found"] = true;
                     j["confirmed"] = true;
+                    j["spendConfirmations"] = chain.nBlocks - h + 1;
                     j["height"] = h;
                     j["txid"] = tx.value("txid", string());
                     vector<unsigned char> secret, vchSig;
@@ -4273,6 +4324,7 @@ static json CoinFindSecret(const string& coin, const json& p)
     j["found"] = true;
     // From a block (it has a height), or only from the memory pool.
     j["confirmed"] = j.contains("height");
+    j["spendConfirmations"] = j.contains("height") ? chain.nBlocks - j["height"].get<int>() + 1 : 0;
     j["txid"] = spend.GetHash().GetHex();
     for (size_t k = 0; k < spend.vin.size(); k++)
     {
@@ -4363,9 +4415,12 @@ static json rpc_swaplookup(const json& p)
     try
     {
         btcswap::Chain chain = RequireChain(coin);
-        string txid;
+        string txid, errPaid;
         int vout = -1;
-        if (CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout))
+        CorePaid paid = CoreWalletPaid(chain, prior.value("contractAddress", string()), txid, vout, errPaid);
+        if (paid == CORE_UNKNOWN)
+            j["checkError"] = errPaid;
+        else if (paid == CORE_PAID)
         {
             LogSwap(json{{"tag", tag}, {"state", "funded"}, {"contractAddress", prior.value("contractAddress", string())},
                          {"contractTxid", txid}, {"vout", vout}, {"recovered", true}});
@@ -4373,6 +4428,7 @@ static json rpc_swaplookup(const json& p)
             j["contractTxid"] = txid;
             j["vout"] = vout;
         }
+        // Only a listing that answered and does not show it, ten minutes on.
         else if (GetTime() - prior.value("time", (int64)0) > 600)
             j["state"] = "unpaid";
     }

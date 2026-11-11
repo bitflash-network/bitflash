@@ -493,9 +493,25 @@ bool WriteFileAtomicPrivate(const std::string& path, const std::string& data, st
         return false;
     }
 #ifdef WIN32
-    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    // A scanner or a backup tool holding the file open for a moment makes the
+    // replace fail with a sharing violation: tried again, briefly, before
+    // that counts as a failure.
+    DWORD dwErr = 0;
+    for (int nTry = 0; nTry < 20; nTry++)
     {
-        errOut = strprintf("cannot replace %s (error %lu)", path.c_str(), (unsigned long)GetLastError());
+        if (MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            dwErr = 0;
+            break;
+        }
+        dwErr = GetLastError();
+        if (dwErr != ERROR_SHARING_VIOLATION && dwErr != ERROR_ACCESS_DENIED && dwErr != ERROR_LOCK_VIOLATION)
+            break;
+        Sleep(50);
+    }
+    if (dwErr != 0)
+    {
+        errOut = strprintf("cannot replace %s (error %lu)", path.c_str(), (unsigned long)dwErr);
         remove(tmp.c_str());
         return false;
     }

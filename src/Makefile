@@ -529,6 +529,8 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=swap-parse
 	./bitflash-node -selftest=swap-engine
 	./bitflash-node -selftest=chat-store-save
+	./bitflash-node -selftest=wallet-final
+	./bitflash-node -selftest=swap-rpc
 	./bitflash-node -selftest=fee-policy
 	./bitflash-node -selftest=invoice
 	./bitflash-node -selftest=net-hardening
