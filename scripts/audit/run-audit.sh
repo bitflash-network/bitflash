@@ -38,10 +38,10 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
 # Harnesses that write a structured starting corpus of their own
 # (BITFLASH_FUZZ_WRITE_SEEDS); the rest start from one byte.
-SELF_SEEDING="fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client"
+SELF_SEEDING="fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -254,7 +254,7 @@ phase_fuzz() {
     # (signed spends under each rule set) and fuzz-v4-templates (vault,
     # batch, inheritance), fuzz-p2pool (a line of shares) and fuzz-light-peer
     # (header chains with blocks), and the Tor, SOCKS5, RPC and HTTP client
-    # ones (Tor replies, RPC calls, ...). They join the corpus without
+    # ones (Tor replies, RPC calls, ...), and the chat, Nostr and swap ones. They join the corpus without
     # replacing anything.
     for t in $SELF_SEEDING; do
         [ -x "$LF/$t" ] || continue

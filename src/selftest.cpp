@@ -27,6 +27,7 @@
 #include "btcswap.h"
 #include "btclight.h"
 #include "btfchatswap.h"
+#include "jsonsafe.h"
 #include "invoice.h"
 #include "bip21.h"
 #include "btfchatwallet.h"
@@ -8563,6 +8564,10 @@ static int RunChatRelaySelfTest()
             strSetDataDir = tmp;
     }
 
+    {
+        CTxDB txdb("cr+");   // an inv is looked up in the transaction index; there is none yet
+    }
+
     // A peer that holds chat records, to watch what the node relays to it, and
     // one that does not, to make sure it is never offered any.
     CNode* peerChat = new CNode(INVALID_SOCKET, CAddress());
@@ -8680,6 +8685,17 @@ static int RunChatRelaySelfTest()
     RAND_bytes(&tag2[0], 16);
     btfchat::ChatRecord relayed = SelfTestEnvelope(tag2, 300);
     {
+        // A record is taken from the peer that announced it (and so was asked).
+        unsigned char idRelayed[32];
+        relayed.Id(idRelayed);
+        uint256 hRelayed;
+        memcpy(hRelayed.begin(), idRelayed, 32);
+        CNode announce(INVALID_SOCKET, CAddress());
+        announce.vSend.clear();
+        announce.vSend.SetVersion(VERSION);
+        announce.PushMessage("inv", std::vector<CInv>(1, CInv(MSG_CHATREC, hRelayed)));
+        peerChat->vRecv.insert(peerChat->vRecv.end(), announce.vSend.begin(), announce.vSend.end());
+        ProcessMessages(peerChat);
         CNode wire(INVALID_SOCKET, CAddress());
         wire.vSend.clear();
         wire.vSend.SetVersion(VERSION);
@@ -8829,6 +8845,663 @@ static int RunChatRelaySelfTest()
     delete peerOld;
     delete app;
 
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// One command and one argument, as a peer sends it, handled by the node.
+template <typename T>
+static void FeedChatPeer(CNode* peer, const char* cmd, const T& arg)
+{
+    CNode wire(INVALID_SOCKET, CAddress());
+    wire.vSend.clear();
+    wire.vSend.SetVersion(VERSION);
+    wire.PushMessage(cmd, arg);
+    peer->vRecv.insert(peer->vRecv.end(), wire.vSend.begin(), wire.vSend.end());
+    ProcessMessages(peer);
+}
+
+// -selftest=chat-dos -- the resource limits of the chat (review M7, M10):
+// a store that fills asks for more work with every record and says how much
+// (the chat app mines again); a chat record is taken only from the peer that
+// announced it; the rations that were per connection are also per node; a
+// connection cannot be served without a slot, and a burst of frames saves the
+// store once; and whole numbers are read out of JSON as whole numbers.
+static int RunChatDosSelfTest()
+{
+    printf("chat-dos self-test\n");
+    int nFail = 0;
+    std::string err, why;
+    {
+        std::string tmp;
+        if (MakeTempDir(tmp))
+            strSetDataDir = tmp;
+    }
+
+    {
+        CTxDB txdb("cr+");   // an inv is looked up in the transaction index; there is none yet
+    }
+
+    // ---- M7: the work asked grows as the store fills
+    const size_t B = btfchat::CHATREC_ENVELOPE_BUDGET;
+    nFail += Check(btfchat::ChatRecordFullnessBits(0, B) == 0 && btfchat::ChatRecordFullnessBits(B / 2 - 1, B) == 0 &&
+                   btfchat::ChatRecordFullnessBits(B / 2, B) == 2 && btfchat::ChatRecordFullnessBits(B / 4 * 3, B) == 4 &&
+                   btfchat::ChatRecordFullnessBits(B / 10 * 9, B) == 6 && btfchat::ChatRecordFullnessBits(B, B) == 6 &&
+                   btfchat::ChatRecordFullnessBits(5, 0) == 0,
+                   "nothing extra below half the budget, then 2, 4 and 6 more bits") ? 0 : 1;
+    nFail += Check(btfchat::ChatRecordAskedBits("not enough proof of work: this node asks 24 bits now") == 24 &&
+                   btfchat::ChatRecordAskedBits("not enough proof of work") == 0 &&
+                   btfchat::ChatRecordAskedBits("this node asks 999999 bits now") == 0 &&
+                   btfchat::ChatRecordAskedBits("this node asks 99 bits") == 99 &&
+                   btfchat::ChatRecordAskedBits("this node asks 300 bits now") == 0 &&
+                   btfchat::ChatRecordAskedBits("asks -5 bits now") == 0 &&
+                   btfchat::ChatRecordAskedBits("") == 0,
+                   "the figure is read off a refusal, and nothing else is taken for one") ? 0 : 1;
+    {
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+        btfchat::ChatStore st(1);
+        int64_t nNow = GetTime();
+        int nKept = 0;
+        for (int i = 0; i < 400 && st.Bytes(btfchat::CHATREC_ENVELOPE) < B / 2; i++)
+        {
+            btfchat::ChatRecord r;
+            r.kind = btfchat::CHATREC_ENVELOPE;
+            r.key.assign(16, 0);
+            r.key[0] = (unsigned char)i;
+            r.key[1] = (unsigned char)(i >> 8);
+            r.nTime = nNow;
+            r.payload.assign(60000, (unsigned char)i);
+            btfchat::ChatRecordMine(r, 0, 1);
+            unsigned char id[32];
+            if (st.Accept(ctx, r, nNow, why, id) == btfchat::ChatStore::ACCEPTED)
+                nKept++;
+        }
+        nFail += Check(st.Bytes(btfchat::CHATREC_ENVELOPE) >= B / 2, "a store is filled to half its envelope budget") ? 0 : 1;
+        nFail += Check(st.RequiredBits(btfchat::CHATREC_ENVELOPE, 100) == 3 &&
+                       st.RequiredBits(btfchat::CHATREC_DESC, 100) == 1,
+                       "an envelope now needs 2 more bits than a descriptor, whose budget is empty") ? 0 : 1;
+        btfchat::ChatRecord r;
+        r.kind = btfchat::CHATREC_ENVELOPE;
+        r.key.assign(16, 0xee);
+        r.nTime = nNow;
+        r.payload.assign(100, 7);
+        btfchat::ChatRecordMine(r, 0, 1);
+        while (btfchat::ChatRecordWork(r) >= 3)
+            r.nNonce++;
+        unsigned char id[32];
+        btfchat::ChatStore::Result res = st.Accept(ctx, r, nNow, why, id);
+        nFail += Check(res == btfchat::ChatStore::REJECTED && btfchat::ChatRecordAskedBits(why) == 3,
+                       "a record with the old work is refused, and the refusal says 3 bits") ? 0 : 1;
+        nFail += Check(st.RequiredBits(btfchat::CHATREC_ENVELOPE, 100, true) == 1 &&
+                       st.Accept(ctx, r, nNow, why, id, true) == btfchat::ChatStore::ACCEPTED,
+                       "the same record relayed by another node needs one step (2 bits) less of this store's fullness") ? 0 : 1;
+        nFail += Check(btfchat::ChatRecordFullnessBits(B / 4 * 3, B) == 4 &&
+                       btfchat::ChatRecordFullnessBits(B / 10 * 9, B) == 6,
+                       "(at three quarters full a relayed record pays 2 bits over base, at nine tenths 4: the budget cannot be filled at the base price)") ? 0 : 1;
+        btfchat::ChatRecord r2 = r;
+        r2.payload[0] ^= 1;
+        btfchat::ChatRecordMine(r2, 0, 1);
+        while (btfchat::ChatRecordWork(r2) >= 3)
+            r2.nNonce++;
+        nFail += Check(st.Accept(ctx, r2, nNow, why, id) == btfchat::ChatStore::REJECTED,
+                       "while one put by a chat app with that work is still refused") ? 0 : 1;
+        r = r2;
+        btfchat::ChatRecordMine(r, 0, 3);
+        nFail += Check(st.Accept(ctx, r, nNow, why, id) == btfchat::ChatStore::ACCEPTED,
+                       "the same record mined to what was asked is kept") ? 0 : 1;
+        secp256k1_context_destroy(ctx);
+    }
+
+    // ---- M7: only what a peer announced is taken from it
+    CNode* peer = new CNode(INVALID_SOCKET, CAddress());
+    peer->nVersion = VERSION;
+    peer->nServices = NODE_NETWORK | NODE_CHAT;
+    peer->vSend.SetVersion(VERSION);
+    peer->vRecv.SetVersion(VERSION);
+    CRITICAL_BLOCK(cs_vNodes)
+        vNodes.push_back(peer);
+    {
+        std::vector<unsigned char> tagA(16), tagB(16);
+        RAND_bytes(&tagA[0], 16);
+        RAND_bytes(&tagB[0], 16);
+        btfchat::ChatRecord a = SelfTestEnvelope(tagA, 300);
+        btfchat::ChatRecord b = SelfTestEnvelope(tagB, 300);
+        unsigned char idA[32], idB[32];
+        a.Id(idA);
+        b.Id(idB);
+        uint256 hA, hB;
+        memcpy(hA.begin(), idA, 32);
+        memcpy(hB.begin(), idB, 32);
+        CInv invA(MSG_CHATREC, hA), invB(MSG_CHATREC, hB);
+
+        FeedChatPeer(peer, "chatrec", a.Serialize());
+        nFail += Check(!ChatRelayAlreadyHave(invA), "a record nobody announced is not taken") ? 0 : 1;
+        FeedChatPeer(peer, "inv", std::vector<CInv>(1, invA));
+        FeedChatPeer(peer, "chatrec", b.Serialize());
+        nFail += Check(!ChatRelayAlreadyHave(invB) && !ChatRelayAlreadyHave(invA),
+                       "after an announcement of one record, another is still not taken") ? 0 : 1;
+        FeedChatPeer(peer, "chatrec", a.Serialize());
+        nFail += Check(ChatRelayAlreadyHave(invA), "the announced one is") ? 0 : 1;
+    }
+
+    // ---- M7: the answer to chatget is bounded per connection
+    {
+        CNode* app = new CNode(INVALID_SOCKET, CAddress(), true);
+        HandlerStream st(app);
+        btfchat::NodeLink link(st);
+        link.Handshake(err);
+        std::vector<unsigned char> tag(16);
+        RAND_bytes(&tag[0], 16);
+        btfchat::ChatRecord env = SelfTestEnvelope(tag, 700);
+        int nResult = -1;
+        nFail += Check(link.Put(env, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                       "an envelope is left with the node") ? 0 : 1;
+        std::vector<CChatQuery> q(1);
+        q[0].kind = btfchat::CHATREC_ENVELOPE; q[0].key = tag; q[0].nSince = 0; q[0].nMax = 64;
+        std::vector<std::vector<btfchat::ChatRecord> > ans;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].size() == 1,
+                       "and served back") ? 0 : 1;
+        app->nChatWindowStart = GetTime();
+        app->nChatAnswerBytesInWindow = (size_t)1 << 40;
+        nFail += Check(link.Get(q, ans, err) && ans.size() == 1 && ans[0].empty(),
+                       "a connection that has been served its minute's bytes gets an empty answer") ? 0 : 1;
+        delete app;
+    }
+
+    // ---- M7: the rations per connection are also per node, and are charged
+    // only for records that show their work
+    {
+        int nPuts0 = 0, nRel0 = 0, nPuts1 = 0, nRel1 = 0;
+        ChatRelayRations(nPuts0, nRel0);
+        std::vector<CNode*> apps;
+        btfchat::ChatRecord junk;
+        junk.kind = btfchat::CHATREC_ENVELOPE;
+        junk.key.assign(16, 0);
+        junk.nTime = GetTime();
+        junk.payload.assign(10, 1);
+        int nResult = -1;
+        int nWorkRefusals = 0;
+        for (int c = 0; c < 11; c++)
+        {
+            CNode* g = new CNode(INVALID_SOCKET, CAddress(), true);
+            apps.push_back(g);
+            HandlerStream gs(g);
+            btfchat::NodeLink gl(gs);
+            gl.Handshake(err);
+            for (int i = 0; i < 59; i++)
+                if (gl.Put(junk, nResult, why, err) && why.find("proof of work") != std::string::npos)
+                    nWorkRefusals++;
+        }
+        ChatRelayRations(nPuts1, nRel1);
+        nFail += Check(nWorkRefusals == 11 * 59 && nPuts1 == nPuts0 && nRel1 == nRel0,
+                       "649 records with no work are refused for it and cost the node-wide ration nothing") ? 0 : 1;
+
+        CNode* fresh = new CNode(INVALID_SOCKET, CAddress(), true);
+        HandlerStream fs(fresh);
+        btfchat::NodeLink fl(fs);
+        fl.Handshake(err);
+        std::vector<unsigned char> tag(16);
+        RAND_bytes(&tag[0], 16);
+        btfchat::ChatRecord fine = SelfTestEnvelope(tag, 100);
+        nResult = -1;
+        nFail += Check(fl.Put(fine, nResult, why, err) && nResult == btfchat::ChatStore::ACCEPTED,
+                       "so a record with its work still goes in after all that") ? 0 : 1;
+        ChatRelayRations(nPuts1, nRel1);
+        nFail += Check(nPuts1 == nPuts0 + 1, "and it is the one thing the ration counted") ? 0 : 1;
+        nResult = -1;
+        nFail += Check(fl.Put(fine, nResult, why, err) && nResult == btfchat::ChatStore::DUPLICATE, "the same record again is a duplicate") ? 0 : 1;
+        ChatRelayRations(nPuts1, nRel1);
+        nFail += Check(nPuts1 == nPuts0 + 1, "and replaying a record the node holds costs the node's minute nothing") ? 0 : 1;
+        btfchat::ChatRecord gone = SelfTestEnvelope(tag, 100);
+        gone.nTime = GetTime() - 3 * 24 * 3600;           // long expired, with real work for its own time
+        btfchat::ChatRecordMine(gone);
+        nResult = -1;
+        nFail += Check(fl.Put(gone, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED, "an expired one is refused") ? 0 : 1;
+        ChatRelayRations(nPuts1, nRel1);
+        nFail += Check(nPuts1 == nPuts0 + 1, "and costs the ration nothing either") ? 0 : 1;
+
+        ChatRelayExhaustRations();
+        RAND_bytes(&tag[0], 16);
+        btfchat::ChatRecord fine2 = SelfTestEnvelope(tag, 100);
+        nResult = -1;
+        nFail += Check(fl.Put(fine2, nResult, why, err) && nResult == btfchat::ChatStore::REJECTED &&
+                       why.find("too many records right now") != std::string::npos,
+                       "once the node's minute is spent, a record with its work is told to slow down") ? 0 : 1;
+        nFail += Check(fl.Put(junk, nResult, why, err) && why.find("proof of work") != std::string::npos,
+                       "and one without is still told about its work") ? 0 : 1;
+        delete fresh;
+        for (size_t i = 0; i < apps.size(); i++)
+            delete apps[i];
+    }
+
+    CRITICAL_BLOCK(cs_vNodes)
+        vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peer));
+    delete peer;
+
+    // ---- M10: serving slots, and the save after a frame
+    {
+        std::vector<uint64_t> tickets;
+        int nTaken = 0;
+        for (int i = 0; i < 100; i++)
+        {
+            uint64_t t = 0;
+            if (btfchat::ChatServeSlotTake(INVALID_SOCKET, t, 1000 + i))
+            {
+                nTaken++;
+                tickets.push_back(t);
+            }
+        }
+        nFail += Check(nTaken == 100 && btfchat::ChatServeThreadCount() == 32,
+                       "connections that never finish their handshake take turns in 32 slots, the oldest put out") ? 0 : 1;
+        for (size_t i = 0; i < tickets.size(); i++)
+            btfchat::ChatServeSlotHandshaken(tickets[i]);
+        uint64_t t = 0;
+        nFail += Check(!btfchat::ChatServeSlotTake(INVALID_SOCKET, t, 2000) && btfchat::ChatServeThreadCount() == 32,
+                       "once 32 have finished theirs, the 33rd is turned away") ? 0 : 1;
+        btfchat::ChatServeSlotRelease(tickets.back());
+        bool fTook = btfchat::ChatServeThreadCount() == 31 && btfchat::ChatServeSlotTake(INVALID_SOCKET, t, 2001);
+        btfchat::ChatServeSlotHandshaken(t);
+        nFail += Check(fTook && !btfchat::ChatServeSlotTake(INVALID_SOCKET, t, 2002),
+                       "one that ends frees one for the next") ? 0 : 1;
+        btfchat::ChatServeSlotRelease(t);
+        for (size_t i = 0; i < tickets.size(); i++)
+            btfchat::ChatServeSlotRelease(tickets[i]);
+        nFail += Check(btfchat::ChatServeThreadCount() == 0, "and they all come back (a ticket given twice does nothing)") ? 0 : 1;
+        {
+            std::vector<uint64_t> fresh;
+            for (int i = 0; i < 32; i++)
+            {
+                uint64_t tk = 0;
+                btfchat::ChatServeSlotTake(INVALID_SOCKET, tk, 5000);
+                fresh.push_back(tk);
+            }
+            uint64_t extra = 0;
+            bool fEarly = btfchat::ChatServeSlotTake(INVALID_SOCKET, extra, 5002);
+            bool fLate = btfchat::ChatServeSlotTake(INVALID_SOCKET, extra, 5006);
+            nFail += Check(!fEarly && fLate,
+                           "a handshake is put out for a new connection only once it has had five seconds") ? 0 : 1;
+            btfchat::ChatServeSlotForget(fresh[5]);        // no handle left to shut down; the slot stays
+            for (size_t i = 0; i < fresh.size(); i++)
+                btfchat::ChatServeSlotRelease(fresh[i]);
+            btfchat::ChatServeSlotRelease(extra);
+            nFail += Check(btfchat::ChatServeThreadCount() == 0, "and they come back") ? 0 : 1;
+        }
+
+        bool fDirty = false;
+        bool a = btfchat::ChatServeSaveDue(50000, fDirty);
+        bool fDirtyA = fDirty;
+        bool b = btfchat::ChatServeSaveDue(50000, fDirty);
+        bool fDirtyB = fDirty;
+        bool c = btfchat::ChatServeSaveDue(50001, fDirty);
+        bool fDirtyC = fDirty;
+        bool d = btfchat::ChatServeSaveDue(49000, fDirty);
+        nFail += Check(a && !fDirtyA && !b && fDirtyB && c && !fDirtyC && d,
+                       "frames in the same second save once, a later one saves, and a clock set back does not stall it") ? 0 : 1;
+    }
+
+    // ---- whole numbers out of JSON
+    {
+        using nlohmann::json;
+        json j = json::parse("{\"a\":5,\"b\":1.9,\"c\":1e300,\"d\":\"7\",\"e\":-3,\"f\":4294967296,\"g\":18446744073709551615,\"h\":null}");
+        nFail += Check(JsonIntValue<int>(j, "a", 0) == 5 && JsonIntValue<int>(j, "missing", 9) == 9 &&
+                       JsonIntValue<int>(j, "e", 0) == -3 && JsonIntValue<int64_t>(j, "f", 0) == 4294967296LL,
+                       "an integer that fits is read, a missing key gives the default") ? 0 : 1;
+        const char* bad[] = { "b", "c", "d", "f", "g", "h" };
+        bool fAllThrow = true;
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        {
+            bool fThrew = false;
+            try { JsonIntValue<int>(j, bad[i], 0); }
+            catch (...) { fThrew = true; }
+            if (!fThrew)
+                fAllThrow = false;
+        }
+        nFail += Check(fAllThrow, "a float, a string, null or a number out of range is refused, not cast") ? 0 : 1;
+        bool fThrew = false;
+        try { JsonIntValue<int>(json::parse("[1]"), "a", 0); }
+        catch (...) { fThrew = true; }
+        nFail += Check(fThrew, "and a value that is not an object is not read as one") ? 0 : 1;
+
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+        const char* frames[] = {
+            "{\"v\":1e300,\"k\":1,\"from\":\"x\",\"t\":1,\"id\":\"i\",\"sig\":\"\"}",
+            "{\"v\":1,\"k\":1e300,\"from\":\"x\",\"t\":1,\"id\":\"i\",\"sig\":\"\"}",
+            "{\"v\":1,\"k\":2.5,\"from\":\"x\",\"t\":1,\"id\":\"i\",\"sig\":\"\"}",
+            "{\"v\":1,\"k\":1,\"from\":\"x\",\"t\":1e300,\"id\":\"i\",\"sig\":\"\"}",
+            "{\"v\":1,\"k\":1,\"from\":\"x\",\"t\":1,\"amt\":-1e300,\"id\":\"i\",\"sig\":\"\"}",
+        };
+        bool fNoThrowNoOpen = true;
+        for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++)
+        {
+            btfchat::Frame f;
+            bool fOpened = true, fThrow = false;
+            try { fOpened = btfchat::OpenFrame(ctx, frames[i], f, err); }
+            catch (...) { fThrow = true; }
+            if (fThrow || fOpened)
+                fNoThrowNoOpen = false;
+        }
+        nFail += Check(fNoThrowNoOpen, "a frame whose numbers are floats out of range is refused, without throwing") ? 0 : 1;
+        secp256k1_context_destroy(ctx);
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// An event as a relay would send it, signed by the key sk.
+static nlohmann::json NostrTestEvent(secp256k1_context* ctx, const unsigned char sk[32], int64 nCreated,
+                                     int nKind, const nlohmann::json& tags, const std::string& content)
+{
+    secp256k1_keypair kp;
+    secp256k1_keypair_create(ctx, &kp, sk);
+    secp256k1_xonly_pubkey xp;
+    secp256k1_keypair_xonly_pub(ctx, &xp, NULL, &kp);
+    unsigned char pk[32];
+    secp256k1_xonly_pubkey_serialize(ctx, pk, &xp);
+    std::string pkHex = HexStr(pk, pk + 32, false);
+    std::string ser = nlohmann::json::array({ 0, pkHex, nCreated, nKind, tags, content }).dump();
+    unsigned char id[32], sig[64];
+    SHA256((const unsigned char*)ser.data(), ser.size(), id);
+    secp256k1_schnorrsig_sign32(ctx, sig, id, &kp, NULL);
+    nlohmann::json ev = nlohmann::json::object();
+    ev["id"] = HexStr(id, id + 32, false);
+    ev["pubkey"] = pkHex;
+    ev["created_at"] = nCreated;
+    ev["kind"] = nKind;
+    ev["tags"] = tags;
+    ev["content"] = content;
+    ev["sig"] = HexStr(sig, sig + 64, false);
+    return ev;
+}
+
+static std::string NostrTestMessage(const char* sub, const nlohmann::json& ev)
+{
+    return nlohmann::json::array({ "EVENT", sub, ev }).dump();
+}
+
+static void NostrTestKey(int n, unsigned char sk[32])
+{
+    std::string s = strprintf("nostr-relay self-test key %d", n);
+    SHA256((const unsigned char*)s.data(), s.size(), sk);
+}
+
+static std::string NostrTestAddress(secp256k1_context* ctx, const unsigned char sk[32])
+{
+    secp256k1_keypair kp;
+    secp256k1_keypair_create(ctx, &kp, sk);
+    secp256k1_xonly_pubkey xp;
+    secp256k1_keypair_xonly_pub(ctx, &xp, NULL, &kp);
+    unsigned char pk[32];
+    secp256k1_xonly_pubkey_serialize(ctx, pk, &xp);
+    return btf::Address(pk);
+}
+
+// -selftest=nostr-relay -- what public relays hand the node (review M8): an
+// event is believed only if its id is its hash and its signature verifies; a
+// date ahead of the clock or long past is not taken; the table of discovered
+// peers and the list of pools have a size, and one relay adds only so many
+// addresses a round; a descriptor is believed because its own signature
+// verifies, whatever the event around it says.
+static int RunNostrRelaySelfTest()
+{
+    printf("nostr-relay self-test\n");
+    int nFail = 0;
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const int64 nNow = GetTime();
+    const std::string sub = "btf-disc-1";
+    const nlohmann::json dTags = nlohmann::json::array({ nlohmann::json::array({ "d", NostrDescriptorTag() }) });
+    unsigned char sk0[32];
+    NostrTestKey(0, sk0);
+
+    // ---- an event signed by something else: BIP-340 as the BIP's own reference
+    // code writes it (pure Python, no libsecp256k1), over a NIP-01 event
+    {
+        const char* vec = "{\"id\":\"3cbb6d6babe5f774c30894f7f395d811791014f5888cf46f17cb6ab30694391f\","
+                          "\"pubkey\":\"8cc23dde23a163ad3152b8fcf826d61faf4f73f8ca1a5d212623b96c7b234b4c\","
+                          "\"created_at\":1790000000,\"kind\":1,\"tags\":[[\"d\",\"btf-descriptor-2\"]],"
+                          "\"content\":\"hello nostr\","
+                          "\"sig\":\"80b86170d2654c1bd02df168d9df4627d6582ebccad522599a99da40db2a891d"
+                          "8e6852ada342ac7b75311c8e67be0f39bc98bf6b1a5249252a5a65fb7736effd\"}";
+        NostrEvent out;
+        std::string err;
+        nFail += Check(NostrVerifyEvent(ctx, vec, out, err) && out.content == "hello nostr",
+                       "an event signed by an independent implementation verifies") ? 0 : 1;
+        std::string bad = vec;
+        bad[bad.find("hello")] = 'j';
+        nFail += Check(!NostrVerifyEvent(ctx, bad, out, err), "and with one letter of its content changed it does not") ? 0 : 1;
+    }
+
+    // ---- an event is checked, not believed
+    {
+        nlohmann::json ev = NostrTestEvent(ctx, sk0, nNow, NostrDescriptorKind(), dTags, "hello");
+        NostrEvent out;
+        std::string err;
+        nFail += Check(NostrVerifyEvent(ctx, ev.dump(), out, err) && out.content == "hello" && out.kind == NostrDescriptorKind(),
+                       "a signed event is taken") ? 0 : 1;
+        nlohmann::json bad = ev;
+        bad["content"] = "hellp";
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err), "one whose content was changed is not (its id is no longer its hash)") ? 0 : 1;
+        bad = ev;
+        std::string sg = bad["sig"].get<std::string>();
+        sg[5] = sg[5] == '0' ? '1' : '0';
+        bad["sig"] = sg;
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err), "nor one whose signature was changed") ? 0 : 1;
+        bad = ev;
+        std::string up = bad["id"].get<std::string>();
+        for (size_t i = 0; i < up.size(); i++)
+            up[i] = (char)toupper((unsigned char)up[i]);
+        bad["id"] = up;
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err),
+                       "nor one with an id in capitals: one key, one spelling") ? 0 : 1;
+        bad = ev;
+        bad["pubkey"] = std::string(64, '0');
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err), "nor one claiming a key that is not a point") ? 0 : 1;
+        bad = ev;
+        bad["created_at"] = 1e300;
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err), "nor one dated with a float out of range") ? 0 : 1;
+        bad = ev;
+        bad["tags"] = "none";
+        nFail += Check(!NostrVerifyEvent(ctx, bad.dump(), out, err), "nor one whose tags are not a list") ? 0 : 1;
+        nFail += Check(!NostrVerifyEvent(ctx, "[1,2,3]", out, err) && !NostrVerifyEvent(ctx, "", out, err),
+                       "nor something that is not an event") ? 0 : 1;
+    }
+
+    // ---- discovery: a signed descriptor event adds a peer; the rest do not
+    {
+        int nNew = 0;
+        int nBefore = GetDiscoveredPeerCount();
+        nlohmann::json ev = NostrTestEvent(ctx, sk0, nNow, NostrDescriptorKind(), dTags, "x");
+        std::string msg = NostrTestMessage(sub.c_str(), ev);
+        nFail += Check(NostrIngestDiscovery(ctx, msg, sub, NULL, nNow, nNew) == NOSTR_MSG_TAKEN &&
+                       GetDiscoveredPeerCount() == nBefore + 1 && nNew == 1,
+                       "a signed discovery event adds one peer") ? 0 : 1;
+
+        nlohmann::json forged = ev;
+        unsigned char sk1[32];
+        NostrTestKey(1, sk1);
+        nlohmann::json other = NostrTestEvent(ctx, sk1, nNow, NostrDescriptorKind(), dTags, "x");
+        forged["pubkey"] = other["pubkey"];     // somebody else's key on this event
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), forged), sub, NULL, nNow, nNew) == NOSTR_MSG_REFUSED &&
+                       GetDiscoveredPeerCount() == nBefore + 1,
+                       "the same event with another key's name on it adds nothing") ? 0 : 1;
+
+        unsigned char sk2[32];
+        NostrTestKey(2, sk2);
+        nlohmann::json future = NostrTestEvent(ctx, sk2, nNow + 3600, NostrDescriptorKind(), dTags, "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), future), sub, NULL, nNow, nNew) == NOSTR_MSG_REFUSED &&
+                       GetDiscoveredPeerCount() == nBefore + 1,
+                       "an event dated an hour ahead adds nothing: it would sort first for good") ? 0 : 1;
+        nlohmann::json soon = NostrTestEvent(ctx, sk2, nNow + 300, NostrDescriptorKind(), dTags, "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), soon), sub, NULL, nNow, nNew) == NOSTR_MSG_TAKEN,
+                       "one a few minutes ahead (clocks differ) does") ? 0 : 1;
+        unsigned char sk3[32];
+        NostrTestKey(3, sk3);
+        nlohmann::json stale = NostrTestEvent(ctx, sk3, nNow - 5 * 3600, NostrDescriptorKind(), dTags, "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), stale), sub, NULL, nNow, nNew) == NOSTR_MSG_REFUSED,
+                       "and a stale one adds nothing: there is nobody to dial") ? 0 : 1;
+        nlohmann::json wrongKind = NostrTestEvent(ctx, sk3, nNow, 1, dTags, "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), wrongKind), sub, NULL, nNow, nNew) == NOSTR_MSG_REFUSED,
+                       "nor one of another kind") ? 0 : 1;
+        nlohmann::json noTag = NostrTestEvent(ctx, sk3, nNow, NostrDescriptorKind(), nlohmann::json::array(), "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), noTag), sub, NULL, nNow, nNew) == NOSTR_MSG_REFUSED,
+                       "nor one without the tag the subscription asks for") ? 0 : 1;
+        unsigned char selfPk[32];
+        {
+            secp256k1_keypair kp;
+            secp256k1_keypair_create(ctx, &kp, sk3);
+            secp256k1_xonly_pubkey xp;
+            secp256k1_keypair_xonly_pub(ctx, &xp, NULL, &kp);
+            secp256k1_xonly_pubkey_serialize(ctx, selfPk, &xp);
+        }
+        nlohmann::json mine = NostrTestEvent(ctx, sk3, nNow, NostrDescriptorKind(), dTags, "x");
+        nFail += Check(NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), mine), sub, selfPk, nNow, nNew) == NOSTR_MSG_REFUSED,
+                       "this node's own event is not added as a peer") ? 0 : 1;
+        nFail += Check(NostrIngestDiscovery(ctx, nlohmann::json::array({ "EOSE", sub }).dump(), sub, NULL, nNow, nNew) == NOSTR_MSG_EOSE &&
+                       NostrIngestDiscovery(ctx, NostrTestMessage("other-sub", ev), sub, NULL, nNow, nNew) == NOSTR_MSG_OTHER &&
+                       NostrIngestDiscovery(ctx, "garbage", sub, NULL, nNow, nNew) == NOSTR_MSG_OTHER,
+                       "end of stored events, another subscription's event and garbage are told apart") ? 0 : 1;
+    }
+
+    // ---- one relay adds at most so many new addresses a round; the table has a ceiling
+    {
+        int nNew = 0;
+        int nBefore = GetDiscoveredPeerCount();
+        for (int i = 0; i < 80; i++)
+        {
+            unsigned char k[32];
+            NostrTestKey(1000 + i, k);
+            NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), NostrTestEvent(ctx, k, nNow, NostrDescriptorKind(), dTags, "x")),
+                                 sub, NULL, nNow, nNew);
+        }
+        nFail += Check(nNew == (int)NOSTR_MAX_NEW_PEERS_PER_ROUND && GetDiscoveredPeerCount() == nBefore + (int)NOSTR_MAX_NEW_PEERS_PER_ROUND,
+                       "a relay that sends eighty new addresses in one round adds fifty") ? 0 : 1;
+        for (int round = 0; round < 45; round++)
+        {
+            nNew = 0;
+            for (int i = 0; i < (int)NOSTR_MAX_NEW_PEERS_PER_ROUND; i++)
+            {
+                unsigned char k[32];
+                NostrTestKey(2000 + round * 100 + i, k);
+                NostrIngestDiscovery(ctx, NostrTestMessage(sub.c_str(), NostrTestEvent(ctx, k, nNow - 1000 + round, NostrDescriptorKind(), dTags, "x")),
+                                     sub, NULL, nNow, nNew);
+            }
+        }
+        nFail += Check(GetDiscoveredPeerCount() == (int)NOSTR_MAX_BTF_PEERS,
+                       "round after round, the table stops at its ceiling") ? 0 : 1;
+    }
+
+    // ---- pools
+    {
+        const std::string psub = "btf-pools-1";
+        unsigned char pk[32];
+        NostrTestKey(5000, pk);
+        std::string addr = NostrTestAddress(ctx, pk);
+        nlohmann::json content = { { "btf", addr }, { "name", "Selftest pool" }, { "fee_pct", 1.5 }, { "miners", 3 }, { "hashrate", 1234.5 } };
+        nlohmann::json tags = nlohmann::json::array({ nlohmann::json::array({ "d", "btf-pool" }) });
+        nlohmann::json ev = NostrTestEvent(ctx, pk, nNow, NostrPoolKind(), tags, content.dump());
+        nFail += Check(NostrIngestPool(NostrTestMessage(psub.c_str(), ev), psub, nNow) == NOSTR_MSG_TAKEN &&
+                       NostrDiscoveredPoolCount() == 1,
+                       "a pool announcement signed by the key whose address it names is listed") ? 0 : 1;
+        nlohmann::json forged = ev;
+        std::string sg = forged["sig"].get<std::string>();
+        sg[9] = sg[9] == '0' ? '1' : '0';
+        forged["sig"] = sg;
+        nFail += Check(NostrIngestPool(NostrTestMessage(psub.c_str(), forged), psub, nNow) == NOSTR_MSG_REFUSED,
+                       "the same with a bad signature is not") ? 0 : 1;
+        unsigned char pk2[32];
+        NostrTestKey(5001, pk2);
+        nlohmann::json other = content;
+        other["btf"] = addr;       // another key announcing this pool's address
+        nFail += Check(NostrIngestPool(NostrTestMessage(psub.c_str(), NostrTestEvent(ctx, pk2, nNow, NostrPoolKind(), tags, other.dump())), psub, nNow) == NOSTR_MSG_REFUSED,
+                       "an announcement of another key's address is not: a pool speaks for itself") ? 0 : 1;
+        nFail += Check(NostrIngestPool(NostrTestMessage(psub.c_str(), NostrTestEvent(ctx, pk, nNow + 7200, NostrPoolKind(), tags, content.dump())), psub, nNow) == NOSTR_MSG_REFUSED,
+                       "nor one dated two hours ahead") ? 0 : 1;
+        nlohmann::json odd = content;
+        odd["miners"] = 1e300;
+        odd["fee_pct"] = -50;
+        NostrIngestPool(NostrTestMessage(psub.c_str(), NostrTestEvent(ctx, pk, nNow + 1, NostrPoolKind(), tags, odd.dump())), psub, nNow);
+        std::vector<BtfPoolAnnouncement> pools;
+        BtfGetPoolAnnouncements(pools);
+        nFail += Check(pools.size() == 1 && pools[0].connectedMiners == 0 && pools[0].feePercent == 0,
+                       "figures that are not figures read as zero") ? 0 : 1;
+
+        for (int i = 0; i < 260; i++)
+        {
+            unsigned char k[32];
+            NostrTestKey(6000 + i, k);
+            nlohmann::json c = { { "btf", NostrTestAddress(ctx, k) }, { "name", "p" } };
+            NostrIngestPool(NostrTestMessage(psub.c_str(), NostrTestEvent(ctx, k, nNow, NostrPoolKind(), tags, c.dump())), psub, nNow);
+        }
+        nFail += Check(NostrDiscoveredPoolCount() == NOSTR_MAX_POOLS, "the list of pools stops at its ceiling") ? 0 : 1;
+        {
+            std::vector<BtfPoolAnnouncement> all;
+            BtfGetPoolAnnouncements(all);
+            unsigned char klast[32];
+            NostrTestKey(6000 + 259, klast);
+            std::string lastAddr = NostrTestAddress(ctx, klast);
+            bool fHave = false;
+            for (size_t i = 0; i < all.size(); i++)
+                if (all[i].btfAddress == lastAddr)
+                    fHave = true;
+            nFail += Check(fHave, "and the newest announcement is in it: a full list drops the oldest, it does not turn the new away") ? 0 : 1;
+        }
+        {
+            std::string e50;
+            for (int i = 0; i < 50; i++)
+                e50 += "\xc3\xa9";                 // 100 bytes of e-acute
+            std::string c = NostrClampUtf8(e50, 63);
+            nFail += Check(c.size() == 62 && NostrClampUtf8("short", 64) == "short" &&
+                           NostrClampUtf8(std::string(100, 'a'), 64).size() == 64 &&
+                           (unsigned char)c[0] == 0xc3,
+                           "a pool name is cut to the size the network accepts, never inside a character") ? 0 : 1;
+        }
+        unsigned char kl[32];
+        NostrTestKey(7000, kl);
+        nlohmann::json cl = { { "btf", NostrTestAddress(ctx, kl) }, { "name", "late" } };
+        NostrIngestPool(NostrTestMessage(psub.c_str(), NostrTestEvent(ctx, kl, nNow + 100000, NostrPoolKind(), tags, cl.dump())), psub, nNow + 100000);
+        nFail += Check(NostrDiscoveredPoolCount() == 1, "and an old announcement is dropped when a new one is added, not only when somebody looks") ? 0 : 1;
+    }
+
+    // ---- a descriptor is believed for its own signature
+    {
+        const std::string dsub = "btf-resolve-1";
+        unsigned char dk[32];
+        NostrTestKey(8000, dk);
+        std::string addr = NostrTestAddress(ctx, dk);
+        nlohmann::json anyEvent = NostrTestEvent(ctx, dk, nNow, NostrDescriptorKind(), dTags, "x");
+        std::string hexpk = anyEvent["pubkey"].get<std::string>();
+        std::string encHex(64, 'a');
+        std::string desc = btf::SignDescriptor(ctx, dk, encHex, "", (uint64_t)nNow,
+                                               "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8533");
+        std::map<std::string, std::string> want;
+        want[hexpk] = addr;
+        std::string a, c;
+        nlohmann::json ev = anyEvent;
+        ev["content"] = desc;             // the id and signature no longer match: the descriptor is what counts
+        nFail += Check(NostrIngestDescriptor(ctx, NostrTestMessage(dsub.c_str(), ev), dsub, want, a, c) == NOSTR_MSG_TAKEN &&
+                       a == addr && c == desc,
+                       "a descriptor signed by the address asked for is taken") ? 0 : 1;
+        nlohmann::json tampered = ev;
+        std::string d2 = desc;
+        d2[d2.size() / 2] = d2[d2.size() / 2] == 'a' ? 'b' : 'a';
+        tampered["content"] = d2;
+        nFail += Check(NostrIngestDescriptor(ctx, NostrTestMessage(dsub.c_str(), tampered), dsub, want, a, c) == NOSTR_MSG_REFUSED,
+                       "one changed on the way is not") ? 0 : 1;
+        std::map<std::string, std::string> none;
+        nFail += Check(NostrIngestDescriptor(ctx, NostrTestMessage(dsub.c_str(), ev), dsub, none, a, c) == NOSTR_MSG_REFUSED,
+                       "nor one from a key nobody asked about") ? 0 : 1;
+        nlohmann::json num = ev;
+        num["pubkey"] = 5;
+        num["content"] = 7;
+        nFail += Check(NostrIngestDescriptor(ctx, NostrTestMessage(dsub.c_str(), num), dsub, want, a, c) == NOSTR_MSG_REFUSED,
+                       "nor an event whose fields are not text") ? 0 : 1;
+    }
+
+    secp256k1_context_destroy(ctx);
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
@@ -10907,7 +11580,11 @@ struct EngineHost : public btfchat::SwapHost
     bool SendStep(const std::string&, const std::string& text, std::string&) { steps.push_back(text); return true; }
     void Contacts(std::vector<std::string>& out) { out.assign(1, "them"); }
     void Conversation(const std::string&, std::vector<btfchat::LogEntry>& out) { out = convo; }
-    bool FindMyOffer(const std::string&, btfchat::SwapOffer&) { return false; }
+    bool fUnlockedChat = true;                       // false: the chat is locked and every conversation reads back empty
+    bool Unlocked() { return fUnlockedChat; }
+    bool fHaveOffer = false;                         // an offer of ours any take names
+    btfchat::SwapOffer myOffer;
+    bool FindMyOffer(const std::string&, btfchat::SwapOffer& out) { if (!fHaveOffer) return false; out = myOffer; return true; }
     bool Wallet(const std::string& method, const nlohmann::json& params, nlohmann::json& r, std::string& err)
     {
         calls.push_back(std::make_pair(method, params));
@@ -11208,6 +11885,211 @@ static int RunSwapEngineSelfTest()
     }
 
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// -selftest=swap-prune -- what the chat swap engine keeps (review L4): one take
+// of an offer at a time from a peer, and a few takes per peer in all; a swap
+// that is over is dropped after a while, but never one that is not over and
+// never a failed one that may hold a lock of ours; the step ids kept are the
+// ones a conversation still holds.
+static int RunSwapPruneSelfTest()
+{
+    printf("swap-prune self-test\n");
+    int nFail = 0;
+    int64_t nNow = GetTime();
+
+    btfchat::SwapOffer o;
+    o.give = "BTC"; o.giveAmount = 100000; o.want = "BTF"; o.wantAmount = COIN;
+    const std::string offerA(32, 'a'), offerB(32, 'b');
+
+    auto TakeStep = [&](int n, const std::string& offer) {
+        btfchat::SwapStep st;
+        st.swap = strprintf("%032x", n);
+        st.step = "take";
+        st.offer = offer;
+        st.terms = o;
+        st.to = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
+        btfchat::LogEntry le;
+        le.from = "them"; le.kind = btfchat::MSG_SWAP; le.outgoing = false;
+        le.id = strprintf("%032x", 0x1000 + n);
+        le.sent = GetTime();
+        le.text = btfchat::FormatSwapStep(st);
+        return le;
+    };
+    {
+        btfchat::SwapStep chk;
+        std::string err;
+        nFail += Check(btfchat::ParseSwapStep(TakeStep(1, offerA).text, chk, err), "the take used here is a good one") ? 0 : 1;
+    }
+
+    auto Count = [](btfchat::SwapEngine& e, int stage) {
+        std::vector<btfchat::SwapView> v;
+        e.List(v);
+        int n = 0;
+        for (size_t i = 0; i < v.size(); i++)
+            if (stage < 0 || v[i].stage == stage)
+                n++;
+        return n;
+    };
+
+    // ---- one take of an offer at a time, a few per peer
+    {
+        EngineHost h;
+        h.fHaveOffer = true;
+        h.myOffer = o;
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        for (int i = 1; i <= 20; i++)
+            h.convo.push_back(TakeStep(i, offerA));
+        e.Round();
+        nFail += Check(Count(e, -1) == 1 && Count(e, btfchat::SW_TAKE_RECEIVED) == 1,
+                       "twenty takes of one offer with twenty swap ids make one swap") ? 0 : 1;
+        h.convo.clear();
+        for (int i = 21; i <= 60; i++)
+            h.convo.push_back(TakeStep(i, strprintf("%032x", 0x2000 + i)));
+        e.Round();
+        nFail += Check(Count(e, -1) == 8, "and takes of forty other offers make seven more, eight in all") ? 0 : 1;
+        // The same ids again, from the conversation, are not read twice.
+        int nBefore = Count(e, -1);
+        e.Round();
+        nFail += Check(Count(e, -1) == nBefore, "a step read once is not read again") ? 0 : 1;
+    }
+
+    // ---- finished swaps are dropped after their time, the open and the failed-with-a-lock are not
+    {
+        EngineHost h;
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        const int64_t nOld = nNow - 40 * 24 * 3600;
+        nlohmann::json arr = nlohmann::json::array();
+        auto Sw = [&](int n, int stage, int64_t nUpdated, const char* contract) {
+            nlohmann::json sw = { { "id", strprintf("%032x", n) }, { "peer", "them" }, { "maker", true }, { "give", "BTF" },
+                                  { "ga", 100000000 }, { "want", "LTC" }, { "wa", 200000000 }, { "stage", stage },
+                                  { "created", nUpdated }, { "updated", nUpdated } };
+            if (contract[0])
+                sw["myC"] = contract;
+            return sw;
+        };
+        arr.push_back(Sw(1, btfchat::SW_DONE, nOld, ""));
+        arr.push_back(Sw(2, btfchat::SW_CANCELLED, nOld, ""));
+        arr.push_back(Sw(3, btfchat::SW_REFUNDED, nOld, ""));
+        arr.push_back(Sw(4, btfchat::SW_FAILED, nOld, ""));
+        arr.push_back(Sw(5, btfchat::SW_FAILED, nNow - 5 * 24 * 3600, "aabb"));
+        arr.push_back(Sw(6, btfchat::SW_DONE, nNow - 3600, ""));
+        arr.push_back(Sw(7, btfchat::SW_LOCKED, nOld, "aabb"));
+        arr.push_back(Sw(8, btfchat::SW_TAKE_RECEIVED, nOld, ""));
+        arr.push_back(Sw(9, btfchat::SW_DONE, nOld, "aabb"));
+        e.FromJson(nlohmann::json{ { "swaps", arr }, { "seen", nlohmann::json::array({ "gone", "also-gone" }) } }.dump());
+        {
+            btfchat::LogEntry le;           // a conversation that can be read: something in it
+            le.from = "them"; le.kind = btfchat::MSG_SWAP; le.outgoing = false; le.sent = nNow;
+            le.id = std::string(32, '9');
+            le.text = "{\"s\":\"" + std::string(32, '5') + "\",\"step\":\"cancel\"}";
+            h.convo.push_back(le);
+        }
+        nFail += Check(Count(e, -1) == 9, "nine swaps loaded") ? 0 : 1;
+        e.Round();
+        std::vector<btfchat::SwapView> v;
+        e.List(v);
+        std::set<std::string> kept;
+        for (size_t i = 0; i < v.size(); i++)
+            kept.insert(v[i].id);
+        nFail += Check(!kept.count(strprintf("%032x", 1)) && !kept.count(strprintf("%032x", 2)) &&
+                       !kept.count(strprintf("%032x", 3)) && !kept.count(strprintf("%032x", 4)) &&
+                       !kept.count(strprintf("%032x", 9)),
+                       "swaps that finished long ago are dropped, those with a lock of ours only after the 30 days too") ? 0 : 1;
+        nFail += Check(kept.count(strprintf("%032x", 5)) && kept.count(strprintf("%032x", 6)) &&
+                       kept.count(strprintf("%032x", 7)) && kept.count(strprintf("%032x", 8)),
+                       "a recent one, one that failed with a lock of ours a few days ago, and the ones not over are kept") ? 0 : 1;
+        nFail += Check(e.ToJson().find("gone") == std::string::npos,
+                       "step ids no conversation holds are forgotten") ? 0 : 1;
+    }
+
+    // ---- no more finished swaps kept than the limit
+    {
+        EngineHost h;
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        nlohmann::json arr = nlohmann::json::array();
+        for (int n = 1; n <= 130; n++)
+            arr.push_back({ { "id", strprintf("%032x", n) }, { "peer", "them" }, { "maker", true }, { "give", "BTF" },
+                            { "ga", 100000000 }, { "want", "LTC" }, { "wa", 200000000 },
+                            { "stage", (int)btfchat::SW_DONE }, { "created", nNow - 1000 - n }, { "updated", nNow - 1000 - n } });
+        e.FromJson(nlohmann::json{ { "swaps", arr }, { "seen", nlohmann::json::array() } }.dump());
+        e.Round();
+        std::vector<btfchat::SwapView> v;
+        e.List(v);
+        bool fNewest = false, fOldest = false;
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            if (v[i].id == strprintf("%032x", 1)) fNewest = true;
+            if (v[i].id == strprintf("%032x", 130)) fOldest = true;
+        }
+        nFail += Check(v.size() == 100 && fNewest && !fOldest,
+                       "a hundred and thirty finished swaps become the newest hundred") ? 0 : 1;
+    }
+
+    // ---- a swap with a lock of ours is not counted out
+    {
+        EngineHost h;
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        nlohmann::json arr = nlohmann::json::array();
+        for (int n = 1; n <= 260; n++)
+        {
+            nlohmann::json sw = { { "id", strprintf("%032x", n) }, { "peer", "them" }, { "maker", true }, { "give", "BTF" },
+                                  { "ga", 100000000 }, { "want", "LTC" }, { "wa", 200000000 },
+                                  { "stage", (int)btfchat::SW_DONE }, { "created", nNow - 1000 - n }, { "updated", nNow - 1000 - n } };
+            if (n % 2 == 0)
+                sw["myC"] = "aabb";             // had a contract: done, and a redeem that may be unconfirmed
+            arr.push_back(sw);
+        }
+        e.FromJson(nlohmann::json{ { "swaps", arr }, { "seen", nlohmann::json::array() } }.dump());
+        e.Round();
+        std::vector<btfchat::SwapView> v;
+        e.List(v);
+        int nWithLock = 0, nWithout = 0;
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            int n = (int)strtol(v[i].id.c_str(), NULL, 16);
+            (n % 2 == 0 ? nWithLock : nWithout)++;
+        }
+        nFail += Check(nWithLock == 130 && nWithout == 100,
+                       "the count limit takes the oldest of those that never locked; all 130 that had a contract stay") ? 0 : 1;
+    }
+
+    // ---- the step ids are kept while a conversation cannot be read, and an old take is not news
+    {
+        EngineHost h;
+        h.fHaveOffer = true;
+        h.myOffer = o;
+        btfchat::SwapEngine e(&h);
+        h.pEngine = &e;
+        h.convo.push_back(TakeStep(1, offerA));
+        e.Round();
+        nFail += Check(Count(e, -1) == 1 && e.ToJson().find(TakeStep(1, offerA).id) != std::string::npos,
+                       "a take is read and its step id kept") ? 0 : 1;
+        h.convo.clear();                       // the chat is locked: the conversation comes back empty
+        h.fUnlockedChat = false;
+        e.Round();
+        h.fUnlockedChat = true;
+        nFail += Check(e.ToJson().find(TakeStep(1, offerA).id) != std::string::npos,
+                       "a locked chat does not make the engine forget what it has read") ? 0 : 1;
+        h.convo.push_back(TakeStep(2, offerB));
+        e.Round();
+        h.convo[0].sent = nNow - 3 * 24 * 3600;
+        h.convo[0].id = strprintf("%032x", 0x5000);
+        h.convo[0].text = btfchat::FormatSwapStep([&] { btfchat::SwapStep st; st.swap = strprintf("%032x", 77); st.step = "take";
+                                                       st.offer = std::string(32, 'c'); st.terms = o; st.to = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"; return st; }());
+        int nBefore = Count(e, -1);
+        e.Round();
+        nFail += Check(Count(e, -1) == nBefore, "a take three days old, long past answering, makes no swap") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
     fflush(stdout);
     return nFail == 0 ? 0 : 1;
 }
@@ -16399,6 +17281,12 @@ int RunSelfTest(const std::string& name)
         return RunSwapParseSelfTest();
     if (name == "swap-engine")
         return RunSwapEngineSelfTest();
+    if (name == "swap-prune")
+        return RunSwapPruneSelfTest();
+    if (name == "chat-dos")
+        return RunChatDosSelfTest();
+    if (name == "nostr-relay")
+        return RunNostrRelaySelfTest();
     if (name == "chat-store-save")
         return RunChatStoreSaveSelfTest();
     if (name == "wallet-final")
@@ -16439,6 +17327,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }

@@ -43,6 +43,7 @@
 #include "btfchat.h"
 #include "btfchatlog.h"
 #include "btfchatmsg.h"
+#include "btfsock.h"
 
 #include <string>
 #include <vector>
@@ -203,6 +204,21 @@ PeerState ChatPeerState(const std::string& peerAddr);
 
 // Where the sealed roster and history live, so the interface can say so.
 std::string ChatStorePath();
+
+// The inbound connection ceiling (btfchatnode.cpp, CHAT_MAX_SERVE_THREADS):
+// take a slot for a connection just accepted (false: all busy and past their
+// handshake, close it; a connection still in its handshake is put out for a
+// new one), say its handshake is done, give the slot back when it ends, and how
+// many are taken.
+bool ChatServeSlotTake(btf_socket_t sock, uint64_t& ticketOut, int64_t nNow);
+void ChatServeSlotHandshaken(uint64_t ticket);
+void ChatServeSlotForget(uint64_t ticket);   // before the thread closes its own socket
+void ChatServeSlotRelease(uint64_t ticket);
+int  ChatServeThreadCount();
+// The debounce for the store save after a frame delivered to the listener:
+// true when it is time to save (at most once a second); otherwise fDirty is
+// set and a later frame, or the end of the connection, saves.
+bool ChatServeSaveDue(int64_t nNow, bool& fDirty);
 
 } // namespace btfchat
 

@@ -33,6 +33,21 @@ static int g_fail = 0;
 // exercised on its own below.
 static const unsigned int TEST_BITS = 6;
 
+// Accept, and when the store says it is filling and asks for more work, mine
+// to what it asked and offer the record again: what the chat app does.
+static ChatStore::Result AcceptMining(ChatStore& st, void* ctx, ChatRecord& r, int64_t nNow,
+                                      std::string& err, unsigned char id[32])
+{
+    ChatStore::Result res = st.Accept(ctx, r, nNow, err, id);
+    unsigned int nAsk = ChatRecordAskedBits(err);
+    if (res == ChatStore::REJECTED && nAsk > 0)
+    {
+        ChatRecordMine(r, 0, nAsk);
+        res = st.Accept(ctx, r, nNow, err, id);
+    }
+    return res;
+}
+
 static std::vector<unsigned char> Bytes(size_t n, unsigned char fill)
 {
     return std::vector<unsigned char>(n, fill);
@@ -252,8 +267,8 @@ int main()
         {
             std::vector<unsigned char> tag = Bytes(16, 0);
             tag[0] = (unsigned char)i; tag[1] = (unsigned char)(i >> 8);
-            ChatStore::Result res = st.Accept(ctx, Envelope(tag, NOW - 10000 + (int64_t)i, nEach, (unsigned char)i),
-                                              NOW, err, id);
+            ChatRecord rec = Envelope(tag, NOW - 10000 + (int64_t)i, nEach, (unsigned char)i);
+            ChatStore::Result res = AcceptMining(st, ctx, rec, NOW, err, id);
             if (res == ChatStore::ACCEPTED) nKept++;
             else if (err.find("full") != std::string::npos) nRefusedFull++;
         }
@@ -270,8 +285,8 @@ int main()
 
         // Expiry is what makes room again.
         st.Expire(NOW + CHATREC_ENVELOPE_LIFETIME - 10000 + 5);
-        CHECK(st.Accept(ctx, Envelope(last, NOW + CHATREC_ENVELOPE_LIFETIME - 9000, 100, 1),
-                        NOW + CHATREC_ENVELOPE_LIFETIME - 9000, err, id) == ChatStore::ACCEPTED,
+        ChatRecord again = Envelope(last, NOW + CHATREC_ENVELOPE_LIFETIME - 9000, 100, 1);
+        CHECK(AcceptMining(st, ctx, again, NOW + CHATREC_ENVELOPE_LIFETIME - 9000, err, id) == ChatStore::ACCEPTED,
               "and once the oldest expire, new records fit again");
     }
 
@@ -304,15 +319,15 @@ int main()
             std::string d = btf::SignDescriptor(ctx, sk, std::string(64, 'a'), "", (uint64_t)r.nTime, ONION);
             r.payload.assign(d.begin(), d.end());
             ChatRecordMine(r, 0, TEST_BITS);
-            res = st.Accept(ctx, r, NOW, err, id);
+            res = AcceptMining(st, ctx, r, NOW, err, id);
             if (res == ChatStore::ACCEPTED)
                 nFill++;
         }
         CHECK(res == ChatStore::REJECTED && err.find("full") != std::string::npos,
               "with the budget spent, a new identity is refused");
         ChatRecord d2 = Desc(ctx, alice, NOW - 60, ONION);
-        CHECK(st.Accept(ctx, d2, NOW, err, id) == ChatStore::ACCEPTED,
-              "but alice can still replace her own descriptor");
+        CHECK(AcceptMining(st, ctx, d2, NOW, err, id) == ChatStore::ACCEPTED,
+              "but alice can still replace her own descriptor (for the work a full store asks)");
         printf("       (%u descriptors to fill %u bytes)\n", (unsigned)nFill, (unsigned)CHATREC_DESC_BUDGET);
     }
 

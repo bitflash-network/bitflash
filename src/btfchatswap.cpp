@@ -10,6 +10,7 @@
 #include "swap.h"
 
 #include <sodium.h>
+#include <algorithm>
 
 using json = nlohmann::json;
 
@@ -1216,6 +1217,19 @@ void SwapEngine::OnStep(const std::string& peer, const SwapStep& st, int64_t nNo
         if (swaps.count(st.swap) || !pMyOffer)
             return;
         const SwapOffer& o = *pMyOffer;
+        // One take of this offer at a time from this peer, and a few takes
+        // waiting in all: a fresh swap id costs the sender nothing, and each
+        // swap is kept (and written out) until it is pruned.
+        int nPending = 0;
+        for (std::map<std::string, ChatSwap>::const_iterator q = swaps.begin(); q != swaps.end(); ++q)
+            if (q->second.peer == peer && q->second.fMaker && !IsFinal(q->second.stage))
+            {
+                if (q->second.offerId == st.offer)
+                    return;
+                nPending++;
+            }
+        if (nPending >= config.nMaxPendingTakesPerPeer)
+            return;
         if (o.give != st.terms.give || o.want != st.terms.want ||
             o.giveAmount != st.terms.giveAmount || o.wantAmount != st.terms.wantAmount)
             return;     // not its terms
@@ -1267,12 +1281,64 @@ void SwapEngine::OnStep(const std::string& peer, const SwapStep& st, int64_t nNo
     // "redeemed" needs no handling: the secret is read off the chain.
 }
 
+// Under cs. Drops finished swaps past their keeping time, and, of those that
+// never locked anything of ours, the oldest past the most kept; and the step
+// ids that no conversation holds any more. Never a swap that is not over, and
+// no swap with a contract or a transaction of ours (done, with a redeem that
+// may not be confirmed yet; cancelled after a lock; failed) before its keeping
+// time: its status and contract are what the person has to go on.
+bool SwapEngine::Prune(int64_t nNow, const std::set<std::string>& stepIdsPresent, bool fPruneSteps)
+{
+    bool fChanged = false;
+    std::vector<std::pair<int64_t, std::string> > finals;   // never locked: count and age
+    std::vector<std::pair<int64_t, std::string> > locked;   // had a lock: age only
+    for (std::map<std::string, ChatSwap>::const_iterator it = swaps.begin(); it != swaps.end(); ++it)
+    {
+        const ChatSwap& s = it->second;
+        if (!IsFinal(s.stage))
+            continue;
+        bool fLocked = !s.myContract.empty() || !s.myTxid.empty() || s.fLockTried;
+        (fLocked ? locked : finals).push_back(std::make_pair(std::max(s.updated, s.created), it->first));
+    }
+    std::sort(finals.begin(), finals.end());
+    size_t nDrop = finals.size() > config.nKeepFinalMax ? finals.size() - config.nKeepFinalMax : 0;
+    std::vector<std::string> vDrop;
+    for (size_t i = 0; i < finals.size(); i++)
+        if (i < nDrop || nNow - finals[i].first > config.nKeepFinalSecs)
+            vDrop.push_back(finals[i].second);
+    for (size_t i = 0; i < locked.size(); i++)
+        if (nNow - locked[i].first > config.nKeepFinalSecs)
+            vDrop.push_back(locked[i].second);
+    for (size_t i = 0; i < vDrop.size(); i++)
+    {
+        std::map<std::string, ChatSwap>::iterator it = swaps.find(vDrop[i]);
+        if (it != swaps.end() && !it->second.secret.empty())
+            sodium_memzero(&it->second.secret[0], it->second.secret.size());
+        swaps.erase(vDrop[i]);
+        fChanged = true;
+    }
+    if (fPruneSteps)
+        for (std::set<std::string>::iterator it = stepsSeen.begin(); it != stepsSeen.end(); )
+            if (!stepIdsPresent.count(*it))
+            {
+                stepsSeen.erase(it++);
+                fChanged = true;
+            }
+            else
+                ++it;
+    return fChanged;
+}
+
 void SwapEngine::ReadSteps()
 {
     std::vector<std::string> peers;
     host->Contacts(peers);
     int64_t nNow = GetTime();
     bool fChanged = false;
+    std::set<std::string> present;      // the step ids in the conversations now
+    // Whether what is gone from the conversations is really gone: not while the
+    // chat is locked (every conversation then reads back empty).
+    bool fAllRead = !peers.empty() && host->Unlocked();
     for (size_t i = 0; i < peers.size(); i++)
     {
         std::vector<LogEntry> v;
@@ -1282,6 +1348,7 @@ void SwapEngine::ReadSteps()
             const LogEntry& e = v[k];
             if (e.kind != MSG_SWAP || e.outgoing || e.from != peers[i])
                 continue;
+            present.insert(e.id);
             bool fNew = false;
             CRITICAL_BLOCK(cs)
                 fNew = stepsSeen.insert(e.id).second;
@@ -1292,12 +1359,22 @@ void SwapEngine::ReadSteps()
             std::string err;
             if (!ParseSwapStep(e.text, st, err))
                 continue;
+            // A take nobody could have answered in time is not news: it would
+            // only wait for the person and then be cancelled.
+            if (st.step == "take" && nNow - e.sent > config.nAnswerWithin)
+                continue;
             SwapOffer mine;
             bool fMine = st.step == "take" && host->FindMyOffer(st.offer, mine);
             CRITICAL_BLOCK(cs)
                 OnStep(peers[i], st, nNow, fMine ? &mine : NULL);
         }
     }
+    // Pruned after the reading, so what was just read is not read again: the
+    // step ids kept are the ones still in a conversation, which is where a
+    // step would be read from.
+    CRITICAL_BLOCK(cs)
+        if (Prune(nNow, present, fAllRead))
+            fChanged = true;
     if (fChanged)
     {
         bool fSaved = host->Changed();
@@ -1563,6 +1640,7 @@ public:
         return WalletRpc(method, params, resultOut, errOut);
     }
     bool Changed() { return ChatSaveStore(); }
+    bool Unlocked() { return ChatUnlocked(); }
 };
 
 static ChatHost g_chatHost;

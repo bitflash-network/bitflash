@@ -29,8 +29,107 @@ static const int CHAT_QUERIES_PER_MINUTE   = 1200;
 static const int64 CHAT_INV_INTERVAL       = 10 * 60;
 static const size_t CHAT_INV_OFFER         = 5000;
 
+// The per-connection rations above live in CNode, so a peer that reconnects
+// starts afresh, and an onion peer can reconnect as often as it likes. These
+// are the same rations for all connections together: what the node takes in a
+// minute, and what it serves, however many connections ask.
+static const int CHAT_PUTS_PER_MINUTE_ALL     = 600;
+static const int CHAT_RELAYED_PER_MINUTE_ALL  = 20000;
+// Answer bytes per minute for one connection, and a generous figure for all of
+// them together. One chatget can ask for CHAT_MAX_ANSWER_BYTES; a connection
+// may not turn that into an unbounded stream by asking again before reading.
+// The shared figure is far above what honest mailbox reads add up to (it is
+// there so that many connections together cannot saturate the node's link); a
+// tight one would let a few connections starve everybody's reads.
+static const size_t CHAT_ANSWER_BYTES_PER_MINUTE     = 16 * 1024 * 1024;
+static const size_t CHAT_ANSWER_BYTES_PER_MINUTE_ALL = 256 * 1024 * 1024;
+// And never more than this waiting in one connection's send buffer: a peer
+// that asks and does not read gets empty answers until it reads.
+static const size_t CHAT_MAX_SEND_QUEUED = 2 * 1024 * 1024;
+// Records announced to us by one peer that we have not received yet. A
+// chatrec is taken only for an id the same peer announced (we asked it), so
+// nothing arrives unsolicited. Entries older than this are forgotten.
+static const size_t CHAT_MAX_ASKED_PER_PEER = CHAT_INV_OFFER + 1000;
+static const int64  CHAT_ASKED_TTL          = 15 * 60;
+
 static CCriticalSection cs_chatStore;
 static ChatStore g_chatStore;
+
+// The node-wide minute, see above.
+static CCriticalSection cs_chatAll;
+static int64  g_nChatAllWindowStart = 0;
+static int    g_nChatAllPuts = 0;
+static int    g_nChatAllRelayed = 0;
+static size_t g_nChatAllAnswerBytes = 0;
+
+static void RationAll(int64 nNow)
+{
+    if (nNow - g_nChatAllWindowStart >= 60 || nNow < g_nChatAllWindowStart)
+    {
+        g_nChatAllWindowStart = nNow;
+        g_nChatAllPuts = 0;
+        g_nChatAllRelayed = 0;
+        g_nChatAllAnswerBytes = 0;
+    }
+}
+
+// Is there room in a node-wide ration this minute (nothing is taken)?
+static bool RationOpen(int64 nNow, int nCounter, int nMax)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_chatAll)
+    {
+        RationAll(nNow);
+        fOk = nCounter < nMax;
+    }
+    return fOk;
+}
+
+// Take one from a node-wide ration; false once it is spent for this minute.
+static bool TakeAll(int64 nNow, int& nCounter, int nMax)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_chatAll)
+    {
+        RationAll(nNow);
+        fOk = ++nCounter <= nMax;
+    }
+    return fOk;
+}
+
+void ChatRelayRations(int& nPuts, int& nRelayed)
+{
+    CRITICAL_BLOCK(cs_chatAll)
+    {
+        nPuts = g_nChatAllPuts;
+        nRelayed = g_nChatAllRelayed;
+    }
+}
+
+// For the self-tests. They run from the release binary (-selftest=...), so this
+// is not compiled out; it only ever empties a ration.
+void ChatRelayExhaustRations()
+{
+    CRITICAL_BLOCK(cs_chatAll)
+    {
+        g_nChatAllWindowStart = GetTime();
+        g_nChatAllPuts = CHAT_PUTS_PER_MINUTE_ALL;
+        g_nChatAllRelayed = CHAT_RELAYED_PER_MINUTE_ALL;
+    }
+}
+
+#ifdef BITFLASH_FUZZ
+// Fuzzing only (never in a release build): records with real work cannot be
+// made at fuzzing speed, so the harness replaces the store with one whose work
+// rule is nBits, and resets the node-wide rations between inputs.
+void ChatRelayFuzzReset(unsigned int nBits)
+{
+    CRITICAL_BLOCK(cs_chatStore)
+        g_chatStore = ChatStore(nBits);
+    CRITICAL_BLOCK(cs_chatAll)
+        g_nChatAllWindowStart = 0;
+}
+#endif
 
 static secp256k1_context* VerifyContext()
 {
@@ -46,12 +145,58 @@ static secp256k1_context* VerifyContext()
 
 static void Ration(CNode* pfrom, int64 nNow)
 {
-    if (nNow - pfrom->nChatWindowStart >= 60)
+    if (nNow - pfrom->nChatWindowStart >= 60 || nNow < pfrom->nChatWindowStart)
     {
         pfrom->nChatWindowStart = nNow;
         pfrom->nChatPutsInWindow = 0;
         pfrom->nChatQueriesInWindow = 0;
+        pfrom->nChatAnswerBytesInWindow = 0;
     }
+}
+
+void ChatRelayNoteAnnounced(CNode* pfrom, const uint256& hash)
+{
+    if (!pfrom)
+        return;
+    int64 nNow = GetTime();
+    std::map<uint256, int64>& m = pfrom->mapChatAsked;
+    if (m.size() >= CHAT_MAX_ASKED_PER_PEER)
+    {
+        // Full. Forget what this peer announced long ago and never sent, but
+        // look through the list at most once a minute: an inv may name tens of
+        // thousands of records, and each would otherwise rescan all of it.
+        if (nNow - pfrom->nChatAskedPurged < 60 && pfrom->nChatAskedPurged <= nNow)
+            return;
+        pfrom->nChatAskedPurged = nNow;
+        for (std::map<uint256, int64>::iterator it = m.begin(); it != m.end(); )
+        {
+            if (nNow - it->second > CHAT_ASKED_TTL || it->second > nNow)
+                m.erase(it++);
+            else
+                ++it;
+        }
+        if (m.size() >= CHAT_MAX_ASKED_PER_PEER)
+            return;   // still full: its chatrec for this id will be refused
+    }
+    m[hash] = nNow;
+}
+
+// Did this peer announce the record (so that we asked it for it)? Consumes
+// the entry.
+static bool WasAnnounced(CNode* pfrom, const std::vector<unsigned char>& blob)
+{
+    ChatRecord r;
+    if (blob.empty() || !r.Parse(&blob[0], blob.size()))
+        return false;
+    unsigned char id[32];
+    r.Id(id);
+    uint256 h;
+    memcpy(h.begin(), id, 32);
+    std::map<uint256, int64>::iterator it = pfrom->mapChatAsked.find(h);
+    if (it == pfrom->mapChatAsked.end())
+        return false;
+    pfrom->mapChatAsked.erase(it);
+    return true;
 }
 
 static CInv InvFor(const unsigned char id[32])
@@ -79,8 +224,15 @@ static void Announce(const unsigned char id[32], CNode* pfrom)
 }
 
 // Check and keep one record. `pfrom` is where it came from, for the relay.
+//
+// The node-wide ration (pnAll against nAllMax) is charged only for a record
+// that parses, shows the work the store asks and is kept: a junk record, or a
+// replay of one already held, costs its sender a refusal and nobody else
+// anything, so the ration cannot be spent for free.
+// A record relayed by another node is judged by the base work, not by how
+// full this node's own store is (fRelayed); a chat app's put is judged by both.
 static int Take(CNode* pfrom, const std::vector<unsigned char>& blob,
-                unsigned char idOut[32], std::string& whyOut)
+                unsigned char idOut[32], std::string& whyOut, bool fRelayed, int* pnAll, int nAllMax)
 {
     memset(idOut, 0, 32);
     ChatRecord r;
@@ -90,8 +242,31 @@ static int Take(CNode* pfrom, const std::vector<unsigned char>& blob,
         return ChatStore::REJECTED;
     }
     int nResult = ChatStore::REJECTED;
+    bool fWorked = false;
     CRITICAL_BLOCK(cs_chatStore)
-        nResult = g_chatStore.Accept(VerifyContext(), r, GetAdjustedTime(), whyOut, idOut);
+    {
+        // What has expired no longer counts towards how full the store is.
+        g_chatStore.Expire(GetAdjustedTime());
+        fWorked = ChatRecordWork(r) >= g_chatStore.RequiredBits(r.kind, r.payload.size(), fRelayed);
+        if (!fWorked)
+            nResult = g_chatStore.Accept(VerifyContext(), r, GetAdjustedTime(), whyOut, idOut, fRelayed);
+    }
+    if (fWorked)
+    {
+        // Looked at before and charged after: only a record that is kept costs
+        // the node's minute. A replay of one already held (a duplicate), an
+        // expired or future-dated one, costs its sender a refusal and nobody
+        // else anything.
+        if (!RationOpen(GetTime(), *pnAll, nAllMax))
+        {
+            whyOut = "this node is taking too many records right now; slow down";
+            return ChatStore::REJECTED;
+        }
+        CRITICAL_BLOCK(cs_chatStore)
+            nResult = g_chatStore.Accept(VerifyContext(), r, GetAdjustedTime(), whyOut, idOut, fRelayed);
+        if (nResult == ChatStore::ACCEPTED)
+            TakeAll(GetTime(), *pnAll, nAllMax);
+    }
     if (pfrom)
         pfrom->AddInventoryKnown(InvFor(idOut));
     if (nResult == ChatStore::ACCEPTED)
@@ -162,9 +337,16 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
             return true;
         std::vector<unsigned char> blob;
         vRecv >> blob;
+        // Only what this peer announced and we asked for: an unsolicited
+        // record costs its sender nothing to send and us a work check.
+        if (!WasAnnounced(pfrom, blob))
+        {
+            LogPrint("net", "chatrec: not asked of %s, ignored\n", pfrom->addr.ToString().c_str());
+            return true;
+        }
         unsigned char id[32];
         std::string why;
-        int n = Take(pfrom, blob, id, why);
+        int n = Take(pfrom, blob, id, why, true, &g_nChatAllRelayed, CHAT_RELAYED_PER_MINUTE_ALL);
         if (n == ChatStore::REJECTED)
             LogPrint("net", "chatrec: refused from %s: %s\n",
                      pfrom->addr.ToString().c_str(), why.c_str());
@@ -186,7 +368,7 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
         if (++pfrom->nChatPutsInWindow > CHAT_PUTS_PER_MINUTE)
             why = "too many records from this connection; slow down";
         else
-            nResult = Take(pfrom, blob, &vId[0], why);
+            nResult = Take(pfrom, blob, &vId[0], why, false, &g_nChatAllPuts, CHAT_PUTS_PER_MINUTE_ALL);
         pfrom->PushMessage("chatack", nReq, vId, nResult, why);
         return true;
     }
@@ -201,6 +383,26 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
         std::vector<std::vector<std::vector<unsigned char> > > vAnswer;
         size_t nBytes = 0;
         bool fCut = false;
+        // What this answer may carry: the per-message cap, less what this
+        // connection and (generously) the node have been served this minute,
+        // and nothing while the peer has not read what it was sent.
+        size_t nQueued = 0;
+        CRITICAL_BLOCK(pfrom->cs_vSend)
+            nQueued = pfrom->vSend.size();
+        size_t nAllowed = CHAT_MAX_ANSWER_BYTES;
+        if (nQueued >= CHAT_MAX_SEND_QUEUED)
+            nAllowed = 0;
+        size_t nConnLeft = pfrom->nChatAnswerBytesInWindow >= CHAT_ANSWER_BYTES_PER_MINUTE ? 0 :
+                           CHAT_ANSWER_BYTES_PER_MINUTE - pfrom->nChatAnswerBytesInWindow;
+        nAllowed = std::min(nAllowed, nConnLeft);
+        CRITICAL_BLOCK(cs_chatAll)
+        {
+            RationAll(nNow);
+            nAllowed = std::min(nAllowed, g_nChatAllAnswerBytes >= CHAT_ANSWER_BYTES_PER_MINUTE_ALL ? (size_t)0 :
+                                          CHAT_ANSWER_BYTES_PER_MINUTE_ALL - g_nChatAllAnswerBytes);
+        }
+        if (nAllowed == 0)
+            fCut = true;
         CRITICAL_BLOCK(cs_chatStore)
         {
             g_chatStore.Expire(GetAdjustedTime());
@@ -220,7 +422,7 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
                     for (size_t k = 0; k < recs.size(); k++)
                     {
                         std::vector<unsigned char> w = recs[k].Serialize();
-                        if (nBytes + w.size() > CHAT_MAX_ANSWER_BYTES)
+                        if (nBytes + w.size() > nAllowed)
                         {
                             fCut = true;
                             break;
@@ -232,6 +434,9 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
                 vAnswer.push_back(one);
             }
         }
+        pfrom->nChatAnswerBytesInWindow += nBytes;
+        CRITICAL_BLOCK(cs_chatAll)
+            g_nChatAllAnswerBytes += nBytes;
         pfrom->PushMessage("chatrecs", nReq, vAnswer);
         return true;
     }

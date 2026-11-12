@@ -15,6 +15,7 @@
 #include <secp256k1_extrakeys.h>
 #include <openssl/sha.h>
 #include <nlohmann/json.hpp>
+#include "jsonsafe.h"
 
 #include <cstring>
 
@@ -337,8 +338,8 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
     std::string sigHex;
     try
     {
-        f.version = j.value("v", 0);
-        int nKind = j.value("k", -1);
+        f.version = JsonIntValue<int>(j, "v", 0);
+        int nKind = JsonIntValue<int>(j, "k", -1);
         if (nKind < MSG_INVITE || nKind > MSG_SWAP)
         {
             errOut = "unknown frame kind";
@@ -346,13 +347,13 @@ bool OpenFrame(void* secpctx, const std::string& jsonStr, Frame& out,
         }
         f.kind  = (MsgKind)nKind;
         f.from  = j.value("from", std::string());
-        f.sent  = j.value("t", (int64_t)0);
+        f.sent  = JsonIntValue<int64_t>(j, "t", 0);
         f.id    = j.value("id", std::string());
         f.group = j.value("g", std::string());
         f.text  = j.value("text", std::string());
         f.proof = j.value("proof", std::string());
         f.payTo = j.value("pay", std::string());
-        f.amount = j.value("amt", (int64_t)0);
+        f.amount = JsonIntValue<int64_t>(j, "amt", 0);
         f.txid  = j.value("txid", std::string());
         sigHex  = j.value("sig", std::string());
     }
