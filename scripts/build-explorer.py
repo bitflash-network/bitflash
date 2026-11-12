@@ -427,7 +427,7 @@ INDEX_HTML = r"""<!doctype html>
       <li><a href="https://bitflash.network/treasury">Treasury</a></li>
     </ul></div>
     <div><h2>Community</h2><ul>
-      <li><a href="https://discord.gg/kcgeg696YE">Discord</a></li>
+      <li><a href="https://bitflash.network/discord">Discord</a></li>
       <li><a href="https://x.com/BTFBitflash">X</a></li>
     </ul></div>
     <div><h2>This page</h2><ul>

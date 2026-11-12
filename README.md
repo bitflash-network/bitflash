@@ -11,7 +11,7 @@ RandomX proof of work, nodes reached only through Tor onion services, no premine
 [Documentation](https://docs.bitflash.network/) &nbsp;·&nbsp;
 [Explorer](https://explorer.bitflash.network/) &nbsp;·&nbsp;
 [Testnet faucet](https://faucet.bitflash.network/) &nbsp;·&nbsp;
-[Discord](https://discord.gg/kcgeg696YE) &nbsp;·&nbsp;
+[Discord](https://bitflash.network/discord) &nbsp;·&nbsp;
 [X](https://x.com/BTFBitflash)
 
 </div>
@@ -303,7 +303,7 @@ The same documents are published at [docs.bitflash.network](https://docs.bitflas
 
 Bug reports and pull requests are welcome on GitHub. Consensus and wallet changes are expected
 to come with tests, and are proven on testnet before release. Please report security issues
-privately to the maintainers on [Discord](https://discord.gg/kcgeg696YE) rather than in a
+privately to the maintainers on [Discord](https://bitflash.network/discord) rather than in a
 public issue.
 
 Bitflash is a young network. Keep your node up to date and do not put in more than you can
