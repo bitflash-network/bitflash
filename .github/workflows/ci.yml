@@ -49,6 +49,12 @@ jobs:
       - name: Run decoder fuzz smoke (addresses, base58, BIP39/32, payment links, amounts, hex)
         run: make fuzz-decoders-smoke
 
+      - name: Run P2Pool share-chain fuzz smoke
+        run: make fuzz-p2pool-smoke
+
+      - name: Run light-client peer fuzz smoke (headers, blocks, filters, merkle differential)
+        run: make fuzz-light-peer-smoke
+
   windows-ucrt64:
     name: Windows UCRT64 selftests
     runs-on: windows-latest

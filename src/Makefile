@@ -392,6 +392,28 @@ fuzz-decoders-smoke: fuzz-decoders
 	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/decoders ./fuzz-decoders -runs=0
 	./fuzz-decoders -runs=20000 ../work/fuzz-corpus/decoders
 
+# The share chain as an untrusted peer feeds it (fuzz_p2pool.cpp), and the
+# light clients as a foreign chain's peers feed them (fuzz_light_peer.cpp).
+fuzz-p2pool: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_p2pool.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-p2pool"
+
+fuzz-light-peer: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_light_peer.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-light-peer"
+
+fuzz-p2pool-smoke: fuzz-p2pool
+	@rm -rf ../work/fuzz-corpus/p2pool && mkdir -p ../work/fuzz-corpus/p2pool
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/p2pool ./fuzz-p2pool -runs=0
+	./fuzz-p2pool -runs=2000 ../work/fuzz-corpus/p2pool
+
+fuzz-light-peer-smoke: fuzz-light-peer
+	@rm -rf ../work/fuzz-corpus/light-peer && mkdir -p ../work/fuzz-corpus/light-peer
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/light-peer ./fuzz-light-peer -runs=0
+	./fuzz-light-peer -runs=2000 ../work/fuzz-corpus/light-peer
+
 # Payloads straight into ProcessMessage after the handshake (block, tx, inv,
 # ...); the harness writes its own structured seeds.
 fuzz-p2p-payload-smoke: fuzz-p2p-payload
@@ -428,7 +450,7 @@ fuzz-v4-templates-smoke: fuzz-v4-templates
 	./fuzz-v4-templates -runs=2000 ../work/fuzz-corpus/v4-templates
 
 clean:
-	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -558,6 +580,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=p2pool-chain
 	./bitflash-node -selftest=p2pool-sync
 	./bitflash-node -selftest=p2pool-peers
+	./bitflash-node -selftest=p2pool-dos
 	./bitflash-node -selftest=sigcheck
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light
@@ -593,4 +616,4 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-wallet
 
 .PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
-        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke
+        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-p2pool-smoke fuzz-light-peer-smoke

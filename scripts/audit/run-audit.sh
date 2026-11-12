@@ -38,7 +38,7 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -249,8 +249,10 @@ phase_fuzz() {
     # (a block on genesis, a transaction, inv, ...), the deserializer one
     # (every type), the decoder one (a sample of every format), fuzz-script
     # (signed spends under each rule set) and fuzz-v4-templates (vault,
-    # batch, inheritance). They join the corpus without replacing anything.
-    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates; do
+    # batch, inheritance), fuzz-p2pool (a line of shares) and fuzz-light-peer
+    # (header chains with blocks). They join the corpus without replacing
+    # anything.
+    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer; do
         [ -x "$LF/$t" ] || continue
         sd=$OUT/fuzz-seeds/$t
         rm -rf "$sd"; mkdir -p "$sd"

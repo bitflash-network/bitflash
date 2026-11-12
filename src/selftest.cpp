@@ -12,7 +12,7 @@
 #include "bip32.h"
 #include "proxy.h"
 #include "selftest.h"
-#include "p2pool_chain.h"
+#include "p2pool_net.h"
 #include "sigcheck.h"
 #ifndef _WIN32
 #include <sys/wait.h>   // WIFEXITED/WEXITSTATUS for the child-process helper
@@ -6308,6 +6308,522 @@ static int RunP2PoolPeersSelfTest()
 
     nFail += Check((nLocalServices & NODE_P2POOL) != 0, "this node says it holds the share chain") ? 0 : 1;
 
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
+// ---- p2pool-dos: what peers can make the share chain spend ----------------
+// H4 (share side), M6 and L6 of the DoS review: one budget for the RandomX
+// hashes unproven peers cause, asked only after every cheap check; history
+// served and asked for within shared budgets; orphan shares that expire on
+// their own; a byte cap on the shares held.
+
+namespace {
+class CountingGate : public p2pool::WorkGate
+{
+public:
+    explicit CountingGate(bool fOpenIn) : fOpen(fOpenIn), nAsked(0) {}
+    bool Allow() { nAsked++; return fOpen; }
+    bool fOpen;
+    int nAsked;
+};
+}
+
+// A peer past its version, as the message thread sees it.
+static CNode* NewP2PoolTestNode(bool fInbound)
+{
+    CNode* p = new CNode(INVALID_SOCKET, CAddress("127.0.0.1"), fInbound);
+    p->nVersion = VERSION;
+    p->nServices = NODE_P2POOL;
+    p->vSend.clear();
+    p->vSend.SetVersion(VERSION);
+    p->vRecv.SetVersion(VERSION);
+    return p;
+}
+
+static void SendP2PoolTest(CNode* pnode, const char* pszCommand, const CDataStream& ss)
+{
+    CDataStream v(ss);
+    try { P2PoolProcessMessage(pnode, pszCommand, v); }
+    catch (std::exception& e) { printf("       %s: %s\n", pszCommand, e.what()); }
+}
+
+template <typename T>
+static void SendP2PoolTestItem(CNode* pnode, const char* pszCommand, const T& item)
+{
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << item;
+    SendP2PoolTest(pnode, pszCommand, ss);
+}
+
+// Real RandomX work on a share target as easy as targets go.
+static void GrindShare(p2pool::Share& s)
+{
+    CBigNum bnShare;
+    bnShare.SetCompact(s.data.nShareBits);
+    for (s.nNonce = 0; CBigNum(s.Header().GetPoWHash()) > bnShare; s.nNonce++)
+        ;
+}
+
+// A share whose parent nobody has: a valid coinbase paying one address,
+// committing to its data, with real work.
+static p2pool::Share OrphanTestShare(const uint256& parent, unsigned int nClaimedHeight, unsigned int nShareBits,
+                                     const vector<unsigned char>& payout, unsigned int nTime)
+{
+    p2pool::Share s;
+    s.data.hashPrevShare = parent;
+    s.data.nShareHeight = nClaimedHeight;
+    s.data.nShareBits = nShareBits;
+    s.data.payoutScript = payout;
+    s.coinbase.vin.resize(1);
+    s.coinbase.vin[0].prevout.SetNull();
+    s.coinbase.vin[0].scriptSig << 61001 << (int64)nTime << p2pool::CommitmentPush(s.data.GetHash());
+    s.coinbase.vout.push_back(CTxOut(CBlock().GetBlockValue(61001, 0), CScript(payout.begin(), payout.end())));
+    s.nVersion = 1;
+    s.hashPrevBlock = 0;
+    s.hashMerkleRoot = s.coinbase.GetHash();
+    s.nTime = nTime;
+    s.nBits = 0x1d00ffff;
+    GrindShare(s);
+    return s;
+}
+
+static int RunP2PoolDosSelfTest()
+{
+    printf("p2pool-dos self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    string err;
+    RandomXInit();
+
+    // The bucket: three tokens, one more every ten seconds, never past three.
+    {
+        P2PoolBudget b(3, 10);
+        bool fThree = b.Take(1000) && b.Take(1000) && b.Take(1000);
+        bool fFourth = b.Take(1000);
+        bool fEarly = b.Take(1009);
+        bool fRefill = b.Take(1010);
+        nFail += Check(fThree && !fFourth && !fEarly && fRefill && b.Tokens(1000000) == 3,
+                       "a budget of three: three taken, the fourth waits ten seconds, and it fills to three at most") ? 0 : 1;
+    }
+
+    auto script = [](unsigned char tag) {
+        vector<unsigned char> s;
+        s.push_back(0x76); s.push_back(0xa9); s.push_back(20);
+        for (int i = 0; i < 20; i++) s.push_back(tag);
+        s.push_back(0x88); s.push_back(0xac);
+        return s;
+    };
+    const unsigned int EASY = 0x207fffff, HARD = 0x1d00ffff;
+    CBigNum bnEasy;
+    bnEasy.SetCompact(EASY);
+
+    // The gate is asked right before the hash, after every cheap check: not
+    // for a share whose branch is wrong, nor for one that pays the wrong
+    // window; once for one that would be hashed. A closed gate refuses it
+    // with a refusal that blames nobody.
+    {
+        vector<p2pool::WindowShare> window;
+        p2pool::WindowShare w;
+        w.payoutScript = script(1); w.work = 300; window.push_back(w);
+        w.payoutScript = script(2); w.work = 300; window.push_back(w);
+        const int HEIGHT = 61000;
+        p2pool::Share s = MakeTestShare(window, EASY, HARD, HEIGHT);
+        bool fBlock;
+        CountingGate closed(false), open(true);
+        p2pool::Share t = s;
+        t.vMerkleBranch.push_back(uint256(1));
+        bool fBranch = !p2pool::CheckShareWork(t, bnEasy, fBlock, err, true, &closed) &&
+                       err == "the coinbase is not in the merkle root" && closed.nAsked == 0;
+        vector<p2pool::WindowShare> other = window;
+        other[0].work = 600;
+        bool fWindow = !p2pool::CheckShare(s, other, HEIGHT, bnEasy, fBlock, err, true, &closed) &&
+                       err == "the coinbase does not pay the window" && closed.nAsked == 0;
+        nFail += Check(fBranch && fWindow,
+                       "the gate is not asked for a share a cheap check refuses (branch, window)") ? 0 : 1;
+        bool fClosed = !p2pool::CheckShareWork(s, bnEasy, fBlock, err, true, &closed) &&
+                       err == p2pool::WORK_GATE_CLOSED && p2pool::InnocentRefusal(err) && closed.nAsked == 1;
+        bool fClosed2 = !p2pool::CheckShare(s, window, HEIGHT, bnEasy, fBlock, err, true, &closed) &&
+                        err == p2pool::WORK_GATE_CLOSED && closed.nAsked == 2;
+        nFail += Check(fClosed && fClosed2,
+                       "a share past every cheap check asks the gate once; closed, it is refused and nobody is blamed") ? 0 : 1;
+        bool fOpen = p2pool::CheckShare(s, window, HEIGHT, bnEasy, fBlock, err, true, &open) && open.nAsked == 1;
+        nFail += Check(fOpen, "an open gate lets the hash run, and the share is valid") ? 0 : 1;
+    }
+
+    // The node's share chain, at the easiest floor, with real RandomX work.
+    P2PoolResetForTest(bnEasy, true);
+    TestMainView main;
+    main.nBits = HARD;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    unsigned int t0 = (unsigned int)GetTime() - 100;
+    p2pool::Share s0;
+    CRITICAL_BLOCK(cs_p2pool)
+        s0 = ChainShare(P2PoolChain(), main, 0, script(1), t0);
+    GrindShare(s0);
+    unsigned int nBits0;
+    CRITICAL_BLOCK(cs_p2pool)
+        nBits0 = P2PoolChain().NextShareBits(s0.GetId());
+
+    // Every orphan this test sends, ground before anything is timed.
+    vector<p2pool::Share> vOrphans;
+    for (int i = 0; i < 120; i++)
+    {
+        uint256 parent = Hash(BEGIN(i), END(i)) ^ uint256(77);
+        vOrphans.push_back(OrphanTestShare(parent, 3, nBits0, script((unsigned char)(10 + i % 40)), t0 + 1 + i));
+    }
+    size_t iNext = 0;
+
+    CNode* pOut = NewP2PoolTestNode(false);
+    SendP2PoolTestItem(pOut, "p2pshare", s0);
+    bool fRoot;
+    CRITICAL_BLOCK(cs_p2pool)
+        fRoot = P2PoolChain().Tip() == s0.GetId();
+    nFail += Check(fRoot, "a share from a peer this node dialled starts the chain") ? 0 : 1;
+
+    // A peer this node dialled is proven: forty orphans from it are all
+    // hashed and queued, past the shared budget's thirty-two.
+    int nTokens0 = P2PoolShareWorkTokens();
+    for (int i = 0; i < 40; i++)
+        SendP2PoolTestItem(pOut, "p2pshare", vOrphans[iNext++]);
+    nFail += Check(P2PoolOrphanCount() == 40 && P2PoolShareWorkTokens() >= nTokens0,
+                   "forty orphans from a dialled peer are all queued, and draw nothing from the shared budget") ? 0 : 1;
+
+    // A backlog that big makes this node ask for a history -- but not
+    // because a share it has already hashed comes again over a new
+    // connection: that re-armed the ask on every reconnect.
+    CNode* pAgain = NewP2PoolTestNode(true);
+    SendP2PoolTestItem(pAgain, "p2pshare", vOrphans[5]);
+    nFail += Check(pAgain->nP2PoolSyncAskedAt == 0 && P2PoolOrphanCount() == 40,
+                   "an orphan already hashed, sent again by a new inbound peer, opens no history ask") ? 0 : 1;
+
+    // New orphans from three new inbound peers: each is hashed (budget), but
+    // only two of them are asked for their history (the shared ask budget).
+    int nAsked = 0;
+    vector<CNode*> vIn;
+    for (int i = 0; i < 3; i++)
+    {
+        vIn.push_back(NewP2PoolTestNode(true));
+        SendP2PoolTestItem(vIn.back(), "p2pshare", vOrphans[iNext++]);
+        nAsked += vIn.back()->nP2PoolSyncAskedAt != 0;
+    }
+    nFail += Check(P2PoolOrphanCount() == 43 && nAsked == 2,
+                   strprintf("three new inbound peers with new orphans: all queued, %d of them asked for a history (2)", nAsked).c_str()) ? 0 : 1;
+
+    // One unproven inbound peer with sixty new orphans: only what is left of
+    // the shared budget is hashed; the rest are not, and it is not blamed.
+    CNode* pFlood = NewP2PoolTestNode(true);
+    int nLeft = P2PoolShareWorkTokens();
+    int64 nStart = GetTime();
+    size_t nBefore = P2PoolOrphanCount();
+    for (int i = 0; i < 60; i++)
+        SendP2PoolTestItem(pFlood, "p2pshare", vOrphans[iNext++]);
+    int64 nSlack = (GetTime() - nStart) / 2 + 1;
+    size_t nQueued = P2PoolOrphanCount() - nBefore;
+    nFail += Check(nQueued >= (size_t)nLeft && nQueued <= (size_t)(nLeft + nSlack) && nQueued < 60 &&
+                   pFlood->nMisbehavior == 0 && P2PoolDeferredCount() == 1,
+                   strprintf("sixty orphans from one unproven inbound peer: %u hashed (budget %d), the rest refused "
+                             "unblamed, its newest held for later", (unsigned)nQueued, nLeft).c_str()) ? 0 : 1;
+    P2PoolForgetDeferred(pFlood);
+
+    // The budget is spent, and a dialled peer is still heard in full.
+    nBefore = P2PoolOrphanCount();
+    for (int i = 0; i < 5; i++)
+        SendP2PoolTestItem(pOut, "p2pshare", vOrphans[iNext++]);
+    nFail += Check(P2PoolOrphanCount() == nBefore + 5, "with the budget spent, five orphans from a dialled peer are still taken") ? 0 : 1;
+
+    // A dialled peer that has since misbehaved goes through the budget like an
+    // unproven one: proven status is not taken back within a connection.
+    {
+        P2PoolDrainBudgetsForTest();
+        CNode* pBad = NewP2PoolTestNode(false);
+        pBad->nMisbehavior = 20;
+        size_t n0 = P2PoolOrphanCount();
+        SendP2PoolTestItem(pBad, "p2pshare", vOrphans[iNext++]);
+        bool fGated = P2PoolOrphanCount() == n0 && P2PoolDeferredCount() == 1;
+        P2PoolForgetDeferred(pBad);
+        delete pBad;
+        nFail += Check(fGated, "a dialled peer that has misbehaved draws on the shared budget; spent, its share waits") ? 0 : 1;
+    }
+
+    // A share the spent budget refuses an unproven peer is held, not lost, and
+    // taken once the budget refills: a miner that dials out and listens for
+    // nobody is unproven at every node it reaches, and its shares are its pay.
+    {
+        p2pool::Share sChild;
+        CRITICAL_BLOCK(cs_p2pool)
+            sChild = ChainShare(P2PoolChain(), main, s0.GetId(), script(3), t0 + 10);
+        GrindShare(sChild);
+        CNode* pMiner = NewP2PoolTestNode(true);
+        P2PoolDrainBudgetsForTest();
+        SendP2PoolTestItem(pMiner, "p2pshare", sChild);
+        bool fNotYet;
+        CRITICAL_BLOCK(cs_p2pool)
+            fNotYet = !P2PoolChain().Has(sChild.GetId());
+        bool fHeld = fNotYet && P2PoolDeferredCount() == 1 && pMiner->nMisbehavior == 0 && !P2PoolPeerProven(pMiner);
+        P2PoolServeDeferred();   // still no token: it stays
+        bool fStill = P2PoolDeferredCount() == 1;
+        P2PoolRefillBudgetsForTest();
+        // With tokens back, a share that comes in live on a newer connection
+        // waits behind the held one instead of taking the token first.
+        CNode* pLate = NewP2PoolTestNode(true);
+        pLate->nTimeConnected = pMiner->nTimeConnected + 1;
+        size_t nOrphans0 = P2PoolOrphanCount();
+        SendP2PoolTestItem(pLate, "p2pshare", vOrphans[iNext++]);
+        bool fBehind = P2PoolOrphanCount() == nOrphans0 && P2PoolDeferredCount() == 2;
+        P2PoolServeDeferred();
+        bool fTaken;
+        CRITICAL_BLOCK(cs_p2pool)
+            fTaken = P2PoolChain().Has(sChild.GetId());
+        nFail += Check(fHeld && fStill && fTaken && P2PoolDeferredCount() == 0 && P2PoolPeerProven(pMiner),
+                       "an unproven peer's share the spent budget refused is held, then taken when the budget refills") ? 0 : 1;
+        nFail += Check(fBehind && P2PoolOrphanCount() == nOrphans0 + 1,
+                       "a live share on a newer connection waits behind the held one, and is hashed after it") ? 0 : 1;
+        delete pMiner;
+        delete pLate;
+
+        // A connection that closes meanwhile loses what was held for it.
+        CNode* pGone = NewP2PoolTestNode(true);
+        P2PoolDrainBudgetsForTest();
+        SendP2PoolTestItem(pGone, "p2pshare", vOrphans[iNext++]);
+        bool fHeld2 = P2PoolDeferredCount() == 1;
+        pGone->fDisconnect = true;
+        P2PoolRefillBudgetsForTest();
+        size_t n0 = P2PoolOrphanCount();
+        P2PoolServeDeferred();
+        nFail += Check(fHeld2 && P2PoolDeferredCount() == 0 && P2PoolOrphanCount() == n0,
+                       "what was held for a connection that closed is dropped, not hashed") ? 0 : 1;
+        delete pGone;
+    }
+
+    // Orphans expire on their own clock, not only when another is queued:
+    // a full backlog stayed full for good, and kept history asks armed.
+    P2PoolAgeOrphansForTest(20 * 60 + 1);
+    SendP2PoolTestItem(pOut, "p2pshare", s0);   // already held: queues nothing
+    nFail += Check(P2PoolOrphanCount() == 0, "orphans past their expiry are gone at the next share, though none was queued") ? 0 : 1;
+
+    // History served: four times to new unproven peers, then they wait for
+    // the shared budget; a dialled peer is served regardless.
+    int nServed = 0;
+    vector<CNode*> vAsk;
+    for (int i = 0; i < 6; i++)
+    {
+        vAsk.push_back(NewP2PoolTestNode(true));
+        SendP2PoolTest(vAsk.back(), "p2psync", CDataStream(SER_NETWORK, VERSION));
+        nServed += vAsk.back()->vSend.size() != 0;
+    }
+    CNode* pOut2 = NewP2PoolTestNode(false);
+    SendP2PoolTest(pOut2, "p2psync", CDataStream(SER_NETWORK, VERSION));
+    nFail += Check(nServed == 4 && pOut2->vSend.size() != 0 && P2PoolDeferredCount() == 2,
+                   strprintf("six new inbound peers asking for the history: %d served (4), the other two held; "
+                             "a dialled peer is served", nServed).c_str()) ? 0 : 1;
+    for (size_t i = 0; i < vAsk.size(); i++)
+        P2PoolForgetDeferred(vAsk[i]);
+    // One history in the life of an unproven connection: asking again, even
+    // past the interval, neither gets one nor keeps a place in the queue.
+    {
+        CNode* pServed = vAsk[0];
+        P2PoolRefillBudgetsForTest();
+        pServed->nP2PoolSyncServed = GetTime() - 3600;
+        size_t nSent = pServed->vSend.size();
+        SendP2PoolTest(pServed, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        nFail += Check(pServed->vSend.size() == nSent && P2PoolDeferredCount() == 0,
+                       "an unproven peer that already had its history gets no second one, and holds no place") ? 0 : 1;
+    }
+
+    // Nor is a history started for an inbound peer past what inbound peers
+    // together hold queued (a proven one counts: one share relayed first
+    // proves a peer); it waits, and is sent once there is room. A peer this
+    // node dialled is served whatever others hold.
+    {
+        P2PoolRefillBudgetsForTest();
+        CNode* pFull = NewP2PoolTestNode(true);
+        pFull->nP2PoolLastGood = GetTime();
+        pFull->vSend.resize(65 * 1000 * 1000);
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.push_back(pFull);
+        CNode* pIn = NewP2PoolTestNode(true);
+        SendP2PoolTest(pIn, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        bool fHeld = pIn->vSend.size() == 0 && P2PoolDeferredCount() == 1 && !pFull->fDisconnect;
+        CNode* pOut3 = NewP2PoolTestNode(false);
+        SendP2PoolTest(pOut3, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        bool fDialled = pOut3->vSend.size() != 0;
+        P2PoolServeDeferred();
+        bool fStill = pIn->vSend.size() == 0 && P2PoolDeferredCount() == 1;
+        pFull->vSend.clear();
+        P2PoolServeDeferred();
+        bool fLater = pIn->vSend.size() != 0 && P2PoolDeferredCount() == 0;
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), pFull), vNodes.end());
+        P2PoolForgetDeferred(pIn);
+        delete pFull;
+        delete pIn;
+        delete pOut3;
+        nFail += Check(fHeld && fDialled && fStill && fLater,
+                       "with 65 MB queued to inbound peers, an inbound peer's history waits and is sent once "
+                       "there is room; a dialled peer is served at once") ? 0 : 1;
+    }
+
+    // An inbound peer that still has a history's worth queued long after it
+    // was sent one reads too slowly: while inbound queues are over the cap it
+    // is cut off, and the waiting ask is answered.
+    {
+        P2PoolRefillBudgetsForTest();
+        CNode* pSlow = NewP2PoolTestNode(true);
+        pSlow->nP2PoolLastGood = GetTime();
+        pSlow->nP2PoolSyncServed = GetTime() - 3600;
+        pSlow->vSend.resize(65 * 1000 * 1000);
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.push_back(pSlow);
+        CNode* pNew = NewP2PoolTestNode(true);
+        SendP2PoolTest(pNew, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        bool fDropped = pSlow->fDisconnect && pNew->vSend.size() == 0 && P2PoolDeferredCount() == 1;
+        P2PoolServeDeferred();
+        bool fServed = pNew->vSend.size() != 0 && P2PoolDeferredCount() == 0;
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), pSlow), vNodes.end());
+        P2PoolForgetDeferred(pNew);
+        delete pSlow;
+        delete pNew;
+        nFail += Check(fDropped && fServed,
+                       "an inbound peer still holding a history's worth 15 minutes after it was sent one is cut off "
+                       "when inbound queues are full, and the waiting ask is answered") ? 0 : 1;
+    }
+
+    // The bytes of the shares held are capped (L6): side lines go, the tip's
+    // line stays, and every count stays true.
+    {
+        p2pool::ShareChain c(bnEasy, false);
+        unsigned int t = (unsigned int)main.nNow - 1000;
+        vector<uint256> line;
+        uint256 prev = 0;
+        bool fBuilt = true;
+        for (int i = 0; i < 20 && fBuilt; i++)
+        {
+            p2pool::Share s = ChainShare(c, main, prev, script((unsigned char)(1 + i % 3)), t + 10 * i);
+            fBuilt = c.Add(s, main, err);
+            prev = s.GetId();
+            line.push_back(prev);
+        }
+        // A side line far behind the tip in work (forked from the second
+        // share): a line near the tip is kept whatever the caps say.
+        vector<uint256> side;
+        uint256 sp = line[1];
+        for (int i = 0; i < 2 && fBuilt; i++)
+        {
+            p2pool::Share s = ChainShare(c, main, sp, script(9), t + 10 * 1 + 5 + 10 * i);
+            fBuilt = c.Add(s, main, err);
+            sp = s.GetId();
+            side.push_back(sp);
+        }
+        bool fInv = c.CheckInvariants(err);
+        if (!fInv) printf("       %s\n", err.c_str());
+        size_t nAll = c.Bytes();
+        // Below what the tip's line holds: the cap is then that line's bytes.
+        c.SetMaxBytesForTest(1);
+        p2pool::Share next = ChainShare(c, main, line.back(), script(4), t + 300);
+        fBuilt = fBuilt && c.Add(next, main, err);
+        bool fSideGone = true, fLineKept = c.Has(next.GetId());
+        for (size_t i = 0; i < side.size(); i++)
+            fSideGone &= !c.Has(side[i]);
+        for (size_t i = 0; i < line.size(); i++)
+            fLineKept &= c.Has(line[i]);
+        bool fInv2 = c.CheckInvariants(err);
+        if (!fInv2) printf("       %s\n", err.c_str());
+        nFail += Check(fBuilt && fInv && fInv2 && fSideGone && fLineKept &&
+                       c.Bytes() < nAll + ::GetSerializeSize(next, SER_NETWORK),
+                       "past the byte cap the side line goes, the tip's line stays, the counts stay true") ? 0 : 1;
+
+        c.SetMaxBytesForTest(p2pool::MAX_CHAIN_BYTES);
+        // A share held on trust is dropped when its parent comes checked in
+        // full, found through the index by parent.
+        p2pool::Share parent = ChainShare(c, main, next.GetId(), script(5), t + 310);
+        p2pool::Share child = OrphanTestShare(parent.GetId(), parent.data.nShareHeight + 1, c.NextShareBits(0),
+                                              script(6), t + 320);
+        bool fTrusted = c.AddTrusted(child, err) && c.TrustedBytes() > 0;
+        bool fParent = c.Add(parent, main, err);
+        bool fInv3 = c.CheckInvariants(err);
+        if (!fInv3) printf("       %s\n", err.c_str());
+        nFail += Check(fTrusted && fParent && !c.Has(child.GetId()) && c.TrustedBytes() == 0 && fInv3,
+                       "a share held on trust under a parent then checked in full is dropped, and its bytes with it") ? 0 : 1;
+    }
+
+    // What the tip's line holds may pass the byte cap by itself (a window
+    // paying thousands of addresses). A line still in play is kept even then:
+    // a share at the tip's height, which a nephew then names as an uncle, and
+    // a line forked near the tip that overtakes it. Evicted the moment they
+    // came, this node stalled while every node with room moved on. A side
+    // share far behind the tip in work still goes.
+    {
+        p2pool::ShareChain c(bnEasy, false);
+        unsigned int t = (unsigned int)main.nNow - 1000;
+        vector<uint256> line;
+        uint256 prev = 0;
+        bool fBuilt = true;
+        for (int i = 0; i < 30 && fBuilt; i++)
+        {
+            p2pool::Share s = ChainShare(c, main, prev, script((unsigned char)(1 + i % 3)), t + 10 * i);
+            fBuilt = c.Add(s, main, err);
+            prev = s.GetId();
+            line.push_back(prev);
+        }
+        c.SetMaxBytesForTest(1);
+        p2pool::Share sib = ChainShare(c, main, line[28], script(7), t + 10 * 29 + 3);
+        bool fSib = fBuilt && c.Add(sib, main, err) && c.Has(sib.GetId());
+        p2pool::Share nephew = ChainShare(c, main, line[29], script(8), t + 10 * 30, vector<uint256>(1, sib.GetId()));
+        bool fNephew = c.Add(nephew, main, err) && c.Tip() == nephew.GetId() && c.Has(sib.GetId());
+        if (!fNephew) printf("       nephew: %s\n", err.c_str());
+        // A line forked four shares back, grown past the tip.
+        uint256 fp = line[26];
+        bool fFork = true;
+        vector<uint256> fork;
+        for (int i = 0; i < 8 && fFork; i++)
+        {
+            p2pool::Share s = ChainShare(c, main, fp, script(9), t + 10 * 31 + 10 * i + 5);
+            fFork = c.Add(s, main, err) && c.Has(s.GetId());
+            fp = s.GetId();
+            fork.push_back(fp);
+        }
+        bool fOvertook = fFork && c.Tip() == fork.back();
+        if (!fOvertook) printf("       fork: %s\n", err.c_str());
+        // Far behind in work: forked from the third share, it goes at once.
+        p2pool::Share deep = ChainShare(c, main, line[2], script(10), t + 25);
+        bool fDeepAdded = c.Add(deep, main, err);
+        bool fDeepGone = fDeepAdded && !c.Has(deep.GetId());
+        bool fInv = c.CheckInvariants(err);
+        if (!fInv) printf("       %s\n", err.c_str());
+        nFail += Check(fSib && fNephew && fOvertook && fDeepGone && fInv,
+                       "past the byte cap a share at the tip's height stays and its nephew is taken, a line forked "
+                       "near the tip overtakes, a side share far behind in work goes") ? 0 : 1;
+    }
+
+    string errInv;
+    bool fChainInv;
+    CRITICAL_BLOCK(cs_p2pool)
+        fChainInv = P2PoolChain().CheckInvariants(errInv);
+    if (!fChainInv) printf("       %s\n", errInv.c_str());
+    nFail += Check(fChainInv, "the node's share chain holds its invariants after all that") ? 0 : 1;
+
+    delete pOut;
+    delete pOut2;
+    delete pAgain;
+    delete pFlood;
+    for (size_t i = 0; i < vIn.size(); i++) delete vIn[i];
+    for (size_t i = 0; i < vAsk.size(); i++) delete vAsk[i];
+    P2PoolResetForTest(bnProofOfWorkLimit, true);
     SetCurrentDir(cwd);
     RemoveTree(tmp);
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
@@ -13995,6 +14511,8 @@ int RunSelfTest(const std::string& name)
         return RunP2PoolSyncSelfTest();
     if (name == "p2pool-peers")
         return RunP2PoolPeersSelfTest();
+    if (name == "p2pool-dos")
+        return RunP2PoolDosSelfTest();
     if (name == "p2pool-chain")
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")
@@ -14077,6 +14595,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }

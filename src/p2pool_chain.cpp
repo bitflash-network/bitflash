@@ -291,13 +291,26 @@ bool ShareChain::GetShare(const uint256& id, Share& out) const
     return true;
 }
 
-bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock)
+bool ShareChain::Add(const Share& s, const MainView& main, string& errOut, vector<uint256>* pvMissing, bool* pfBlock,
+                     WorkGate* pGate)
 {
-    return AddInContext(s, main, errOut, pvMissing, pfBlock);
+    return AddInContext(s, main, errOut, pvMissing, pfBlock, pGate);
+}
+
+void ShareChain::Keep(const uint256& id, const Entry& e)
+{
+    Drop(id);
+    mapShares[id] = e;
+    nBytes += e.nSize;
+    if (e.fTrusted)
+    {
+        nTrustedBytes += e.nSize;
+        mapTrustedByParent.insert(make_pair(e.share.data.hashPrevShare, id));
+    }
 }
 
 bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errOut,
-                              vector<uint256>* pvMissing, bool* pfBlock)
+                              vector<uint256>* pvMissing, bool* pfBlock, WorkGate* pGate)
 {
     if (pvMissing) pvMissing->clear();
     if (pfBlock) *pfBlock = false;
@@ -367,7 +380,7 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
         return false;
 
     bool fBlock = false;
-    if (!CheckShare(s, window, nBlockHeight, bnFloor, fBlock, errOut, fCheckPoW))
+    if (!CheckShare(s, window, nBlockHeight, bnFloor, fBlock, errOut, fCheckPoW, pGate))
         return false;
 
     Entry e;
@@ -379,15 +392,16 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
         e.bnOwnWork += CBigNum((uint64)Get(d.vUncles[i])->work);
     e.bnChainWork = (parent ? parent->bnChainWork : CBigNum(0)) + e.bnOwnWork;
     e.fTrusted = false;
-    mapShares[id] = e;
+    e.nSize = ::GetSerializeSize(s, SER_NETWORK);
+    Keep(id, e);
 
     // A share taken on its work alone, from an earlier history, cannot hang
     // on a share checked in full: it would carry whatever it says onto this
     // line unchecked.
     vector<uint256> vTrustedChildren;
-    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
-        if (it->second.fTrusted && it->second.share.data.hashPrevShare == id)
-            vTrustedChildren.push_back(it->first);
+    for (multimap<uint256, uint256>::const_iterator it = mapTrustedByParent.lower_bound(id);
+         it != mapTrustedByParent.end() && it->first == id; ++it)
+        vTrustedChildren.push_back(it->second);
     for (size_t i = 0; i < vTrustedChildren.size(); i++)
         Drop(vTrustedChildren[i]);
 
@@ -411,14 +425,23 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     // node's limit, not the sender's fault. Refusing at once let the first
     // peers to answer fill the room with lines of no work and keep the
     // honest history out.
-    if (mapShares.size() >= MAX_CHAIN_SHARES)
-        Evict(1);
-    if (mapShares.size() >= MAX_CHAIN_SHARES)
-        return Fail(errOut, "here: no room for more history");
+    size_t nShareBytes = ::GetSerializeSize(s, SER_NETWORK);
+    if (mapShares.size() >= MAX_CHAIN_SHARES || nBytes + nShareBytes > nMaxBytes)
+    {
+        Evict(1, nShareBytes);
+        if (mapShares.size() >= MAX_CHAIN_SHARES)
+            return Fail(errOut, "here: no room for more history");
+        if (nBytes + nShareBytes > nMaxBytes)
+        {
+            set<uint256> keep;
+            Kept(keep);
+            if (nBytes + nShareBytes > ByteCap(keep))
+                return Fail(errOut, "here: no room for more history");
+        }
+    }
     // And in bytes: what such a share pays is never checked, so a history of
     // shares as big as a message allows would otherwise be kept whole.
-    size_t nBytes = ::GetSerializeSize(s, SER_NETWORK);
-    if (nTrustedBytes + nBytes > MAX_TRUSTED_BYTES)
+    if (nTrustedBytes + nShareBytes > MAX_TRUSTED_BYTES)
         return Fail(errOut, "here: no room for more history");
     bool fBlock;
     if (!CheckShareWork(s, bnFloor, fBlock, errOut, fCheckPoW))
@@ -444,8 +467,8 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
                 e.bnOwnWork += CBigNum((uint64)Get(d.vUncles[i])->work);
     e.bnChainWork = (parent ? parent->bnChainWork : CBigNum(0)) + e.bnOwnWork;
     e.fTrusted = true;
-    mapShares[id] = e;
-    nTrustedBytes += nBytes;
+    e.nSize = nShareBytes;
+    Keep(id, e);
     return true;
 }
 
@@ -454,12 +477,93 @@ void ShareChain::Drop(const uint256& id)
     map<uint256, Entry>::iterator it = mapShares.find(id);
     if (it == mapShares.end())
         return;
-    if (it->second.fTrusted)
+    const Entry& e = it->second;
+    nBytes = e.nSize > nBytes ? 0 : nBytes - e.nSize;
+    if (e.fTrusted)
     {
-        size_t n = ::GetSerializeSize(it->second.share, SER_NETWORK);
-        nTrustedBytes = n > nTrustedBytes ? 0 : nTrustedBytes - n;
+        nTrustedBytes = e.nSize > nTrustedBytes ? 0 : nTrustedBytes - e.nSize;
+        const uint256& parent = e.share.data.hashPrevShare;
+        for (multimap<uint256, uint256>::iterator t = mapTrustedByParent.lower_bound(parent);
+             t != mapTrustedByParent.end() && t->first == parent; ++t)
+            if (t->second == id)
+            {
+                mapTrustedByParent.erase(t);
+                break;
+            }
     }
     mapShares.erase(it);
+}
+
+bool ShareChain::CheckInvariants(string& errOut) const
+{
+    size_t nAll = 0, nTrusted = 0, nIndexed = 0;
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+    {
+        const Entry& e = it->second;
+        if (it->first != e.share.GetId())
+            return Fail(errOut, "a share held under another id");
+        if (e.nSize != ::GetSerializeSize(e.share, SER_NETWORK))
+            return Fail(errOut, "a share's byte count is wrong");
+        nAll += e.nSize;
+        if (e.fTrusted)
+        {
+            nTrusted += e.nSize;
+            bool fIndexed = false;
+            const uint256& parent = e.share.data.hashPrevShare;
+            for (multimap<uint256, uint256>::const_iterator t = mapTrustedByParent.lower_bound(parent);
+                 t != mapTrustedByParent.end() && t->first == parent; ++t)
+                fIndexed |= t->second == it->first;
+            if (!fIndexed)
+                return Fail(errOut, "a trusted share missing from the parent index");
+        }
+        else
+        {
+            const Entry* p = Get(e.share.data.hashPrevShare);
+            if (p && e.nHeight != p->nHeight + 1)
+                return Fail(errOut, "a share checked in full not one past its parent");
+            if (!p && e.share.data.hashPrevShare == 0 && e.nHeight != 0)
+                return Fail(errOut, "a first share not at height 0");
+            if ((int)e.share.data.nShareHeight != e.nHeight)
+                return Fail(errOut, "a share checked in full held at another height");
+        }
+    }
+    for (multimap<uint256, uint256>::const_iterator t = mapTrustedByParent.begin(); t != mapTrustedByParent.end(); ++t)
+    {
+        const Entry* e = Get(t->second);
+        if (!e || !e->fTrusted || e->share.data.hashPrevShare != t->first)
+            return Fail(errOut, "the parent index names a share not held on trust under that parent");
+        nIndexed++;
+    }
+    if (nAll != nBytes || nTrusted != nTrustedBytes)
+        return Fail(errOut, "byte counts out of step with the shares held");
+    if (nTrustedBytes > MAX_TRUSTED_BYTES)
+        return Fail(errOut, "more bytes held on trust than MAX_TRUSTED_BYTES");
+    if (hashTip != 0)
+    {
+        const Entry* t = Get(hashTip);
+        if (!t)
+            return Fail(errOut, "the tip is not held");
+        if (t->fTrusted)
+            return Fail(errOut, "the tip was taken on trust");
+    }
+    else if (mapShares.size() && !std::all_of(mapShares.begin(), mapShares.end(),
+                                              [](const pair<const uint256, Entry>& p) { return p.second.fTrusted; }))
+        return Fail(errOut, "shares checked in full but no tip");
+    // Over a cap only with nothing left that Evict may drop: every share
+    // held is kept (Kept) or has children.
+    if (mapShares.size() > MAX_CHAIN_SHARES || nBytes > nMaxBytes)
+    {
+        set<uint256> keep, parents;
+        Kept(keep);
+        if (mapShares.size() <= MAX_CHAIN_SHARES && nBytes <= ByteCap(keep))
+            return true;
+        for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+            parents.insert(it->second.share.data.hashPrevShare);
+        for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+            if (!keep.count(it->first) && !parents.count(it->first))
+                return Fail(errOut, "over a cap with a side line still held");
+    }
+    return true;
 }
 
 bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut)
@@ -670,21 +774,87 @@ void ShareChain::Prune()
 // room is free again. Never the tip's line nor an uncle it names, which a
 // template's window needs. A dropped share that later turns out to matter
 // is asked for again like any missing one.
-void ShareChain::Evict(size_t nRoom)
+//
+// A side line still near the tip in work is kept as well: a share at the
+// tip's height, which a later share may name as an uncle, or a line about to
+// overtake. Evicted the moment it came, as it was once the bytes the tip's
+// line holds passed the byte cap's target, the uncle was asked for again and
+// dropped again, and an overtaking line could never win here while every
+// node with room moved to it. "Near" is chain work, not height: a line of
+// shares at the floor reaches any height cheaply, but not the tip's work.
+// A line too short for NEAR_TIP_SHARES keeps only itself; it holds little.
+void ShareChain::Kept(set<uint256>& keep) const
 {
-    if (mapShares.size() + nRoom <= MAX_CHAIN_SHARES)
-        return;
-    set<uint256> keep;
     uint256 cur = hashTip;
+    const Entry* pNear = NULL;
     for (unsigned int n = 0; n < HISTORY_SHARES + 10 && cur != 0; n++)
     {
         const Entry* e = Get(cur);
         if (!e)
             break;
+        if (n == (unsigned int)NEAR_TIP_SHARES)
+            pNear = e;
         keep.insert(cur);
         keep.insert(e->share.data.vUncles.begin(), e->share.data.vUncles.end());
         cur = e->share.data.hashPrevShare;
     }
+    if (!pNear)
+        return;
+    // The newest share of each such line (a share no other names as parent),
+    // the heaviest MAX_NEAR_TIP_LINES of them: the shares behind one have a
+    // child and are not dropped while it stays. Each costs a share's work at
+    // the line's own target, and the count of them is bounded all the same.
+    set<uint256> parents;
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+        parents.insert(it->second.share.data.hashPrevShare);
+    vector<pair<CBigNum, uint256> > vNear;
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+    {
+        const Entry& e = it->second;
+        if (e.fTrusted || e.bnChainWork < pNear->bnChainWork || keep.count(it->first) || parents.count(it->first))
+            continue;
+        vNear.push_back(make_pair(e.bnChainWork, it->first));
+    }
+    std::sort(vNear.begin(), vNear.end(),
+              [](const pair<CBigNum, uint256>& a, const pair<CBigNum, uint256>& b) {
+                  return a.first > b.first || (a.first == b.first && a.second < b.second);
+              });
+    for (size_t i = 0; i < vNear.size() && i < MAX_NEAR_TIP_LINES; i++)
+    {
+        const Entry* e = Get(vNear[i].second);
+        keep.insert(vNear[i].second);
+        keep.insert(e->share.data.vUncles.begin(), e->share.data.vUncles.end());
+    }
+}
+
+size_t ShareChain::ByteCap(const set<uint256>& keep) const
+{
+    size_t nKept = 0;
+    for (set<uint256>::const_iterator it = keep.begin(); it != keep.end(); ++it)
+    {
+        const Entry* e = Get(*it);
+        if (e)
+            nKept += e->nSize;
+    }
+    return std::max(nMaxBytes, nKept + nMaxBytes / 2);
+}
+
+// The same past the byte cap, down to a quarter of MAX_CHAIN_BYTES below it:
+// when what is kept passes the cap by itself, a quarter of MAX_CHAIN_BYTES
+// stays for side lines, the heaviest last, so a heavier line forked deeper
+// than NEAR_TIP_SHARES still has room to come in before it is near the tip.
+void ShareChain::Evict(size_t nRoom, size_t nRoomBytes)
+{
+    bool fCount = mapShares.size() + nRoom > MAX_CHAIN_SHARES;
+    bool fBytes = nBytes + nRoomBytes > nMaxBytes;
+    if (!fCount && !fBytes)
+        return;
+    set<uint256> keep;
+    Kept(keep);
+    size_t nCap = ByteCap(keep);
+    fBytes = nBytes + nRoomBytes > nCap;
+    if (!fCount && !fBytes)
+        return;
     map<uint256, int> children;
     for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
         if (Has(it->second.share.data.hashPrevShare))
@@ -694,7 +864,8 @@ void ShareChain::Evict(size_t nRoom)
         if (!keep.count(it->first) && !children.count(it->first))
             leaves.insert(make_pair(it->second.bnChainWork, it->first));
     size_t nTarget = MAX_CHAIN_SHARES * 3 / 4;
-    while (mapShares.size() > nTarget && !leaves.empty())
+    size_t nTargetBytes = nCap - nMaxBytes / 4;
+    while (((fCount && mapShares.size() > nTarget) || (fBytes && nBytes > nTargetBytes)) && !leaves.empty())
     {
         uint256 id = leaves.begin()->second;
         leaves.erase(leaves.begin());

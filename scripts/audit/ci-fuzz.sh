@@ -50,12 +50,13 @@ if ! make -j "$J" RANDOMX_DIR="$RANDOMX_DIR" FUZZ_CXX="$fcxx" \
 fi
 bin=$SRC/src/$t
 
-# The payload, deserializer, decoder, script and v4-templates harnesses write
-# structured seeds of their own; they join the corpus (a kept one too:
-# fuzz-script's predates its structured spends) without replacing anything.
-# The others start from one byte.
+# The payload, deserializer, decoder, script, v4-templates, P2Pool and
+# light-peer harnesses write structured seeds of their own; they join the
+# corpus (a kept one too, so seeds added later reach it) without replacing
+# anything. The others start from one byte.
 if [ "$t" = fuzz-p2p-payload ] || [ "$t" = fuzz-deserialize ] || [ "$t" = fuzz-decoders ] ||
-   [ "$t" = fuzz-script ] || [ "$t" = fuzz-v4-templates ]; then
+   [ "$t" = fuzz-script ] || [ "$t" = fuzz-v4-templates ] || [ "$t" = fuzz-p2pool ] ||
+   [ "$t" = fuzz-light-peer ]; then
     sd=$OUT/seeds-$t
     rm -rf "$sd"; mkdir -p "$sd"
     BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true
