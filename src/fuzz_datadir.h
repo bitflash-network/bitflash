@@ -54,13 +54,16 @@ extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv)
 // fuzz-net-message (22.7 M inputs, the environment opened once) stopped on
 // exactly these two blocks, 136 bytes. The 711 leak reports of the fork-mode
 // campaign before it, whose stacks fork mode does not keep, behaved the same
-// way: none of their inputs reproduces a leak on its own. Only blocks
-// __env_alloc makes are suppressed. A Db, DbEnv or DbTxn the node leaks is
-// allocated with operator new and is still reported (that is how the CDB
-// open leak was found), and so is any other allocation inside libdb.
+// way: none of their inputs reproduces a leak on its own. Allocations made
+// inside libdb are suppressed by its allocator, __os_malloc: libdb is built
+// without frame pointers, so most of its stacks stop there (a narrower
+// pattern, __env_alloc, left the fuzz-p2p-payload smoke stopping on six
+// blocks whose stack ends at __os_malloc). A Db, DbEnv or DbTxn the node
+// leaks is allocated with operator new from node code and is still reported
+// (that is how the CDB open leak was found).
 extern "C" const char* __lsan_default_suppressions()
 {
-    return "leak:__env_alloc\n";
+    return "leak:__os_malloc\n";
 }
 
 // What a node builds for its whole run (block index entries, orphan blocks

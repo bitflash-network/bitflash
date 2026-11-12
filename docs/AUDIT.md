@@ -118,8 +118,8 @@ per target: what one engine finds is minimised into the corpus
 `crashes/<engine>-<target>-*`; replay one with `./<target> <file>`.
 
 LeakSanitizer settings shared by every harness that links the node are in
-`src/fuzz_datadir.h`: the blocks Berkeley DB allocates for its environment's
-regions (`__env_alloc`) are suppressed, since a heap scan cannot see what
+`src/fuzz_datadir.h`: the blocks Berkeley DB allocates internally
+(`__os_malloc`) are suppressed, since a heap scan cannot see what
 references them, and there is no leak check at exit, where the node's global
 maps would all read as leaks. libFuzzer still checks after every input. A
 `leak-*` file is replayed as a corpus, `./<target> -runs=0 <dir holding it>`,
