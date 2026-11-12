@@ -50,18 +50,17 @@ if ! make -j "$J" RANDOMX_DIR="$RANDOMX_DIR" FUZZ_CXX="$fcxx" \
 fi
 bin=$SRC/src/$t
 
-# The payload, deserializer, decoder, script, v4-templates, P2Pool and
-# light-peer harnesses write structured seeds of their own; they join the
-# corpus (a kept one too, so seeds added later reach it) without replacing
-# anything. The others start from one byte.
-if [ "$t" = fuzz-p2p-payload ] || [ "$t" = fuzz-deserialize ] || [ "$t" = fuzz-decoders ] ||
-   [ "$t" = fuzz-script ] || [ "$t" = fuzz-v4-templates ] || [ "$t" = fuzz-p2pool ] ||
-   [ "$t" = fuzz-light-peer ]; then
+# Some harnesses write structured seeds of their own (the payload,
+# deserializer, decoder, script, v4-templates, P2Pool, light-peer, Tor,
+# SOCKS5, RPC and HTTP client ones); they join the corpus (a kept one too,
+# so seeds added later reach it) without replacing anything. The others
+# start from one byte.
+case " fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client " in *" $t "*)
     sd=$OUT/seeds-$t
     rm -rf "$sd"; mkdir -p "$sd"
     BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true
-    cp -n "$sd"/* "$CORPUS/" 2>/dev/null || true
-fi
+    cp -n "$sd"/* "$CORPUS/" 2>/dev/null || true ;;
+esac
 [ -n "$(ls -A "$CORPUS")" ] || printf '\000' > "$CORPUS/seed0"
 
 w=$OUT/work-$engine-$t

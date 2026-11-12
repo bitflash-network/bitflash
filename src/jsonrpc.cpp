@@ -1125,8 +1125,13 @@ static json rpc_signrawtransaction(const json& p)
             const json& pv = p[1][i];
             if (!pv.is_object() || !pv.contains("txid") || !pv.contains("vout") || !pv.contains("scriptPubKey"))
                 throw runtime_error("each prevtx needs txid, vout and scriptPubKey");
+            // vout read with get<int>() from a JSON float (1e70) is a
+            // double-to-int conversion out of range: undefined behaviour,
+            // found by fuzz-rpc-postauth.
+            if (!pv["vout"].is_number_integer() || pv["vout"].get<int64>() < 0 || pv["vout"].get<int64>() > 0x7fffffffLL)
+                throw runtime_error("vout must be a non-negative integer");
             vector<unsigned char> vch = ParseHex(pv["scriptPubKey"].get<string>());
-            mapPrevOut[COutPoint(uint256(pv["txid"].get<string>()), pv["vout"].get<int>())] = CScript(vch.begin(), vch.end());
+            mapPrevOut[COutPoint(uint256(pv["txid"].get<string>()), (unsigned int)pv["vout"].get<int64>())] = CScript(vch.begin(), vch.end());
             if (pv.contains("redeemScript") && pv["redeemScript"].is_string())
             {
                 vector<unsigned char> r = ParseHex(pv["redeemScript"].get<string>());
@@ -4601,6 +4606,10 @@ static const RpcEntry kMethods[] = {
     { "help",             rpc_help },
 };
 
+#ifdef BITFLASH_FUZZ
+bool (*g_pfnFuzzRpcAllow)(const char* pszMethod) = NULL;
+#endif
+
 static json Dispatch(const json& req)
 {
     json id = req.contains("id") ? req["id"] : json(nullptr);
@@ -4625,6 +4634,13 @@ static json Dispatch(const json& req)
         RpcMethod fn = NULL;
         for (size_t i = 0; i < ARRAYLEN(kMethods); i++)
             if (method == kMethods[i].name) { fn = kMethods[i].fn; break; }
+#ifdef BITFLASH_FUZZ
+        // Fuzz builds only: the post-authentication harness lets through the
+        // methods that parse input without spending, writing the wallet or
+        // dialling out (fuzz_rpc_postauth.cpp). Unset, nothing changes.
+        if (fn && g_pfnFuzzRpcAllow && !g_pfnFuzzRpcAllow(method.c_str()))
+            fn = NULL;
+#endif
         if (!fn)
             throw runtime_error("method not found");
 
@@ -4647,32 +4663,113 @@ static json Dispatch(const json& req)
 // ---------------------------------------------------------------------------
 // http
 
-static bool RecvAll(btf_socket_t s, string& out, int nTimeoutSecs)
+static const size_t MAX_RPC_REQUEST = 1 << 20;   // nobody needs a 1 MB request
+
+static string HttpTrim(const string& s)
 {
-    // Read headers, then exactly Content-Length bytes of body. No keep-alive:
-    // one request, one response, close -- which is how every RPC client that
-    // targets bitcoind behaves anyway.
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t')) b++;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) e--;
+    return s.substr(b, e - b);
+}
+
+static bool HttpNameIs(const string& name, const char* pszWant)
+{
+    size_t n = strlen(pszWant);
+    if (name.size() != n) return false;
+    for (size_t i = 0; i < n; i++)
+        if (tolower((unsigned char)name[i]) != pszWant[i]) return false;
+    return true;
+}
+
+// The value of every header called pszName (lower case), in order. Header
+// lines only: the request line is never read as one.
+static vector<string> HttpHeaderValues(const string& strHeaders, const char* pszName)
+{
+    vector<string> v;
+    size_t pos = strHeaders.find("\r\n");
+    while (pos != string::npos)
+    {
+        size_t start = pos + 2;
+        size_t end = strHeaders.find("\r\n", start);
+        string line = strHeaders.substr(start, end == string::npos ? string::npos : end - start);
+        pos = end;
+        size_t colon = line.find(':');
+        if (colon != string::npos && HttpNameIs(line.substr(0, colon), pszName))
+            v.push_back(HttpTrim(line.substr(colon + 1)));
+    }
+    return v;
+}
+
+int JsonRpcRequestLength(const string& buf, size_t& nTotalOut)
+{
+    // Headers, then exactly Content-Length bytes of body. The length must be
+    // a plain decimal number no larger than a request may be, and every
+    // Content-Length header must agree: atoi() took "-1" as a length that
+    // wrapped the sum below and ended the read before the body arrived.
+    nTotalOut = 0;
+    size_t nHeaderEnd = buf.find("\r\n\r\n");
+    if (nHeaderEnd == string::npos)
+        return buf.size() > MAX_RPC_REQUEST ? -1 : 0;
+    size_t nBodyLen = 0;
+    vector<string> v = HttpHeaderValues(buf.substr(0, nHeaderEnd), "content-length");
+    for (size_t i = 0; i < v.size(); i++)
+    {
+        const string& s = v[i];
+        if (s.empty() || s.size() > 7)
+            return -1;
+        size_t n = 0;
+        for (size_t j = 0; j < s.size(); j++)
+        {
+            if (s[j] < '0' || s[j] > '9')
+                return -1;
+            n = n * 10 + (s[j] - '0');
+        }
+        if (n > MAX_RPC_REQUEST || (i > 0 && n != nBodyLen))
+            return -1;
+        nBodyLen = n;
+    }
+    nTotalOut = nHeaderEnd + 4 + nBodyLen;
+    if (nTotalOut > MAX_RPC_REQUEST)
+        return -1;
+    return buf.size() >= nTotalOut ? 1 : 0;
+}
+
+static void SetRpcSocketTimeout(btf_socket_t s, int nSecs)
+{
+#ifdef _WIN32
+    DWORD tv = (DWORD)nSecs * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = nSecs;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#endif
+}
+
+// Not static: fuzz-rpc-preauth drives it over a socketpair.
+bool JsonRpcRecvRequest(btf_socket_t s, string& out, int nTimeoutSecs)
+{
+    // No keep-alive: one request, one response, close -- which is how every
+    // RPC client that targets bitcoind behaves anyway. The server answers one
+    // connection at a time, so a client that connects and sends nothing must
+    // not hold it: without a receive timeout, recv() waited for good and the
+    // deadline below was never looked at again.
+    SetRpcSocketTimeout(s, nTimeoutSecs);
     char buf[4096];
     int64 nStart = GetTime();
-    size_t nHeaderEnd = string::npos, nBodyLen = 0;
     while (GetTime() - nStart < nTimeoutSecs)
     {
         int r = recv(s, buf, sizeof(buf), 0);
         if (r <= 0) return false;
         out.append(buf, r);
-        if (out.size() > 1 << 20) return false;                  // nobody needs a 1 MB request
-        if (nHeaderEnd == string::npos)
-        {
-            nHeaderEnd = out.find("\r\n\r\n");
-            if (nHeaderEnd == string::npos) continue;
-            string hdr = out.substr(0, nHeaderEnd);
-            string lower = hdr;
-            for (size_t i = 0; i < lower.size(); i++) lower[i] = (char)tolower((unsigned char)lower[i]);
-            size_t p = lower.find("content-length:");
-            if (p != string::npos)
-                nBodyLen = (size_t)atoi(hdr.c_str() + p + 15);
-        }
-        if (out.size() >= nHeaderEnd + 4 + nBodyLen)
+        size_t nTotal = 0;
+        int n = JsonRpcRequestLength(out, nTotal);
+        if (n < 0) return false;
+        if (n > 0)
             return true;
     }
     return false;
@@ -4702,47 +4799,39 @@ static void SendHttp(btf_socket_t s, int nCode, const string& strBody)
 
 static bool Authorised(const string& strHeaders)
 {
-    string lower = strHeaders;
-    for (size_t i = 0; i < lower.size(); i++) lower[i] = (char)tolower((unsigned char)lower[i]);
-    size_t p = lower.find("authorization: basic ");
-    if (p == string::npos) return false;
-    size_t e = strHeaders.find("\r\n", p);
-    string b64 = strHeaders.substr(p + 21, e == string::npos ? string::npos : e - (p + 21));
-    while (!b64.empty() && isspace((unsigned char)b64[b64.size()-1])) b64.erase(b64.size()-1);
+    // The first Authorization header line, scheme Basic in any case; the
+    // credentials (the cookie's are "__cookie__:<random>") compared in
+    // constant time. A header name or a scheme inside the request line or
+    // another header's value is not one.
+    if (g_rpcUser.empty() || g_rpcPassword.empty()) return false;
+    vector<string> v = HttpHeaderValues(strHeaders, "authorization");
+    if (v.empty()) return false;
+    const string& value = v[0];
+    if (value.size() < 6 || !HttpNameIs(value.substr(0, 5), "basic") || (value[5] != ' ' && value[5] != '\t'))
+        return false;
+    string b64 = HttpTrim(value.substr(6));
     return ConstantTimeEqual(Base64Decode(b64), g_rpcUser + ":" + g_rpcPassword);
 }
 
-static void HandleConnection(btf_socket_t s)
+int JsonRpcHandleRequest(const string& req, string& strReplyOut)
 {
-    string req;
-    if (!RecvAll(s, req, 30))
-    {
-        rpc_close(s);
-        return;
-    }
+    strReplyOut.clear();
     size_t nHeaderEnd = req.find("\r\n\r\n");
+    if (nHeaderEnd == string::npos)
+        return 400;
     string headers = req.substr(0, nHeaderEnd);
     string body    = req.substr(nHeaderEnd + 4);
 
     if (!Authorised(headers))
-    {
-        // Same answer whether the user is unknown or the password is wrong,
-        // and a pause so a brute force at loopback speed is still slow.
-        Sleep(250);
-        SendHttp(s, 401, "");
-        rpc_close(s);
-        return;
-    }
+        return 401;
     if (headers.compare(0, 5, "POST ") != 0)
-    {
-        SendHttp(s, 404, "");
-        rpc_close(s);
-        return;
-    }
+        return 404;
 
     json reply;
     try
     {
+        if (!JsonNestingWithin(body, MAX_JSON_NESTING))
+            throw runtime_error(strprintf("request nests deeper than %u levels", (unsigned)MAX_JSON_NESTING));
         json parsed = json::parse(body);
         if (parsed.is_array())
         {
@@ -4767,7 +4856,27 @@ static void HandleConnection(btf_socket_t s)
     {
         reply = json{{"result", nullptr}, {"error", json{{"code", -32600}, {"message", e.what()}}}, {"id", nullptr}};
     }
-    SendHttp(s, 200, reply.dump());
+    strReplyOut = reply.dump();
+    return 200;
+}
+
+static void HandleConnection(btf_socket_t s)
+{
+    string req;
+    if (!JsonRpcRecvRequest(s, req, 30))
+    {
+        rpc_close(s);
+        return;
+    }
+    string strReply;
+    int nCode = JsonRpcHandleRequest(req, strReply);
+    if (nCode == 401)
+    {
+        // Same answer whether the user is unknown or the password is wrong,
+        // and a pause so a brute force at loopback speed is still slow.
+        Sleep(250);
+    }
+    SendHttp(s, nCode, strReply);
     rpc_close(s);
 }
 

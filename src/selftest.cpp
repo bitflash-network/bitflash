@@ -34,6 +34,7 @@
 #include "community.h"
 #include "explorer.h"
 #include "jsonrpc.h"
+#include "rpcclient.h"
 // The chat test signs frames, so it needs a secp256k1 context of its own. Not
 // the node identity from nostr.h: asking for that would generate and persist a
 // node key, and a self-test has no business creating one.
@@ -4870,6 +4871,426 @@ static int RunSocks5ProxySelfTest()
                    "completes SOCKS5 domain-name CONNECT handshake" :
                    strprintf("completes SOCKS5 domain-name CONNECT handshake (%s)",
                              handshakeErr.c_str()).c_str()) ? 0 : 1;
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// --- reply-parsers: what the fuzz-tor-control, fuzz-socks5, fuzz-rpc-* and
+// fuzz-http-client harnesses feed, and what they found -----------------------
+
+bool BtfTorReadReply(SOCKET s, BtfTorReply& out);                       // tor.cpp
+bool BtfNostrReadRelayStream(SOCKET s, size_t nMax, vector<string>& vMsgOut);   // nostr.cpp
+bool JsonRpcRecvRequest(SOCKET s, std::string& out, int nTimeoutSecs);   // jsonrpc.cpp
+
+// A connected pair of loopback TCP sockets (no socketpair on Windows):
+// write the other side's bytes into b, shut it, hand a to the code under test.
+static bool SelfTestLoopbackPair(SOCKET& a, SOCKET& b)
+{
+    a = b = INVALID_SOCKET;
+    SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (l == INVALID_SOCKET)
+        return false;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    if (::bind(l, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(l, 1) != 0 ||
+        getsockname(l, (struct sockaddr*)&addr, &len) != 0)
+    {
+        closesocket(l);
+        return false;
+    }
+    a = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (a == INVALID_SOCKET || connect(a, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+    {
+        if (a != INVALID_SOCKET)
+            closesocket(a);
+        closesocket(l);
+        a = INVALID_SOCKET;
+        return false;
+    }
+    b = accept(l, NULL, NULL);
+    closesocket(l);
+    if (b == INVALID_SOCKET)
+    {
+        closesocket(a);
+        a = INVALID_SOCKET;
+        return false;
+    }
+    SelfTestSetSocketTimeout(a, 5);
+    SelfTestSetSocketTimeout(b, 5);
+    return true;
+}
+
+// The peer's bytes, sent and the sending side shut, on a fresh pair.
+struct SelfTestPeer
+{
+    SOCKET node, peer;
+    bool fOk;
+    explicit SelfTestPeer(const std::string& bytes) : node(INVALID_SOCKET), peer(INVALID_SOCKET), fOk(false)
+    {
+        if (!SelfTestLoopbackPair(node, peer))
+            return;
+        fOk = bytes.empty() || SelfTestWriteN(peer, bytes.data(), (int)bytes.size());
+#ifdef _WIN32
+        shutdown(peer, SD_SEND);
+#else
+        shutdown(peer, SHUT_WR);
+#endif
+    }
+    ~SelfTestPeer()
+    {
+        if (node != INVALID_SOCKET) closesocket(node);
+        if (peer != INVALID_SOCKET) closesocket(peer);
+    }
+    // What the node wrote, without waiting for more than is already there.
+    std::string Received()
+    {
+        std::string s;
+        char buf[4096];
+        SelfTestSetSocketTimeout(peer, 1);
+        for (;;)
+        {
+            int n = recv(peer, buf, sizeof(buf), 0);
+            if (n <= 0)
+                break;
+            s.append(buf, n);
+        }
+        return s;
+    }
+};
+
+static std::string SelfTestB64(const std::string& in)
+{
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    unsigned int val = 0;
+    int bits = -6;
+    for (size_t i = 0; i < in.size(); i++)
+    {
+        val = (val << 8) + (unsigned char)in[i];
+        bits += 8;
+        while (bits >= 0)
+        {
+            out.push_back(t[(val >> bits) & 0x3F]);
+            bits -= 6;
+        }
+    }
+    if (bits > -6)
+        out.push_back(t[((val << 8) >> (bits + 8)) & 0x3F]);
+    while (out.size() % 4)
+        out.push_back('=');
+    return out;
+}
+
+static std::string SelfTestWsFrame(unsigned char b0, const std::string& payload)
+{
+    std::string f;
+    f += (char)b0;
+    if (payload.size() < 126)
+        f += (char)payload.size();
+    else
+    {
+        f += (char)126;
+        f += (char)(payload.size() >> 8);
+        f += (char)(payload.size() & 0xff);
+    }
+    return f + payload;
+}
+
+static int RunReplyParsersSelfTest()
+{
+    printf("reply-parsers self-test\n");
+    int nFail = 0;
+#ifdef _WIN32
+    SelfTestWinsock winsock;
+#endif
+
+    // ---- Tor control port
+    {
+        BtfTorReply r;
+        size_t pos = 0;
+        std::string two = "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=25 TAG=x SUMMARY=\"Asking \\\"x\\\"\"\r\n250 OK\r\n515 no\r\n";
+        nFail += Check(BtfTorReadReplyBuffer(two, pos, r) && r.nCode == 250 && r.vLines.size() == 2 &&
+                       r.vLines[1] == "OK", "Tor: a multi-line reply is read whole") ? 0 : 1;
+        int pct = -1;
+        std::string summary;
+        nFail += Check(BtfTorParseBootstrap(r, pct, summary) && pct == 25 && summary == "Asking \"x\"",
+                       "Tor: bootstrap percentage and quoted summary") ? 0 : 1;
+        BtfTorReply r2;
+        nFail += Check(BtfTorReadReplyBuffer(two, pos, r2) && r2.nCode == 515 && pos == two.size(),
+                       "Tor: the next reply starts where the last one ended") ? 0 : 1;
+        {
+            SelfTestPeer p(two);
+            BtfTorReply viaSocket;
+            nFail += Check(p.fOk && BtfTorReadReply(p.node, viaSocket) && viaSocket.nCode == r.nCode &&
+                           viaSocket.vLines == r.vLines, "Tor: the socket reader reads the same reply") ? 0 : 1;
+        }
+
+        pos = 0;
+        std::string mixed = "250-a\r\n551 b\r\n";
+        nFail += Check(!BtfTorReadReplyBuffer(mixed, pos, r), "Tor: lines with different codes are malformed") ? 0 : 1;
+        pos = 0;
+        std::string data = "250+config-text=\r\nSocksPort 9050\r\n..x\r\n.\r\n250 OK\r\n";
+        nFail += Check(BtfTorReadReplyBuffer(data, pos, r) && r.vLines.size() == 2 &&
+                       r.vLines[0] == "config-text=\nSocksPort 9050\n.x", "Tor: a data block, dots unescaped") ? 0 : 1;
+
+        const char* bad[] = {
+            "551-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done\r\n551 no\r\n",   // not a 250
+            "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=-5 TAG=x\r\n250 OK\r\n",
+            "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=101 TAG=x\r\n250 OK\r\n",
+            "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=99999999999 TAG=x\r\n250 OK\r\n",
+            "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=1x TAG=x\r\n250 OK\r\n",
+            "250-something-else PROGRESS=100\r\n250 OK\r\n",
+        };
+        bool fAllRefused = true;
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        {
+            pos = 0;
+            pct = -1;
+            if (BtfTorReadReplyBuffer(bad[i], pos, r) && BtfTorParseBootstrap(r, pct, summary))
+                fAllRefused = false;
+        }
+        nFail += Check(fAllRefused, "Tor: no bootstrap percentage from an error, a non-number or the wrong line") ? 0 : 1;
+        pos = 0;
+        std::string ctl = std::string("250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=5 SUMMARY=\"a\x1b[2Jb\"\r\n250 OK\r\n");
+        nFail += Check(BtfTorReadReplyBuffer(ctl, pos, r) && BtfTorParseBootstrap(r, pct, summary) &&
+                       summary == "a?[2Jb", "Tor: the summary reaches the screen without control characters") ? 0 : 1;
+
+        std::string ep;
+        std::string onion = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion";
+        nFail += Check(BtfTorHostnameEndpoint(onion + "\r\n", 8434, ep) && ep == onion + ":8434",
+                       "Tor: hostname file to endpoint") ? 0 : 1;
+        nFail += Check(!BtfTorHostnameEndpoint("evil.example\n", 8434, ep) &&
+                       !BtfTorHostnameEndpoint(std::string("abc\0", 4) + onion, 8434, ep) &&
+                       !BtfTorHostnameEndpoint(onion, 0, ep),
+                       "Tor: a hostname file without a v3 onion name is refused") ? 0 : 1;
+        std::vector<std::string> br = BtfParseBridgeLines("Bridge # retired obfs4 1.2.3.4:1\nBridge snowflake 192.0.2.3:80 x\n");
+        nFail += Check(br.size() == 1 && br[0] == "snowflake 192.0.2.3:80 x",
+                       "Tor: 'Bridge # ...' is a comment, not a bridge") ? 0 : 1;
+    }
+
+    // ---- SOCKS5
+    {
+        std::string host = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion";
+        std::string v6 = std::string("\x05\x00\x05\x00\x00\x04", 6) + std::string(16, '\x01') + std::string("\x20\xf1", 2) + "after";
+        {
+            SelfTestPeer p(v6);
+            bool fOk = p.fOk && BtfSocks5Handshake(p.node, host, 8433);
+            char rest[5] = {0};
+            nFail += Check(fOk && SelfTestReadN(p.node, rest, 5) && memcmp(rest, "after", 5) == 0,
+                           "SOCKS5: an IPv6 reply is read in full and nothing past it") ? 0 : 1;
+            std::string sent = p.Received();
+            nFail += Check(sent.size() == 3 + 7 + host.size() && sent[6] == 0x03 && sent.compare(8, host.size(), host) == 0,
+                           "SOCKS5: CONNECT by name, never a local lookup") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(std::string("\x05\x00\x05\x00\x00\x03\x03" "abc" "\x00\x50", 12));
+            nFail += Check(p.fOk && BtfSocks5Handshake(p.node, host, 8433), "SOCKS5: a domain-name reply") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(std::string("\x05\x00\x05\x00\x00\x01\x7f", 7));
+            nFail += Check(p.fOk && !BtfSocks5Handshake(p.node, host, 8433), "SOCKS5: a truncated reply fails") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(std::string("\x05\x02", 2));
+            nFail += Check(p.fOk && !BtfSocks5Handshake(p.node, host, 8433), "SOCKS5: a proxy that wants a password fails") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(std::string("\x05\x00\x05\x00\x00\x09", 6));
+            nFail += Check(p.fOk && !BtfSocks5Handshake(p.node, host, 8433), "SOCKS5: an unknown address type fails") ? 0 : 1;
+        }
+    }
+
+    // ---- JSON-RPC server
+    {
+        size_t n = 0;
+        nFail += Check(JsonRpcRequestLength("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n{}", n) == -1,
+                       "RPC: a negative Content-Length is refused (it ended the read early)") ? 0 : 1;
+        nFail += Check(JsonRpcRequestLength("POST / HTTP/1.1\r\nContent-Length: 2\r\ncontent-length: 3\r\n\r\n{}x", n) == -1 &&
+                       JsonRpcRequestLength("POST / HTTP/1.1\r\nContent-Length: 2x\r\n\r\n{}", n) == -1 &&
+                       JsonRpcRequestLength("POST / HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n", n) == -1,
+                       "RPC: conflicting, non-numeric or oversized lengths are refused") ? 0 : 1;
+        nFail += Check(JsonRpcRequestLength("POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n{}", n) == 0 &&
+                       JsonRpcRequestLength("POST / HTTP/1.1\r\ncontent-length:2\r\n\r\n{}", n) == 1 && n == 39,
+                       "RPC: waits for the body, then has the request") ? 0 : 1;
+        nFail += Check(JsonRpcRequestLength("POST /x HTTP/1.1\r\nX-Content-Length: 5\r\n\r\n", n) == 1 &&
+                       n == std::string("POST /x HTTP/1.1\r\nX-Content-Length: 5\r\n\r\n").size(),
+                       "RPC: only the Content-Length header is a length") ? 0 : 1;
+
+        nFail += Check(JsonNestingWithin("[[[\"]]]]]]]]\"]]]", 3) && !JsonNestingWithin("[[[[1]]]]", 3) &&
+                       JsonNestingWithin("{\"a\\\"[[[[\":1}", 1),
+                       "JSON: nesting counted outside strings") ? 0 : 1;
+
+        const std::string user = "selftest", pass = "selftest-password-0123456789";
+        JsonRpcConfigure(user, pass, "");
+        std::string good = "Authorization: Basic " + SelfTestB64(user + ":" + pass) + "\r\n";
+        std::string body = "{\"id\":7,\"method\":\"help\",\"params\":[]}";
+        std::string len = strprintf("Content-Length: %u\r\n\r\n", (unsigned)body.size());
+        std::string reply;
+        nFail += Check(JsonRpcHandleRequest("POST / HTTP/1.1\r\n" + len + body, reply) == 401 && reply.empty(),
+                       "RPC: no credentials, 401") ? 0 : 1;
+        nFail += Check(JsonRpcHandleRequest("POST / HTTP/1.1\r\nAuthorization: Basic " + SelfTestB64(user + ":x") + "\r\n" + len + body, reply) == 401,
+                       "RPC: wrong password, 401") ? 0 : 1;
+        nFail += Check(JsonRpcHandleRequest("POST /?Authorization: Basic " + SelfTestB64(user + ":" + pass) + " HTTP/1.1\r\n" + len + body, reply) == 401 &&
+                       JsonRpcHandleRequest("POST / HTTP/1.1\r\nX-Note: Authorization: Basic " + SelfTestB64(user + ":" + pass) + "\r\n" + len + body, reply) == 401,
+                       "RPC: credentials outside an Authorization header line are not credentials") ? 0 : 1;
+        nFail += Check(JsonRpcHandleRequest("GET / HTTP/1.1\r\n" + good + "\r\n", reply) == 404,
+                       "RPC: right credentials, not a POST, 404") ? 0 : 1;
+        nFail += Check(JsonRpcHandleRequest("POST / HTTP/1.1\r\n" + good + len + body, reply) == 200 &&
+                       reply.find("\"id\":7") != std::string::npos && reply.find("getinfo") != std::string::npos,
+                       "RPC: right credentials, the call is answered") ? 0 : 1;
+        nFail += Check(JsonRpcHandleRequest("POST / HTTP/1.1\r\nauthorization:  BASIC " + SelfTestB64(user + ":" + pass) + "\r\n" + len + body, reply) == 200,
+                       "RPC: header name and scheme in any case") ? 0 : 1;
+        // Deep enough to run any thread's stack out when the reply copied
+        // and printed the id back, as it did.
+        std::string deep = "{\"id\":" + std::string(200000, '[') + std::string(200000, ']') + ",\"method\":\"help\"}";
+        nFail += Check(JsonRpcHandleRequest("POST / HTTP/1.1\r\n" + good + strprintf("Content-Length: %u\r\n\r\n", (unsigned)deep.size()) + deep, reply) == 200 &&
+                       reply.find("nests deeper") != std::string::npos,
+                       "RPC: a request nested 200000 deep is answered with an error, not a crash") ? 0 : 1;
+        // fuzz-rpc-postauth: a prevtx "vout" given as a float (1e70) went
+        // through get<int>(), a double-to-int conversion out of range.
+        {
+            CTransaction txSign;
+            txSign.vin.push_back(CTxIn(COutPoint(uint256(1), 0), CScript()));
+            txSign.vout.push_back(CTxOut(1, CScript() << OP_TRUE));
+            CDataStream ssSign(SER_NETWORK);
+            ssSign << txSign;
+            std::string hexTx = HexStr(ssSign.begin(), ssSign.end(), false);
+            const char* arszVout[] = { "1e70", "-1", "4294967296", "1.5", "\"1\"" };
+            bool fAllRefused = true;
+            for (size_t i = 0; i < sizeof(arszVout) / sizeof(arszVout[0]); i++)
+            {
+                std::string sb = "{\"id\":1,\"method\":\"signrawtransaction\",\"params\":[\"" + hexTx +
+                                 "\",[{\"txid\":\"" + uint256(1).GetHex() + "\",\"vout\":" + arszVout[i] +
+                                 ",\"scriptPubKey\":\"51\"}],[]]}";
+                JsonRpcHandleRequest("POST / HTTP/1.1\r\n" + good + strprintf("Content-Length: %u\r\n\r\n", (unsigned)sb.size()) + sb, reply);
+                if (reply.find("vout must be a non-negative integer") == std::string::npos)
+                    fAllRefused = false;
+            }
+            nFail += Check(fAllRefused, "RPC: a prevtx vout that is not a non-negative integer is refused") ? 0 : 1;
+        }
+        // The receive timeout: a caller that connects and says nothing, or
+        // stops after part of a request, is let go; a slow but live one is not.
+        {
+            SOCKET node, peer;
+            if (SelfTestLoopbackPair(node, peer))
+            {
+                std::string req;
+                int64 t0 = GetTime();
+                bool fGot = JsonRpcRecvRequest(node, req, 2);
+                int64 nTook = GetTime() - t0;
+                nFail += Check(!fGot && nTook <= 4, "RPC: a silent caller is let go after the timeout") ? 0 : 1;
+                closesocket(node);
+                closesocket(peer);
+            }
+            else
+                nFail += Check(false, "RPC: loopback pair for the timeout test") ? 0 : 1;
+            if (SelfTestLoopbackPair(node, peer))
+            {
+                std::string full = "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+                std::string req;
+                std::thread th([&]() {
+                    send(peer, full.data(), 20, 0);
+                    Sleep(500);
+                    send(peer, full.data() + 20, (int)full.size() - 20, 0);
+                });
+                bool fGot = JsonRpcRecvRequest(node, req, 2);
+                th.join();
+                nFail += Check(fGot && req == full, "RPC: a request written in two pieces 500 ms apart is taken") ? 0 : 1;
+                closesocket(node);
+                closesocket(peer);
+            }
+            else
+                nFail += Check(false, "RPC: loopback pair for the two-piece test") ? 0 : 1;
+        }
+        JsonRpcConfigure("", "", "");
+    }
+
+    // ---- answers to the node's own requests
+    {
+        LoopbackRpc to;
+        nlohmann::json result;
+        std::string err;
+        int nCode = 0;
+        nFail += Check(ParseLoopbackRpcResponse(to, "HTTP/1.1 200 OK\r\n\r\n{\"result\":5,\"error\":null}", result, err, &nCode) &&
+                       result == 5, "client: a result") ? 0 : 1;
+        nFail += Check(!ParseLoopbackRpcResponse(to, "HTTP/1.1 500 x\r\n\r\n{\"error\":{\"code\":-8,\"message\":\"m\"}}", result, err, &nCode) &&
+                       nCode == -8 && err == "m", "client: an error and its code") ? 0 : 1;
+        nCode = 0;
+        nFail += Check(!ParseLoopbackRpcResponse(to, "HTTP/1.1 500 x\r\n\r\n{\"error\":{\"code\":4294967271,\"message\":\"m\"}}", result, err, &nCode) &&
+                       nCode == 0, "client: a code that does not fit an int is not passed on truncated") ? 0 : 1;
+        std::string deep = "HTTP/1.1 500 x\r\n\r\n{\"error\":" + std::string(200000, '[') + std::string(200000, ']') + "}";
+        nFail += Check(!ParseLoopbackRpcResponse(to, deep, result, err, &nCode),
+                       "client: an answer nested 200000 deep is refused, not a crash") ? 0 : 1;
+        nFail += Check(!ParseLoopbackRpcResponse(to, "HTTP/1.1 404 Not Found\r\n\r\n<html>[[[[ no such page</html>", result, err, &nCode) &&
+                       err.find("no such wallet") != std::string::npos,
+                       "client: an HTML 404 page keeps the unknown-wallet hint") ? 0 : 1;
+
+        nFail += Check(invoice::WebhookAnswerOk("HTTP/1.1 204 No Content\r\n", err) &&
+                       !invoice::WebhookAnswerOk("HTTP/1.1 2", err) &&
+                       !invoice::WebhookAnswerOk("\x1b[2JHTTP/1.1 204", err) && err == "answered ?[2JHTTP/1.1",
+                       "webhook: 2xx only, the refusal quoted printable") ? 0 : 1;
+
+        unsigned int ip = 0;
+        bool fThrew = false;
+        bool fParsed = true;
+        try { fParsed = ParseExternalIPResponse("\n\n\r", ip); }
+        catch (...) { fThrew = true; }
+        nFail += Check(!fThrew && !fParsed, "external IP: a bare \"\\n\\n\\r\" answer, no exception (it killed the node)") ? 0 : 1;
+        nFail += Check(!ParseExternalIPResponse("HTTP/1.1 200 OK\r\n\r\n999.1.1.1", ip) &&
+                       !ParseExternalIPResponse("HTTP/1.1 200 OK\r\n\r\n1.2.3.4 junk", ip) &&
+                       !ParseExternalIPResponse("HTTP/1.1 200 OK\r\n\r\n127.0.0.1", ip),
+                       "external IP: not a public dotted quad, refused (999.1.1.1 became 255.255.255.255)") ? 0 : 1;
+        unsigned char b[4] = {0, 0, 0, 0};
+        bool fIp = ParseExternalIPResponse("HTTP/1.0 200 OK\n\n203.0.113.7\r\n", ip);
+        memcpy(b, &ip, 4);
+        nFail += Check(fIp && b[0] == 203 && b[1] == 0 && b[2] == 113 && b[3] == 7,
+                       "external IP: a plain answer, network byte order") ? 0 : 1;
+
+        std::string up = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        {
+            SelfTestPeer p("HTTP/1.1 403 Forbidden\r\nX-Note: 101 \r\n\r\n");
+            vector<string> v;
+            nFail += Check(p.fOk && !BtfNostrReadRelayStream(p.node, 4, v),
+                           "relay: a 403 with \" 101 \" in a header is not an upgrade") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(up + SelfTestWsFrame(0x89, "hi") + SelfTestWsFrame(0x01, "[\"a\",") + SelfTestWsFrame(0x80, "1]"));
+            vector<string> v;
+            nFail += Check(p.fOk && BtfNostrReadRelayStream(p.node, 4, v) && v.size() == 1 && v[0] == "[\"a\",1]",
+                           "relay: a fragmented message around a ping") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(up + SelfTestWsFrame(0x89, std::string(126, 'p')) + SelfTestWsFrame(0x81, "x"));
+            vector<string> v;
+            nFail += Check(p.fOk && BtfNostrReadRelayStream(p.node, 4, v) && v.empty(),
+                           "relay: a ping over 125 bytes ends the connection (its pong was corrupt)") ? 0 : 1;
+        }
+        {
+            std::string pings;
+            for (int i = 0; i < 4100; i++)
+                pings += SelfTestWsFrame(0x8a, "");
+            SelfTestPeer p(up + pings + SelfTestWsFrame(0x81, "x"));
+            vector<string> v;
+            nFail += Check(p.fOk && BtfNostrReadRelayStream(p.node, 4, v) && v.empty(),
+                           "relay: endless pongs and nothing else end the connection") ? 0 : 1;
+        }
+        {
+            SelfTestPeer p(up + SelfTestWsFrame(0x83, "x") + SelfTestWsFrame(0xc1, "y") + SelfTestWsFrame(0x80, "z"));
+            vector<string> v;
+            nFail += Check(p.fOk && BtfNostrReadRelayStream(p.node, 4, v) && v.empty(),
+                           "relay: reserved opcodes and RSV bits are refused") ? 0 : 1;
+        }
+    }
 
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
            nFail, nFail == 1 ? "" : "s");
@@ -15912,6 +16333,8 @@ int RunSelfTest(const std::string& name)
         return RunMultisigSelfTest();
     if (name == "socks5-proxy")
         return RunSocks5ProxySelfTest();
+    if (name == "reply-parsers")
+        return RunReplyParsersSelfTest();
     if (name == "managed-tor")
         return RunManagedTorSelfTest();
     if (name == "treasury")
@@ -16012,6 +16435,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }

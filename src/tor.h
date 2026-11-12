@@ -120,6 +120,49 @@ unsigned short BtfManagedTorChatPort();
 // "host.onion:port" once Tor has created the service, "" until then.
 std::string BtfManagedTorChatOnion();
 
+// --- What Tor answers on the control port ------------------------------
+// The node speaks to its own Tor's control port (AUTHENTICATE with the
+// cookie, GETINFO status/bootstrap-phase, SIGNAL SHUTDOWN) and reads the
+// hostname file Tor writes for each onion service. A Tor that is buggy,
+// replaced or compromised must not be able to crash the node or make it
+// believe something false through either; these are the parsers, apart from
+// the sockets so the self-test and fuzz-tor-control can reach them.
+struct BtfTorReply
+{
+    int nCode;                         // the three-digit status of every line
+    std::vector<std::string> vLines;   // each line's text after "NNN-", "NNN+" or "NNN ";
+                                       // a data block is appended to its "+" line, "\n"-separated
+    BtfTorReply() : nCode(0) {}
+};
+
+class BtfTorReplyParser
+{
+public:
+    enum { BAD = -1, MORE = 0, DONE = 1 };
+    static const size_t MAX_LINES = 256;
+    static const size_t MAX_BYTES = 64 * 1024;
+    BtfTorReplyParser() : fData(false), fDone(false), nBytes(0) {}
+    // One line without its CRLF. BAD for a malformed reply: no status code,
+    // codes that differ between lines, too many lines or bytes.
+    int AddLine(const std::string& line);
+    BtfTorReply reply;
+private:
+    bool fData;
+    bool fDone;
+    size_t nBytes;
+};
+
+// One complete reply from buf starting at pos (advanced past what was read),
+// split into lines exactly as the socket reader splits them.
+bool BtfTorReadReplyBuffer(const std::string& buf, size_t& pos, BtfTorReply& out);
+// The bootstrap percentage (0..100) and summary from the reply to
+// GETINFO status/bootstrap-phase; false for anything else.
+bool BtfTorParseBootstrap(const BtfTorReply& reply, int& pctOut, std::string& summaryOut);
+// "host.onion:port" from the contents of an onion service's hostname file,
+// only when it holds a v3 onion name.
+bool BtfTorHostnameEndpoint(const std::string& contents, unsigned short port,
+                            std::string& endpointOut);
+
 std::string BtfBuildManagedTorrcForTest(const std::string& dataDir,
                                         const std::string& hiddenServiceDir,
                                         unsigned short socksPort,

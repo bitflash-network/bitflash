@@ -721,26 +721,72 @@ bool GetMyExternalIP(unsigned int& ipRet)
         }
         BtfCloseSocket(hSocket);
 
-        // Find blank line separating headers from body
-        size_t bodyPos = response.find("\r\n\r\n");
-        if (bodyPos == string::npos) bodyPos = response.find("\n\n");
-        if (bodyPos == string::npos) continue;
-        string body = response.substr(bodyPos + (response[bodyPos+2]=='\r' ? 4 : 2));
-
-        // Trim whitespace
-        while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
-            body.pop_back();
-
-        // Parse as IP
-        CAddress addr(body.c_str());
-        if (addr.ip == 0) continue;
-
-        printf("GetMyExternalIP() via %s: %s\n", svc.host, body.c_str());
-        ipRet = addr.ip;
+        unsigned int ip = 0;
+        if (!ParseExternalIPResponse(response, ip))
+            continue;
+        CAddress addr;
+        addr.ip = ip;
+        printf("GetMyExternalIP() via %s: %s\n", svc.host, addr.ToStringIP().c_str());
+        ipRet = ip;
         return true;
     }
 
     return error("GetMyExternalIP() : all services failed\n");
+}
+
+bool ParseExternalIPResponse(const string& response, unsigned int& ipOut)
+{
+    // Plain HTTP from a public service: anything on the path can answer.
+    // The blank line between headers and body, CRLF or bare LF. The old
+    // "response[bodyPos+2] == '\r' ? 4 : 2" read a third byte of a bare
+    // "\n\n" and, when it was '\r' at the very end, asked substr() for a
+    // position past the end: std::out_of_range in a thread nothing catches.
+    size_t bodyPos = response.find("\r\n\r\n");
+    size_t nSkip = 4;
+    if (bodyPos == string::npos)
+    {
+        bodyPos = response.find("\n\n");
+        nSkip = 2;
+    }
+    if (bodyPos == string::npos)
+        return false;
+    string body = response.substr(bodyPos + nSkip);
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+        body.pop_back();
+
+    // Exactly a dotted quad. CAddress's parser takes "999.1.1.1" (inet_addr
+    // fails, returns INADDR_NONE, and 255.255.255.255 became our address)
+    // and "1.2.3.4 anything".
+    unsigned int nPart[4];
+    size_t i = 0;
+    for (int n = 0; n < 4; n++)
+    {
+        if (n > 0)
+        {
+            if (i >= body.size() || body[i] != '.')
+                return false;
+            i++;
+        }
+        size_t nDigits = 0;
+        unsigned int v = 0;
+        while (i < body.size() && body[i] >= '0' && body[i] <= '9' && nDigits < 4)
+        {
+            v = v * 10 + (body[i] - '0');
+            i++;
+            nDigits++;
+        }
+        if (nDigits == 0 || nDigits > 3 || v > 255)
+            return false;
+        nPart[n] = v;
+    }
+    if (i != body.size())
+        return false;
+    if (nPart[0] == 0 || nPart[0] == 127 || nPart[0] >= 224)
+        return false;   // this host, loopback, multicast and reserved: never a public address
+    unsigned char b[4] = { (unsigned char)nPart[0], (unsigned char)nPart[1],
+                           (unsigned char)nPart[2], (unsigned char)nPart[3] };
+    memcpy(&ipOut, b, 4);  // network byte order, as inet_addr gives it
+    return true;
 }
 
 

@@ -665,11 +665,17 @@ public:
             "Sec-WebSocket-Version: 13\r\n\r\n";
         if (!RawWrite(req.data(), (int)req.size()))
             return false;
+        return ReadHandshakeResponse(host);
+    }
 
+    // The relay's answer to the upgrade request, up to and including the
+    // blank line. True only for a 101 status line, with nothing read past it.
+    bool ReadHandshakeResponse(const string& host)
+    {
         // Read the handshake response until \r\n\r\n
         string resp;
         char c;
-        while (resp.find("\r\n\r\n") == string::npos)
+        while (resp.size() < 4 || resp.compare(resp.size() - 4, 4, "\r\n\r\n") != 0)
         {
             int n = RawRead(&c, 1);
             if (n <= 0) return error("Nostr: no handshake response from %s", host.c_str());
@@ -682,7 +688,10 @@ public:
             if (resp.size() > 8192)
                 return error("Nostr: handshake headers too large from %s", host.c_str());
         }
-        if (resp.find(" 101 ") == string::npos)
+        // The status line says 101, not some header further down: "HTTP/1.1
+        // 403 Forbidden" with an "X-Note: 101 " header used to count as an
+        // upgrade, and the error page was then read as frames.
+        if (resp.compare(0, 13, "HTTP/1.1 101 ") != 0 && resp.compare(0, 14, "HTTP/1.1 101\r\n") != 0)
             return error("Nostr: handshake refused by %s", host.c_str());
         return true;
     }
@@ -720,6 +729,8 @@ public:
     bool RecvText(string& out)
     {
         out.clear();
+        bool fInMessage = false;
+        int nControl = 0;
         for (;;)
         {
             unsigned char hdr[2];
@@ -727,6 +738,20 @@ public:
             bool fin = hdr[0] & 0x80;
             int opcode = hdr[0] & 0x0f;
             bool masked = hdr[1] & 0x80;
+            // RFC 6455 5.2-5.5: no extension was negotiated, so the RSV bits
+            // are 0; opcodes 3-7 and 11-15 are reserved; a control frame
+            // (close, ping, pong) is unfragmented and carries at most 125
+            // bytes -- SendPong echoes a ping in a one-byte length, so a
+            // longer one went back as a corrupt frame; a continuation needs a
+            // message to continue and a new message needs the last one ended.
+            if (hdr[0] & 0x70) return false;
+            if ((opcode >= 0x3 && opcode <= 0x7) || opcode >= 0xB) return false;
+            if (opcode >= 0x8 && (!fin || (hdr[1] & 0x7f) > 125)) return false;
+            if (opcode == 0x0 && !fInMessage) return false;
+            if ((opcode == 0x1 || opcode == 0x2) && fInMessage) return false;
+            // Pings and pongs answer no question: a relay sending nothing
+            // else would otherwise keep this loop, and its thread, forever.
+            if (opcode >= 0x8 && ++nControl > 4096) return false;
             uint64 len = hdr[1] & 0x7f;
             if (len == 126)
             {
@@ -765,6 +790,7 @@ public:
             if (out.size() + payload.size() > MAX_WS_MESSAGE) return false;
             out += payload;                                   // text/continuation
             if (fin) return true;
+            fInMessage = true;
         }
     }
 
@@ -794,6 +820,24 @@ private:
         RawWrite(frame.data(), (int)frame.size());
     }
 };
+
+// A relay's half of a connection, read the way every relay call reads it: the
+// answer to the upgrade request, then up to nMax messages. Plain TCP, the
+// bytes TLS would carry. For the self-test and fuzz-http-client, which play
+// the relay over a local socket (declared there; nostr.h does not know
+// SOCKET). The socket stays the caller's. False when the upgrade was refused.
+bool BtfNostrReadRelayStream(SOCKET s, size_t nMax, vector<string>& vMsgOut)
+{
+    CWebSocket ws;
+    ws.hSocket = s;
+    ws.fTls = false;
+    bool fOk = ws.ReadHandshakeResponse("test relay");
+    string msg;
+    while (fOk && vMsgOut.size() < nMax && ws.RecvText(msg))
+        vMsgOut.push_back(msg);
+    ws.hSocket = INVALID_SOCKET;
+    return fOk;
+}
 
 
 // Persistent relay connections. Public relays (relay.damus.io in particular)

@@ -479,11 +479,23 @@ static bool PostWebhook(const Config& cfg, const std::string& body, std::string&
         errOut = "no answer";
         return false;
     }
-    buf[n] = 0;
+    return WebhookAnswerOk(std::string(buf, n), errOut);
+}
+
+bool WebhookAnswerOk(const std::string& answer, std::string& errOut)
+{
     // "HTTP/1.x 2xx"
-    if (n >= 12 && strncmp(buf, "HTTP/1.", 7) == 0 && buf[9] == '2')
+    if (answer.size() >= 12 && answer.compare(0, 7, "HTTP/1.") == 0 && answer[8] == ' ' &&
+        answer[9] == '2' && isdigit((unsigned char)answer[10]) && isdigit((unsigned char)answer[11]))
         return true;
-    errOut = std::string("answered ") + std::string(buf, std::min(n, 12));
+    // Whatever the other side sent goes to the log: no control characters.
+    std::string quoted;
+    for (size_t i = 0; i < answer.size() && i < 12; i++)
+    {
+        unsigned char c = (unsigned char)answer[i];
+        quoted += (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    errOut = "answered " + quoted;
     return false;
 }
 

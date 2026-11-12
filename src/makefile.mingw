@@ -417,6 +417,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=block-index-load
 	./bitflash.exe -selftest=multisig
 	./bitflash.exe -selftest=socks5-proxy
+	./bitflash.exe -selftest=reply-parsers
 	./bitflash.exe -selftest=managed-tor
 	./bitflash.exe -selftest=treasury
 	./bitflash.exe -selftest=chat-link

@@ -77,7 +77,7 @@ LIBS = -L$(SECP_LIB) -lsecp256k1 \
 # past -- "duplicate section ... has different size". That is one object
 # indexing a struct by the old layout and another by the new one, in the same
 # binary. Nothing crashed here, and nothing would say so if it had.
-HEADERS = headers_core.h headers.h fuzz_datadir.h util.h main.h serialize.h uint256.h \
+HEADERS = headers_core.h headers.h fuzz_datadir.h fuzz_socket.h jsonrpc.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
@@ -414,6 +414,48 @@ fuzz-light-peer-smoke: fuzz-light-peer
 	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/light-peer ./fuzz-light-peer -runs=0
 	./fuzz-light-peer -runs=2000 ../work/fuzz-corpus/light-peer
 
+# What the node reads from outside that is not a peer: its own Tor's control
+# port and hostname files, a SOCKS5 proxy's replies, the JSON-RPC port before
+# and after authentication, and the answers to its own outgoing requests
+# (LoopbackRpcCall, webhooks, the IP echo, a Nostr relay's WebSocket). The
+# ones that play the other end of a connection do it over a socketpair
+# (fuzz_socket.h). Each writes its own seeds with BITFLASH_FUZZ_WRITE_SEEDS.
+FUZZ_IO_TARGETS = fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client
+
+fuzz-tor-control: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_tor_control.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-tor-control"
+
+fuzz-socks5: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_socks5.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-socks5"
+
+fuzz-rpc-preauth: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_rpc_preauth.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-rpc-preauth"
+
+fuzz-rpc-postauth: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_rpc_postauth.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-rpc-postauth"
+
+fuzz-http-client: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_http_client.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-http-client"
+
+# The five above, each from its own seeds, a few thousand inputs: cheap
+# enough for every push.
+fuzz-io-smoke: $(FUZZ_IO_TARGETS)
+	@for t in $(FUZZ_IO_TARGETS); do \
+	  d=../work/fuzz-corpus/$${t#fuzz-}; rm -rf $$d && mkdir -p $$d && \
+	  BITFLASH_FUZZ_WRITE_SEEDS=$$d ./$$t -runs=0 > /dev/null 2>&1 && \
+	  echo "== $$t" && ./$$t -runs=4000 $$d || exit 1; \
+	done
+
 # Payloads straight into ProcessMessage after the handshake (block, tx, inv,
 # ...); the harness writes its own structured seeds.
 fuzz-p2p-payload-smoke: fuzz-p2p-payload
@@ -450,7 +492,7 @@ fuzz-v4-templates-smoke: fuzz-v4-templates
 	./fuzz-v4-templates -runs=2000 ../work/fuzz-corpus/v4-templates
 
 clean:
-	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer $(FUZZ_IO_TARGETS) test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -613,6 +655,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=block-index-load
 	./bitflash-node -selftest=multisig
 	./bitflash-node -selftest=socks5-proxy
+	./bitflash-node -selftest=reply-parsers
 	./bitflash-node -selftest=managed-tor
 	./bitflash-node -selftest=treasury
 	./bitflash-node -selftest=chat-link
@@ -621,4 +664,4 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-wallet
 
 .PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
-        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-p2pool-smoke fuzz-light-peer-smoke
+        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-p2pool-smoke fuzz-light-peer-smoke fuzz-io-smoke

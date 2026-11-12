@@ -12,12 +12,13 @@ make -j"$(nproc)" RANDOMX_DIR="$HOME/RandomX" FUZZ_CXX="$CXX" \
     FUZZ_CXXFLAGS="\$(filter-out -O2,\$(CXXFLAGS)) $CXXFLAGS -g" \
     FUZZ_LDFLAGS="$CXXFLAGS $LIB_FUZZING_ENGINE" \
     fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload \
-    fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer
+    fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer \
+    fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client
 
 # The runner image has none of the shared libraries the node links, so they
 # travel with the targets and are found through $ORIGIN.
 mkdir -p "$OUT/lib"
-for t in fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer; do
+for t in fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client; do
     cp "$t" "$OUT/"
     ldd "$t" | awk '/=> \// {print $3}' | grep -E 'libdb|libsqlite3|libsodium|libssl|libcrypto|libboost' | while read -r lib; do
         cp -L -n "$lib" "$OUT/lib/" || true
@@ -38,8 +39,9 @@ mk_seed fuzz-sigcheck '\000\000\001\001' '\030\001\040\001'
 # fuzz-script (signed spends under each rule set) and fuzz-v4-templates
 # (vault, batch, inheritance). Built for the fuzzing engine, they run here
 # as well. fuzz-script's zip already holds the two raw seeds above; its own
-# are added to it.
-for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer; do
+# are added to it. The Tor, SOCKS5, RPC and HTTP client harnesses write Tor
+# replies, proxy answers, RPC calls and answers to the node's own requests.
+for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client; do
     d=$(mktemp -d)
     if BITFLASH_FUZZ_WRITE_SEEDS="$d" ./"$t" -runs=0 > /dev/null 2>&1 && [ -n "$(ls -A "$d")" ]; then
         (cd "$d" && zip -q "$OUT/${t}_seed_corpus.zip" ./*)

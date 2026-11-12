@@ -71,6 +71,9 @@ std::string SignBody(const std::string& secret, const std::string& body);
 // http://host[:port]/path, or false.
 bool ParseHttpUrl(const std::string& url, std::string& hostOut, unsigned short& portOut,
                   std::string& pathOut);
+// The first bytes of the shop's answer to a webhook: true for a 2xx status
+// line; otherwise errOut quotes the status line, printable characters only.
+bool WebhookAnswerOk(const std::string& answer, std::string& errOut);
 
 } // namespace invoice
 

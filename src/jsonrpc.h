@@ -20,6 +20,18 @@ bool JsonRpcConfigure(const std::string& strUser, const std::string& strPassword
 bool JsonRpcConfigureCookie(const std::string& strPort);
 void ThreadJsonRpcServer(void* parg);
 
+// The HTTP side, apart from the socket so the self-test and the fuzz
+// harnesses reach exactly what a caller does.
+//
+// Whether buf holds a whole request: 1 (nTotalOut = headers + body length),
+// 0 (not yet), -1 (never: a Content-Length that is not a plain number, two
+// that disagree, or more than a request may be).
+int JsonRpcRequestLength(const std::string& buf, size_t& nTotalOut);
+// One complete request: the credentials checked first (401 without the
+// right ones, before anything else is looked at), then POST (404), then the
+// JSON-RPC call or batch. Returns the HTTP status; strReplyOut is the body.
+int JsonRpcHandleRequest(const std::string& req, std::string& strReplyOut);
+
 // Renews the inheritances this wallet owns before they open to the heir
 // (docs/inheritance.md). Runs whether or not the RPC server does.
 void ThreadInheritance(void* parg);

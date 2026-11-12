@@ -157,6 +157,13 @@ void ParseString(const string& str, char c, vector<string>& v);
 string FormatMoney(int64 n, bool fPlus=false);
 bool ParseMoney(const char* pszIn, int64& nRet);
 bool FileExists(const char* psz);
+// True when no JSON array or object in s nests deeper than nMax levels.
+// The JSON library parses deep input without recursing, but copying,
+// comparing and printing a value recurse once per level, so a request or a
+// reply of nothing but '[' would run the stack out after it parsed. Call
+// before json::parse on anything that came from outside.
+bool JsonNestingWithin(const string& s, size_t nMax);
+static const size_t MAX_JSON_NESTING = 64;
 // Opens a new file for writing that only this user can read, from the moment
 // it exists (fopen, then chmod, leaves a window in which another local user
 // can open it and keep reading what is written later). fExclusive refuses an

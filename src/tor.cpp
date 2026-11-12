@@ -5,6 +5,7 @@
 #include "tor.h"
 #include "nostr.h"
 #include "proxy.h"
+#include "btfaddr.h"
 // util.h's snprintf macro breaks nlohmann/json (see nostr.cpp).
 #ifdef snprintf
 #undef snprintf
@@ -268,21 +269,211 @@ static bool SendAll(SOCKET s, const std::string& data)
     return true;
 }
 
+// One byte of a control-port line. Shared by the socket reader below and the
+// buffer reader the self-test and the fuzz harness use, so both split lines
+// the same way: LF ends a line, CR is dropped, a line over 4096 bytes is an
+// error.
+static int TorControlLineAddChar(std::string& line, char ch)
+{
+    if (ch == '\n')
+        return 1;
+    if (ch != '\r')
+    {
+        if (line.size() >= 4096)
+            return -1;
+        line += ch;
+    }
+    return 0;
+}
+
 static bool RecvControlLine(SOCKET s, std::string& line)
 {
     line.clear();
-    while (line.size() < 4096)
+    for (;;)
     {
         char ch = 0;
         int n = recv(s, &ch, 1, 0);
         if (n <= 0)
             return false;
-        if (ch == '\n')
+        int r = TorControlLineAddChar(line, ch);
+        if (r != 0)
+            return r > 0;
+    }
+}
+
+// control-spec 2.3: every line of a reply starts with the same three-digit
+// status code, then '-' (more lines follow), '+' (a data block follows, ended
+// by a line holding a single '.') or ' ' (the last line).
+int BtfTorReplyParser::AddLine(const std::string& line)
+{
+    if (fDone)
+        return BAD;
+    nBytes += line.size() + 2;
+    if (nBytes > MAX_BYTES)
+        return BAD;
+    if (fData)
+    {
+        if (line == ".")
+        {
+            fData = false;
+            return MORE;
+        }
+        // A leading '.' is doubled on the wire.
+        reply.vLines.back() += "\n";
+        reply.vLines.back() += (line.size() > 1 && line[0] == '.') ? line.substr(1) : line;
+        return MORE;
+    }
+    if (line.size() < 4 || reply.vLines.size() >= MAX_LINES)
+        return BAD;
+    for (int i = 0; i < 3; i++)
+        if (line[i] < '0' || line[i] > '9')
+            return BAD;
+    int nCode = (line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0');
+    if (!reply.vLines.empty() && nCode != reply.nCode)
+        return BAD;
+    reply.nCode = nCode;
+    reply.vLines.push_back(line.substr(4));
+    if (line[3] == '-')
+        return MORE;
+    if (line[3] == '+')
+    {
+        fData = true;
+        return MORE;
+    }
+    if (line[3] == ' ')
+    {
+        fDone = true;
+        return DONE;
+    }
+    return BAD;
+}
+
+bool BtfTorReadReplyBuffer(const std::string& buf, size_t& pos, BtfTorReply& out)
+{
+    BtfTorReplyParser parser;
+    std::string line;
+    while (pos < buf.size())
+    {
+        int r = TorControlLineAddChar(line, buf[pos++]);
+        if (r < 0)
+            return false;
+        if (r == 0)
+            continue;
+        int n = parser.AddLine(line);
+        line.clear();
+        if (n == BtfTorReplyParser::BAD)
+            return false;
+        if (n == BtfTorReplyParser::DONE)
+        {
+            out = parser.reply;
             return true;
-        if (ch != '\r')
-            line += ch;
+        }
     }
     return false;
+}
+
+// The same over the control socket. Not static: the fuzz harness drives it
+// over a socketpair and checks it against the buffer reader.
+bool BtfTorReadReply(SOCKET s, BtfTorReply& out)
+{
+    BtfTorReplyParser parser;
+    std::string line;
+    while (RecvControlLine(s, line))
+    {
+        int n = parser.AddLine(line);
+        if (n == BtfTorReplyParser::BAD)
+            return false;
+        if (n == BtfTorReplyParser::DONE)
+        {
+            out = parser.reply;
+            return true;
+        }
+    }
+    return false;
+}
+
+// What Tor says goes to the log and the screen: printable ASCII only, short.
+static std::string TorPrintable(const std::string& s, size_t nMax)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size() && out.size() < nMax; i++)
+    {
+        unsigned char c = (unsigned char)s[i];
+        out += (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    return out;
+}
+
+bool BtfTorParseBootstrap(const BtfTorReply& reply, int& pctOut, std::string& summaryOut)
+{
+    // 250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=25 TAG=... SUMMARY="..."
+    // Only from a positive reply, only from the line that answers the
+    // question, and only a percentage that is one: a confused or hostile Tor
+    // must not be able to report 100% (which ends the bridge ladder) from an
+    // error line, a negative number or one that overflows.
+    if (reply.nCode != 250)
+        return false;
+    static const std::string key = "status/bootstrap-phase=";
+    for (size_t i = 0; i < reply.vLines.size(); i++)
+    {
+        const std::string& l = reply.vLines[i];
+        if (l.compare(0, key.size(), key) != 0)
+            continue;
+        size_t p = l.find(" PROGRESS=", key.size());
+        if (p == std::string::npos)
+            return false;
+        p += 10;
+        int pct = 0;
+        size_t nDigits = 0;
+        while (p < l.size() && l[p] >= '0' && l[p] <= '9' && nDigits < 4)
+        {
+            pct = pct * 10 + (l[p] - '0');
+            p++;
+            nDigits++;
+        }
+        if (nDigits == 0 || nDigits > 3 || pct > 100 || (p < l.size() && l[p] != ' '))
+            return false;
+
+        std::string summary;
+        size_t q = l.find(" SUMMARY=\"", key.size());
+        if (q != std::string::npos)
+        {
+            // A quoted string: backslash escapes the next character.
+            for (q += 10; q < l.size() && l[q] != '"'; q++)
+            {
+                if (l[q] == '\\' && q + 1 < l.size())
+                    q++;
+                summary += l[q];
+            }
+        }
+        pctOut = pct;
+        summaryOut = TorPrintable(summary, 160);
+        return true;
+    }
+    return false;
+}
+
+bool BtfTorHostnameEndpoint(const std::string& contents, unsigned short port,
+                            std::string& endpointOut)
+{
+    // The first line of the hostname file Tor writes into the service's
+    // directory, as fgets would read it into a 256-byte buffer.
+    endpointOut.clear();
+    std::string line;
+    for (size_t i = 0; i < contents.size() && line.size() < 255; i++)
+    {
+        if (contents[i] == '\0')
+            break;
+        line += contents[i];
+        if (contents[i] == '\n')
+            break;
+    }
+    while (!line.empty() && (line[line.size() - 1] == '\n' || line[line.size() - 1] == '\r' ||
+                             line[line.size() - 1] == ' ' || line[line.size() - 1] == '\t'))
+        line.erase(line.size() - 1);
+    if (line.empty() || port == 0)
+        return false;
+    return btf::NormalizeOnionEndpoint(strprintf("%s:%u", line.c_str(), (unsigned)port), endpointOut);
 }
 
 static SOCKET ConnectLoopback(unsigned short port, std::string& errOut)
@@ -334,15 +525,18 @@ static void CloseLoopback(SOCKET s)
 
 static bool ReadPositiveTorControlReply(SOCKET s, std::string& errOut)
 {
-    std::string line;
-    if (!RecvControlLine(s, line))
+    // The whole reply, not just its first line: a multi-line answer read
+    // halfway would leave the rest to be taken for the next command's reply.
+    BtfTorReply reply;
+    if (!BtfTorReadReply(s, reply))
     {
-        errOut = "Tor control port closed before replying";
+        errOut = "Tor control port closed or sent a malformed reply";
         return false;
     }
-    if (line.size() >= 3 && line.substr(0, 3) == "250")
+    if (reply.nCode == 250)
         return true;
-    errOut = strprintf("Tor control command failed: %s", line.c_str());
+    errOut = strprintf("Tor control command failed: %d %s", reply.nCode,
+                       TorPrintable(reply.vLines.empty() ? std::string() : reply.vLines[0], 160).c_str());
     return false;
 }
 
@@ -381,10 +575,13 @@ static bool RequestManagedTorShutdown(std::string& errOut)
     }
 
     {
-        std::string reply;
-        if (RecvControlLine(s, reply) && !(reply.size() >= 3 && reply.substr(0, 3) == "250"))
+        // Tor may close the connection as it shuts down, before or instead
+        // of answering; only an answer that says no is a failure.
+        BtfTorReply reply;
+        if (BtfTorReadReply(s, reply) && reply.nCode != 250)
         {
-            errOut = strprintf("Tor rejected shutdown signal: %s", reply.c_str());
+            errOut = strprintf("Tor rejected shutdown signal: %d %s", reply.nCode,
+                               TorPrintable(reply.vLines.empty() ? std::string() : reply.vLines[0], 160).c_str());
             goto done;
         }
     }
@@ -423,25 +620,8 @@ static bool QueryManagedTorBootstrap(int& pctOut, std::string& summaryOut)
     if (SendAll(s, auth) && ReadPositiveTorControlReply(s, err) &&
         SendAll(s, "GETINFO status/bootstrap-phase\r\n"))
     {
-        std::string line;
-        for (int i = 0; i < 8 && RecvControlLine(s, line); i++)
-        {
-            size_t p = line.find("PROGRESS=");
-            if (p != std::string::npos)
-            {
-                pctOut = atoi(line.c_str() + p + 9);
-                size_t q = line.find("SUMMARY=\"");
-                summaryOut.clear();
-                if (q != std::string::npos)
-                {
-                    size_t e = line.find('"', q + 9);
-                    summaryOut = line.substr(q + 9, e == std::string::npos ? std::string::npos : e - (q + 9));
-                }
-                ok = true;
-            }
-            if (line == "250 OK" || (line.size() >= 4 && line[3] == ' '))
-                break;
-        }
+        BtfTorReply reply;
+        ok = BtfTorReadReply(s, reply) && BtfTorParseBootstrap(reply, pctOut, summaryOut);
     }
     CloseLoopback(s);
     return ok;
@@ -711,7 +891,9 @@ std::vector<std::string> BtfParseBridgeLines(const std::string& text)
             a = t.find_first_not_of(" \t");
             t = a == std::string::npos ? "" : t.substr(a);
         }
-        if (!t.empty())
+        // "Bridge # old line" is a comment too: kept, it became a torrc line
+        // "Bridge #..." with no bridge in it, and Tor refused to start.
+        if (!t.empty() && t[0] != '#')
             out.push_back(t);
     }
     return out;
@@ -1578,13 +1760,16 @@ static void ThreadManagedTorHostname(void*)
         // up the node's own endpoint below -- nor to be held up by it.
         if (chatPort != 0 && BtfManagedTorChatOnion().empty())
         {
-            std::string chatOnion;
-            if (ReadOneLine(chatHostnamePath, chatOnion) && !chatOnion.empty())
+            // Checked the way the P2P endpoint below is (BtfSetLocalOnionEndpoint):
+            // whatever is in that file is what the chat hands out as its address.
+            std::string chatEndpoint, chatErr;
+            std::vector<unsigned char> chatFile;
+            if (ReadBinaryFile(chatHostnamePath, chatFile, chatErr) &&
+                BtfTorHostnameEndpoint(std::string(chatFile.begin(), chatFile.end()), chatPort, chatEndpoint))
             {
                 CRITICAL_BLOCK(cs_managedTor)
                 {
-                    g_managedTorChatOnion = strprintf("%s:%u", chatOnion.c_str(),
-                                                      (unsigned)chatPort);
+                    g_managedTorChatOnion = chatEndpoint;
 #ifdef BITFLASH_CHAT_APP
                     // Otherwise the status line says "starting" forever: the only
                     // place that writes "running" is the P2P endpoint path, and
