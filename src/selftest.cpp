@@ -14503,6 +14503,1325 @@ static int RunBigNumIntSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- orphan-tx: the orphan transaction pool --------------------------------
+// AddOrphanTx, EraseOrphanTx and LimitOrphanTx keep two maps in step: the
+// orphans by hash, and each input's parent hash to the orphan naming it. A
+// stale entry in the second would point at a freed stream. No self-test
+// reached these before (coverage, November 2026).
+
+extern map<uint256, CDataStream*> mapOrphanTransactions;
+extern multimap<uint256, CDataStream*> mapOrphanTransactionsByPrev;
+
+static CDataStream OrphanTestTx(const vector<pair<uint256, unsigned int> >& vPrev, int nTag)
+{
+    CTransaction tx;
+    for (size_t i = 0; i < vPrev.size(); i++)
+    {
+        CTxIn in;
+        in.prevout = COutPoint(vPrev[i].first, vPrev[i].second);
+        tx.vin.push_back(in);
+    }
+    tx.vout.push_back(CTxOut(COIN + nTag, CScript() << OP_TRUE));
+    CDataStream ss(SER_NETWORK);
+    ss << tx;
+    return ss;
+}
+
+static uint256 OrphanTestHash(const CDataStream& ss)
+{
+    CTransaction tx;
+    CDataStream(ss) >> tx;
+    return tx.GetHash();
+}
+
+// Every parent entry points at a live orphan that names that parent.
+static bool OrphanMapsInStep()
+{
+    for (multimap<uint256, CDataStream*>::const_iterator mi = mapOrphanTransactionsByPrev.begin();
+         mi != mapOrphanTransactionsByPrev.end(); ++mi)
+    {
+        bool fLive = false;
+        for (map<uint256, CDataStream*>::const_iterator it = mapOrphanTransactions.begin();
+             it != mapOrphanTransactions.end(); ++it)
+            if (it->second == mi->second)
+            {
+                CTransaction tx;
+                CDataStream(*it->second) >> tx;
+                for (size_t i = 0; i < tx.vin.size(); i++)
+                    fLive |= tx.vin[i].prevout.hash == mi->first;
+            }
+        if (!fLive)
+            return false;
+    }
+    return true;
+}
+
+static int RunOrphanTxSelfTest()
+{
+    printf("orphan-tx self-test\n");
+    int nFail = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        while (!mapOrphanTransactions.empty())
+            EraseOrphanTx(mapOrphanTransactions.begin()->first);
+        nFail += Check(mapOrphanTransactionsByPrev.empty(), "the orphan pool starts empty") ? 0 : 1;
+
+        uint256 P = Hash(BEGIN("P"), END("P")), Q = Hash(BEGIN("Q"), END("Q")), R = Hash(BEGIN("R"), END("R"));
+        vector<pair<uint256, unsigned int> > v;
+
+        v.assign(1, make_pair(P, 0u));
+        CDataStream a = OrphanTestTx(v, 1);
+        AddOrphanTx(a);
+        AddOrphanTx(a);
+        nFail += Check(mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1,
+                       "an orphan is held once, under its one parent, however often it comes") ? 0 : 1;
+
+        v.clear();
+        v.push_back(make_pair(P, 1u));
+        v.push_back(make_pair(Q, 0u));
+        CDataStream b = OrphanTestTx(v, 2);
+        AddOrphanTx(b);
+        v.clear();
+        v.push_back(make_pair(R, 0u));
+        v.push_back(make_pair(R, 1u));
+        CDataStream c = OrphanTestTx(v, 3);
+        AddOrphanTx(c);
+        nFail += Check(mapOrphanTransactions.size() == 3 && mapOrphanTransactionsByPrev.size() == 5 &&
+                       mapOrphanTransactionsByPrev.count(P) == 2 && mapOrphanTransactionsByPrev.count(R) == 2 &&
+                       OrphanMapsInStep(),
+                       "two parents, and one parent named twice: an entry per input, each pointing at its orphan") ? 0 : 1;
+
+        EraseOrphanTx(OrphanTestHash(b));
+        bool fB = mapOrphanTransactions.size() == 2 && mapOrphanTransactionsByPrev.size() == 3 &&
+                  mapOrphanTransactionsByPrev.count(P) == 1 && mapOrphanTransactionsByPrev.count(Q) == 0;
+        EraseOrphanTx(OrphanTestHash(c));
+        bool fC = mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1 &&
+                  mapOrphanTransactionsByPrev.count(R) == 0;
+        EraseOrphanTx(OrphanTestHash(c));   // gone already: nothing happens
+        nFail += Check(fB && fC && OrphanMapsInStep() && mapOrphanTransactions.size() == 1,
+                       "erasing an orphan removes every parent entry it had and no other; erasing it twice is harmless") ? 0 : 1;
+
+        v.clear();
+        for (unsigned int i = 0; i < 10001; i++)
+            v.push_back(make_pair(Q, i));
+        AddOrphanTx(OrphanTestTx(v, 4));
+        nFail += Check(mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1,
+                       "an orphan with more than 10,000 inputs is not held") ? 0 : 1;
+
+        for (int i = 0; i < (int)MAX_ORPHAN_TRANSACTIONS + 50; i++)
+        {
+            uint256 parent = Hash(BEGIN(i), END(i));
+            v.assign(1, make_pair(parent, 0u));
+            AddOrphanTx(OrphanTestTx(v, 100 + i));
+        }
+        nFail += Check(mapOrphanTransactions.size() == MAX_ORPHAN_TRANSACTIONS &&
+                       mapOrphanTransactionsByPrev.size() == MAX_ORPHAN_TRANSACTIONS && OrphanMapsInStep(),
+                       strprintf("past %u orphans, others are dropped at random and the maps stay in step",
+                                 MAX_ORPHAN_TRANSACTIONS).c_str()) ? 0 : 1;
+
+        LimitOrphanTx(10);
+        bool fTen = mapOrphanTransactions.size() == 10 && mapOrphanTransactionsByPrev.size() == 10 && OrphanMapsInStep();
+        while (!mapOrphanTransactions.empty())
+            EraseOrphanTx(mapOrphanTransactions.begin()->first);
+        nFail += Check(fTen && mapOrphanTransactionsByPrev.empty(),
+                       "a lower limit drops down to it; erasing all leaves both maps empty") ? 0 : 1;
+    }
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- script-opcodes: every opcode the interpreter has, one row each ----------
+// A table of scripts run through EvalScript under four rule sets: before rules
+// v3 (the flags all off), v3 (CLTV, no OP_VER), v4 (CSV, CTV, CSFS) and v5 (the
+// multisig key cap). Each row says which sets it runs under, whether the
+// script is true, and for the scripts that run to their end, the stack they
+// leave. The expectations are Bitcoin's where this node follows Bitcoin; where
+// it does not (numbers of any length, the unassigned NOP bytes failing,
+// OP_VERIF before v3, the v4 opcodes before v4) a comment on the row says so
+// and the row pins what the code does. Signature-dependent cases are the other
+// suites' (rules-v2 to rules-v5, script-eval, multisig).
+
+typedef std::vector<unsigned char> OpVal;
+
+static OpVal OV(std::initializer_list<int> l)
+{
+    OpVal v;
+    for (std::initializer_list<int>::const_iterator it = l.begin(); it != l.end(); ++it)
+        v.push_back((unsigned char)*it);
+    return v;
+}
+
+static CScript OpRaw(std::initializer_list<int> l)
+{
+    OpVal v = OV(l);
+    CScript s;
+    s.insert(s.end(), v.begin(), v.end());
+    return s;
+}
+
+static CScript OpRepeat(opcodetype op, int n)
+{
+    CScript s;
+    for (int i = 0; i < n; i++)
+        s << op;
+    return s;
+}
+
+// n copies of one opcode, appended with <<.
+struct OpRun
+{
+    opcodetype op;
+    int n;
+    OpRun(opcodetype o, int c) : op(o), n(c) { }
+};
+static CScript& operator<<(CScript& s, const OpRun& r)
+{
+    for (int i = 0; i < r.n; i++)
+        s << r.op;
+    return s;
+}
+static CScript operator<<(CScript&& s, const OpRun& r)
+{
+    for (int i = 0; i < r.n; i++)
+        s << r.op;
+    return s;
+}
+
+static OpVal OpBytes(int n, int fill)
+{
+    return OpVal(n, (unsigned char)fill);
+}
+
+static CScript OpCat(const CScript& a, const OpVal& b)
+{
+    CScript s = a;
+    s.insert(s.end(), b.begin(), b.end());
+    return s;
+}
+
+// Bitcoin's number encoding (little endian, sign in the top bit of the last
+// byte, nothing for zero), written out here so the table does not lean on the
+// CBigNum the interpreter itself uses.
+static OpVal OpNum(int64 n)
+{
+    OpVal v;
+    if (n == 0)
+        return v;
+    bool fNeg = n < 0;
+    uint64 a = fNeg ? (uint64)(-n) : (uint64)n;
+    while (a)
+    {
+        v.push_back((unsigned char)(a & 0xff));
+        a >>= 8;
+    }
+    if (v.back() & 0x80)
+        v.push_back(fNeg ? 0x80 : 0x00);
+    else if (fNeg)
+        v.back() |= 0x80;
+    return v;
+}
+
+struct OpRow
+{
+    std::string section, name;
+    CScript script;
+    unsigned sets;          // bit 0: before v3, 1: v3, 2: v4, 3: v5
+    bool ok;
+    bool fStack;
+    std::vector<OpVal> stack;
+    int tx;
+    unsigned policy;
+};
+
+struct OpTable
+{
+    std::string cur;
+    std::vector<OpRow> rows;
+    void Add(const std::string& name, const CScript& s, unsigned sets, bool ok, int tx = 0, unsigned policy = 0)
+    {
+        OpRow r;
+        r.section = cur; r.name = name; r.script = s; r.sets = sets; r.ok = ok; r.fStack = false; r.tx = tx; r.policy = policy;
+        rows.push_back(r);
+    }
+    void AddS(const std::string& name, const CScript& s, unsigned sets, bool ok, const std::vector<OpVal>& st,
+              int tx = 0, unsigned policy = 0)
+    {
+        Add(name, s, sets, ok, tx, policy);
+        rows.back().fStack = true;
+        rows.back().stack = st;
+    }
+};
+
+static CTransaction OpTx(int nVersion, unsigned int nLockTime, unsigned int nSequence, int nOuts = 1)
+{
+    CTransaction tx;
+    tx.nVersion = nVersion;
+    tx.nLockTime = nLockTime;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint(uint256(4242), 0);
+    tx.vin[0].nSequence = nSequence;
+    for (int i = 0; i < nOuts; i++)
+        tx.vout.push_back(CTxOut(COIN + i, CScript() << OP_TRUE));
+    return tx;
+}
+
+static int RunScriptOpcodesSelfTest()
+{
+    printf("script-opcodes self-test\n");
+    int nFail = 0;
+
+    const unsigned PRE = 1, V3 = 2, V4 = 4, V5 = 8, ALL = 15, V3UP = V3 | V4 | V5, V4UP = V4 | V5;
+    const OpVal T = OV({1}), F = OV({});
+    typedef std::vector<OpVal> Stk;
+
+    // The transactions the lock opcodes look at.
+    enum { TX_PLAIN, TX_LOCK100, TX_LOCKTIME, TX_LOCK100_FINAL, TX_SEQ10, TX_SEQTIME10, TX_V1_SEQ10, TX_SEQ_DISABLED,
+           TX_TWO_OUTS, TX_NEGVERSION, TX_V2_FINAL, TX_COUNT };
+    std::vector<CTransaction> txs(TX_COUNT);
+    txs[TX_PLAIN]          = OpTx(1, 0, SEQUENCE_FINAL);
+    txs[TX_LOCK100]        = OpTx(1, 100, 0);
+    txs[TX_LOCKTIME]       = OpTx(1, 600000000, 0);
+    txs[TX_LOCK100_FINAL]  = OpTx(1, 100, SEQUENCE_FINAL);
+    txs[TX_SEQ10]          = OpTx(2, 0, 10);
+    txs[TX_SEQTIME10]      = OpTx(2, 0, SEQUENCE_LOCKTIME_TYPE_FLAG | 10);
+    txs[TX_V1_SEQ10]       = OpTx(1, 0, 10);
+    txs[TX_SEQ_DISABLED]   = OpTx(2, 0, SEQUENCE_LOCKTIME_DISABLE_FLAG | 10);
+    txs[TX_TWO_OUTS]       = OpTx(1, 0, SEQUENCE_FINAL, 2);
+    txs[TX_NEGVERSION]     = OpTx(-1, 0, 10);
+    txs[TX_V2_FINAL]       = OpTx(2, 0, SEQUENCE_FINAL);
+
+    OpTable t;
+
+    // ---- constants and pushes
+    t.cur = "constants and pushes";
+    t.AddS("empty script: nothing on the stack, false", CScript(), ALL, false, Stk());
+    t.AddS("OP_0 pushes an empty element, which is false", CScript() << OP_0, ALL, false, Stk{F});
+    for (int n = 1; n <= 16; n++)
+        t.AddS(strprintf("OP_%d pushes %d", n, n), OpRaw({0x50 + n}), ALL, true, Stk{OV({n})});
+    t.AddS("OP_1NEGATE pushes -1 (0x81)", OpRaw({0x4f}), ALL, true, Stk{OV({0x81})});
+    t.AddS("a direct push of one byte", OpRaw({0x01, 0x05}), ALL, true, Stk{OV({5})});
+    t.AddS("a direct push of three bytes", OpRaw({0x03, 1, 2, 3}), ALL, true, Stk{OV({1, 2, 3})});
+    t.AddS("PUSHDATA1 of three bytes", OpRaw({0x4c, 0x03, 0xaa, 0xbb, 0xcc}), ALL, true, Stk{OV({0xaa, 0xbb, 0xcc})});
+    t.AddS("PUSHDATA2 of two bytes", OpRaw({0x4d, 0x02, 0x00, 0xaa, 0xbb}), ALL, true, Stk{OV({0xaa, 0xbb})});
+    t.AddS("PUSHDATA4 of one byte", OpRaw({0x4e, 0x01, 0x00, 0x00, 0x00, 0xaa}), ALL, true, Stk{OV({0xaa})});
+    // Minimal encoding is not enforced (Bitcoin enforces it only as policy).
+    t.AddS("PUSHDATA1 of zero bytes is an empty element, then OP_1", OpRaw({0x4c, 0x00, 0x51}), ALL, true, Stk{F, T});
+    t.AddS("PUSHDATA2 of zero bytes", OpRaw({0x4d, 0x00, 0x00, 0x51}), ALL, true, Stk{F, T});
+    t.AddS("PUSHDATA4 of zero bytes", OpRaw({0x4e, 0x00, 0x00, 0x00, 0x00, 0x51}), ALL, true, Stk{F, T});
+    t.AddS("PUSHDATA1 of one byte (a non-minimal push of 5)", OpRaw({0x4c, 0x01, 0x05}), ALL, true, Stk{OV({5})});
+    t.AddS("a direct push of the byte 1 (a non-minimal OP_1)", OpRaw({0x01, 0x01}), ALL, true, Stk{T});
+    t.Add("a bare PUSHDATA1 with no length byte", OpRaw({0x4c}), ALL, false);
+    t.Add("PUSHDATA1 longer than what is left", OpRaw({0x4c, 0x05, 0x01, 0x02}), ALL, false);
+    t.Add("a bare PUSHDATA2", OpRaw({0x4d}), ALL, false);
+    t.Add("PUSHDATA2 with one length byte", OpRaw({0x4d, 0x01}), ALL, false);
+    t.Add("PUSHDATA2 longer than what is left", OpRaw({0x4d, 0x05, 0x00, 0x01}), ALL, false);
+    t.Add("PUSHDATA4 with three length bytes", OpRaw({0x4e, 0x01, 0x00, 0x00}), ALL, false);
+    t.Add("PUSHDATA4 of 65536 bytes with none behind it", OpRaw({0x4e, 0x00, 0x00, 0x01, 0x00}), ALL, false);
+    t.Add("a direct push of one byte with none behind it", OpRaw({0x01}), ALL, false);
+    t.Add("a direct push of two bytes with one behind it", OpRaw({0x02, 0xaa}), ALL, false);
+    t.AddS("control: a complete push inside a branch not taken is skipped", OpCat(CScript() << OP_0 << OP_IF, OV({0x4c, 0x01, 0x01})) << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.Add("a push cut short inside a branch not taken fails: the script cannot be read (the control above, closed, passes)", OpRaw({0x00, 0x63, 0x4c, 0x05, 0x01}), ALL, false);
+    t.AddS("a 520-byte push is allowed", CScript() << OpBytes(520, 7), ALL, true, Stk{OpBytes(520, 7)});
+    t.Add("a 521-byte push is refused", CScript() << OpBytes(521, 7), ALL, false);
+    t.Add("a 521-byte push in a branch not taken is refused too", CScript() << OP_0 << OP_IF << OpBytes(521, 7) << OP_ENDIF << OP_1, ALL, false);
+    t.AddS("a 520-byte PUSHDATA4", OpCat(OpRaw({0x4e, 0x08, 0x02, 0x00, 0x00}), OpBytes(520, 9)), ALL, true, Stk{OpBytes(520, 9)});
+    t.Add("a 521-byte PUSHDATA4", OpCat(OpRaw({0x4e, 0x09, 0x02, 0x00, 0x00}), OpBytes(521, 9)), ALL, false);
+    t.Add("OP_RESERVED run fails", OpRaw({0x50}), ALL, false);
+    t.AddS("OP_RESERVED in a branch not taken is skipped", CScript() << OP_0 << OP_IF << OP_RESERVED << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.Add("OP_RESERVED1 run fails", CScript() << OP_RESERVED1, ALL, false);
+    t.Add("OP_RESERVED2 run fails", CScript() << OP_RESERVED2, ALL, false);
+    t.AddS("OP_RESERVED1 in a branch not taken is skipped", CScript() << OP_0 << OP_IF << OP_RESERVED1 << OP_ENDIF << OP_1, ALL, true, Stk{T});
+
+    // ---- flow control
+    t.cur = "flow control";
+    t.AddS("OP_NOP does nothing", CScript() << OP_1 << OP_NOP, ALL, true, Stk{T});
+    t.AddS("IF takes the true branch", CScript() << OP_1 << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({2})});
+    t.AddS("IF takes the false branch", CScript() << OP_0 << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({3})});
+    t.AddS("NOTIF takes the true branch on false", CScript() << OP_0 << OP_NOTIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({2})});
+    t.AddS("NOTIF takes the else on true", CScript() << OP_1 << OP_NOTIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({3})});
+    t.AddS("IF without ELSE, false: nothing runs and the condition is gone", CScript() << OP_1 << OP_0 << OP_IF << OP_2 << OP_ENDIF, ALL, true, Stk{T});
+    t.AddS("IF consumes its condition", CScript() << OP_1 << OP_1 << OP_IF << OP_ENDIF, ALL, true, Stk{T});
+    t.AddS("nested IF, both taken", CScript() << OP_1 << OP_IF << OP_1 << OP_IF << OP_5 << OP_ELSE << OP_6 << OP_ENDIF << OP_ENDIF, ALL, true, Stk{OV({5})});
+    t.AddS("nested IF, inner else", CScript() << OP_1 << OP_IF << OP_0 << OP_IF << OP_5 << OP_ELSE << OP_6 << OP_ENDIF << OP_ENDIF, ALL, true, Stk{OV({6})});
+    t.AddS("nested IF under a false outer: the inner ELSE does not wake it",
+           CScript() << OP_0 << OP_IF << OP_1 << OP_IF << OP_5 << OP_ELSE << OP_6 << OP_ENDIF << OP_ELSE << OP_7 << OP_ENDIF, ALL, true, Stk{OV({7})});
+    t.AddS("an IF inside a branch not taken needs no condition", CScript() << OP_0 << OP_IF << OP_IF << OP_ENDIF << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("a second ELSE flips back (as in Bitcoin)", CScript() << OP_1 << OP_IF << OP_ELSE << OP_ELSE << OP_2 << OP_ENDIF, ALL, true, Stk{OV({2})});
+    t.AddS("negative zero is false for IF", CScript() << OpVal(OV({0x80})) << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({3})});
+    t.AddS("0x0000 is false for IF", CScript() << OV({0, 0}) << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({3})});
+    t.AddS("0x0080 (a negative zero) is false for IF", CScript() << OV({0, 0x80}) << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({3})});
+    t.AddS("0x8000 (128) is true for IF", CScript() << OV({0x80, 0}) << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({2})});
+    t.AddS("0x000001 is true for IF", CScript() << OV({0, 0, 1}) << OP_IF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, ALL, true, Stk{OV({2})});
+    t.Add("a lone ELSE", CScript() << OP_ELSE, ALL, false);
+    t.Add("a lone ENDIF", CScript() << OP_ENDIF, ALL, false);
+    t.Add("an IF left open", CScript() << OP_1 << OP_IF, ALL, false);
+    t.Add("an IF left open on the false branch", CScript() << OP_1 << OP_0 << OP_IF << OP_2, ALL, false);
+    t.Add("one ENDIF too many", CScript() << OP_1 << OP_IF << OP_1 << OP_ENDIF << OP_ENDIF, ALL, false);
+    t.Add("a NOTIF left open", CScript() << OP_1 << OP_NOTIF << OP_1, ALL, false);
+    t.Add("IF on an empty stack", CScript() << OP_IF << OP_ENDIF, ALL, false);
+    t.Add("NOTIF on an empty stack", CScript() << OP_NOTIF << OP_ENDIF, ALL, false);
+    t.AddS("VERIFY of a true value pops it", CScript() << OP_1 << OP_1 << OP_VERIFY, ALL, true, Stk{T});
+    t.Add("VERIFY of a false value fails the script", CScript() << OP_1 << OP_0 << OP_VERIFY, ALL, false);
+    t.Add("VERIFY ends the script: what follows a failed one does not rescue it", CScript() << OP_1 << OP_0 << OP_VERIFY << OP_1, ALL, false);
+    t.Add("VERIFY of a negative zero fails", CScript() << OP_1 << OV({0x80}) << OP_VERIFY, ALL, false);
+    t.Add("VERIFY on an empty stack", CScript() << OP_VERIFY, ALL, false);
+    t.Add("VERIFY failing inside an IF leaves the IF open: false", CScript() << OP_1 << OP_IF << OP_0 << OP_VERIFY << OP_ENDIF, ALL, false);
+    t.Add("RETURN fails the script", CScript() << OP_1 << OP_RETURN, ALL, false);
+    t.Add("RETURN fails even with a true stack and more script behind it", CScript() << OP_1 << OP_RETURN << OP_1, ALL, false);
+    t.AddS("RETURN in a branch not taken is skipped", CScript() << OP_0 << OP_IF << OP_RETURN << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("VERIFY in a branch not taken is skipped", CScript() << OP_0 << OP_IF << OP_VERIFY << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    // OP_VER, OP_VERIF, OP_VERNOTIF: this node's version decides, until rules
+    // v3, which makes all three invalid wherever they sit (Bitcoin did it for
+    // every block; here it waits for the fork height).
+    t.Add("OP_VER before v3 pushes this node's version (true)", CScript() << OP_VER, PRE, true);
+    t.Add("OP_VER from v3 fails", CScript() << OP_VER, V3UP, false);
+    t.AddS("OP_VER in a branch not taken is skipped before v3", CScript() << OP_0 << OP_IF << OP_VER << OP_ENDIF << OP_1, PRE, true, Stk{T});
+    t.Add("OP_VER in a branch not taken from v3", CScript() << OP_0 << OP_IF << OP_VER << OP_ENDIF << OP_1, V3UP, false);
+    t.AddS("OP_VERIF before v3: this version is at least 0, so the branch runs",
+           CScript() << OP_0 << OP_VERIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, PRE, true, Stk{OV({2})});
+    t.AddS("OP_VERIF before v3 against a number far above any version: the else branch",
+           CScript() << OV({0xff, 0xff, 0xff, 0xff, 0x7f}) << OP_VERIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, PRE, true, Stk{OV({3})});
+    t.AddS("OP_VERNOTIF before v3 is the opposite",
+           CScript() << OP_0 << OP_VERNOTIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, PRE, true, Stk{OV({3})});
+    t.Add("OP_VERIF from v3 fails", CScript() << OP_0 << OP_VERIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, V3UP, false);
+    t.Add("OP_VERNOTIF from v3 fails", CScript() << OP_0 << OP_VERNOTIF << OP_2 << OP_ELSE << OP_3 << OP_ENDIF, V3UP, false);
+    t.Add("OP_VERIF in a branch not taken from v3 fails", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_ENDIF << OP_1, V3UP, false);
+    t.Add("OP_VERNOTIF in a branch not taken from v3 fails", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1, V3UP, false);
+    t.Add("OP_VERIF with no condition on an empty stack", CScript() << OP_VERIF << OP_ENDIF, PRE, false);
+    // Before v3, in a branch not taken, OP_VERIF and OP_VERNOTIF still open a branch of their own, as OP_IF
+    // does: it takes its own OP_ENDIF (Bitcoin made them invalid everywhere, so the question never arises).
+    t.AddS("OP_VERIF in a branch not taken opens a branch: two ENDIFs close it", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_ENDIF << OP_1, PRE, true, Stk{T});
+    t.Add("and with one ENDIF the outer IF is left open: false", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_1, PRE, false);
+    t.AddS("OP_VERNOTIF in a branch not taken opens a branch: two ENDIFs close it", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1, PRE, true, Stk{T});
+    t.Add("and with one ENDIF the outer IF is left open: false (OP_VERNOTIF)", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_1, PRE, false);
+    // The limits.
+    t.AddS("201 non-push opcodes are allowed", CScript() << OP_1 << OpRun(OP_NOP, 201), ALL, true, Stk{T});
+    t.Add("202 are not", CScript() << OP_1 << OpRun(OP_NOP, 202), ALL, false);
+    t.Add("pushes are not counted: 300 of OP_1 .. then 201 NOPs is fine (stack 300)", CScript() << OpRun(OP_1, 300) << OpRun(OP_NOP, 201), ALL, true);
+    t.AddS("opcodes in a branch not taken count too: 201 in all is allowed",
+           CScript() << OP_0 << OP_IF << OpRun(OP_NOP, 199) << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.Add("and 202 in all is not", CScript() << OP_0 << OP_IF << OpRun(OP_NOP, 200) << OP_ENDIF << OP_1, ALL, false);
+    t.AddS("a stack of 1000 elements is allowed", OpRepeat(OP_1, 1000), ALL, true, Stk(1000, T));
+    t.Add("a stack of 1001 is not", OpRepeat(OP_1, 1001), ALL, false);
+    t.Add("999 and a DUP reaches exactly 1000", CScript() << OpRun(OP_1, 999) << OP_DUP, ALL, true);
+    t.Add("1000 and a DUP is one too many", CScript() << OpRun(OP_1, 1000) << OP_DUP, ALL, false);
+    t.Add("the altstack counts against the same 1000 (999 + 1 moved + 2 pushed)", CScript() << OpRun(OP_1, 999) << OP_TOALTSTACK << OP_1 << OP_1, ALL, false);
+    t.Add("998 on the stack + 1 on the altstack + 1 = 1000: allowed", CScript() << OpRun(OP_1, 999) << OP_TOALTSTACK << OP_1, ALL, true);
+
+    // ---- stack operations
+    t.cur = "stack operations";
+    t.AddS("TOALTSTACK takes the top", CScript() << OP_1 << OP_2 << OP_TOALTSTACK, ALL, true, Stk{T});
+    t.AddS("FROMALTSTACK brings it back", CScript() << OP_1 << OP_2 << OP_TOALTSTACK << OP_FROMALTSTACK, ALL, true, Stk{T, OV({2})});
+    t.AddS("the altstack is last in, first out", CScript() << OP_1 << OP_TOALTSTACK << OP_2 << OP_TOALTSTACK << OP_FROMALTSTACK << OP_FROMALTSTACK, ALL, true, Stk{OV({2}), T});
+    t.AddS("what is left on the altstack does not matter", CScript() << OP_1 << OP_1 << OP_TOALTSTACK, ALL, true, Stk{T});
+    t.Add("FROMALTSTACK with an empty altstack", CScript() << OP_1 << OP_FROMALTSTACK, ALL, false);
+    t.AddS("2DROP", CScript() << OP_1 << OP_2 << OP_3 << OP_2DROP, ALL, true, Stk{T});
+    t.AddS("2DUP", CScript() << OP_1 << OP_2 << OP_2DUP, ALL, true, Stk{T, OV({2}), T, OV({2})});
+    t.AddS("3DUP", CScript() << OP_1 << OP_2 << OP_3 << OP_3DUP, ALL, true, Stk{T, OV({2}), OV({3}), T, OV({2}), OV({3})});
+    t.AddS("2OVER", CScript() << OP_1 << OP_2 << OP_3 << OP_4 << OP_2OVER, ALL, true, Stk{T, OV({2}), OV({3}), OV({4}), T, OV({2})});
+    t.AddS("2ROT", CScript() << OP_1 << OP_2 << OP_3 << OP_4 << OP_5 << OP_6 << OP_2ROT, ALL, true, Stk{OV({3}), OV({4}), OV({5}), OV({6}), T, OV({2})});
+    t.AddS("2SWAP", CScript() << OP_1 << OP_2 << OP_3 << OP_4 << OP_2SWAP, ALL, true, Stk{OV({3}), OV({4}), T, OV({2})});
+    t.AddS("IFDUP of a true value duplicates it", CScript() << OP_1 << OP_IFDUP, ALL, true, Stk{T, T});
+    t.AddS("IFDUP of a false value does not", CScript() << OP_0 << OP_IFDUP, ALL, false, Stk{F});
+    t.AddS("IFDUP of a negative zero does not", CScript() << OV({0x80}) << OP_IFDUP, ALL, false, Stk{OV({0x80})});
+    t.AddS("DEPTH of an empty stack is 0", CScript() << OP_DEPTH, ALL, false, Stk{F});
+    t.AddS("DEPTH counts the stack", CScript() << OP_5 << OP_6 << OP_DEPTH, ALL, true, Stk{OV({5}), OV({6}), OV({2})});
+    t.AddS("DROP", CScript() << OP_1 << OP_2 << OP_DROP, ALL, true, Stk{T});
+    t.AddS("DUP", CScript() << OP_1 << OP_DUP, ALL, true, Stk{T, T});
+    t.AddS("NIP", CScript() << OP_1 << OP_2 << OP_NIP, ALL, true, Stk{OV({2})});
+    t.AddS("OVER", CScript() << OP_1 << OP_2 << OP_OVER, ALL, true, Stk{T, OV({2}), T});
+    t.AddS("PICK copies the element n deep", CScript() << OP_1 << OP_2 << OP_3 << OP_2 << OP_PICK, ALL, true, Stk{T, OV({2}), OV({3}), T});
+    t.AddS("PICK 0 is DUP", CScript() << OP_1 << OP_0 << OP_PICK, ALL, true, Stk{T, T});
+    t.AddS("ROLL moves the element n deep", CScript() << OP_1 << OP_2 << OP_3 << OP_2 << OP_ROLL, ALL, true, Stk{OV({2}), OV({3}), T});
+    t.AddS("ROLL 0 does nothing", CScript() << OP_1 << OP_0 << OP_ROLL, ALL, true, Stk{T});
+    t.AddS("PICK reads its index as a number: 0x0100 is 1", CScript() << OP_1 << OP_2 << OV({1, 0}) << OP_PICK, ALL, true, Stk{T, OV({2}), T});
+    t.AddS("PICK of a negative zero index is index 0", CScript() << OP_1 << OV({0x80}) << OP_PICK, ALL, true, Stk{T, T});
+    t.Add("PICK past the bottom", CScript() << OP_1 << OP_1 << OP_PICK, ALL, false);
+    t.Add("ROLL past the bottom", CScript() << OP_1 << OP_1 << OP_ROLL, ALL, false);
+    t.Add("PICK with a negative index", CScript() << OP_1 << OP_1NEGATE << OP_PICK, ALL, false);
+    t.Add("ROLL with a negative index", CScript() << OP_1 << OP_1NEGATE << OP_ROLL, ALL, false);
+    t.Add("PICK with an index that does not fit an int", CScript() << OP_1 << OV({0xff, 0xff, 0xff, 0xff, 0x00}) << OP_PICK, ALL, false);
+    // 2^32: its low 32 bits are zero, which reads as index 0 where an int is 32 bits (the fix of CBigNum::getint).
+    t.Add("PICK with an index of 2^32 fails (not index 0)", CScript() << OP_1 << OV({0, 0, 0, 0, 1}) << OP_PICK, ALL, false);
+    t.Add("ROLL with an index of 2^32 fails (not index 0)", CScript() << OP_1 << OV({0, 0, 0, 0, 1}) << OP_ROLL, ALL, false);
+    t.AddS("ROT", CScript() << OP_1 << OP_2 << OP_3 << OP_ROT, ALL, true, Stk{OV({2}), OV({3}), T});
+    t.AddS("SWAP", CScript() << OP_1 << OP_2 << OP_SWAP, ALL, true, Stk{OV({2}), T});
+    t.AddS("TUCK", CScript() << OP_1 << OP_2 << OP_TUCK, ALL, true, Stk{OV({2}), T, OV({2})});
+    t.AddS("SIZE of three bytes", CScript() << OV({1, 2, 3}) << OP_SIZE, ALL, true, Stk{OV({1, 2, 3}), OV({3})});
+    t.AddS("SIZE of an empty element is 0", CScript() << OP_0 << OP_SIZE, ALL, false, Stk{F, F});
+    t.AddS("SIZE of a 520-byte element", CScript() << OpBytes(520, 1) << OP_SIZE, ALL, true, Stk{OpBytes(520, 1), OV({0x08, 0x02})});
+    {
+        // Every stack operation one element short of what it needs.
+        struct { opcodetype op; int need; } aNeed[] = {
+            { OP_TOALTSTACK, 1 }, { OP_2DROP, 2 }, { OP_2DUP, 2 }, { OP_3DUP, 3 }, { OP_2OVER, 4 }, { OP_2ROT, 6 },
+            { OP_2SWAP, 4 }, { OP_IFDUP, 1 }, { OP_DROP, 1 }, { OP_DUP, 1 }, { OP_NIP, 2 }, { OP_OVER, 2 },
+            { OP_PICK, 2 }, { OP_ROLL, 2 }, { OP_ROT, 3 }, { OP_SWAP, 2 }, { OP_TUCK, 2 }, { OP_SIZE, 1 },
+            { OP_EQUAL, 2 }, { OP_EQUALVERIFY, 2 }, { OP_1ADD, 1 }, { OP_1SUB, 1 }, { OP_NEGATE, 1 }, { OP_ABS, 1 },
+            { OP_NOT, 1 }, { OP_0NOTEQUAL, 1 }, { OP_ADD, 2 }, { OP_SUB, 2 }, { OP_BOOLAND, 2 }, { OP_BOOLOR, 2 },
+            { OP_NUMEQUAL, 2 }, { OP_NUMEQUALVERIFY, 2 }, { OP_NUMNOTEQUAL, 2 }, { OP_LESSTHAN, 2 },
+            { OP_GREATERTHAN, 2 }, { OP_LESSTHANOREQUAL, 2 }, { OP_GREATERTHANOREQUAL, 2 }, { OP_MIN, 2 },
+            { OP_MAX, 2 }, { OP_WITHIN, 3 }, { OP_RIPEMD160, 1 }, { OP_SHA1, 1 }, { OP_SHA256, 1 },
+            { OP_HASH160, 1 }, { OP_HASH256, 1 }, { OP_CHECKSIG, 2 }, { OP_CHECKSIGVERIFY, 2 },
+        };
+        for (size_t i = 0; i < sizeof(aNeed) / sizeof(aNeed[0]); i++)
+            t.Add(strprintf("%s with %d element%s fails", GetOpName(aNeed[i].op), aNeed[i].need - 1, aNeed[i].need == 2 ? "" : "s"),
+                  OpRepeat(OP_1, aNeed[i].need - 1) << aNeed[i].op, ALL, false);
+    }
+
+    // ---- the disabled splice, bitwise and arithmetic opcodes
+    // Bitcoin removed these in 0.3.x because OP_CAT and the shifts can be used
+    // to exhaust memory; this node does the same, from genesis, under every
+    // rule set, and -- as Bitcoin does -- even in a branch that is not taken.
+    t.cur = "disabled opcodes";
+    {
+        const opcodetype aDisabled[] = { OP_CAT, OP_SUBSTR, OP_LEFT, OP_RIGHT, OP_INVERT, OP_AND, OP_OR, OP_XOR,
+                                         OP_2MUL, OP_2DIV, OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT, OP_RSHIFT };
+        for (size_t i = 0; i < sizeof(aDisabled) / sizeof(aDisabled[0]); i++)
+        {
+            t.Add(strprintf("%s with operands ready fails", GetOpName(aDisabled[i])),
+                  OpRepeat(OP_1, 3) << aDisabled[i], ALL, false);
+            t.Add(strprintf("%s fails in a branch not taken", GetOpName(aDisabled[i])),
+                  CScript() << OP_0 << OP_IF << aDisabled[i] << OP_ENDIF << OP_1, ALL, false);
+            t.Add(strprintf("%s fails on an empty stack too", GetOpName(aDisabled[i])),
+                  CScript() << aDisabled[i], ALL, false);
+        }
+    }
+
+    // ---- equality
+    t.cur = "equality";
+    t.AddS("EQUAL of equal numbers", CScript() << OP_1 << OP_1 << OP_EQUAL, ALL, true, Stk{T});
+    t.AddS("EQUAL of different numbers", CScript() << OP_1 << OP_2 << OP_EQUAL, ALL, false, Stk{F});
+    t.AddS("EQUAL of two empty elements", CScript() << OP_0 << OP_0 << OP_EQUAL, ALL, true, Stk{T});
+    t.AddS("EQUAL of OP_0 and an empty PUSHDATA1", OpCat(CScript() << OP_0, OV({0x4c, 0x00})) << OP_EQUAL, ALL, true, Stk{T});
+    t.AddS("EQUAL compares bytes: 0x01 and 0x0100 differ", CScript() << OV({1}) << OV({1, 0}) << OP_EQUAL, ALL, false, Stk{F});
+    t.AddS("EQUAL compares bytes: negative zero and empty differ", CScript() << OV({0x80}) << OP_0 << OP_EQUAL, ALL, false, Stk{F});
+    t.AddS("EQUAL of equal 520-byte elements", CScript() << OpBytes(520, 3) << OpBytes(520, 3) << OP_EQUAL, ALL, true, Stk{T});
+    t.AddS("EQUALVERIFY of equal values pops both and goes on", CScript() << OP_1 << OP_1 << OP_EQUALVERIFY << OP_1, ALL, true, Stk{T});
+    t.Add("EQUALVERIFY of different values fails", CScript() << OP_1 << OP_2 << OP_EQUALVERIFY << OP_1, ALL, false);
+
+    // ---- arithmetic
+    t.cur = "arithmetic";
+    {
+        struct { opcodetype op; int64 a, r; } aUn[] = {
+            { OP_1ADD, 0, 1 }, { OP_1ADD, 1, 2 }, { OP_1ADD, -1, 0 }, { OP_1ADD, 127, 128 }, { OP_1ADD, 255, 256 },
+            { OP_1ADD, 2147483647LL, 2147483648LL }, { OP_1ADD, -2147483648LL, -2147483647LL },
+            { OP_1SUB, 0, -1 }, { OP_1SUB, 1, 0 }, { OP_1SUB, -127, -128 }, { OP_1SUB, 128, 127 },
+            { OP_NEGATE, 5, -5 }, { OP_NEGATE, 0, 0 }, { OP_NEGATE, -5, 5 }, { OP_NEGATE, 127, -127 }, { OP_NEGATE, 128, -128 },
+            { OP_ABS, -5, 5 }, { OP_ABS, 5, 5 }, { OP_ABS, 0, 0 }, { OP_ABS, -128, 128 },
+            { OP_NOT, 0, 1 }, { OP_NOT, 1, 0 }, { OP_NOT, 5, 0 }, { OP_NOT, -1, 0 },
+            { OP_0NOTEQUAL, 0, 0 }, { OP_0NOTEQUAL, 5, 1 }, { OP_0NOTEQUAL, -5, 1 },
+        };
+        for (size_t i = 0; i < sizeof(aUn) / sizeof(aUn[0]); i++)
+            t.AddS(strprintf("%s of %lld is %lld", GetOpName(aUn[i].op), (long long)aUn[i].a, (long long)aUn[i].r),
+                   CScript() << aUn[i].a << aUn[i].op, ALL, aUn[i].r != 0, Stk{OpNum(aUn[i].r)});
+
+        struct { opcodetype op; int64 a, b, r; } aBin[] = {
+            { OP_ADD, 2, 3, 5 }, { OP_ADD, -2, 3, 1 }, { OP_ADD, 0, 0, 0 }, { OP_ADD, -5, -6, -11 },
+            { OP_ADD, 2147483647LL, 1, 2147483648LL }, { OP_ADD, 2147483647LL, 2147483647LL, 4294967294LL },
+            { OP_ADD, -2147483647LL, -2147483647LL, -4294967294LL },
+            { OP_SUB, 2, 3, -1 }, { OP_SUB, 3, 2, 1 }, { OP_SUB, 0, 5, -5 }, { OP_SUB, -3, -4, 1 }, { OP_SUB, 5, 5, 0 },
+            { OP_BOOLAND, 1, 0, 0 }, { OP_BOOLAND, 1, 2, 1 }, { OP_BOOLAND, 0, 0, 0 }, { OP_BOOLAND, -1, -1, 1 },
+            { OP_BOOLOR, 0, 0, 0 }, { OP_BOOLOR, 0, 1, 1 }, { OP_BOOLOR, -3, 0, 1 },
+            { OP_NUMEQUAL, 2, 2, 1 }, { OP_NUMEQUAL, 2, 3, 0 }, { OP_NUMEQUAL, -1, -1, 1 }, { OP_NUMEQUAL, 0, 0, 1 },
+            { OP_NUMNOTEQUAL, 2, 3, 1 }, { OP_NUMNOTEQUAL, 2, 2, 0 },
+            { OP_LESSTHAN, 2, 3, 1 }, { OP_LESSTHAN, 3, 2, 0 }, { OP_LESSTHAN, 2, 2, 0 }, { OP_LESSTHAN, -3, -2, 1 }, { OP_LESSTHAN, -1, 0, 1 },
+            { OP_GREATERTHAN, 3, 2, 1 }, { OP_GREATERTHAN, 2, 3, 0 }, { OP_GREATERTHAN, 2, 2, 0 }, { OP_GREATERTHAN, 0, -1, 1 },
+            { OP_LESSTHANOREQUAL, 2, 2, 1 }, { OP_LESSTHANOREQUAL, 2, 3, 1 }, { OP_LESSTHANOREQUAL, 3, 2, 0 },
+            { OP_GREATERTHANOREQUAL, 2, 2, 1 }, { OP_GREATERTHANOREQUAL, 3, 2, 1 }, { OP_GREATERTHANOREQUAL, 2, 3, 0 },
+            { OP_MIN, 2, 3, 2 }, { OP_MIN, 3, 2, 2 }, { OP_MIN, -1, 1, -1 }, { OP_MIN, 5, 5, 5 },
+            { OP_MAX, 2, 3, 3 }, { OP_MAX, 3, 2, 3 }, { OP_MAX, -1, 1, 1 }, { OP_MAX, -5, -7, -5 },
+        };
+        for (size_t i = 0; i < sizeof(aBin) / sizeof(aBin[0]); i++)
+            t.AddS(strprintf("%lld %lld %s is %lld", (long long)aBin[i].a, (long long)aBin[i].b, GetOpName(aBin[i].op), (long long)aBin[i].r),
+                   CScript() << aBin[i].a << aBin[i].b << aBin[i].op, ALL, aBin[i].r != 0, Stk{OpNum(aBin[i].r)});
+
+        struct { int64 x, lo, hi, r; } aWithin[] = {
+            { 2, 1, 3, 1 }, { 1, 1, 3, 1 }, { 3, 1, 3, 0 }, { 0, 1, 3, 0 }, { -1, -2, 0, 1 }, { 5, 5, 5, 0 }, { 5, 6, 4, 0 },
+        };
+        for (size_t i = 0; i < sizeof(aWithin) / sizeof(aWithin[0]); i++)
+            t.AddS(strprintf("%lld in [%lld, %lld) is %lld", (long long)aWithin[i].x, (long long)aWithin[i].lo, (long long)aWithin[i].hi, (long long)aWithin[i].r),
+                   CScript() << aWithin[i].x << aWithin[i].lo << aWithin[i].hi << OP_WITHIN, ALL, aWithin[i].r != 0, Stk{OpNum(aWithin[i].r)});
+    }
+    t.AddS("NUMEQUALVERIFY of equal numbers goes on", CScript() << OP_2 << OP_2 << OP_NUMEQUALVERIFY << OP_1, ALL, true, Stk{T});
+    t.Add("NUMEQUALVERIFY of different numbers fails", CScript() << OP_2 << OP_3 << OP_NUMEQUALVERIFY << OP_1, ALL, false);
+    // Numbers are read as Bitcoin 0.1.0 read them: any length, negative zero
+    // is zero, a number need not be minimal, and the result is always minimal.
+    t.AddS("negative zero is zero for NOT", CScript() << OV({0x80}) << OP_NOT, ALL, true, Stk{T});
+    t.AddS("negative zero is zero for 0NOTEQUAL", CScript() << OV({0x80}) << OP_0NOTEQUAL, ALL, false, Stk{F});
+    t.AddS("negative zero plus one", CScript() << OV({0x80}) << OP_1ADD, ALL, true, Stk{T});
+    t.AddS("negating a negative zero is the empty zero", CScript() << OV({0x80}) << OP_NEGATE, ALL, false, Stk{F});
+    t.AddS("the absolute value of a negative zero", CScript() << OV({0x80}) << OP_ABS, ALL, false, Stk{F});
+    t.AddS("0x0000 is zero for NOT", CScript() << OV({0, 0}) << OP_NOT, ALL, true, Stk{T});
+    t.AddS("0x0000000000 plus one", CScript() << OV({0, 0, 0, 0, 0}) << OP_1ADD, ALL, true, Stk{T});
+    t.AddS("a non-minimal 1 plus one", CScript() << OV({1, 0}) << OP_1ADD, ALL, true, Stk{OV({2})});
+    t.AddS("a non-minimal -2 (0x0280) plus one is -1", CScript() << OV({2, 0x80}) << OP_1ADD, ALL, true, Stk{OV({0x81})});
+    t.AddS("NUMEQUAL ignores padding", CScript() << OV({1, 0, 0, 0}) << OP_1 << OP_NUMEQUAL, ALL, true, Stk{T});
+    t.AddS("NUMEQUAL: negative zero equals zero", CScript() << OV({0x80}) << OP_0 << OP_NUMEQUAL, ALL, true, Stk{T});
+    // Not Bitcoin's 4-byte limit: this node reads operands of any length (up
+    // to the 520 an element can hold), as 0.1.0 did, and a changed rule here
+    // would be a fork. The results are exact, with no wrap at 2^31 or 2^32.
+    t.AddS("a 4-byte maximum plus one does not wrap: a 5-byte result", CScript() << OV({0xff, 0xff, 0xff, 0x7f}) << OP_1ADD, ALL, true, Stk{OV({0, 0, 0, 0x80, 0})});
+    t.AddS("a 5-byte operand is accepted (Bitcoin refuses an operand over four bytes)", CScript() << OV({0, 0, 0, 0x80, 0}) << OP_1ADD, ALL, true, Stk{OV({1, 0, 0, 0x80, 0})});
+    t.AddS("an 8-byte operand is accepted", CScript() << OV({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}) << OP_1ADD, ALL, true, Stk{OV({0, 0, 0, 0, 0, 0, 0, 0x80, 0})});
+    t.AddS("two 8-byte operands add exactly", CScript() << OV({1, 0, 0, 0, 0, 0, 0, 0}) << OV({1, 0, 0, 0, 0, 0, 0, 0}) << OP_ADD, ALL, true, Stk{OV({2})});
+    t.AddS("an operand of 0x0100000000 (2^32) is 2^32", CScript() << OV({0, 0, 0, 0, 1}) << OP_1SUB, ALL, true, Stk{OV({0xff, 0xff, 0xff, 0xff, 0})});
+    t.AddS("a 520-byte zero is zero", CScript() << OpBytes(520, 0) << OP_NOT, ALL, true, Stk{T});
+    t.AddS("-(2^31-1) negated", CScript() << OV({0xff, 0xff, 0xff, 0xff}) << OP_NEGATE, ALL, true, Stk{OV({0xff, 0xff, 0xff, 0x7f})});
+
+    // ---- crypto
+    t.cur = "hash opcodes";
+    {
+        const OpVal abc = OV({'a', 'b', 'c'});
+        struct { opcodetype op; bool fAbc; const char* hex; } aHash[] = {
+            { OP_RIPEMD160, false, "9c1185a5c5e9fc54612808977ee8f548b2258d31" },
+            { OP_SHA1,      false, "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
+            { OP_SHA256,    false, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+            { OP_HASH160,   false, "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb" },
+            { OP_HASH256,   false, "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456" },
+            { OP_RIPEMD160, true,  "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc" },
+            { OP_SHA1,      true,  "a9993e364706816aba3e25717850c26c9cd0d89d" },
+            { OP_SHA256,    true,  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+            { OP_HASH160,   true,  "bb1be98c142444d7a56aa3981c3942a978e4dc33" },
+            { OP_HASH256,   true,  "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358" },
+        };
+        for (size_t i = 0; i < sizeof(aHash) / sizeof(aHash[0]); i++)
+        {
+            CScript s;
+            if (aHash[i].fAbc)
+                s << abc;
+            else
+                s << OP_0;
+            s << aHash[i].op;
+            t.AddS(strprintf("%s of %s", GetOpName(aHash[i].op), aHash[i].fAbc ? "\"abc\"" : "the empty string"),
+                   s, ALL, true, Stk{ParseHex(aHash[i].hex)});
+        }
+    }
+    t.AddS("SHA256 twice is HASH256", CScript() << OP_0 << OP_SHA256 << OP_SHA256, ALL, true,
+           Stk{ParseHex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456")});
+    t.AddS("HASH160 is RIPEMD160 of SHA256", CScript() << OP_0 << OP_SHA256 << OP_RIPEMD160, ALL, true,
+           Stk{ParseHex("b472a266d0bd89c13706a4132ccfb16f7c3b9fcb")});
+    t.Add("a 520-byte element hashes", CScript() << OpBytes(520, 0xab) << OP_SHA256 << OP_SIZE << OP_NIP, ALL, true);
+    t.AddS("the hash of a hash has the right size (20 for HASH160)", CScript() << OP_1 << OP_HASH160 << OP_SIZE << OP_NIP, ALL, true, Stk{OV({20})});
+    t.AddS("and 32 for HASH256", CScript() << OP_1 << OP_HASH256 << OP_SIZE << OP_NIP, ALL, true, Stk{OV({32})});
+
+    // ---- code separator and the signature opcodes that need no signature
+    t.cur = "code separator and signature opcodes";
+    t.AddS("CODESEPARATOR does nothing to the stack", CScript() << OP_1 << OP_CODESEPARATOR, ALL, true, Stk{T});
+    t.AddS("CODESEPARATOR in a branch not taken", CScript() << OP_0 << OP_IF << OP_CODESEPARATOR << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("CHECKSIG of an empty signature and key is false, not a failure", CScript() << OP_0 << OP_0 << OP_CHECKSIG, ALL, false, Stk{F});
+    t.AddS("CHECKSIG of garbage is false", CScript() << OV({1, 2, 3}) << OV({4, 5, 6}) << OP_CHECKSIG, ALL, false, Stk{F});
+    t.Add("CHECKSIGVERIFY of garbage fails", CScript() << OV({1, 2, 3}) << OV({4, 5, 6}) << OP_CHECKSIGVERIFY << OP_1, ALL, false);
+    t.AddS("CHECKMULTISIG, no signatures and no keys, takes the dummy: true",
+           CScript() << OP_0 << OP_0 << OP_0 << OP_CHECKMULTISIG, ALL, true, Stk{T});
+    t.Add("CHECKMULTISIG without the dummy element fails", CScript() << OP_0 << OP_0 << OP_CHECKMULTISIG, ALL, false);
+    t.AddS("CHECKMULTISIGVERIFY, no signatures and no keys", CScript() << OP_0 << OP_0 << OP_0 << OP_CHECKMULTISIGVERIFY << OP_1, ALL, true, Stk{T});
+    t.Add("CHECKMULTISIG with more keys than the stack holds", CScript() << OP_0 << OP_0 << OP_5 << OP_CHECKMULTISIG, ALL, false);
+    t.Add("CHECKMULTISIG with a negative key count", CScript() << OP_0 << OP_0 << OP_1NEGATE << OP_CHECKMULTISIG, ALL, false);
+    t.Add("CHECKMULTISIG with more signatures than keys", CScript() << OP_0 << OP_2 << OP_0 << OP_1 << OP_CHECKMULTISIG, ALL, false);
+    t.Add("CHECKMULTISIG with a negative signature count", CScript() << OP_0 << OP_1NEGATE << OP_0 << OP_1 << OP_CHECKMULTISIG, ALL, false);
+    t.AddS("CHECKMULTISIG of an empty signature against an empty key is false",
+           CScript() << OP_0 << OP_0 << OP_1 << OP_0 << OP_1 << OP_CHECKMULTISIG, ALL, false, Stk{F});
+    t.Add("CHECKMULTISIGVERIFY of that fails", CScript() << OP_0 << OP_0 << OP_1 << OP_0 << OP_1 << OP_CHECKMULTISIGVERIFY << OP_1, ALL, false);
+    t.AddS("20 keys and no signatures: allowed everywhere",
+           CScript() << OP_0 << OP_0 << OpRun(OP_0, 20) << 20 << OP_CHECKMULTISIG, ALL, true, Stk{T});
+    // Rules v5: at most MAX_PUBKEYS_PER_MULTISIG (20) keys, the 20 signature
+    // operations the block is charged for it.
+    t.AddS("21 keys and no signatures before v5", CScript() << OP_0 << OP_0 << OpRun(OP_0, 21) << 21 << OP_CHECKMULTISIG, ALL & ~V5, true, Stk{T});
+    t.Add("21 keys under rules v5 fail", CScript() << OP_0 << OP_0 << OpRun(OP_0, 21) << 21 << OP_CHECKMULTISIG, V5, false);
+    t.Add("a key count of 2^32 + 1 fails (not 1)", CScript() << OP_0 << OP_0 << OV({1, 0, 0, 0, 1}) << OP_CHECKMULTISIG, ALL, false);
+    t.Add("a signature count of 2^32 with one key fails (not 0 signatures, which would pass)", CScript() << OP_0 << OV({0, 0, 0, 0, 1}) << OP_0 << OP_1 << OP_CHECKMULTISIG, ALL, false);
+    // Bitcoin adds the key count of an OP_CHECKMULTISIG to the 201-opcode count; this node counts the opcode
+    // alone (the 20 signature operations are charged to the block by GetSigOpCount instead). So 20 keys and
+    // 190 NOPs, 211 by Bitcoin's count, are 191 here and pass; 201 NOPs after it are 202 and fail.
+    t.AddS("20 keys and 190 NOPs pass here (211 by Bitcoin's count)", CScript() << OP_0 << OP_0 << OpRun(OP_0, 20) << 20 << OP_CHECKMULTISIG << OpRun(OP_NOP, 190), ALL, true, Stk{T});
+    t.Add("the multisig opcode itself still counts: 201 NOPs after it are one too many", CScript() << OP_0 << OP_0 << OpRun(OP_0, 20) << 20 << OP_CHECKMULTISIG << OpRun(OP_NOP, 201), ALL, false);
+
+    // ---- the NOP bytes and the bytes no rule gives a meaning
+    // Bitcoin runs 0xb0 and 0xb3..0xb9 as NOPs and leaves them to soft forks.
+    // This node has no upgradable NOPs: the byte is unknown and fails the
+    // script that runs it, like 0xba and every byte above the assigned ones.
+    // Only OP_NOP (0x61) is a NOP. A byte not run (a branch not taken) is
+    // skipped, as is an opcode of any value.
+    t.cur = "unassigned bytes";
+    t.AddS("OP_NOP (0x61)", OpRaw({0x61, 0x51}), ALL, true, Stk{T});
+    {
+        const int aUnknown[] = { 0xb0, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xc0, 0xcb, 0xcd, 0xd0, 0xef };
+        for (size_t i = 0; i < sizeof(aUnknown) / sizeof(aUnknown[0]); i++)
+        {
+            t.Add(strprintf("byte 0x%02x run fails (Bitcoin: NOP or reserved, here unknown)", aUnknown[i]),
+                  OpRaw({0x51, aUnknown[i]}), ALL, false);
+            t.AddS(strprintf("byte 0x%02x in a branch not taken is skipped", aUnknown[i]),
+                   OpCat(CScript() << OP_0 << OP_IF, OV({aUnknown[i]})) << OP_ENDIF << OP_1, ALL, true, Stk{T});
+        }
+    }
+    t.Add("a two-byte opcode (0xf000) run fails", OpRaw({0xf0, 0x00}), ALL, false);
+    t.AddS("a two-byte opcode in a branch not taken is skipped", OpCat(CScript() << OP_0 << OP_IF, OV({0xf0, 0x00})) << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.Add("a lone 0xf0 as the last byte inside a branch not taken fails: its second byte is missing, so the script cannot be read (the two-byte form above, closed, passes)", OpCat(CScript() << OP_0 << OP_IF, OV({0xf0})), ALL, false);
+
+    // ---- OP_CHECKLOCKTIMEVERIFY (rules v3)
+    t.cur = "OP_CHECKLOCKTIMEVERIFY";
+    t.Add("before v3 the byte is unknown and fails", CScript() << 100 << OP_CHECKLOCKTIMEVERIFY, PRE, false, TX_LOCK100);
+    t.AddS("before v3 it is skipped in a branch not taken", CScript() << OP_0 << OP_IF << OP_CHECKLOCKTIMEVERIFY << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("lock 100, tx lock time 100: satisfied, and the lock stays on the stack", CScript() << 100 << OP_CHECKLOCKTIMEVERIFY, V3UP, true, Stk{OV({100})}, TX_LOCK100);
+    t.AddS("lock 99 is passed", CScript() << 99 << OP_CHECKLOCKTIMEVERIFY, V3UP, true, Stk{OV({99})}, TX_LOCK100);
+    t.Add("lock 101 is not yet", CScript() << 101 << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100);
+    t.AddS("lock 0", CScript() << OP_0 << OP_CHECKLOCKTIMEVERIFY << OP_1, V3UP, true, Stk{F, T}, TX_LOCK100);
+    t.Add("a negative lock fails", CScript() << OP_1NEGATE << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100);
+    t.Add("an empty stack fails", CScript() << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100);
+    t.AddS("a 5-byte lock is read (a time after 2038 needs five)", CScript() << OV({100, 0, 0, 0, 0}) << OP_CHECKLOCKTIMEVERIFY, V3UP, true, Stk{OV({100, 0, 0, 0, 0})}, TX_LOCK100);
+    t.Add("a 6-byte lock fails", CScript() << OV({100, 0, 0, 0, 0, 0}) << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100);
+    t.AddS("a time lock against a time", CScript() << 500000000 << OP_CHECKLOCKTIMEVERIFY, V3UP, true, Stk{OV({0x00, 0x65, 0xcd, 0x1d})}, TX_LOCKTIME);
+    t.Add("a time lock not yet reached", CScript() << 600000001 << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCKTIME);
+    t.Add("a height lock does not satisfy a time (units differ)", CScript() << 100 << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCKTIME);
+    t.Add("a time lock does not satisfy a height", CScript() << 500000000 << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100);
+    t.Add("a final input switches the lock off: fails", CScript() << 100 << OP_CHECKLOCKTIMEVERIFY, V3UP, false, TX_LOCK100_FINAL);
+    t.Add("lock time 0 and a final input", CScript() << OP_0 << OP_CHECKLOCKTIMEVERIFY << OP_1, V3UP, false, TX_PLAIN);
+
+    // ---- OP_CHECKSEQUENCEVERIFY (rules v4)
+    t.cur = "OP_CHECKSEQUENCEVERIFY";
+    const unsigned CSVPRE = PRE | V3;
+    t.Add("before v4 the byte is unknown and fails", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, CSVPRE, false, TX_SEQ10);
+    t.AddS("before v4 it is skipped in a branch not taken", CScript() << OP_0 << OP_IF << OP_CHECKSEQUENCEVERIFY << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("sequence 10, lock 10", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10})}, TX_SEQ10);
+    t.AddS("lock 5", CScript() << 5 << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({5})}, TX_SEQ10);
+    t.Add("lock 11 is not yet", CScript() << 11 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
+    t.AddS("lock 0", CScript() << OP_0 << OP_CHECKSEQUENCEVERIFY << OP_1, V4UP, true, Stk{F, T}, TX_SEQ10);
+    t.AddS("a negative zero lock is 0, not 128", CScript() << OV({0x80}) << OP_CHECKSEQUENCEVERIFY << OP_1, V4UP, true, Stk{OV({0x80}), T}, TX_SEQ10);
+    t.Add("a negative lock fails", CScript() << OP_1NEGATE << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
+    t.Add("an empty stack fails", CScript() << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
+    t.Add("a 6-byte lock fails", CScript() << OV({10, 0, 0, 0, 0, 0}) << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
+    t.Add("transaction version 1 has no relative locks", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_V1_SEQ10);
+    t.AddS("a negative transaction version reads as a large one (unsigned, as in Bitcoin)", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10})}, TX_NEGVERSION);
+    t.Add("an input with the disable flag set fails", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ_DISABLED);
+    t.Add("a final input has the disable flag (version 2, so it is the sequence that refuses it)", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_V2_FINAL);
+    t.Add("blocks against a time-based input", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQTIME10);
+    t.AddS("time against time", CScript() << OV({10, 0, 0x40}) << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10, 0, 0x40})}, TX_SEQTIME10);
+    t.Add("time against blocks", CScript() << OV({10, 0, 0x40}) << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
+    t.Add("a time lock longer than the input's", CScript() << OV({11, 0, 0x40}) << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQTIME10);
+    t.AddS("bits outside the mask mean nothing (bit 21)", CScript() << OV({10, 0, 0x20}) << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10, 0, 0x20})}, TX_SEQ10);
+    t.AddS("nothing above bit 31 means anything (2^32 + 10)", CScript() << OV({10, 0, 0, 0, 1}) << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10, 0, 0, 0, 1})}, TX_SEQ10);
+    // Bit 31 in the script's number is an upgrade hook: consensus lets it pass
+    // whatever the transaction, relay policy refuses it.
+    t.AddS("bit 31 in the lock passes by consensus (a hook for a later rule), on any transaction",
+           CScript() << OV({0, 0, 0, 0x80, 0}) << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({0, 0, 0, 0x80, 0})}, TX_PLAIN);
+    t.Add("and relay policy refuses it", CScript() << OV({0, 0, 0, 0x80, 0}) << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+    t.AddS("policy leaves an ordinary lock alone", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10})}, TX_SEQ10, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+
+    // ---- OP_CHECKTEMPLATEVERIFY (rules v4)
+    t.cur = "OP_CHECKTEMPLATEVERIFY";
+    {
+        uint256 hashPlain = CheckTemplateHash(txs[TX_PLAIN], 0);
+        OpVal vchHash(hashPlain.begin(), hashPlain.end());
+        t.Add("before v4 the byte is unknown and fails", CScript() << vchHash << OP_CHECKTEMPLATEVERIFY, CSVPRE, false, TX_PLAIN);
+        t.AddS("before v4 it is skipped in a branch not taken", CScript() << OP_0 << OP_IF << OP_CHECKTEMPLATEVERIFY << OP_ENDIF << OP_1, ALL, true, Stk{T});
+        t.AddS("the template hash of this transaction", CScript() << vchHash << OP_CHECKTEMPLATEVERIFY, V4UP, true, Stk{vchHash}, TX_PLAIN);
+        t.Add("the same hash on a transaction with another output", CScript() << vchHash << OP_CHECKTEMPLATEVERIFY, V4UP, false, TX_TWO_OUTS);
+        t.Add("the same hash on a transaction with another version and sequence", CScript() << vchHash << OP_CHECKTEMPLATEVERIFY, V4UP, false, TX_SEQ10);
+        OpVal vchWrong = vchHash;
+        vchWrong[31] ^= 1;
+        t.Add("a hash one bit off", CScript() << vchWrong << OP_CHECKTEMPLATEVERIFY, V4UP, false, TX_PLAIN);
+        t.Add("an empty stack fails", CScript() << OP_CHECKTEMPLATEVERIFY, V4UP, false, TX_PLAIN);
+        // Any other size is an upgrade hook: consensus lets it pass.
+        t.AddS("a 31-byte argument passes (reserved for a later rule)", CScript() << OpBytes(31, 5) << OP_CHECKTEMPLATEVERIFY << OP_1, V4UP, true, Stk{OpBytes(31, 5), T}, TX_PLAIN);
+        t.AddS("a 33-byte argument passes", CScript() << OpBytes(33, 5) << OP_CHECKTEMPLATEVERIFY << OP_1, V4UP, true, Stk{OpBytes(33, 5), T}, TX_PLAIN);
+        t.AddS("an empty argument passes", CScript() << OP_0 << OP_CHECKTEMPLATEVERIFY << OP_1, V4UP, true, Stk{F, T}, TX_PLAIN);
+        t.Add("relay policy refuses a 31-byte argument", CScript() << OpBytes(31, 5) << OP_CHECKTEMPLATEVERIFY << OP_1, V4UP, false, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+        t.Add("relay policy refuses an empty argument", CScript() << OP_0 << OP_CHECKTEMPLATEVERIFY << OP_1, V4UP, false, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+        t.AddS("relay policy lets the real hash through", CScript() << vchHash << OP_CHECKTEMPLATEVERIFY, V4UP, true, Stk{vchHash}, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+    }
+
+    // ---- OP_CHECKSIGFROMSTACK (rules v4), the cases that need no valid signature
+    t.cur = "OP_CHECKSIGFROMSTACK";
+    t.Add("before v4 the byte is unknown and fails", CScript() << OP_0 << OP_0 << OpBytes(32, 2) << OP_CHECKSIGFROMSTACK, CSVPRE, false);
+    t.AddS("before v4 it is skipped in a branch not taken", CScript() << OP_0 << OP_IF << OP_CHECKSIGFROMSTACK << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.AddS("an empty signature is the one way to say false (32-byte key)", CScript() << OP_0 << OV({'h', 'i'}) << OpBytes(32, 2) << OP_CHECKSIGFROMSTACK, V4UP, false, Stk{F});
+    t.AddS("and OP_NOT of it is true", CScript() << OP_0 << OV({'h', 'i'}) << OpBytes(32, 2) << OP_CHECKSIGFROMSTACK << OP_NOT, V4UP, true, Stk{T});
+    t.Add("an empty key fails", CScript() << OP_0 << OP_0 << OP_0 << OP_CHECKSIGFROMSTACK, V4UP, false);
+    t.Add("a signature that does not verify against a 32-byte key fails the script", CScript() << OpBytes(64, 1) << OV({'h', 'i'}) << OpBytes(32, 1) << OP_CHECKSIGFROMSTACK, V4UP, false);
+    t.Add("a bad signature fails whatever follows", CScript() << OpBytes(64, 1) << OV({'h', 'i'}) << OpBytes(32, 1) << OP_CHECKSIGFROMSTACK << OP_NOT, V4UP, false);
+    t.Add("two elements are not enough", CScript() << OP_1 << OP_1 << OP_CHECKSIGFROMSTACK, V4UP, false);
+    // A key that is not 32 bytes is an upgrade hook: consensus takes any
+    // non-empty signature as valid for it. Relay policy refuses it.
+    t.AddS("a 33-byte key with any signature passes by consensus (a hook for a later key type)",
+           CScript() << OpBytes(64, 1) << OV({'h', 'i'}) << OpBytes(33, 2) << OP_CHECKSIGFROMSTACK, V4UP, true, Stk{T});
+    t.AddS("a 1-byte key too", CScript() << OP_1 << OV({'h', 'i'}) << OV({7}) << OP_CHECKSIGFROMSTACK, V4UP, true, Stk{T});
+    t.AddS("a 33-byte key with an empty signature is false", CScript() << OP_0 << OV({'h', 'i'}) << OpBytes(33, 2) << OP_CHECKSIGFROMSTACK, V4UP, false, Stk{F});
+    t.Add("relay policy refuses the 33-byte key", CScript() << OpBytes(64, 1) << OV({'h', 'i'}) << OpBytes(33, 2) << OP_CHECKSIGFROMSTACK, V4UP, false, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+    t.Add("relay policy refuses it even with an empty signature", CScript() << OP_0 << OV({'h', 'i'}) << OpBytes(33, 2) << OP_CHECKSIGFROMSTACK, V4UP, false, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+    t.AddS("relay policy leaves a 32-byte key and an empty signature alone", CScript() << OP_0 << OV({'h', 'i'}) << OpBytes(32, 2) << OP_CHECKSIGFROMSTACK << OP_NOT, V4UP, true, Stk{T}, TX_PLAIN, SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4);
+
+    // ---- run the table
+    const char* const aSetName[4] = { "before v3", "v3", "v4", "v5" };
+    const bool aR3[4] = { false, true, true, true };
+    const bool aR4[4] = { false, false, true, true };
+    const bool aR5[4] = { false, false, false, true };
+    std::vector<std::string> vSections;
+    std::map<std::string, std::pair<int, int> > mapSection;   // runs, failures
+    for (size_t i = 0; i < t.rows.size(); i++)
+    {
+        const OpRow& r = t.rows[i];
+        if (!mapSection.count(r.section))
+        {
+            vSections.push_back(r.section);
+            mapSection[r.section] = std::make_pair(0, 0);
+        }
+        for (int s = 0; s < 4; s++)
+        {
+            if (!(r.sets & (1u << s)))
+                continue;
+            std::vector<OpVal> stack;
+            bool fResult = false;
+            try
+            {
+                fResult = EvalScript(r.script, txs[r.tx], 0, 0, &stack, false, aR3[s], aR4[s], r.policy, aR5[s]);
+            }
+            catch (const std::exception& e)
+            {
+                printf("  FAIL [%s] %s (%s): exception %s\n", r.section.c_str(), r.name.c_str(), aSetName[s], e.what());
+                mapSection[r.section].first++;
+                mapSection[r.section].second++;
+                continue;
+            }
+            bool fGood = fResult == r.ok && (!r.fStack || stack == r.stack);
+            mapSection[r.section].first++;
+            if (!fGood)
+            {
+                mapSection[r.section].second++;
+                printf("  FAIL [%s] %s (%s): result %d, expected %d", r.section.c_str(), r.name.c_str(), aSetName[s], (int)fResult, (int)r.ok);
+                if (r.fStack && fResult == r.ok)
+                    printf("; stack differs (%d elements, expected %d)", (int)stack.size(), (int)r.stack.size());
+                printf("\n");
+            }
+        }
+    }
+    int nRuns = 0;
+    for (size_t i = 0; i < vSections.size(); i++)
+    {
+        const std::pair<int, int>& p = mapSection[vSections[i]];
+        nRuns += p.first;
+        nFail += Check(p.second == 0, strprintf("%s: %d runs", vSections[i].c_str(), p.first).c_str()) ? 0 : 1;
+    }
+    printf("  info %d rows, %d runs under the four rule sets\n", (int)t.rows.size(), nRuns);
+
+    // ---- pay-to-script-hash: what VerifySignature runs before and from v3
+    {
+        CScript redeem = CScript() << OP_ADD << OP_5 << OP_EQUAL;
+        OpVal vchRedeem(redeem.begin(), redeem.end());
+        CTransaction txFrom;
+        txFrom.vout.push_back(CTxOut(COIN, CScript() << OP_HASH160 << Hash160(vchRedeem) << OP_EQUAL));
+        CTransaction txTo = OpTx(1, 0, SEQUENCE_FINAL);
+        txTo.vin[0].prevout = COutPoint(txFrom.GetHash(), 0);
+        nFail += Check(txFrom.vout[0].scriptPubKey.IsPayToScriptHash(), "the output is pay-to-script-hash") ? 0 : 1;
+
+        txTo.vin[0].scriptSig = CScript() << OP_2 << OP_3 << vchRedeem;
+        nFail += Check(VerifySignature(txFrom, txTo, 0, 0, false, false) && VerifySignature(txFrom, txTo, 0, 0, false, true),
+                       "2 3 <redeem>: the redeem script is satisfied, before and from v3") ? 0 : 1;
+        txTo.vin[0].scriptSig = CScript() << OP_2 << OP_4 << vchRedeem;
+        nFail += Check(VerifySignature(txFrom, txTo, 0, 0, false, false),
+                       "2 4 <redeem>: before v3 the hash alone spends it (the script is not run)") ? 0 : 1;
+        nFail += Check(!VerifySignature(txFrom, txTo, 0, 0, false, true),
+                       "and from v3 the redeem script runs, finds 2 + 4 != 5, and refuses") ? 0 : 1;
+        txTo.vin[0].scriptSig = CScript() << OP_2 << OP_3 << OV({1, 2, 3});
+        nFail += Check(!VerifySignature(txFrom, txTo, 0, 0, false, false) && !VerifySignature(txFrom, txTo, 0, 0, false, true),
+                       "a last push that does not hash to the script hash spends nothing") ? 0 : 1;
+        txTo.vin[0].scriptSig = CScript() << OP_2 << OP_3 << OP_NOP << vchRedeem;
+        nFail += Check(!VerifySignature(txFrom, txTo, 0, 0, false, false) && !VerifySignature(txFrom, txTo, 0, 0, false, true),
+                       "a scriptSig with an operator is refused") ? 0 : 1;
+        txTo.vin[0].scriptSig = CScript();
+        nFail += Check(!VerifySignature(txFrom, txTo, 0, 0, false, false) && !VerifySignature(txFrom, txTo, 0, 0, false, true),
+                       "an empty scriptSig spends nothing") ? 0 : 1;
+        txTo.vin[0].scriptSig = CScript() << OP_2 << OP_3 << vchRedeem;
+        nFail += Check(VerifyScriptP2SH(txTo.vin[0].scriptSig, txFrom.vout[0].scriptPubKey, txTo, 0, false, true) &&
+                       !VerifyScriptP2SH(CScript() << OP_2 << OP_4 << vchRedeem, txFrom.vout[0].scriptPubKey, txTo, 0, false, true),
+                       "VerifyScriptP2SH itself always runs the redeem script") ? 0 : 1;
+        // A redeem script with an IF/ELSE, and a scriptSig that picks the branch with OP_TRUE or OP_0 in front of
+        // it: those pushes carry no data (OP_1 .. OP_16), and the split of the scriptSig must keep them as they were.
+        CScript redeemIf = CScript() << OP_IF << OP_1 << OP_ELSE << OP_0 << OP_ENDIF;
+        OpVal vchIf(redeemIf.begin(), redeemIf.end());
+        CTransaction txFrom2;
+        txFrom2.vout.push_back(CTxOut(COIN, CScript() << OP_HASH160 << Hash160(vchIf) << OP_EQUAL));
+        CTransaction txTo2 = OpTx(1, 0, SEQUENCE_FINAL);
+        txTo2.vin[0].prevout = COutPoint(txFrom2.GetHash(), 0);
+        txTo2.vin[0].scriptSig = CScript() << OP_TRUE << vchIf;
+        bool fTrue = VerifySignature(txFrom2, txTo2, 0, 0, false, true);
+        txTo2.vin[0].scriptSig = CScript() << OP_FALSE << vchIf;
+        bool fFalse = VerifySignature(txFrom2, txTo2, 0, 0, false, true);
+        nFail += Check(fTrue && !fFalse, "OP_TRUE before the redeem script selects the true branch, OP_0 the false one") ? 0 : 1;
+        // VerifyScriptP2SH takes the rule flag too: a redeem script using OP_VER passes without it and fails with it.
+        CScript redeemVer = CScript() << OP_VER << OP_DROP << OP_1;
+        OpVal vchVer(redeemVer.begin(), redeemVer.end());
+        CScript pubVer = CScript() << OP_HASH160 << Hash160(vchVer) << OP_EQUAL;
+        CScript sigVer = CScript() << vchVer;
+        nFail += Check(VerifyScriptP2SH(sigVer, pubVer, txTo, 0, false, false) && !VerifyScriptP2SH(sigVer, pubVer, txTo, 0, false, true),
+                       "VerifyScriptP2SH without the v3 flag runs the redeem script by the old rules (OP_VER passes), with it by v3's (it fails)") ? 0 : 1;
+        nFail += Check(!VerifyScriptP2SH(CScript() << OP_2 << OP_4 << vchRedeem, txFrom.vout[0].scriptPubKey, txTo, 0, false, false),
+                       "and a redeem script that is false is refused without the flag too") ? 0 : 1;
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- orphan-blocks: ProcessBlock with a parent it does not have -------------
+// A block whose parent is unknown is held, and what is waiting for a block is
+// connected, in order, when it arrives. CheckBlock runs before the block is
+// held, so these are real blocks with RandomX proof of work at the floor
+// (about 4096 hashes each at this chain's minimum difficulty). Mining them on
+// every run would take minutes, so each carries the nonce found when the test
+// was written: the search starts from it, and on a miss (a change to the
+// header, the coinbase or the hash function) it carries on from there, slowly
+// but correctly, and says so. The headers are fixed: they hang off the
+// genesis block and use its time plus a constant.
+
+uint256 GetOrphanRoot(const CBlock* pblock);   // main.cpp, not in a header
+
+static unsigned int OrphanBlocksSumBytes()
+{
+    unsigned int n = 0;
+    for (map<uint256, CBlock*>::iterator mi = mapOrphanBlocks.begin(); mi != mapOrphanBlocks.end(); ++mi)
+        n += ::GetSerializeSize(*(*mi).second, SER_NETWORK);
+    return n;
+}
+
+static CBlock OrphanTestBlock(const uint256& hashPrev, int nHeight, int nTag, unsigned int nTime, unsigned int nHint, const char* pszName)
+{
+    CBlock block;
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << nHeight << nTag;
+    cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+    block.vtx.push_back(cb);
+    block.nVersion = 1;
+    block.hashPrevBlock = hashPrev;
+    block.nTime = nTime;
+    block.nBits = bnProofOfWorkLimit.GetCompact();
+    block.hashMerkleRoot = block.BuildMerkleTree();
+    uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+    block.nNonce = nHint;
+    unsigned int nTries = 0;
+    int64 nStart = GetTime();
+    // A stale hint is a failure, not a quarter of an hour of hashing on every
+    // run: BITFLASH_SELFTEST_MINE=1 lets the search run, and prints the nonce
+    // to put in the table.
+    const unsigned int nMaxTries = getenv("BITFLASH_SELFTEST_MINE") ? 0xffffffffU : 64;
+    while (block.GetPoWHash() > hashTarget)
+    {
+        block.nNonce++;
+        nTries++;
+        if (nTries > nMaxTries)
+            throw std::runtime_error(strprintf("the nonce hint %u for block %s no longer meets the target (the header or the proof of work changed); "
+                                               "run with BITFLASH_SELFTEST_MINE=1 to find new ones", nHint, pszName));
+    }
+    if (nTries)
+        printf("  info %s: the nonce hint %u missed; found %u after %u hashes (%lld s)\n",
+               pszName, nHint, block.nNonce, nTries, (long long)(GetTime() - nStart));
+    return block;
+}
+
+// The blocks every test here builds on: A1 A2 A3 off the genesis block, and
+// their nonces.
+static void OrphanTestChainA(CBlock& A1, CBlock& A2, CBlock& A3)
+{
+    const unsigned int nGenesisTime = pindexGenesisBlock->nTime;
+    A1 = OrphanTestBlock(pindexGenesisBlock->GetBlockHash(), 1, 1, nGenesisTime + 120, 7607, "A1");
+    A2 = OrphanTestBlock(A1.GetHash(), 2, 2, nGenesisTime + 240, 4677, "A2");
+    A3 = OrphanTestBlock(A2.GetHash(), 3, 3, nGenesisTime + 360, 805, "A3");
+}
+
+static bool OrphanTestProcess(const CBlock& block, CNode* pfrom, int* pnDoS)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_main)
+        fOk = ProcessBlock(pfrom, new CBlock(block), pnDoS);
+    return fOk;
+}
+
+// A block that has not been mined and never will be: it fills the pool.
+static CBlock* OrphanTestFiller(int i, size_t nPadding)
+{
+    CBlock* pblock = new CBlock();
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << 1 << (60000 + i);
+    // One well-formed push: OP_PUSHDATA4, a four-byte length, the bytes (CScript << vector writes a
+    // two-byte length, which a padding of 900 kB does not fit).
+    CScript pad;
+    if (nPadding < 256)
+        pad << std::vector<unsigned char>(nPadding, (unsigned char)i);
+    else
+    {
+        pad.push_back(OP_PUSHDATA4);
+        for (int k = 0; k < 4; k++)
+            pad.push_back((unsigned char)((nPadding >> (8 * k)) & 0xff));
+        pad.insert(pad.end(), nPadding, (unsigned char)i);
+    }
+    cb.vout.push_back(CTxOut(0, pad));
+    pblock->vtx.push_back(cb);
+    pblock->hashPrevBlock = uint256(70000 + i);
+    pblock->nNonce = i;
+    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+    return pblock;
+}
+
+static int RunOrphanBlocksSelfTest()
+{
+    printf("orphan-blocks self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    CNode* pPeer = NULL;
+    try
+    {
+        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        LimitOrphanBlocks(0);
+        const unsigned int nGenesisTime = pindexGenesisBlock->nTime;
+        const uint256 hashGenesis = pindexGenesisBlock->GetBlockHash();
+        const uint256 hashUnknown1 = uint256(0x0a0b0c01), hashUnknown2 = uint256(0x0a0b0c02), hashUnknown3 = uint256(0x0a0b0c03);
+
+        // The chain A1 A2 A3 off genesis; X1 X2 with a parent nobody has;
+        // C, a child of A1 that AcceptBlock will refuse (dated before genesis).
+        int64 nMineStart = GetTime();
+        CBlock A1, A2, A3;
+        OrphanTestChainA(A1, A2, A3);
+        CBlock X1 = OrphanTestBlock(hashUnknown1, 1, 4, nGenesisTime + 120, 3460, "X1");
+        CBlock X2 = OrphanTestBlock(X1.GetHash(), 2, 5, nGenesisTime + 240, 4130, "X2");
+        CBlock C  = OrphanTestBlock(A1.GetHash(), 2, 6, nGenesisTime - 1000, 6078, "C");
+        CBlock Y1 = OrphanTestBlock(hashUnknown2, 1, 7, nGenesisTime + 120, 4287, "Y1");
+        CBlock Y2 = OrphanTestBlock(hashUnknown3, 1, 8, nGenesisTime + 120, 4270, "Y2");
+        printf("  info the blocks took %lld s\n", (long long)(GetTime() - nMineStart));
+        nFail += Check(A1.CheckBlock(NULL) && A3.CheckBlock(NULL) && X2.CheckBlock(NULL) && C.CheckBlock(NULL),
+                       "the test blocks meet CheckBlock, proof of work included") ? 0 : 1;
+
+        pPeer = P2PDoSPeer();
+        int64 nWithoutParent = nBlocksWithoutParent;
+        int nDoS = -1;
+
+        // ---- one orphan
+        nFail += Check(OrphanTestProcess(A3, pPeer, &nDoS) && nDoS == 0, "a block whose parent is unknown is accepted into the orphan pool") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 1 && mapOrphanBlocks.count(A3.GetHash()) &&
+                       mapOrphanBlocksByPrev.size() == 1 && mapOrphanBlocksByPrev.count(A2.GetHash()) &&
+                       !mapBlockIndex.count(A3.GetHash()) && pindexBest == pindexGenesisBlock,
+                       "it is held under its parent's hash, is not in the block index, and the chain has not moved") ? 0 : 1;
+        nFail += Check(nOrphanBlockBytes == ::GetSerializeSize(A3, SER_NETWORK) && nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "the pool counts its bytes") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&A3) == A3.GetHash() && GetOrphanRoot(mapOrphanBlocks[A3.GetHash()]) == A3.GetHash(),
+                       "GetOrphanRoot of a lone orphan is itself") ? 0 : 1;
+        nFail += Check(pPeer->hashLastGetBlocksEnd == A3.GetHash() && pPeer->pindexLastGetBlocksBegin == pindexBest &&
+                       nBlocksWithoutParent == nWithoutParent + 1,
+                       "the peer is asked for the blocks in between, up to the orphan's root, and the orphan is counted") ? 0 : 1;
+
+        // ---- the same block again
+        unsigned int nBytes = nOrphanBlockBytes;
+        nDoS = -1;
+        nFail += Check(!OrphanTestProcess(A3, NULL, &nDoS) && nDoS == 0, "the same orphan again is refused, with no points") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 1 && mapOrphanBlocksByPrev.size() == 1 && nOrphanBlockBytes == nBytes,
+                       "and nothing is held twice") ? 0 : 1;
+
+        // ---- a chain of orphans: the root is the one with no parent held
+        nFail += Check(OrphanTestProcess(A2, pPeer, &nDoS), "its parent, also unknown parent, is held too") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 2 && mapOrphanBlocksByPrev.size() == 2 && nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "two held, in step") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&A3) == A2.GetHash() && GetOrphanRoot(&A2) == A2.GetHash(),
+                       "GetOrphanRoot of the child is the parent, which has none held above it") ? 0 : 1;
+        nFail += Check(pPeer->hashLastGetBlocksEnd == A2.GetHash(), "the peer is now asked up to A2") ? 0 : 1;
+
+        // ---- an unrelated orphan chain, and a child that will turn out invalid
+        nFail += Check(OrphanTestProcess(X1, pPeer, NULL) && OrphanTestProcess(X2, pPeer, NULL),
+                       "another chain with a parent nobody has") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&X2) == X1.GetHash() && GetOrphanRoot(&A3) == A2.GetHash(),
+                       "each chain has its own root") ? 0 : 1;
+        nFail += Check(OrphanTestProcess(C, NULL, NULL), "a block dated before its parent's time is held like any other: that is AcceptBlock's check") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 5 && mapOrphanBlocksByPrev.size() == 5 &&
+                       mapOrphanBlocksByPrev.count(A1.GetHash()) == 2 && mapOrphanBlocksByPrev.count(A2.GetHash()) == 1 &&
+                       nOrphanBlockBytes == OrphanBlocksSumBytes(), "five held: A2 and C waiting for A1, A3 for A2, X1 and X2") ? 0 : 1;
+        nFail += Check(pindexBest == pindexGenesisBlock && nBestHeight == 0, "and still nothing connected") ? 0 : 1;
+
+        // ---- the parent arrives
+        nFail += Check(OrphanTestProcess(A1, NULL, &nDoS) && nDoS == 0, "the missing parent arrives and is accepted") ? 0 : 1;
+        nFail += Check(pindexBest != NULL && pindexBest->GetBlockHash() == A3.GetHash() && nBestHeight == 3,
+                       "the whole chain behind it connects: the tip is A3 at height 3") ? 0 : 1;
+        {
+            map<uint256, CBlockIndex*>::iterator m1 = mapBlockIndex.find(A1.GetHash());
+            map<uint256, CBlockIndex*>::iterator m2 = mapBlockIndex.find(A2.GetHash());
+            map<uint256, CBlockIndex*>::iterator m3 = mapBlockIndex.find(A3.GetHash());
+            nFail += Check(m1 != mapBlockIndex.end() && m2 != mapBlockIndex.end() && m3 != mapBlockIndex.end() &&
+                           m1->second->pprev == pindexGenesisBlock && m2->second->pprev == m1->second && m3->second->pprev == m2->second &&
+                           m1->second->nHeight == 1 && m2->second->nHeight == 2 && m3->second->nHeight == 3,
+                           "linked in order: genesis, A1, A2, A3") ? 0 : 1;
+        }
+        nFail += Check(!mapBlockIndex.count(C.GetHash()), "the child AcceptBlock refuses did not connect") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 2 && mapOrphanBlocks.count(X1.GetHash()) && mapOrphanBlocks.count(X2.GetHash()) &&
+                       mapOrphanBlocksByPrev.size() == 2 && mapOrphanBlocksByPrev.count(hashUnknown1) == 1 &&
+                       !mapOrphanBlocks.count(C.GetHash()) && !mapOrphanBlocks.count(A2.GetHash()) && !mapOrphanBlocks.count(A3.GetHash()),
+                       "what connected, and the refused child, left the pool; the other chain is still waiting") ? 0 : 1;
+        nFail += Check(nOrphanBlockBytes == ::GetSerializeSize(X1, SER_NETWORK) + ::GetSerializeSize(X2, SER_NETWORK) &&
+                       nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "and the byte count followed") ? 0 : 1;
+
+        // ---- blocks already in the index
+        nFail += Check(!OrphanTestProcess(A2, NULL, &nDoS) && nDoS == 0 && !OrphanTestProcess(A1, NULL, &nDoS) && nDoS == 0 &&
+                       pindexBest->GetBlockHash() == A3.GetHash() && mapOrphanBlocks.size() == 2,
+                       "a block that already connected is refused, with no points, and nothing changes") ? 0 : 1;
+        nFail += Check(!OrphanTestProcess(X2, NULL, &nDoS) && nDoS == 0 && mapOrphanBlocks.size() == 2,
+                       "a held orphan sent again too") ? 0 : 1;
+
+        // ---- a block that fails CheckBlock is not held
+        {
+            CBlock* pFiller = OrphanTestFiller(500, 100);
+            CBlock bad = *pFiller;
+            delete pFiller;
+            bad.nBits = bnProofOfWorkLimit.GetCompact();
+            bad.nTime = nGenesisTime + 120;
+            unsigned int nBytesBefore = nOrphanBlockBytes;
+            size_t nHeldBefore = mapOrphanBlocks.size();
+            int nDoSBad = 0;
+            bool fBad = OrphanTestProcess(bad, NULL, &nDoSBad);
+            nFail += Check(!fBad && nDoSBad > 0, "an unmined block (an unknown parent, no proof of work) is refused, with DoS points") ? 0 : 1;
+            nFail += Check(mapOrphanBlocks.size() == nHeldBefore && nOrphanBlockBytes == nBytesBefore && !mapOrphanBlocks.count(bad.GetHash()) &&
+                           mapOrphanBlocksByPrev.size() == nHeldBefore,
+                           "and the orphan pool is as it was") ? 0 : 1;
+            printf("  info CheckBlock failure scored %d\n", nDoSBad);
+        }
+
+        // ---- the bounds on the pool, with fillers that were never mined
+        LimitOrphanBlocks(0);
+        nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0, "the pool emptied") ? 0 : 1;
+        {
+            // 36 blocks of about 900 kB are over the byte ceiling together; one
+            // more real orphan comes through ProcessBlock and the pool is cut.
+            for (int i = 0; i < 36; i++)
+                AddOrphanBlock(OrphanTestFiller(i, 900000));
+            unsigned int nBefore = nOrphanBlockBytes;
+            nFail += Check(nBefore > MAX_ORPHAN_BLOCK_BYTES && mapOrphanBlocks.size() == 36,
+                           "36 blocks of 900 kB are over the 32 MB ceiling (nothing has trimmed them yet)") ? 0 : 1;
+            nFail += Check(OrphanTestProcess(Y1, NULL, NULL), "one more orphan is accepted") ? 0 : 1;
+            nFail += Check(nOrphanBlockBytes <= MAX_ORPHAN_BLOCK_BYTES && nOrphanBlockBytes == OrphanBlocksSumBytes() &&
+                           mapOrphanBlocksByPrev.size() == mapOrphanBlocks.size() &&
+                           mapOrphanBlocks.size() >= 35 && mapOrphanBlocks.size() <= 36,
+                           "and the pool is cut back under the byte ceiling, the maps and the count in step") ? 0 : 1;
+            printf("  info %d orphans held, %u of %u bytes\n", (int)mapOrphanBlocks.size(), nOrphanBlockBytes, MAX_ORPHAN_BLOCK_BYTES);
+            LimitOrphanBlocks(0);
+        }
+        {
+            for (unsigned int i = 0; i < MAX_ORPHAN_BLOCKS; i++)
+                AddOrphanBlock(OrphanTestFiller(100 + i, 10));
+            nFail += Check(mapOrphanBlocks.size() == MAX_ORPHAN_BLOCKS, "200 small orphans fill the count ceiling") ? 0 : 1;
+            nFail += Check(OrphanTestProcess(Y2, NULL, NULL), "the 201st comes through ProcessBlock") ? 0 : 1;
+            nFail += Check(mapOrphanBlocks.size() == MAX_ORPHAN_BLOCKS && mapOrphanBlocksByPrev.size() == MAX_ORPHAN_BLOCKS &&
+                           nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                           "one is dropped at random: 200 held, the maps in step, the bytes right") ? 0 : 1;
+            LimitOrphanBlocks(0);
+            nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0, "emptied, nothing counted") ? 0 : 1;
+        }
+        nFail += Check(pindexBest->GetBlockHash() == A3.GetHash(), "through all of it the chain stayed at A3") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    delete pPeer;
+    LimitOrphanBlocks(0);
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- block-index-load: the restart path ------------------------------------
+// A chain written by one run is read back by the next: LoadBlockIndex rebuilds
+// the links, the heights and the accumulated work, picks the best chain the
+// disk names, verifies the tail of it, and when the tail fails takes the
+// failed blocks off the chain and marks them. The valid blocks are the mined
+// ones of orphan-blocks; the failing ones carry no proof of work (what
+// AcceptBlock stores, and CheckBlock at load refuses).
+
+static int RunBlockIndexLoadSelfTest()
+{
+    printf("block-index-load self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    const int nCheckSaved = nCheckBlocksOnLoad;
+    const MapCheckpoints mapCheckpointsSaved = mapCheckpoints;
+    try
+    {
+        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        const uint256 hashGenesis = pindexGenesisBlock->GetBlockHash();
+        nReorgTestStart = pindexGenesisBlock->nTime;
+        CBlock A1, A2, A3;
+        OrphanTestChainA(A1, A2, A3);
+        const uint256 hA1 = A1.GetHash(), hA2 = A2.GetHash(), hA3 = A3.GetHash();
+        nFail += Check(OrphanTestProcess(A1, NULL, NULL) && OrphanTestProcess(A2, NULL, NULL) && OrphanTestProcess(A3, NULL, NULL) &&
+                       nBestHeight == 3 && pindexBest->GetBlockHash() == hA3,
+                       "three blocks with proof of work connect from genesis") ? 0 : 1;
+        const uint256 workA1 = mapBlockIndex[hA1]->nChainWork, workA2 = mapBlockIndex[hA2]->nChainWork,
+                      workA3 = mapBlockIndex[hA3]->nChainWork;
+        nFail += Check(workA1 > 0 && workA2 > workA1 && workA3 > workA2, "accumulated work grows with each block") ? 0 : 1;
+
+        // ---- a restart with nothing to repair
+        nCheckBlocksOnLoad = 288;
+        if (!ReorgTestReload())
+            throw std::runtime_error("reload failed");
+        {
+            CBlockIndex* p1 = mapBlockIndex.count(hA1) ? mapBlockIndex[hA1] : NULL;
+            CBlockIndex* p2 = mapBlockIndex.count(hA2) ? mapBlockIndex[hA2] : NULL;
+            CBlockIndex* p3 = mapBlockIndex.count(hA3) ? mapBlockIndex[hA3] : NULL;
+            nFail += Check(p1 && p2 && p3 && mapBlockIndex.size() == 4, "the genesis block and the three blocks are read back") ? 0 : 1;
+            if (!p1 || !p2 || !p3)
+                throw std::runtime_error("blocks missing after the restart");
+            nFail += Check(pindexGenesisBlock && pindexGenesisBlock->GetBlockHash() == hashGenesis && pindexGenesisBlock->pprev == NULL,
+                           "the genesis block is found") ? 0 : 1;
+            nFail += Check(pindexBest == p3 && hashBestChain == hA3 && nBestHeight == 3,
+                           "the best chain is the one the disk names: A3, height 3") ? 0 : 1;
+            nFail += Check(p1->pprev == pindexGenesisBlock && p2->pprev == p1 && p3->pprev == p2 &&
+                           pindexGenesisBlock->pnext == p1 && p1->pnext == p2 && p2->pnext == p3 && p3->pnext == NULL &&
+                           p1->nHeight == 1 && p2->nHeight == 2 && p3->nHeight == 3,
+                           "heights, parents and next links are rebuilt") ? 0 : 1;
+            nFail += Check(p1->nChainWork == workA1 && p2->nChainWork == workA2 && p3->nChainWork == workA3,
+                           "the accumulated work, which is not on the disk, comes out the same as before") ? 0 : 1;
+            nFail += Check(p2->IsInMainChain() && p3->IsInMainChain() && !p1->fFailed && !p2->fFailed && !p3->fFailed &&
+                           pindexBadChainFork == NULL && pindexBadChainFirst == NULL,
+                           "all of it in the main chain, nothing failed, no repair pending") ? 0 : 1;
+            CTxDB txdb("r");
+            CTransaction tx;
+            nFail += Check(txdb.ReadDiskTx(A2.vtx[0].GetHash(), tx) && tx.GetHash() == A2.vtx[0].GetHash() &&
+                           txdb.ContainsTx(A3.vtx[0].GetHash()),
+                           "the transaction index still finds the blocks' coinbases") ? 0 : 1;
+        }
+
+        // ---- the best chain is the heaviest, not the last one written; a restart whose
+        // tail fails verification goes back to the fork and marks the failed branch
+        CBlockIndex* pA1 = mapBlockIndex[hA1];
+        CBlockIndex* pF2 = ReorgTestExtend(pA1);
+        CBlockIndex* pF3 = pF2 ? ReorgTestExtend(pF2) : NULL;
+        nFail += Check(pF2 && pF3 && pF3->nHeight == 3 && pF3->nChainWork == workA3 && pindexBest->GetBlockHash() == hA3,
+                       "a branch from A1 to the same height and work is stored, and the first one stays the best") ? 0 : 1;
+        CBlockIndex* pF4 = pF3 ? ReorgTestExtend(pF3) : NULL;
+        nFail += Check(pF4 && pindexBest == pF4 && nBestHeight == 4, "one more block on it has more work: it becomes the best chain") ? 0 : 1;
+        if (!pF4)
+            throw std::runtime_error("could not build the branch");
+        const uint256 hF2 = pF2->GetBlockHash(), hF3 = pF3->GetBlockHash(), hF4 = pF4->GetBlockHash();
+        uint256 hFirstBad = 0;
+        int nExpect = ReorgTestExpectedRollback(pF4, 288, &hFirstBad);
+        printf("  info the load check should roll back to height %d\n", nExpect);
+        if (!ReorgTestReload())
+            throw std::runtime_error("second reload failed");
+        nFail += Check(nExpect == 1 && nBestHeight == nExpect && pindexBest && pindexBest->GetBlockHash() == hA1,
+                       "the branch's blocks fail the check at load: the chain goes back to A1, where it forked") ? 0 : 1;
+        nFail += Check(mapBlockIndex.count(hFirstBad) && mapBlockIndex[hFirstBad]->fFailed &&
+                       mapBlockIndex.count(hF4) && mapBlockIndex[hF4]->fFailed && mapBlockIndex.count(hF3) && mapBlockIndex[hF3]->fFailed,
+                       "the first bad block and everything on top of it are marked failed") ? 0 : 1;
+        nFail += Check(mapBlockIndex.count(hA3) && !mapBlockIndex[hA3]->fFailed && !mapBlockIndex[hA2]->fFailed &&
+                       !IsBetterChain(mapBlockIndex[hF4], mapBlockIndex[hA3]) && IsBetterChain(mapBlockIndex[hA3], pindexBest),
+                       "the valid branch is untouched, and a failed branch is never the better chain") ? 0 : 1;
+        fCheckpointWalkBack = true;
+        nFail += Check(ActivateBestKnownChain() && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "the best of what is left, by work, is A3: it is picked, not the heavier failed branch") ? 0 : 1;
+        nFail += Check(pindexBadChainFork == NULL && pindexBadChainFirst == NULL, "no repair left pending") ? 0 : 1;
+
+        // The failed blocks came off the disk index.
+        if (!ReorgTestReload())
+            throw std::runtime_error("third reload failed");
+        nFail += Check(!mapBlockIndex.count(hF2) && !mapBlockIndex.count(hF3) && !mapBlockIndex.count(hF4) && mapBlockIndex.size() == 4 &&
+                       pindexBest && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "the next restart does not read them back: the chain is A3, four entries") ? 0 : 1;
+        nFail += Check(mapBlockIndex[hA3]->nChainWork == workA3 && mapBlockIndex[hA3]->IsInMainChain(),
+                       "and the work of A3 is what it was") ? 0 : 1;
+
+        // ---- only the tail is checked: with a window of one block, the tip
+        // goes and the block under it, never looked at, stays
+        CBlockIndex* pA4 = ReorgTestExtend(pindexBest);
+        CBlockIndex* pA5 = pA4 ? ReorgTestExtend(pA4) : NULL;
+        if (!pA5)
+            throw std::runtime_error("could not extend the chain");
+        const uint256 hA4 = pA4->GetBlockHash(), hA5 = pA5->GetBlockHash();
+        nCheckBlocksOnLoad = 1;
+        uint256 hBad1 = 0;
+        int nExpect1 = ReorgTestExpectedRollback(pA5, 1, &hBad1);
+        if (!ReorgTestReload())
+            throw std::runtime_error("fourth reload failed");
+        nFail += Check(nExpect1 == 4 && nBestHeight == 4 && pindexBest->GetBlockHash() == hA4 && mapBlockIndex.count(hA5) && mapBlockIndex[hA5]->fFailed &&
+                       !mapBlockIndex[hA4]->fFailed,
+                       "a window of one: only the tip is checked and removed; the unchecked block under it is the new tip") ? 0 : 1;
+        uint256 hBad2 = 0;
+        int nExpect2 = ReorgTestExpectedRollback(pindexBest, 1, &hBad2);
+        if (!ReorgTestReload())
+            throw std::runtime_error("fifth reload failed");
+        nFail += Check(!mapBlockIndex.count(hA5) && nExpect2 == 3 && nBestHeight == 3 && pindexBest->GetBlockHash() == hA3 &&
+                       mapBlockIndex.count(hA4) && mapBlockIndex[hA4]->fFailed,
+                       "the next restart checks that one, finds it bad, and is back on A3 with A4 marked") ? 0 : 1;
+        nFail += Check(IndexHasNoDanglingParent(), "no entry points at a block that is gone") ? 0 : 1;
+        nCheckBlocksOnLoad = 0;
+        if (!ReorgTestReload())
+            throw std::runtime_error("sixth reload failed");
+        nFail += Check(nBestHeight == 3 && pindexBest->GetBlockHash() == hA3 && !mapBlockIndex.count(hA4),
+                       "a window of 0 checks the whole chain: all three blocks pass, nothing to repair") ? 0 : 1;
+
+        // ---- a best chain that contradicts a checkpoint goes back to the last block that does not
+        nCheckBlocksOnLoad = 288;
+        mapCheckpoints.clear();
+        mapCheckpoints[2] = uint256(0xdeadbeef);   // not A2
+        fCheckpointWalkBack = false;
+        if (!ReorgTestReload())
+            throw std::runtime_error("seventh reload failed");
+        {
+            CBlockIndex* p2 = mapBlockIndex.count(hA2) ? mapBlockIndex[hA2] : NULL;
+            CBlockIndex* p3 = mapBlockIndex.count(hA3) ? mapBlockIndex[hA3] : NULL;
+            nFail += Check(p2 && p3 && p2->fOffCheckpoint && p3->fOffCheckpoint && !mapBlockIndex[hA1]->fOffCheckpoint,
+                           "a checkpoint at height 2 that is not A2: A2 and A3 are off it, A1 is not") ? 0 : 1;
+            nFail += Check(nBestHeight == 1 && pindexBest && pindexBest->GetBlockHash() == hA1 && fCheckpointWalkBack,
+                           "the load goes back to A1 and asks for a walk back to the best chain by work") ? 0 : 1;
+            nFail += Check(p3 && !p2->fFailed && !p3->fFailed && !IsBetterChain(p3, pindexBest),
+                           "A2 and A3 are not marked failed, and a chain off a checkpoint is not the better one") ? 0 : 1;
+        }
+        // The checkpoint now names A2: nothing is off it, and the walk back finds A3 again.
+        mapCheckpoints[2] = hA2;
+        if (!ReorgTestReload())
+            throw std::runtime_error("eighth reload failed");
+        nFail += Check(nBestHeight == 1 && pindexBest->GetBlockHash() == hA1 && !mapBlockIndex[hA3]->fOffCheckpoint &&
+                       IsBetterChain(mapBlockIndex[hA3], pindexBest),
+                       "with a checkpoint A2 meets, A3 is the better chain again") ? 0 : 1;
+        fCheckpointWalkBack = true;
+        nFail += Check(ActivateBestKnownChain() && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "and the walk back returns to it") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    nCheckBlocksOnLoad = nCheckSaved;
+    mapCheckpoints = mapCheckpointsSaved;
+    fCheckpointWalkBack = false;
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -14577,6 +15896,14 @@ int RunSelfTest(const std::string& name)
         return RunSigHashReferenceSelfTest();
     if (name == "rules-v2")
         return RunRulesV2SelfTest();
+    if (name == "orphan-tx")
+        return RunOrphanTxSelfTest();
+    if (name == "script-opcodes")
+        return RunScriptOpcodesSelfTest();
+    if (name == "orphan-blocks")
+        return RunOrphanBlocksSelfTest();
+    if (name == "block-index-load")
+        return RunBlockIndexLoadSelfTest();
     if (name == "net-hardening")
         return RunNetHardeningSelfTest();
     if (name == "p2p-dos")
@@ -14685,6 +16012,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }
