@@ -2470,11 +2470,36 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     // Check against previous transactions
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
-    unsigned int nSigOps = GetSigOpCount(RulesV4Active((unsigned int)GetAdjustedTime()));
-    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false, 0, 0, &nSigOps))
+    // One reading of the clock for both halves of the count. ConnectInputs
+    // read it again for the redeem scripts, and the two readings could fall
+    // either side of the rules v4 switch, counting OP_CHECKSIGFROMSTACK in one
+    // half and not the other.
+    unsigned int nNow = (unsigned int)GetAdjustedTime();
+    unsigned int nSigOps = GetSigOpCount(RulesV4Active(nNow));
+    if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false, 0, nNow, &nSigOps))
     {
+        // Only a parent this node does not know makes the transaction an
+        // orphan worth keeping. A refusal for policy, a bad signature or a
+        // relative lock is final: reporting it as missing inputs sent the
+        // transaction to the orphan pool and told the user a wrong cause.
         if (pfMissingInputs)
-            *pfMissingInputs = true;
+        {
+            for (int i = 0; i < vin.size(); i++)
+            {
+                const uint256& hashPrev = vin[i].prevout.hash;
+                CTxIndex txindexPrev;
+                if (txdb.ReadTxIndex(hashPrev, txindexPrev))
+                    continue;
+                bool fInPool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInPool = mapTransactions.count(hashPrev) != 0;
+                if (!fInPool)
+                {
+                    *pfMissingInputs = true;
+                    break;
+                }
+            }
+        }
         return error("AcceptTransaction() : ConnectInputs failed %s", hash.ToString().substr(0,6).c_str());
     }
     // Relay policy: no one transaction may take more than a fifth of a
@@ -3307,12 +3332,30 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
                 return fMiner ? false : error("ConnectInputs() : %s input %d is under a relative lock",
                                               GetHash().ToString().substr(0,6).c_str(), i);
 
+            // Relay policy, for the pool and the miner (never a block). The
+            // count of signature operations charges an OP_CHECKMULTISIG 20, but
+            // it checks one signature per key it is handed, and consensus
+            // bounds the keys only by the stack; a script that computes its key
+            // count could check far more than it paid for. With the count a
+            // literal OP_0..OP_16 it never checks more than 16. Found by
+            // fuzz-script, which holds the checks a script makes to its count.
+            // Rules v5 cap the keys at 20 in consensus (EvalScript); until they
+            // are scheduled, this keeps such spends out of every honest block.
+            // It runs before VerifySignature so a refused spend costs no
+            // signature check; the miner drops it silently, like its other
+            // refusals.
+            if (!fBlock &&
+                !InputMultisigKeyCountsAreLiteral(vin[i].scriptSig, txPrev.vout[prevout.n].scriptPubKey, fRulesV3))
+                return fMiner ? false : error("ConnectInputs() : %s input %d runs OP_CHECKMULTISIG on a key count that is not a literal (relay policy)",
+                                              GetHash().ToString().substr(0,6).c_str(), i);
+
             // Verify signature. On the memory-pool path only (neither a block
             // nor the miner), relay policy also refuses the upgrade hooks of
             // rules v4 (SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4). Blocks are
             // checked with no policy at all: what is valid does not change.
             const unsigned int nPolicyFlags = (!fBlock && !fMiner) ? SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4 : 0;
-            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags))
+            if (!VerifySignature(txPrev, *this, i, 0, fStrictSigs, fRulesV3, fRulesV4, nPolicyFlags,
+                                 fRulesV5))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
 
             // Rules v3 runs the redeem script, so its signature operations cost

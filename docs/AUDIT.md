@@ -99,12 +99,13 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Seven harnesses in `src/`:
+Eight harnesses in `src/`:
 
 | target | what it feeds |
 |---|---|
 | `fuzz-net-message` | raw bytes into the P2P receive buffer of a peer, through `ProcessMessages()` |
-| `fuzz-script` | one script through the parser, the standard-form extractors and `EvalScript` |
+| `fuzz-script` | one script through the parser, the standard-form extractors, the sigop counts and `EvalScript`; then a spend: a fuzzed transaction (version, lock time, sequences, outputs) with scriptSig and scriptPubKey or redeem script, valid ECDSA and BIP340 signatures, keys and CTV hashes put in by placeholder, through `EvalScript`, `VerifyScriptP2SH` and `VerifySignature` under all eight combinations of rules v2, v3 and v4, under every rule with v5, and with the pool's relay policy. Aborts when v4 turns a pass into a failure or changes an answer with no v4 opcode in the script, when v3, strict signatures, v5 or the policy change an answer they cannot affect (or v5 or the policy let through what the rules alone refuse), when CLTV and `IsFinalAt` disagree, when `VerifySignature` disagrees with the path it delegates to, when the CTV hash misses a field it commits to or covers one it must not, or when a spend starts more signature checks than the block and the pool charge for it (a counter compiled only with `-DBITFLASH_FUZZ`) |
+| `fuzz-v4-templates` | the vault, CTV batch and inheritance scripts built from fuzzed parameters by the wallet's own builders (`v4templates.h`) and spent as the RPCs spend them, through `VerifySignature`. Aborts when a vault or batch output can leave other than by its template, when the template rebuilt from the contracts file differs, when the honest spend fails or passes before v4, when the hot key or the heir passes outside the timelock or is refused inside it, when any other key or a scriptSig without the right key passes, when a third party's added pushes break a spend, or when `ParseInheritScript` accepts anything but an inheritance script |
 | `fuzz-sigcheck` | signatures and keys into OpenSSL and libsecp256k1 side by side; any disagreement is a crash |
 | `fuzz-light-pow` | headers and histories into the DigiByte and Ravencoin difficulty and proof-of-work checks |
 | `fuzz-p2p-payload` | one message and its payload straight into `ProcessMessage()`, as from a peer past the version handshake: `block`, `tx`, `inv`, `getdata`, `getblocks`, the chat and P2Pool messages. The envelope checksum no fuzzer can forge is behind it, and a flag recomputes a block's merkle root. The node keeps its chain between inputs, and in this binary alone (`-DBITFLASH_FUZZ`, `fFuzzSkipPoW`) the RandomX comparison is skipped, so block acceptance, connection and reorganisation are reached; every other check runs as released |
@@ -359,3 +360,60 @@ in any of the six jobs (corpora 6.0k and 9.2k inputs for `fuzz-deserialize`,
 8.0k and 11.4k for `fuzz-decoders`, libFuzzer and honggfuzz), and the campaign's own coverage of the
 corpora matched the table above (`serialize.h` 61.4%, `base58.h` 94.2%,
 `btfaddr.cpp` 85.9%, `bip32.cpp` 77.3%, `bip21.cpp` 100%, whole files).
+
+## The script engine under every rule set (`fuzz-script`, `fuzz-v4-templates`)
+
+November 2026, on `main` at `c48f8c8`. `fuzz-script` runs each script and
+each structured spend under eleven flag sets (rules v2, v3, v4 in every
+combination, v5, and the relay policy) and aborts when one rule set changes
+an answer it cannot affect, when rules v4 do more than add, when v5 or the
+policy turn a failure into a pass, or when a spend checks more signatures
+than the block and the pool charged for it. `fuzz-v4-templates` builds the
+vault, CTV batch and inheritance scripts with the wallet's own functions and
+spends them as the RPCs do.
+
+### What they found
+
+| found by | what | where |
+|---|---|---|
+| the signature-count invariant of `fuzz-script` | `OP_CHECKMULTISIG` is charged 20 signature operations but checks one signature per key it is handed, and the key count was bounded only by the stack, so a script that computes its count (say `OP_16 OP_9 OP_ADD`) checked more signatures than it paid for. Relay policy now refuses, in the pool and in the miner, an input whose script or redeem script runs `OP_CHECKMULTISIG(VERIFY)` without a literal `OP_0`..`OP_16` count right before it, before any signature is checked. Rules v5 (unscheduled) cap the keys at 20 in consensus. Blocks are judged as before. | `script.cpp`, `main.cpp`, self-tests `script-sigops`, `rules-v5` |
+| reading `AcceptTransaction` for the above | The pool read the clock twice for one transaction's signature count, and the readings could fall either side of the rules v4 switch. One reading now. | `main.cpp` |
+| independent review of the change | A transaction the pool refused for policy, a bad signature or a relative lock was reported as "missing inputs", so it went to the orphan pool, waiting for a parent it already had, and `spendscript` named the wrong cause. Missing inputs now means a parent neither the chain nor the pool knows; `spendscript` checks the key counts first. | `main.cpp`, `jsonrpc.cpp`, self-test `script-sigops` |
+
+Checked and not a defect: rules v2 strict signatures are not monotone (a
+non-DER signature makes `OP_CHECKSIG` return false, so `CHECKSIG NOT` can
+pass), as in Bitcoin before NULLFAIL, already active consensus; any script
+where that leads to a pass already passes with an empty signature. There is
+no `MAX_SCRIPT_SIZE`; the work per operation grows with the script, bounded
+by the block size (a candidate for a later rule set, not measured as a
+problem).
+
+### Runs and coverage
+
+Actions "Audit campaign" run 43130125511, 2 h 10 min per job with
+AddressSanitizer + UndefinedBehaviorSanitizer, no crash, leak or sanitizer
+report:
+
+| target | libFuzzer | AFL++ (4 instances) | honggfuzz |
+|---|---|---|---|
+| `fuzz-script` | 3.9 M executions, corpus 2572, 0/0/0 | 7.3k items, 0 crashes, 0 timeouts | 0 crashes; 345 processes killed at the 20 s limit (below) |
+| `fuzz-v4-templates` | 30.4 M executions, corpus 1079, 0/0/0 | 4.4k items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+
+Under honggfuzz alone, `fuzz-script`'s time per input inside one persistent
+process climbs, from about 0.1 s to as much as 14 s, until honggfuzz
+restarts the process ("became too slow", 67 times) or kills one over its
+20 s limit. Nothing in the node accumulates: honggfuzz's own corpus (8519
+inputs) replayed through the libFuzzer build ran every input in under a
+second (peak memory 884 MB with AddressSanitizer), AFL++ saw no timeout, and inputs built to be
+the slowest (4 kB of signature operations) take at most 0.4 s in the
+honggfuzz build run on its own. It is the cost of honggfuzz's comparison
+hooks on a harness that evaluates each spend 33 times, each operation
+copying and scanning the script; inputs are capped at 4 kB for it.
+
+Line coverage of the merged corpora: `script.cpp` 71.6% (the rest is wallet
+signing and solving, outside the target; `EvalScript` 81%, its misses mostly
+the bodies of disabled opcodes), `CheckTemplateHash`, `GetP2SHSigOpCount` and
+the key-count checks 100%. Measured on the 202 from the same corpora: the
+template builders in `v4templates.h` (`VaultUnvaultScript`, `CtvScript`,
+`TemplateHashFor`, `InheritSequence`, `InheritScript`, `ParseInheritScript`)
+100% each, `OutputsFromParam` 87.5%, `CheckCtvSpendPolicy` 87.0%.

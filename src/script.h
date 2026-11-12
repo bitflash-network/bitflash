@@ -16,6 +16,9 @@ static const unsigned int MAX_SCRIPT_ELEMENT_SIZE = 520;
 // memory, and every node that validates it pays.
 static const unsigned int MAX_OPS_PER_SCRIPT     = 201;
 static const unsigned int MAX_STACK_SIZE         = 1000;
+// Keys one OP_CHECKMULTISIG may be handed, from rules v5 (Bitcoin's
+// MAX_PUBKEYS_PER_MULTISIG): the 20 signature operations it is charged.
+static const int MAX_PUBKEYS_PER_MULTISIG       = 20;
 
 enum
 {
@@ -724,6 +727,9 @@ public:
 // fRulesV3 turns on what rules v3 adds inside a script: OP_CHECKLOCKTIMEVERIFY.
 // fRulesV4: OP_CHECKSEQUENCEVERIFY, OP_CHECKTEMPLATEVERIFY, OP_CHECKSIGFROMSTACK.
 //
+// fRulesV5: OP_CHECKMULTISIG takes at most MAX_PUBKEYS_PER_MULTISIG keys. It comes
+// after nPolicyFlags so that no call written before it changes meaning.
+//
 // nPolicyFlags: relay policy, never consensus. Zero (the default, and what
 // every block-validation path passes) evaluates exactly by the rules.
 //
@@ -739,7 +745,8 @@ public:
 static const unsigned int SCRIPT_POLICY_DISCOURAGE_UPGRADABLE_V4 = (1U << 0);
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
                 vector<vector<unsigned char> >* pvStackRet=NULL, bool fStrictSigs=false,
-                bool fRulesV3=false, bool fRulesV4=false, unsigned int nPolicyFlags=0);
+                bool fRulesV3=false, bool fRulesV4=false, unsigned int nPolicyFlags=0,
+                bool fRulesV5=false);
 // nLockTime below this is a block height; at or above, a unix time (Bitcoin's
 // split, so a lock means the same on both chains).
 static const unsigned int LOCKTIME_THRESHOLD = 500000000;
@@ -782,11 +789,25 @@ bool CheckSig(vector<unsigned char> vchSig, vector<unsigned char> vchPubKey, CSc
 // the redeem script, hashes to it, and the pushes before it satisfy it.
 bool VerifyScriptP2SH(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
                       bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false,
-                      unsigned int nPolicyFlags=0);
+                      unsigned int nPolicyFlags=0, bool fRulesV5=false);
 // Signature operations inside the redeem script a P2SH scriptSig carries
 // (BIP16): counted against the block's limit once rules v3 make them run.
 // fRulesV4 counts OP_CHECKSIGFROMSTACK among them.
 unsigned int GetP2SHSigOpCount(const CScript& scriptSig, bool fRulesV4=false);
+// Relay policy. An OP_CHECKMULTISIG checks one signature per key it is handed,
+// and consensus caps that count only by the stack (MAX_STACK_SIZE), while the
+// sigop count charges it 20. True when every OP_CHECKMULTISIG(VERIFY) in the
+// script takes its key count from an OP_0..OP_16 right before it, so it can
+// never check more than 16. False on a script that does not parse.
+bool MultisigKeyCountsAreLiteral(const CScript& script);
+// The same for what spending an output runs: its scriptPubKey and, once rules
+// v3 run it, the redeem script a P2SH scriptSig carries.
+bool InputMultisigKeyCountsAreLiteral(const CScript& scriptSig, const CScript& scriptPubKey, bool fRulesV3);
+#ifdef BITFLASH_FUZZ
+// Fuzz builds only: how many signature checks EvalScript started (CheckSig
+// calls and BIP340 checks), so a harness can hold them to the sigop count.
+extern unsigned int nFuzzSigChecks;
+#endif
 // Merge two partial multisig scriptSigs (bare, or the inner part of a P2SH
 // spend) for the same input: every signature from either that verifies
 // against one of the keys is kept, in key order, up to nRequired.
@@ -822,10 +843,11 @@ bool ExtractHash160(const CScript& scriptPubKey, uint160& hash160Ret);
 bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int nIn, int nHashType=SIGHASH_ALL, CScript scriptPrereq=CScript());
 // fRulesV3: a pay-to-script-hash output is spent by its redeem script, not by
 // whoever presents a script that hashes right (BIP16), and OP_CHECKLOCKTIMEVERIFY
-// is live. fRulesV4: the opcodes of rules v4 are live.
+// is live. fRulesV4: the opcodes of rules v4 are live. fRulesV5: the
+// multisig key cap of rules v5 holds.
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
                      bool fStrictSigs=false, bool fRulesV3=false, bool fRulesV4=false,
-                     unsigned int nPolicyFlags=0);
+                     unsigned int nPolicyFlags=0, bool fRulesV5=false);
 // A redeem script that pushes a non-empty key other than 32 bytes right before
 // OP_CHECKSIGFROMSTACK: satisfiable by any signature under rules v4. spendscript
 // refuses such a script outright.

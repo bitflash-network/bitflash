@@ -8695,6 +8695,227 @@ static int RunFeePolicySelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- script-sigops: what a spend checks against what it is charged -------------
+//
+// An OP_CHECKMULTISIG is charged 20 signature operations, but it checks one
+// signature per key it is handed, and consensus bounds the keys only by the
+// stack. fuzz-script, which holds the checks a spend makes to what the block
+// and the pool charge for it, found spends whose key count the script
+// computes. The pool now takes a multisig only with its key count a literal
+// OP_0..OP_16 (MultisigKeyCountsAreLiteral); consensus is unchanged.
+
+static int RunScriptSigOpsSelfTest()
+{
+    printf("script-sigops self-test\n");
+    int nFail = 0;
+
+    std::vector<std::vector<unsigned char> > vKeys;
+    for (int i = 0; i < 25; i++)
+    {
+        CKey k;
+        k.MakeNewKey();
+        vKeys.push_back(k.GetPubKey());
+    }
+    CScript literal;
+    literal << OP_2 << vKeys[0] << vKeys[1] << vKeys[2] << OP_3 << OP_CHECKMULTISIG;
+    CScript computed;
+    computed << vKeys[0] << vKeys[1] << OP_1 << OP_1 << OP_ADD << OP_CHECKMULTISIG;
+    CScript wide;   // 25 keys, the count made by OP_ADD
+    for (int i = 0; i < 25; i++)
+        wide << vKeys[i];
+    wide << OP_16 << OP_9 << OP_ADD << OP_CHECKMULTISIG;
+
+    nFail += Check(MultisigKeyCountsAreLiteral(literal) && MultisigKeyCountsAreLiteral(CScript() << OP_0 << OP_CHECKMULTISIGVERIFY) &&
+                   MultisigKeyCountsAreLiteral(CScript() << OP_16 << OP_CHECKMULTISIG) &&
+                   MultisigKeyCountsAreLiteral(CScript() << OP_DUP << OP_HASH160 << uint160(5) << OP_EQUALVERIFY << OP_CHECKSIG),
+                   "policy: a literal key count (OP_0..OP_16), or no multisig at all, is taken") ? 0 : 1;
+    nFail += Check(!MultisigKeyCountsAreLiteral(computed) && !MultisigKeyCountsAreLiteral(wide) &&
+                   !MultisigKeyCountsAreLiteral(CScript() << OP_CHECKMULTISIG) &&
+                   !MultisigKeyCountsAreLiteral(CScript() << OP_1 << OP_IF << OP_2 << OP_ENDIF << OP_CHECKMULTISIG) &&
+                   !MultisigKeyCountsAreLiteral(CScript() << OP_1NEGATE << OP_CHECKMULTISIG) &&
+                   !MultisigKeyCountsAreLiteral(CScript() << std::vector<unsigned char>(1, 2) << OP_CHECKMULTISIG) &&
+                   !MultisigKeyCountsAreLiteral(CScript() << OP_2 << OP_CHECKMULTISIGVERIFY << OP_DROP << OP_CHECKMULTISIG),
+                   "policy: a computed count, none, one across a branch, a data push, OP_1NEGATE are not") ? 0 : 1;
+    {
+        CScript bad;
+        bad << OP_2;
+        bad.push_back(0x4c);   // OP_PUSHDATA1 with no length
+        nFail += Check(!MultisigKeyCountsAreLiteral(bad), "policy: a script that does not parse is not") ? 0 : 1;
+    }
+
+    // The premise: consensus runs a 25-key multisig and charges it 20.
+    CTransaction any;
+    any.vin.resize(1);
+    any.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    nFail += Check(EvalScript((CScript() << OP_0 << OP_0) + wide, any, 0, 0, NULL, true, true, true) &&
+                   wide.GetSigOpCount(true) == 20,
+                   "consensus takes 25 keys in one OP_CHECKMULTISIG and counts it as 20 (why the policy exists)") ? 0 : 1;
+    {
+        CScript twenty;   // 20 keys, the count made by OP_ADD
+        for (int i = 0; i < 20; i++)
+            twenty << vKeys[i];
+        twenty << OP_16 << OP_4 << OP_ADD << OP_CHECKMULTISIG;
+        CScript sixteen = CScript() << OP_0 << OP_0;
+        for (int i = 0; i < 16; i++)
+            sixteen << vKeys[i];
+        sixteen << OP_16 << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript((CScript() << OP_0 << OP_0) + wide, any, 0, 0, NULL, true, true, true, 0, true) &&
+                       EvalScript((CScript() << OP_0 << OP_0) + twenty, any, 0, 0, NULL, true, true, true, 0, true) &&
+                       EvalScript(sixteen, any, 0, 0, NULL, true, true, true, 0, true) &&
+                       EvalScript((CScript() << OP_0 << OP_0) + wide, any, 0, 0, NULL, true, true, true, 0, false),
+                       "rules v5: 25 keys fail the script, 20 (even computed) and 16 do not") ? 0 : 1;
+    }
+
+    CScript literal0;   // 0-of-2: spent with the dummy alone
+    literal0 << OP_0 << vKeys[0] << vKeys[1] << OP_2 << OP_CHECKMULTISIG;
+    CScript p2shComputed, p2shLiteral;
+    p2shComputed.SetPayToScriptHash(computed);
+    p2shLiteral.SetPayToScriptHash(literal0);
+    CScript sigComputed = CScript() << OP_0 << OP_0 << std::vector<unsigned char>(computed.begin(), computed.end());
+    nFail += Check(!InputMultisigKeyCountsAreLiteral(sigComputed, p2shComputed, true) &&
+                   InputMultisigKeyCountsAreLiteral(sigComputed, p2shComputed, false) &&
+                   InputMultisigKeyCountsAreLiteral(CScript() << OP_0, p2shComputed, true) &&   // no redeem script: nothing runs
+                   InputMultisigKeyCountsAreLiteral(CScript() << std::vector<unsigned char>(literal0.begin(), literal0.end()), p2shLiteral, true),
+                   "policy on a spend: the redeem script counts once rules v3 run it") ? 0 : 1;
+
+    // ---- through the pool, on testnet where rules v3 are in force
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    bool fWasTestNet = IsTestNet();
+    SelectNetworkParams(true);
+    try
+    {
+        nFail += Check(RulesV3Active((unsigned int)GetAdjustedTime()), "testnet: rules v3 are in force") ? 0 : 1;
+        CTxDB txdb("cr+");
+        CKey key;
+        key.MakeNewKey();
+        CScript scriptTo;
+        scriptTo << OP_DUP << OP_HASH160 << Hash160(key.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+        CScript bareComputed = (CScript() << OP_0 << OP_0) + computed;   // pushes first: the spend needs no scriptSig
+        CScript bareLiteral = CScript() << OP_0 << OP_0 << OP_0 << OP_CHECKMULTISIG;
+        CTransaction parent;
+        parent.vin.push_back(CTxIn(COutPoint(uint256(78), 0)));
+        parent.vout.push_back(CTxOut(10 * COIN, bareComputed));
+        parent.vout.push_back(CTxOut(10 * COIN, bareLiteral));
+        parent.vout.push_back(CTxOut(10 * COIN, p2shComputed));
+        parent.vout.push_back(CTxOut(10 * COIN, p2shLiteral));
+        FeeTestAddToPool(parent);
+
+        CTransaction a = FeeTestChild(parent, 0, CENT, SEQUENCE_FINAL, scriptTo);
+        CTransaction b = FeeTestChild(parent, 1, CENT, SEQUENCE_FINAL, scriptTo);
+        CTransaction c = FeeTestChild(parent, 2, CENT, SEQUENCE_FINAL, scriptTo);
+        c.vin[0].scriptSig = sigComputed;
+        CTransaction d = FeeTestChild(parent, 3, CENT, SEQUENCE_FINAL, scriptTo);
+        d.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(literal0.begin(), literal0.end());
+
+        nFail += Check(VerifySignature(parent, a, 0, 0, true, true, true) && VerifySignature(parent, c, 0, 0, true, true, true),
+                       "both computed-count spends are valid by consensus") ? 0 : 1;
+        bool fMissing = true;
+        nFail += Check(!a.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                       "the pool refuses a bare multisig with a computed key count, and it is not 'missing inputs'") ? 0 : 1;
+        fMissing = true;
+        nFail += Check(!c.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                       "and a P2SH redeem script with one (a computed-count spend is dropped, not kept as an orphan)") ? 0 : 1;
+        nFail += Check(b.AcceptTransaction(txdb, true) && d.AcceptTransaction(txdb, true),
+                       "a literal count enters, bare or as a redeem script") ? 0 : 1;
+
+        // OP_CHECKMULTISIGVERIFY in a redeem script, count computed.
+        {
+            CScript verifyComputed;
+            verifyComputed << vKeys[0] << vKeys[1] << OP_1 << OP_1 << OP_ADD << OP_CHECKMULTISIGVERIFY << OP_TRUE;
+            CScript p2shVerify;
+            p2shVerify.SetPayToScriptHash(verifyComputed);
+            CTransaction parent2;
+            parent2.vin.push_back(CTxIn(COutPoint(uint256(79), 0)));
+            parent2.vout.push_back(CTxOut(10 * COIN, p2shVerify));
+            FeeTestAddToPool(parent2);
+            CTransaction e = FeeTestChild(parent2, 0, CENT, SEQUENCE_FINAL, scriptTo);
+            e.vin[0].scriptSig = CScript() << OP_0 << OP_0 << std::vector<unsigned char>(verifyComputed.begin(), verifyComputed.end());
+            nFail += Check(VerifySignature(parent2, e, 0, 0, true, true, true),
+                           "the OP_CHECKMULTISIGVERIFY spend is valid by consensus") ? 0 : 1;
+            fMissing = true;
+            nFail += Check(!e.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                           "the pool refuses OP_CHECKMULTISIGVERIFY on a computed count, missing inputs false") ? 0 : 1;
+        }
+
+        // What the wallet makes is never refused: a real signed 2-of-3 P2SH.
+        {
+            CKey k1, k2, k3;
+            k1.MakeNewKey(); k2.MakeNewKey(); k3.MakeNewKey();
+            std::vector<std::vector<unsigned char> > msKeys;
+            msKeys.push_back(k1.GetPubKey()); msKeys.push_back(k2.GetPubKey()); msKeys.push_back(k3.GetPubKey());
+            CScript redeem;
+            redeem.SetMultisig(2, msKeys);
+            CScript p2shReal;
+            p2shReal.SetPayToScriptHash(redeem);
+            CTransaction parent3;
+            parent3.vin.push_back(CTxIn(COutPoint(uint256(80), 0)));
+            parent3.vout.push_back(CTxOut(10 * COIN, p2shReal));
+            FeeTestAddToPool(parent3);
+            CTransaction f = FeeTestChild(parent3, 0, CENT, SEQUENCE_FINAL, scriptTo);
+            uint256 hashSig = SignatureHash(redeem, f, 0, SIGHASH_ALL);
+            std::vector<unsigned char> sig1, sig3;
+            bool fSigned = k1.Sign(hashSig, sig1) && k3.Sign(hashSig, sig3);
+            sig1.push_back((unsigned char)SIGHASH_ALL);
+            sig3.push_back((unsigned char)SIGHASH_ALL);
+            f.vin[0].scriptSig = CScript() << OP_0 << sig1 << sig3 << std::vector<unsigned char>(redeem.begin(), redeem.end());
+            nFail += Check(fSigned && VerifySignature(parent3, f, 0, 0, true, true, true),
+                           "a real 2-of-3 P2SH spend with two signatures verifies") ? 0 : 1;
+            fMissing = true;
+            nFail += Check(f.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                           "the pool takes it: the policy cannot refuse what the wallet makes") ? 0 : 1;
+        }
+
+        // A parent the node does not know is still 'missing inputs'.
+        {
+            CTransaction orphan = FeeTestChild(parent, 1, CENT, SEQUENCE_FINAL, scriptTo);
+            orphan.vin[0].prevout.hash = uint256(999);
+            fMissing = false;
+            nFail += Check(!orphan.AcceptTransaction(txdb, true, &fMissing) && fMissing,
+                           "a spend of an unknown prevout still reports missing inputs") ? 0 : 1;
+        }
+
+        // The miner is held to it too, silently; a block is not (the check
+        // is off for fBlock, so consensus is unchanged).
+        {
+            std::map<uint256, CTxIndex> mapTestPool;
+            mapTestPool[parent.GetHash()] = CTxIndex(CDiskTxPos(1,1,1), parent.vout.size());
+            int64 nFees = 0;
+            nFail += Check(!a.ConnectInputs(txdb, mapTestPool, CDiskTxPos(1,1,1), 0, nFees, false, true, 0,
+                                            (unsigned int)GetAdjustedTime()),
+                           "the miner's path refuses a computed count too (relay policy)") ? 0 : 1;
+            std::map<uint256, CTxIndex> mapTestPool2;
+            mapTestPool2[parent.GetHash()] = CTxIndex(CDiskTxPos(1,1,1), parent.vout.size());
+            nFees = 0;
+            nFail += Check(b.ConnectInputs(txdb, mapTestPool2, CDiskTxPos(1,1,1), 0, nFees, false, true, 0,
+                                           (unsigned int)GetAdjustedTime()),
+                           "and connects a literal one") ? 0 : 1;
+        }
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            mapTransactions.clear();
+            mapNextTx.clear();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    SelectNetworkParams(fWasTestNet);
+    DBFlush(true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // ---- invoice: the shop's own payment gateway (invoice.h) ------------------------
 
 static int RunInvoiceSelfTest()
@@ -10926,6 +11147,39 @@ static int RunRulesV5SelfTest()
             nFail += Check(b.AcceptBlock() && nBestHeight == 143,
                            "v5 off: the same block is accepted, as it always was") ? 0 : 1;
             vCb.push_back(b.vtx[0].GetHash());
+        }
+
+        // fuzz-script: block 144 makes a bare output whose OP_CHECKMULTISIG
+        // takes 25 keys (the count computed, so 20 sigops are charged); block
+        // 145 spends it. Rules v5 cap the keys at 20.
+        {
+            std::vector<std::vector<unsigned char> > vKeys;
+            for (int i = 0; i < 25; i++)
+            {
+                CKey k;
+                k.MakeNewKey();
+                vKeys.push_back(k.GetPubKey());
+            }
+            CScript wide;
+            for (int i = 0; i < 25; i++)
+                wide << vKeys[i];
+            wide << OP_16 << OP_9 << OP_ADD << OP_CHECKMULTISIG;
+            nBenchRulesV5Time = 0;
+            CTransaction make = V5Spend(std::vector<COutPoint>(1, COutPoint(vCb[5], 0)), nCb, 1, wide);
+            CBlock b = V5Block(pindexBest, TimeOf::At(144, T0), std::vector<CTransaction>(1, make));
+            bool fMade = b.AcceptBlock() && nBestHeight == 144;
+            vCb.push_back(b.vtx[0].GetHash());
+            CTransaction spend = V5Spend(std::vector<COutPoint>(1, COutPoint(make.GetHash(), 0)), nCb, 1, CScript() << OP_TRUE);
+            spend.vin[0].scriptSig = CScript() << OP_0 << OP_0;
+            CBlock c = V5Block(pindexBest, TimeOf::At(145, T0), std::vector<CTransaction>(1, spend));
+            nBenchRulesV5Time = TV4;
+            nFail += Check(fMade && wide.GetSigOpCount(true) == 20 && !c.AcceptBlock() && nBestHeight == 144,
+                           "v5 on: spending a 25-key OP_CHECKMULTISIG (charged 20) is refused") ? 0 : 1;
+            V5ForgetRefused(c);
+            nBenchRulesV5Time = 0;
+            nFail += Check(c.AcceptBlock() && nBestHeight == 145,
+                           "v5 off: the same block is accepted, as it always was") ? 0 : 1;
+            vCb.push_back(c.vtx[0].GetHash());
         }
 
         // Finding 2: block 149 is timed 30000 s ahead; block 179 closes the
@@ -13791,6 +14045,8 @@ int RunSelfTest(const std::string& name)
         return RunSwapRpcSelfTest();
     if (name == "fee-policy")
         return RunFeePolicySelfTest();
+    if (name == "script-sigops")
+        return RunScriptSigOpsSelfTest();
     if (name == "invoice")
         return RunInvoiceSelfTest();
     if (name == "chat-live")
@@ -13821,6 +14077,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc\n");
     return 1;
 }
