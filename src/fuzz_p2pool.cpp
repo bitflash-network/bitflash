@@ -438,11 +438,13 @@ static void FuzzP2PoolInit()
 {
     SelectChainParams(false);
     fFuzzShareWorkStandIn = true;
-    // A byte cap a run can reach (the real one is 128 MB), so Evict, the
-    // near-tip lines it keeps and the cap that rises above what is kept are
-    // exercised; CheckInvariants holds them to the same rules.
+    // A byte cap a run reaches within a few inputs (the real one is 128 MB):
+    // a line of seed shares is a few kB, so Evict, the near-tip lines it keeps
+    // and the cap that rises above what is kept all run; CheckInvariants
+    // holds them to the same rules. (256 kB was never reached: the campaign's
+    // coverage showed Kept and ByteCap at 0%.)
     CRITICAL_BLOCK(cs_p2pool)
-        P2PoolChain().SetMaxBytesForTest(256 * 1000);
+        P2PoolChain().SetMaxBytesForTest(4 * 1000);
     const char* pszSeeds = getenv("BITFLASH_FUZZ_WRITE_SEEDS");
     if (pszSeeds && *pszSeeds)
     {

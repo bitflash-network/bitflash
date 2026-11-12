@@ -419,3 +419,35 @@ the key-count checks 100%. Measured on the 202 from the same corpora: the
 template builders in `v4templates.h` (`VaultUnvaultScript`, `CtvScript`,
 `TemplateHashFor`, `InheritSequence`, `InheritScript`, `ParseInheritScript`)
 100% each, `OutputsFromParam` 87.5%, `CheckCtvSpendPolicy` 87.0%.
+
+## P2Pool and the light clients (`fuzz-p2pool`, `fuzz-light-peer`)
+
+November 2026, on `main` at `dc5fefb`. `fuzz-p2pool` is a peer of the share
+chain: every P2Pool message, from an inbound or dialled peer, proven or not,
+with reconnects, history asks and raw shares, against a chain, orphan queue,
+budgets and held entries that live for the whole run (with a 256 kB byte cap
+so eviction is reached); after every input the chain's invariants hold.
+`fuzz-light-peer` is a foreign chain's peer of the light clients, for every
+coin and network they speak, with a merkle differential against Bitflash's
+own `CBlock` code and a filter round trip.
+
+### What changed, and why
+
+| from | what | where |
+|---|---|---|
+| DoS review H4 (share side) | Every share an unproven peer sent was hashed (RandomX) before anything else could refuse it, and a reconnect started the peer afresh. One shared budget (32 hashes, one more every 2 s) covers shares from unproven peers, asked right before the hash and after every cheap check (the payouts are checked first now). A share the budget refuses is held, one per connection, and hashed as the budget refills, the oldest connection first; a share arriving live waits behind one an older connection holds. Nobody is blamed for a refusal; a held share that turns out bad blames its sender. | `p2pool_net.cpp`, `p2pool_share.cpp`, self-test `p2pool-dos` |
+| DoS review M6 | History serving and asking were re-armed on every reconnect, and the orphan-share backlog never shrank. Orphans expire on every share; an orphan already hashed no longer opens a history ask; asks of unproven peers and histories sent to them draw on shared budgets, one history per unproven connection, held when it must wait; the bytes queued to inbound peers together are capped at 64 MB (dialled peers are outside it), and an inbound peer still holding more than 4 MB of a history 15 minutes after it was sent is cut off while the cap is reached. | `p2pool_net.cpp`, self-test `p2pool-dos` |
+| DoS review L6 | Fully checked shares were capped by count only. A byte cap over all shares held (128 MB), the lightest side lines evicted first; trusted shares indexed by parent. | `p2pool_chain.cpp`, self-tests `p2pool-dos`, `p2pool-chain` |
+| independent review of the L6 fix | As first written, the byte cap could evict a share at the tip's height the moment it came, once the tip's own line passed the cap's target: its nephew was never taken and an overtaking line never won, so nodes would part ways. Eviction now keeps the tip's line and its uncles and the heaviest 64 lines still within 16 shares of the tip's work, and when what is kept passes the cap by itself the cap rises to that plus 64 MB, with eviction stopping 32 MB above it. | `p2pool_chain.cpp`, self-test `p2pool-dos` |
+| independent review of the H4 and M6 fixes | The first versions dropped what the budgets refused, so whoever kept them spent starved honest unproven peers (a miner that only dials out is unproven everywhere); live messages could then take every refilled token before the held ones; the queued-bytes cap first counted every peer, dialled ones included, then left out proven inbound peers; slow readers could keep it full. All fixed as described above. | `p2pool_net.cpp`, self-test `p2pool-dos` |
+| `fuzz-light-peer` seeds | Main and test networks' header rules are reached only past the proof-of-work comparison, which no fuzzer can pass: in this binary alone (`fFuzzLightSkipPoW`, `#ifdef BITFLASH_FUZZ`) an input may skip it; DigiByte and Ravencoin decide their headers in code `fuzz-light-pow` covers. A merged-mined Dogecoin header seed reaches the AuxPoW checks. | `btclight.cpp`, `fuzz_light_peer.cpp` |
+
+Left as they are, and why: starving an honest unproven peer is bounded, not
+impossible (each connection older than it that sends shares with no work
+behind them buys about 10 s of the budget before it is cut off); "near the
+tip" is measured by accumulated chain work, which is approximate for a line
+whose deeper shares came from a history.
+
+### Runs and coverage
+
+[[CAMPAIGN]]
