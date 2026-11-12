@@ -23,10 +23,10 @@ struct FuzzReader
     const uint8_t* p;
     size_t n;
     FuzzReader(const uint8_t* pIn, size_t nIn) : p(pIn), n(nIn) {}
-    uint8_t U8() { if (!n) return 0; n--; return *p++; }
-    uint16_t U16() { uint16_t v = U8(); v |= (uint16_t)U8() << 8; return v; }
-    uint32_t U32() { uint32_t v = U16(); v |= (uint32_t)U16() << 16; return v; }
-    uint64_t U64() { uint64_t v = U32(); v |= (uint64_t)U32() << 32; return v; }
+    uint8_t GetU8() { if (!n) return 0; n--; return *p++; }
+    uint16_t GetU16() { uint16_t v = GetU8(); v |= (uint16_t)GetU8() << 8; return v; }
+    uint32_t GetU32() { uint32_t v = GetU16(); v |= (uint32_t)GetU16() << 16; return v; }
+    uint64_t GetU64() { uint64_t v = GetU32(); v |= (uint64_t)GetU32() << 32; return v; }
     std::vector<unsigned char> Bytes(size_t k)
     {
         if (k > n) k = n;

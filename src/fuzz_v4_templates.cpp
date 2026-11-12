@@ -94,10 +94,10 @@ static bool Verify(const CTransaction& txFrom, const CTransaction& tx, bool fV4 
 static CScript Junk(FuzzReader& r)
 {
     CScript s;
-    unsigned int n = r.U8() % 4;
+    unsigned int n = r.GetU8() % 4;
     for (unsigned int i = 0; i < n; i++)
     {
-        uint8_t b = r.U8();
+        uint8_t b = r.GetU8();
         if (b < 0x20)
             s << OP_0;
         else if (b < 0x40)
@@ -112,8 +112,8 @@ static CScript Junk(FuzzReader& r)
 // refuse. False when the change turned out to be no change.
 static bool Mutate(CTransaction& tx, FuzzReader& r)
 {
-    uint8_t m = r.U8();
-    uint32_t x = r.U32() | 1;
+    uint8_t m = r.GetU8();
+    uint32_t x = r.GetU32() | 1;
     switch (m % 8)
     {
     case 0: tx.nVersion ^= (int)x; return true;
@@ -156,7 +156,7 @@ static void CheckCtvContract(const char* pszWhat, const CScript& redeem, const v
 {
     FUZZ_CHECK(TemplateHashFor(vRebuilt) == TemplateHashFor(vTemplate),
                "%s: the outputs read back from the contracts file make another template; it could never be spent", pszWhat);
-    CTransaction txFund = Fund(redeem, nFunded, r.U8() % 2);
+    CTransaction txFund = Fund(redeem, nFunded, r.GetU8() % 2);
     unsigned int nOut = txFund.vout.size() - 1;
     CTransaction tx = SpendOf(txFund, nOut, vRebuilt, 2, 0xffffffff, 0);
     tx.vin[0].scriptSig << valtype(redeem.begin(), redeem.end());
@@ -174,10 +174,10 @@ static void CheckCtvContract(const char* pszWhat, const CScript& redeem, const v
         FUZZ_CHECK(!Verify(txFund, txBad), "%s: a changed spend still verifies", pszWhat);
 
     // Whatever the fuzzer builds: if it verifies, it is the template.
-    int nAnyVersion = (int)r.U32();
-    unsigned int nAnySeq = r.U32(), nAnyLock = r.U32();
+    int nAnyVersion = (int)r.GetU32();
+    unsigned int nAnySeq = r.GetU32(), nAnyLock = r.GetU32();
     CTransaction txAny = SpendOf(txFund, nOut, vRebuilt, nAnyVersion, nAnySeq, nAnyLock);
-    if (r.U8() & 1)
+    if (r.GetU8() & 1)
         Mutate(txAny, r);
     txAny.vin[0].scriptSig = Junk(r);
     txAny.vin[0].scriptSig << valtype(redeem.begin(), redeem.end());
@@ -203,10 +203,10 @@ static bool ForgedPath(const CTransaction& txFrom, CTransaction tx, const CScrip
 {
     const vector<FuzzKey>& keys = FuzzKeys();
     CScript s;
-    unsigned int n = 1 + r.U8() % 5;
+    unsigned int n = 1 + r.GetU8() % 5;
     for (unsigned int i = 0; i < n; i++)
     {
-        uint8_t b = r.U8();
+        uint8_t b = r.GetU8();
         unsigned int k = (b >> 4) & 3;
         if (!(mask & (1u << k)))
             k = 0xff;
@@ -217,8 +217,8 @@ static bool ForgedPath(const CTransaction& txFrom, CTransaction tx, const CScrip
         case 2: if (k != 0xff) s << FuzzSigFor(keys[k], redeem, tx, 0); break;
         case 3: if (k != 0xff) s << keys[k].pubC; break;
         case 4: if (k != 0xff) s << keys[k].pubU; break;
-        case 5: if (k != 0xff) s << FuzzSigFor(keys[k], redeem, tx, 0, kHashTypeFor(r.U8())); break;
-        default: s << r.Bytes(r.U8() % 80); break;
+        case 5: if (k != 0xff) s << FuzzSigFor(keys[k], redeem, tx, 0, kHashTypeFor(r.GetU8())); break;
+        default: s << r.Bytes(r.GetU8() % 80); break;
         }
     }
     s << valtype(redeem.begin(), redeem.end());
@@ -232,11 +232,11 @@ static bool ForgedPath(const CTransaction& txFrom, CTransaction tx, const CScrip
 static void Vault(FuzzReader& r)
 {
     const vector<FuzzKey>& keys = FuzzKeys();
-    unsigned int nDelay = 1 + r.U16() % 0xffff;
-    uint8_t kb = r.U8();
+    unsigned int nDelay = 1 + r.GetU16() % 0xffff;
+    uint8_t kb = r.GetU8();
     unsigned int iHot = kb & 3, iRec = (kb >> 2) & 3;
-    int64 nAmount = (int64)(r.U64() % (21000000 * COIN)) + 1;
-    int64 nFee = (int64)(r.U32() % 100000000) + 1;
+    int64 nAmount = (int64)(r.GetU64() % (21000000 * COIN)) + 1;
+    int64 nFee = (int64)(r.GetU32() % 100000000) + 1;
     if (nAmount <= nFee)   // vaultcreate's rule
         return;
 
@@ -258,15 +258,15 @@ static void Vault(FuzzReader& r)
 
     // Stage 2: the unvault output, as SpendUnvault spends it.
     CTransaction txUnvault = Fund(unvault, nAmount - nFee, 0);
-    int nVersion = (int)r.U32();
-    unsigned int nSeq = r.U32();
-    if (r.U8() & 1)
-        nSeq = nDelay + (r.U8() % 3) - 1;   // near the boundary
-    if (r.U8() & 1)
+    int nVersion = (int)r.GetU32();
+    unsigned int nSeq = r.GetU32();
+    if (r.GetU8() & 1)
+        nSeq = nDelay + (r.GetU8() % 3) - 1;   // near the boundary
+    if (r.GetU8() & 1)
         nVersion = 2;
     vector<CTxOut> vTo(1, CTxOut(nAmount - nFee - CENT, CScript() << OP_DUP << OP_HASH160 << keys[3].hashC
                                                                   << OP_EQUALVERIFY << OP_CHECKSIG));
-    CTransaction tx2 = SpendOf(txUnvault, 0, vTo, nVersion, nSeq, r.U32());
+    CTransaction tx2 = SpendOf(txUnvault, 0, vTo, nVersion, nSeq, r.GetU32());
     CScript junk = Junk(r);
 
     FUZZ_CHECK(SignedPath(txUnvault, tx2, unvault, keys[iRec], false, junk),
@@ -296,19 +296,19 @@ static void Batch(FuzzReader& r)
 {
     const vector<FuzzKey>& keys = FuzzKeys();
     json outputs = json::object();
-    unsigned int n = 1 + r.U8() % 8;
+    unsigned int n = 1 + r.GetU8() % 8;
     for (unsigned int i = 0; i < n; i++)
     {
-        uint8_t kind = r.U8();
+        uint8_t kind = r.GetU8();
         string strAddr;
         if (kind & 1)
             strAddr = Hash160ToAddress(keys[(kind >> 1) & 3].hashC);
         else
         {
-            CScript s = CScript() << r.Bytes(1 + r.U8() % 8);
+            CScript s = CScript() << r.Bytes(1 + r.GetU8() % 8);
             strAddr = Hash160ToScriptAddress(Hash160(s));
         }
-        uint64 v = r.U64();
+        uint64 v = r.GetU64();
         switch ((kind >> 3) & 3)
         {
         case 0: outputs[strAddr] = ValueFromAmount((int64)(v % (21000000 * COIN)) + 1); break;
@@ -316,7 +316,7 @@ static void Batch(FuzzReader& r)
         case 2: outputs[strAddr] = (double)(v % 100000) / 1000.0; break;
         default:
             {
-                valtype b = r.Bytes(r.U8() % 16);
+                valtype b = r.Bytes(r.GetU8() % 16);
                 outputs[strAddr] = string(b.begin(), b.end());
             }
             break;
@@ -334,7 +334,7 @@ static void Batch(FuzzReader& r)
     int64 nTotal = 0;
     foreach(const CTxOut& o, vout)
         nTotal += o.nValue;
-    int64 nFee = (int64)(r.U32() % 100000000) + 1;
+    int64 nFee = (int64)(r.GetU32() % 100000000) + 1;
     CScript batch = CtvScript(TemplateHashFor(vout));
     try
     {
@@ -368,16 +368,16 @@ static void Batch(FuzzReader& r)
 static void Inherit(FuzzReader& r)
 {
     const vector<FuzzKey>& keys = FuzzKeys();
-    uint8_t form = r.U8();
+    uint8_t form = r.GetU8();
     bool fTestNet = (form & 1) != 0;
     double dDays;
     if (form & 2)
     {
-        uint64 bits = r.U64();
+        uint64 bits = r.GetU64();
         memcpy(&dDays, &bits, sizeof(dDays));
     }
     else
-        dDays = (double)r.U32() / 1000.0;
+        dDays = (double)r.GetU32() / 1000.0;
     SelectNetworkParams(fTestNet);
     unsigned int nSeq = 0;
     bool fOk = true;
@@ -401,9 +401,9 @@ static void Inherit(FuzzReader& r)
                    "inherit: %g days became %lld seconds", dDays, (long long)InheritPeriodSecs(nSeq));
     }
     else
-        nSeq = SEQUENCE_LOCKTIME_TYPE_FLAG | (1 + r.U16() % 0xffff);
+        nSeq = SEQUENCE_LOCKTIME_TYPE_FLAG | (1 + r.GetU16() % 0xffff);
 
-    uint8_t kb = r.U8();
+    uint8_t kb = r.GetU8();
     unsigned int iOwner = kb & 3, iHeir = (kb >> 2) & 3;
     CScript redeem = InheritScript(keys[iOwner].hashC, keys[iHeir].hashC, nSeq);
     uint160 hOwner, hHeir;
@@ -411,15 +411,15 @@ static void Inherit(FuzzReader& r)
     FUZZ_CHECK(ParseInheritScript(redeem, hOwner, hHeir, nSeqBack) && hOwner == keys[iOwner].hashC &&
                hHeir == keys[iHeir].hashC && nSeqBack == nSeq, "inherit: the script does not read back");
 
-    CTransaction txFrom = Fund(redeem, 10 * COIN, r.U8() % 2);
+    CTransaction txFrom = Fund(redeem, 10 * COIN, r.GetU8() % 2);
     unsigned int nOut = txFrom.vout.size() - 1;
-    int nVersion = (r.U8() & 1) ? 2 : (int)r.U32();
-    unsigned int nTxSeq = r.U32();
-    uint8_t nNear = r.U8();
+    int nVersion = (r.GetU8() & 1) ? 2 : (int)r.GetU32();
+    unsigned int nTxSeq = r.GetU32();
+    uint8_t nNear = r.GetU8();
     if (nNear & 1)
         nTxSeq = SEQUENCE_LOCKTIME_TYPE_FLAG | ((nSeq & SEQUENCE_LOCKTIME_MASK) + (nNear >> 1) % 3 - 1);
     vector<CTxOut> vTo(1, CTxOut(10 * COIN - CENT, CScript() << OP_TRUE));
-    CTransaction tx = SpendOf(txFrom, nOut, vTo, nVersion, nTxSeq, r.U32());
+    CTransaction tx = SpendOf(txFrom, nOut, vTo, nVersion, nTxSeq, r.GetU32());
     CScript junk = Junk(r);
 
     FUZZ_CHECK(SignedPath(txFrom, tx, redeem, keys[iOwner], true, junk),

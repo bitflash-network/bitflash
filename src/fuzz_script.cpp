@@ -401,23 +401,23 @@ static void Spend(int nHashTypeUnused, FuzzReader& r)
 {
     (void)nHashTypeUnused;
     const vector<FuzzKey>& keys = FuzzKeys();
-    uint8_t ctl = r.U8();
+    uint8_t ctl = r.GetU8();
     CTransaction tx;
-    tx.nVersion = (int)r.U32();
-    tx.nLockTime = r.U32();
-    uint8_t b = r.U8();
+    tx.nVersion = (int)r.GetU32();
+    tx.nLockTime = r.GetU32();
+    uint8_t b = r.GetU8();
     unsigned int nIns = 1 + b % 3, nIn = (b >> 2) % nIns;
     tx.vin.resize(nIns);
     for (unsigned int i = 0; i < nIns; i++)
     {
         tx.vin[i].prevout = COutPoint(uint256(100 + i), i);
-        tx.vin[i].nSequence = r.U32();
+        tx.vin[i].nSequence = r.GetU32();
     }
-    unsigned int nOuts = r.U8() % 4;
+    unsigned int nOuts = r.GetU8() % 4;
     for (unsigned int i = 0; i < nOuts; i++)
     {
-        int64 nValue = (int64)r.U16() * (CENT / 100);
-        uint8_t sel = r.U8();
+        int64 nValue = (int64)r.GetU16() * (CENT / 100);
+        uint8_t sel = r.GetU8();
         CScript s;
         switch (sel & 3)
         {
@@ -428,7 +428,7 @@ static void Spend(int nHashTypeUnused, FuzzReader& r)
         }
         tx.vout.push_back(CTxOut(nValue, s));
     }
-    uint16_t nSigLen = r.U16();
+    uint16_t nSigLen = r.GetU16();
     valtype vSig = r.Bytes(nSigLen);
     valtype vScript = r.Rest();
 
