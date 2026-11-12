@@ -450,4 +450,32 @@ whose deeper shares came from a history.
 
 ### Runs and coverage
 
-[[CAMPAIGN]]
+Actions "Audit campaign", 2 h 10 min per job with AddressSanitizer +
+UndefinedBehaviorSanitizer, no crash, timeout, leak or sanitizer report:
+
+| target | run | libFuzzer | AFL++ (4 instances) | honggfuzz |
+|---|---|---|---|---|
+| `fuzz-p2pool` | 43275125594 | 6.9 M executions, corpus 1517 | 388 new items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+| `fuzz-light-peer` | 43246516215 | 20.2 M executions, corpus 1183 | 270 new items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+
+Under honggfuzz both harnesses slow down inside one persistent process, as
+the share chain and the light clients' state grow, and honggfuzz restarts
+the process ("became too slow"); no input ran past its 20 s limit.
+
+Line coverage of the merged corpora: `p2pool_share.cpp` 90.6%,
+`p2pool_net.cpp` 70.6%, `p2pool_chain.cpp` 70.0% (`P2PoolProcessMessage`
+92%, `AcceptShare` 97%, `AddInContext` 93%, `AddHistory` 100%, `AddTrusted`
+88%, `Evict` and `ByteCap` 100%, `Kept` 37%: the near-tip lines it keeps
+need a line 16 shares deep, which the self-test `p2pool-dos` builds and a
+fuzzed chain rarely reaches; `DropSlowestHistoryReader` is reached only
+with tens of megabytes queued and is covered by `p2pool-dos`).
+`btclight.cpp` 49.7% (the rest is the worker's network and disk side):
+`Peer::Receive`, `VerifyBlock`, `EncodeFilter`/`MatchFilter` 100%,
+`CheckAuxPow` 96%, `PullHeaders` 88%, `Find` 82%, `Headers::NextBits` 78%,
+`Headers::Add` 69%. The first campaign showed `Kept` and `ByteCap` at 0%
+(a 256 kB fuzz cap was never reached) and `NextBits` and `CheckAuxPow` near
+0% (the seeds past the proof of work and the merged-mined header did not
+reach a kept corpus); both were fixed and the harnesses run again.
+
+Self-tests after the last change: Windows suite 83 "ALL TESTS PASSED", 0
+failures; Linux (the 202) 81, 0 failures.
