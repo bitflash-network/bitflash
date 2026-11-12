@@ -132,13 +132,24 @@ public:
         return BN_get_word(bn);
     }
 
+    // The script interpreter reads stack items through this (OP_PICK and
+    // OP_ROLL indexes, OP_CHECKMULTISIG key and signature counts), and Bitflash
+    // never limited script numbers to 4 bytes, so any value can arrive here.
+    // BN_get_word gives a BN_ULONG, 64 bits on every platform the node is
+    // built for, and all ones when the value does not fit. It went into an
+    // unsigned long, which is 32 bits on Windows: 2^32 read as 0 there and as
+    // INT_MAX on Linux, so the two would judge the same script differently,
+    // and a block holding one would split the network along the operating
+    // system. Kept in a BN_ULONG, every platform clamps as Linux always did
+    // (the same results with a 32-bit BN_ULONG too: anything that does not fit
+    // reads as all ones, past INT_MAX).
     int getint() const
     {
-        unsigned long n = BN_get_word(bn);
+        BN_ULONG n = BN_get_word(bn);
         if (!BN_is_negative(bn))
-            return (n > INT_MAX ? INT_MAX : n);
+            return (n > (BN_ULONG)INT_MAX ? INT_MAX : (int)n);
         else
-            return (n > INT_MAX ? INT_MIN : -(int)n);
+            return (n > (BN_ULONG)INT_MAX ? INT_MIN : -(int)n);
     }
 
     void setint64(int64 n)
