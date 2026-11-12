@@ -59,11 +59,40 @@ CBlock Share::Header() const
     return b;
 }
 
-bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
-                    bool fCheckPoW)
+#ifdef BITFLASH_FUZZ
+bool fFuzzShareWorkStandIn = false;
+#endif
+
+// The RandomX hash against the share target, behind the gate. Called only
+// once every cheap check of the share has passed.
+static bool CheckShareHash(const Share& share, bool& fBlockOut, string& errOut, WorkGate* pGate)
 {
-    fBlockOut = false;
-    errOut.clear();
+    CBigNum bnShare, bnBlock;
+    bnShare.SetCompact(share.data.nShareBits);
+    bnBlock.SetCompact(share.nBits);
+    if (pGate && !pGate->Allow())
+        return Fail(errOut, WORK_GATE_CLOSED);
+#ifdef BITFLASH_FUZZ
+    if (fFuzzShareWorkStandIn)
+    {
+        if (share.nNonce & 1)
+            return Fail(errOut, "RandomX work does not meet the share target");
+        fBlockOut = bnBlock > 0 && (share.nNonce & 2) != 0;
+        return true;
+    }
+#endif
+    uint256 hashPoW = share.Header().GetPoWHash();
+    if (CBigNum(hashPoW) > bnShare)
+        return Fail(errOut, "RandomX work does not meet the share target");
+    // A block only if it is one by its own nBits; whether the main chain
+    // takes it is for the main chain to say.
+    fBlockOut = bnBlock > 0 && CBigNum(hashPoW) <= bnBlock;
+    return true;
+}
+
+// Everything CheckShareWork looks at but the hash.
+static bool CheckShareCheap(const Share& share, const CBigNum& bnFloor, string& errOut)
+{
     const ShareData& d = share.data;
 
     if (d.vUncles.size() > MAX_UNCLES)
@@ -114,22 +143,21 @@ bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut,
     // on it either let anybody pick an easy one, or rested on whether a node
     // had that main block -- and two honest nodes, one with it and one
     // without, parted ways for good.
-    CBigNum bnShare, bnBlock;
+    CBigNum bnShare;
     bnShare.SetCompact(d.nShareBits);
-    bnBlock.SetCompact(share.nBits);
     if (bnShare <= 0 || bnShare > bnFloor)
         return Fail(errOut, "share target easier than the floor");
-
-    if (fCheckPoW)
-    {
-        uint256 hashPoW = share.Header().GetPoWHash();
-        if (CBigNum(hashPoW) > bnShare)
-            return Fail(errOut, "RandomX work does not meet the share target");
-        // A block only if it is one by its own nBits; whether the main chain
-        // takes it is for the main chain to say.
-        fBlockOut = bnBlock > 0 && CBigNum(hashPoW) <= bnBlock;
-    }
     return true;
+}
+
+bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
+                    bool fCheckPoW, WorkGate* pGate)
+{
+    fBlockOut = false;
+    errOut.clear();
+    if (!CheckShareCheap(share, bnFloor, errOut))
+        return false;
+    return !fCheckPoW || CheckShareHash(share, fBlockOut, errOut, pGate);
 }
 
 bool IsPayoutScript(const vector<unsigned char>& s)
@@ -145,9 +173,13 @@ bool IsPayoutScript(const vector<unsigned char>& s)
 }
 
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW)
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW, WorkGate* pGate)
 {
-    if (!CheckShareWork(share, bnFloor, fBlockOut, errOut, fCheckPoW))
+    // The hash last: a share that does not pay its window is refused before
+    // anything is spent on its work.
+    fBlockOut = false;
+    errOut.clear();
+    if (!CheckShareCheap(share, bnFloor, errOut))
         return false;
     if (nBlockHeight < 1 || nBlockHeight > MAX_BLOCK_HEIGHT)
         return Fail(errOut, "block height out of range");
@@ -175,7 +207,7 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
             vector<unsigned char>(o.scriptPubKey.begin(), o.scriptPubKey.end()) != want[i].script)
             return Fail(errOut, "the coinbase does not pay the window");
     }
-    return true;
+    return !fCheckPoW || CheckShareHash(share, fBlockOut, errOut, pGate);
 }
 
 } // namespace p2pool

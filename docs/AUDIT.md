@@ -99,7 +99,7 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Eight harnesses in `src/`:
+Ten harnesses in `src/`:
 
 | target | what it feeds |
 |---|---|
@@ -111,6 +111,8 @@ Eight harnesses in `src/`:
 | `fuzz-p2p-payload` | one message and its payload straight into `ProcessMessage()`, as from a peer past the version handshake: `block`, `tx`, `inv`, `getdata`, `getblocks`, the chat and P2Pool messages. The envelope checksum no fuzzer can forge is behind it, and a flag recomputes a block's merkle root. The node keeps its chain between inputs, and in this binary alone (`-DBITFLASH_FUZZ`, `fFuzzSkipPoW`) the RandomX comparison is skipped, so block acceptance, connection and reorganisation are reached; every other check runs as released |
 | `fuzz-deserialize` | raw bytes into every record the node reads from a peer or from its own files, through the `CDataStream >>` the node uses: `CTransaction`, `CBlock` (full, header only, from disk), `CBlockLocator`, `CInv`, `CAddress`, `CMessageHeader`, the transaction parts, `CDiskBlockIndex`, `CTxIndex`, `CDiskTxPos`, `CMerkleTx`, `CWalletTx`, `CWalletMasterKey`, the P2Pool share, chat and marketplace records, and the length prefix on its own. Whatever reads must re-encode to bytes that read back to themselves, `GetSerializeSize` must match, and on every canonical type (all of the wire ones) the re-encoding must be the input byte for byte. Two differentials: a block's id against the hash of its first 80 bytes, and the light client's `btcswap::ParseTx` against the node's reader |
 | `fuzz-decoders` | text into the decoders, each with its encoder where there is one: base58 and base58check, Bitflash key and script addresses (`AddressToHash160`, `DecodeAnyAddress`, which must agree), `.btf` names and onion endpoints, signed service descriptors (`VerifyDescriptor`), BIP39 phrases (checksum recomputed independently) and seeds, BIP32 derivation (path against step by step), payment links (`ParsePaymentLink`/`MakePaymentLink`), the three amount parsers against each other (`ParseMoney`, `ParseCoinAmount`, the payment link's), `ParseHex` and `uint256::SetHex`, the invoice webhook URL, cashaddr, and other chains' addresses (`btclight::Destination`) |
+| `fuzz-p2pool` | every P2Pool message (`p2pshare`, `p2ppeers`, `p2pgetsh`, `p2psync`, `p2pshares`) through `P2PoolProcessMessage()` from an inbound or dialled peer, proven or not, with reconnects and history asks, and raw shares through the share chain's acceptance (`P2PoolSubmitShare`, `ShareChain::Add`/`AddHistory`/`AddTrusted`). Flags fix a share's link, payouts and commitment so mutated shares get past each check. The share chain, orphans and budgets live for the whole run; in this binary alone (`fFuzzShareWorkStandIn`) a rule on `nNonce` stands in for the RandomX comparison, after the shared work budget is asked. `ShareChain::CheckInvariants` (tip held and checked in full, byte counts, trusted index, caps) and the orphan cap are checked after every input |
+| `fuzz-light-peer` | what a foreign chain's peer sends the light clients, per chain and network (Bitcoin, Litecoin, Dogecoin, DigiByte, Ravencoin, Bitcoin Cash, eCash; regtest, test and main): the handshake, `addr`, `headers` (AuxPoW included), `cfheaders`, `cfilter`, `block`, and unsolicited `ping`/`reject`/`notfound`, framed with a correct checksum or as raw bytes, through `Peer::Receive` into the worker's own `Round` (`PullHeaders`, `Headers::Add`, `ScanBlocks`, `VerifyBlock`, the filter checks) and then `Find`/`Call`. A merkle mode is a differential: a block `VerifyBlock` accepts must give the root Bitflash's `CBlock` computes, every branch must climb to it, its re-encoding must pass and a copy with a repeated tail (same root, CVE-2012-2459) must fail. A filter mode round-trips `EncodeFilter`/`MatchFilter` |
 
 Each runs under **libFuzzer**, **AFL++** and **honggfuzz** in turn, all three
 with AddressSanitizer and UndefinedBehaviorSanitizer. They share one corpus
@@ -417,3 +419,63 @@ the key-count checks 100%. Measured on the 202 from the same corpora: the
 template builders in `v4templates.h` (`VaultUnvaultScript`, `CtvScript`,
 `TemplateHashFor`, `InheritSequence`, `InheritScript`, `ParseInheritScript`)
 100% each, `OutputsFromParam` 87.5%, `CheckCtvSpendPolicy` 87.0%.
+
+## P2Pool and the light clients (`fuzz-p2pool`, `fuzz-light-peer`)
+
+November 2026, on `main` at `dc5fefb`. `fuzz-p2pool` is a peer of the share
+chain: every P2Pool message, from an inbound or dialled peer, proven or not,
+with reconnects, history asks and raw shares, against a chain, orphan queue,
+budgets and held entries that live for the whole run (with a 256 kB byte cap
+so eviction is reached); after every input the chain's invariants hold.
+`fuzz-light-peer` is a foreign chain's peer of the light clients, for every
+coin and network they speak, with a merkle differential against Bitflash's
+own `CBlock` code and a filter round trip.
+
+### What changed, and why
+
+| from | what | where |
+|---|---|---|
+| DoS review H4 (share side) | Every share an unproven peer sent was hashed (RandomX) before anything else could refuse it, and a reconnect started the peer afresh. One shared budget (32 hashes, one more every 2 s) covers shares from unproven peers, asked right before the hash and after every cheap check (the payouts are checked first now). A share the budget refuses is held, one per connection, and hashed as the budget refills, the oldest connection first; a share arriving live waits behind one an older connection holds. Nobody is blamed for a refusal; a held share that turns out bad blames its sender. | `p2pool_net.cpp`, `p2pool_share.cpp`, self-test `p2pool-dos` |
+| DoS review M6 | History serving and asking were re-armed on every reconnect, and the orphan-share backlog never shrank. Orphans expire on every share; an orphan already hashed no longer opens a history ask; asks of unproven peers and histories sent to them draw on shared budgets, one history per unproven connection, held when it must wait; the bytes queued to inbound peers together are capped at 64 MB (dialled peers are outside it), and an inbound peer still holding more than 4 MB of a history 15 minutes after it was sent is cut off while the cap is reached. | `p2pool_net.cpp`, self-test `p2pool-dos` |
+| DoS review L6 | Fully checked shares were capped by count only. A byte cap over all shares held (128 MB), the lightest side lines evicted first; trusted shares indexed by parent. | `p2pool_chain.cpp`, self-tests `p2pool-dos`, `p2pool-chain` |
+| independent review of the L6 fix | As first written, the byte cap could evict a share at the tip's height the moment it came, once the tip's own line passed the cap's target: its nephew was never taken and an overtaking line never won, so nodes would part ways. Eviction now keeps the tip's line and its uncles and the heaviest 64 lines still within 16 shares of the tip's work, and when what is kept passes the cap by itself the cap rises to that plus 64 MB, with eviction stopping 32 MB above it. | `p2pool_chain.cpp`, self-test `p2pool-dos` |
+| independent review of the H4 and M6 fixes | The first versions dropped what the budgets refused, so whoever kept them spent starved honest unproven peers (a miner that only dials out is unproven everywhere); live messages could then take every refilled token before the held ones; the queued-bytes cap first counted every peer, dialled ones included, then left out proven inbound peers; slow readers could keep it full. All fixed as described above. | `p2pool_net.cpp`, self-test `p2pool-dos` |
+| `fuzz-light-peer` seeds | Main and test networks' header rules are reached only past the proof-of-work comparison, which no fuzzer can pass: in this binary alone (`fFuzzLightSkipPoW`, `#ifdef BITFLASH_FUZZ`) an input may skip it; DigiByte and Ravencoin decide their headers in code `fuzz-light-pow` covers. A merged-mined Dogecoin header seed reaches the AuxPoW checks. | `btclight.cpp`, `fuzz_light_peer.cpp` |
+
+Left as they are, and why: starving an honest unproven peer is bounded, not
+impossible (each connection older than it that sends shares with no work
+behind them buys about 10 s of the budget before it is cut off); "near the
+tip" is measured by accumulated chain work, which is approximate for a line
+whose deeper shares came from a history.
+
+### Runs and coverage
+
+Actions "Audit campaign", 2 h 10 min per job with AddressSanitizer +
+UndefinedBehaviorSanitizer, no crash, timeout, leak or sanitizer report:
+
+| target | run | libFuzzer | AFL++ (4 instances) | honggfuzz |
+|---|---|---|---|---|
+| `fuzz-p2pool` | 43275125594 | 6.9 M executions, corpus 1517 | 388 new items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+| `fuzz-light-peer` | 43246516215 | 20.2 M executions, corpus 1183 | 270 new items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+
+Under honggfuzz both harnesses slow down inside one persistent process, as
+the share chain and the light clients' state grow, and honggfuzz restarts
+the process ("became too slow"); no input ran past its 20 s limit.
+
+Line coverage of the merged corpora: `p2pool_share.cpp` 90.6%,
+`p2pool_net.cpp` 70.6%, `p2pool_chain.cpp` 70.0% (`P2PoolProcessMessage`
+92%, `AcceptShare` 97%, `AddInContext` 93%, `AddHistory` 100%, `AddTrusted`
+88%, `Evict` and `ByteCap` 100%, `Kept` 37%: the near-tip lines it keeps
+need a line 16 shares deep, which the self-test `p2pool-dos` builds and a
+fuzzed chain rarely reaches; `DropSlowestHistoryReader` is reached only
+with tens of megabytes queued and is covered by `p2pool-dos`).
+`btclight.cpp` 49.7% (the rest is the worker's network and disk side):
+`Peer::Receive`, `VerifyBlock`, `EncodeFilter`/`MatchFilter` 100%,
+`CheckAuxPow` 96%, `PullHeaders` 88%, `Find` 82%, `Headers::NextBits` 78%,
+`Headers::Add` 69%. The first campaign showed `Kept` and `ByteCap` at 0%
+(a 256 kB fuzz cap was never reached) and `NextBits` and `CheckAuxPow` near
+0% (the seeds past the proof of work and the merged-mined header did not
+reach a kept corpus); both were fixed and the harnesses run again.
+
+Self-tests after the last change: Windows suite 83 "ALL TESTS PASSED", 0
+failures; Linux (the 202) 81, 0 failures.

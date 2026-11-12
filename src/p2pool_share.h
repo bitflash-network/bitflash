@@ -89,6 +89,27 @@ struct Share
     uint256 GetId() const { return Header().GetHash(); }
 };
 
+// Asked once per share, right before its RandomX hash and after every cheap
+// check has passed: false refuses the share with an error that starts
+// "here:", so nobody is blamed for it (a budget this node keeps on hashes it
+// spends on what peers send unasked, p2pool_net.cpp). NULL: always hash.
+class WorkGate
+{
+public:
+    virtual ~WorkGate() {}
+    virtual bool Allow() = 0;
+};
+
+#ifdef BITFLASH_FUZZ
+// Fuzz builds only (obj-fuzz, -DBITFLASH_FUZZ; never a node or a release).
+// No fuzzer can find a RandomX hash under a share target, so fuzz-p2pool sets
+// this and CheckShareWork stands a cheap rule in for the hash: the work holds
+// when bit 0 of nNonce is clear, and the share is also a block when bit 1 is
+// set. Both outcomes stay reachable, and everything around the hash -- the
+// gate above, the checks before it, the window after it -- runs as released.
+extern bool fFuzzShareWorkStandIn;
+#endif
+
 // Everything a share can be checked for on its own, given the payout window
 // it claims to pay (the window ending with this share, step 3 builds it):
 // the commitment, the merkle branch, the RandomX work against nShareBits, a
@@ -101,10 +122,14 @@ struct Share
 // coinbase's own rules, the commitment, the merkle branch, the target and the
 // RandomX work (unless !fCheckPoW).
 bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
-                    bool fCheckPoW = true);
+                    bool fCheckPoW = true, WorkGate* pGate = NULL);
 
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW = true);
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW = true,
+                WorkGate* pGate = NULL);
+
+// The refusal a closed WorkGate gives.
+static const char* const WORK_GATE_CLOSED = "here: too many shares to hash from unproven peers just now";
 
 } // namespace p2pool
 

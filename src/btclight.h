@@ -134,6 +134,15 @@ bool CheckChain(const std::string& coin, const std::string& network, btcswap::Ch
 void Watch(const btcswap::Chain& chain, const CScript& contract);
 bool Call(const btcswap::Chain& chain, const std::string& method, const nlohmann::json& params, nlohmann::json& result, std::string& err);
 nlohmann::json Find(const btcswap::Chain& chain, const CScript& contract, const std::string& ref, bool secret);
+#ifdef BITFLASH_FUZZ
+// fuzz-light-peer only (-DBITFLASH_FUZZ): one worker session against peers
+// whose bytes are given, watching contract; see btclight.cpp.
+static const unsigned int FUZZ_SECOND = 1, FUZZ_HANDSHAKE = 2, FUZZ_DISCOVER = 4, FUZZ_QUERY = 8, FUZZ_SKIP_POW = 16;
+// Headers::Add skips the hash-against-target comparison (seeds, FUZZ_SKIP_POW).
+void FuzzSkipPoW(bool skip);
+void FuzzSession(const Net& net, unsigned int flags, int rounds, const Bytes& primaryIn, const Bytes& secondIn,
+                 const CScript& contract);
+#endif
 int SelfTest();
 int SelfTestLitecoin();
 int SelfTestCash();

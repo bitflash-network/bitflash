@@ -2707,6 +2707,8 @@ static void WarnIfBehind()
 }
 
 
+void P2PoolServeDeferred();   // p2pool_net.h
+
 void ThreadMessageHandler2(void* parg)
 {
     printf("ThreadMessageHandler started\n");
@@ -2738,6 +2740,10 @@ void ThreadMessageHandler2(void* parg)
 
             pnode->Release();
         }
+
+        // P2Pool shares and history asks the shared budgets held back from
+        // unproven peers, as the budgets refill (p2pool_net.cpp).
+        P2PoolServeDeferred();
 
         WarnIfBehind();
 

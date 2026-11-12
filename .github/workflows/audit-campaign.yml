@@ -161,8 +161,8 @@ jobs:
           LLVM_PROFILE_FILE="$RUNNER_TEMP/cov-%p.profraw" ./"$T" -runs=0 ../merged > ../replay.log 2>&1 || true
           llvm-profdata merge -sparse "$RUNNER_TEMP"/cov-*.profraw -o ../cov.profdata
           llvm-cov report "./$T" -instr-profile=../cov.profdata > ../coverage.txt
-          llvm-cov report -show-functions "./$T" -instr-profile=../cov.profdata main.cpp script.cpp net.cpp > ../coverage-functions.txt 2>/dev/null || true
-          { echo "### coverage, $T"; echo '```'; grep -E 'TOTAL|/(main|script|net|serialize|p2pool_net|p2pool_chain|btclight|btcswap|btfchatswap|nostr|tor|proxy|jsonrpc|base58|btfaddr|bip32|invoice)\.(cpp|h) ' ../coverage.txt | sed 's|.*/src/||'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          llvm-cov report -show-functions "./$T" -instr-profile=../cov.profdata main.cpp script.cpp net.cpp p2pool_net.cpp p2pool_chain.cpp p2pool_share.cpp btclight.cpp btcswap.cpp > ../coverage-functions.txt 2>/dev/null || true
+          { echo "### coverage, $T"; echo '```'; grep -E 'TOTAL|/(main|script|net|serialize|p2pool_net|p2pool_chain|p2pool_share|btclight|btcswap|btfchatswap|nostr|tor|proxy|jsonrpc|base58|btfaddr|bip32|invoice)\.(cpp|h) ' ../coverage.txt | sed 's|.*/src/||'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Save merged corpus
         uses: actions/cache/save@v4
         with:

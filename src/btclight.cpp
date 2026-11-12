@@ -29,6 +29,19 @@
 using json = nlohmann::json;
 namespace btclight
 {
+#ifdef BITFLASH_FUZZ
+// fuzz-light-peer only (-DBITFLASH_FUZZ; never a node or a release): no
+// fuzzer finds a header under a main or test network's target, so with this
+// set Headers::Add skips the comparison of the header's hash (or scrypt) with
+// its target, and the retarget, time and branch rules behind it are reached.
+// DigiByte and Ravencoin decide their headers in dgb_pow and rvn_kawpow,
+// which fuzz-light-pow covers; this flag does not touch them.
+static bool fFuzzLightSkipPoW = false;
+void FuzzSkipPoW(bool skip) { fFuzzLightSkipPoW = skip; }
+static bool SkipPoW() { return fFuzzLightSkipPoW; }
+#else
+static bool SkipPoW() { return false; }
+#endif
 static uint64_t LE(const Bytes& b, size_t p, size_t n)
 {
     if (p > b.size() || n > b.size() - p || n > 8) throw std::runtime_error("short Bitcoin message");
@@ -859,7 +872,7 @@ bool Headers::Add(const Bytes& raw, std::string& err, const btcswap::AuxPow* aux
             if (net->strictChainId && !net->regtest && (version>>16) != net->auxChainId) throw std::runtime_error("invalid "+net->label+" chain id");
             if (merged && !CheckAuxPow(*aux,h.hash,version>>16,net->strictChainId,auxErr)) throw std::runtime_error("invalid "+net->label+" AuxPoW");
         }
-        if (!net->multiAlgo && !net->kawpow && (target <= 0 || target > limit || Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target))
+        if (!net->multiAlgo && !net->kawpow && (target <= 0 || target > limit || (!SkipPoW() && Number(net->scrypt ? (storedHeaders ? uint256(0) : Scrypt(merged ? aux->parent : raw)) : h.hash) > target)))
             throw std::runtime_error("invalid "+net->label+" proof of work");
         if (!net->multiAlgo && !net->kawpow && h.bits != NextBits(p, h.time)) throw std::runtime_error("invalid "+net->label+" difficulty");
         if (h.time <= Median(p) || (int64)h.time > GetTime()+7200) throw std::runtime_error("invalid "+net->label+" header time");
@@ -1069,8 +1082,25 @@ struct Peer
     ~Peer() { if (socket != INVALID_SOCKET) closesocket(socket); }
     Peer(const Peer&) = delete;
     Peer& operator=(const Peer&) = delete;
+#ifdef BITFLASH_FUZZ
+    // fuzz-light-peer only: what the peer sends is read from fuzzIn, and what
+    // this client sends goes nowhere. Every byte is parsed as from a socket.
+    bool fuzz = false;
+    Bytes fuzzIn;
+    size_t fuzzAt = 0;
+#endif
     void Transfer(unsigned char* data, size_t size, bool writing)
     {
+#ifdef BITFLASH_FUZZ
+        if (fuzz)
+        {
+            if (writing) return;
+            if (fuzzIn.size()-fuzzAt < size) throw std::runtime_error(net.label+" peer disconnected or timed out");
+            if (size) memcpy(data, &fuzzIn[fuzzAt], size);
+            fuzzAt += size;
+            return;
+        }
+#endif
         while (size && !fShutdown)
         {
             int n = writing ? send(socket, (const char*)data, (int)size, 0) : recv(socket, (char*)data, (int)size, 0);
@@ -1151,6 +1181,12 @@ struct Peer
 #endif
         setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+        Handshake();
+    }
+    // version and verack, both ways; the peer's version must say it is a
+    // full node of this chain, at a protocol new enough.
+    void Handshake()
+    {
         Bytes version; Put(version, net.protocol, 4); Put(version, 0, 8); Put(version, GetTime(), 8);
         version.resize(72, 0); uint64_t nonce; randombytes_buf(&nonce, sizeof(nonce)); Put(version, nonce, 8);
         std::string agent = net.agent; Compact(version, agent.size()); version.insert(version.end(), agent.begin(), agent.end());
@@ -1199,8 +1235,17 @@ static State& StateOf(const btcswap::Chain& chain)
     return *it->second;
 }
 static std::string Hex(const Bytes& b) { return HexStr(b.begin(), b.end(), false); }
+#ifdef BITFLASH_FUZZ
+// fuzz-light-peer only: the light state is built and saved as usual, but not
+// written, so a run of millions of sessions does not grow files or fsync.
+static bool fFuzzLightNoDisk = false;
+static bool NoDisk() { return fFuzzLightNoDisk; }
+#else
+static bool NoDisk() { return false; }
+#endif
 static void AtomicFile(const std::string& path, const std::string& data)
 {
+    if (NoDisk()) return;
     std::string temp = path+".tmp";
     FILE* file = fopen(temp.c_str(), "wb");
     if (!file) throw std::runtime_error("cannot write Bitcoin light state");
@@ -1233,6 +1278,7 @@ static void Save(State& s)
 }
 static void AppendHeader(State& s, const Bytes& raw)
 {
+    if (NoDisk()) return;
     std::ofstream f((s.path+".headers").c_str(), std::ios::binary|std::ios::app);
     f.write((const char*)raw.data(), raw.size()); f.flush();
     if (!f) throw std::runtime_error("cannot save Bitcoin header");
@@ -1250,7 +1296,7 @@ static void SaveFilters(State& s)
         data.append((const char*)s.filters[i].hash.begin(),32);
         data.append((const char*)s.filters[i].header.begin(),32);
     }
-    if (append && !data.empty())
+    if (append && !data.empty() && !NoDisk())
     {
         // Appending avoids rewriting a hundred megabytes for every 2000
         // hashes during initial synchronization. Reorgs replace the file.
@@ -1963,6 +2009,56 @@ bool Call(const btcswap::Chain& chain, const std::string& method, const json& pa
     }
     catch (const std::exception& e) { err = e.what(); return false; }
 }
+
+#ifdef BITFLASH_FUZZ
+// fuzz-light-peer: one session of the worker with peers whose bytes come from
+// the input, through the code the worker runs -- the handshake, getaddr,
+// Round (headers from one or two peers, filter headers and filters, the
+// block scan, VerifyBlock) -- and then the wallet's queries on what it kept.
+// A fresh state each time, watching one contract, so an input is replayed
+// the same way on its own.
+void FuzzSession(const Net& net, unsigned int flags, int rounds, const Bytes& primaryIn, const Bytes& secondIn,
+                 const CScript& contract)
+{
+    fFuzzLightNoDisk = true;
+    fFuzzLightSkipPoW = (flags & FUZZ_SKIP_POW) != 0;
+    std::unique_ptr<State> s(new State(net));
+    CScript p2sh; p2sh.SetPayToScriptHash(contract);
+    s->watched.insert(Bytes(p2sh.begin(), p2sh.end()));
+    if (!net.filters) { s->scan = s->headers.Base()+1; s->scanHash = s->headers.At(s->scan-1).hash; }
+    Peer primary(net); primary.fuzz = true; primary.fuzzIn = primaryIn;
+    std::unique_ptr<Peer> second;
+    if (flags & FUZZ_SECOND) { second.reset(new Peer(net)); second->fuzz = true; second->fuzzIn = secondIn; }
+    try
+    {
+        if (flags & FUZZ_HANDSHAKE) primary.Handshake();
+        if (flags & FUZZ_DISCOVER) { std::unique_lock<std::recursive_mutex> lock(s->mutex); Discover(*s,primary,lock); }
+        for (int i = 0; i < rounds; ++i) Round(*s,primary,second.get());
+    }
+    catch (const std::exception&) {}
+    if (!(flags & FUZZ_QUERY)) return;
+    // The wallet's view of what the session kept, as Find and Call give it.
+    const std::string key = net.coin+"/"+net.name;
+    {
+        std::lock_guard<std::mutex> start(startMutex);
+        if (states.count(key)) return;   // never shadow a real client
+        states[key] = s.get();
+    }
+    btcswap::Chain chain; chain.coin = net.coin; chain.name = net.name;
+    try { Find(chain,contract,"",true); } catch (const std::exception&) {}
+    json result; std::string err;
+    Call(chain,"getblockchaininfo",json::array(),result,err);
+    std::map<uint256, Located> txs;
+    { std::lock_guard<std::recursive_mutex> lock(s->mutex); txs = Transactions(*s); }
+    if (!txs.empty())
+    {
+        Call(chain,"getrawtransaction",json::array({txs.begin()->first.GetHex()}),result,err);
+        try { Find(chain,contract,txs.begin()->first.GetHex()+":0",true); } catch (const std::exception&) {}
+    }
+    std::lock_guard<std::mutex> start(startMutex);
+    states.erase(key);
+}
+#endif
 
 #undef printf
 int SelfTest()
