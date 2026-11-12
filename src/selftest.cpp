@@ -14415,6 +14415,94 @@ static int RunP2PDoSSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- bignum-int: script numbers read as int the same on every platform ----
+// CBigNum::getint() kept OpenSSL's 64-bit word in an unsigned long, 32 bits on
+// Windows, so 2^32 read as 0 there and as INT_MAX on Linux. Script numbers are
+// not limited to 4 bytes here, so OP_PICK, OP_ROLL and OP_CHECKMULTISIG could
+// be handed such a value, and Windows and Linux nodes judged the script
+// differently. The cases between 2^32 and 2^64 and the interpreter cases fail
+// on a Windows build of the old code; the others pin the clamping around them.
+// (Neither chain has ever used such a value: no OP_PICK or OP_ROLL, and every
+// multisig count a literal, in all 225,066 mainnet and 28,446 testnet scripts
+// scanned in November 2026.)
+
+static CBigNum BigNumFromLE(const std::vector<unsigned char>& v)
+{
+    return CBigNum(v);   // script numbers: little endian, sign in the top bit
+}
+
+static int RunBigNumIntSelfTest()
+{
+    printf("bignum-int self-test\n");
+    int nFail = 0;
+    typedef std::vector<unsigned char> V;
+    struct Case { V v; int nExpect; const char* name; };
+    const Case cases[] = {
+        { V{0x05}, 5, "5" },
+        { V{0x85}, -5, "-5" },
+        { V{0xff, 0xff, 0xff, 0x7f}, INT_MAX, "2^31-1, the largest int" },
+        { V{0x00, 0x00, 0x00, 0x80, 0x00}, INT_MAX, "2^31 clamps to INT_MAX" },
+        { V{0xff, 0xff, 0xff, 0xff, 0x00}, INT_MAX, "2^32-1 clamps to INT_MAX" },
+        { V{0x00, 0x00, 0x00, 0x00, 0x01}, INT_MAX, "2^32 clamps to INT_MAX (read as 0 on Windows before)" },
+        { V{0x05, 0x00, 0x00, 0x00, 0x01}, INT_MAX, "2^32+5 clamps to INT_MAX (read as 5 on Windows before)" },
+        { V{0x00, 0x00, 0x00, 0x00, 0x81}, INT_MIN, "-2^32 clamps to INT_MIN (read as 0 on Windows before)" },
+        { V{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, INT_MAX, "2^64+1, past 64 bits, clamps to INT_MAX" },
+        { V{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81}, INT_MIN, "-(2^64+1) clamps to INT_MIN" },
+        { V{0x00, 0x00, 0x00, 0x80, 0x80}, INT_MIN, "-2^31 clamps to INT_MIN" },
+        { V{0xff, 0xff, 0xff, 0xff}, -INT_MAX, "-(2^31-1) is itself" },
+        { V{0x80}, 0, "negative zero is 0" },
+        { V{}, 0, "the empty number is 0" },
+        { V{0x05, 0x00, 0x00, 0x00, 0x00}, 5, "a non-minimal 5 is 5" },
+        { V(520, 0x7f), INT_MAX, "a 520-byte number clamps to INT_MAX" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        int n = BigNumFromLE(cases[i].v).getint();
+        nFail += Check(n == cases[i].nExpect, strprintf("getint: %s (got %d)", cases[i].name, n).c_str()) ? 0 : 1;
+    }
+
+    // The same through the interpreter. An index or a count past INT_MAX is
+    // out of range on every platform; on Windows the old code read 2^32 as 0
+    // (OP_PICK became OP_DUP) and 2^32+1 keys as one key.
+    CTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    const V big = V{0x00, 0x00, 0x00, 0x00, 0x01};
+    {
+        CScript s; s << OP_1 << OP_0 << OP_PICK;
+        nFail += Check(EvalScript(s, tx, 0), "control: OP_1 0 OP_PICK runs") ? 0 : 1;
+    }
+    {
+        CScript s; s << OP_1 << big << OP_PICK;
+        nFail += Check(!EvalScript(s, tx, 0), "OP_PICK with index 2^32 fails on every platform") ? 0 : 1;
+    }
+    {
+        CScript s; s << OP_1 << OP_2 << big << OP_ROLL;
+        nFail += Check(!EvalScript(s, tx, 0), "OP_ROLL with index 2^32 fails on every platform") ? 0 : 1;
+    }
+    {
+        // 0 signatures, then 2^32+1 keys with one key on the stack: on Windows
+        // the old code saw one key and the spend ran to the end.
+        CKey key;
+        key.MakeNewKey();
+        CScript s;
+        s << OP_0 << OP_0 << key.GetPubKey() << V{0x01, 0x00, 0x00, 0x00, 0x01} << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript(s, tx, 0), "OP_CHECKMULTISIG with a key count of 2^32+1 fails on every platform") ? 0 : 1;
+        // A signature count of 2^32 with one key: the old Windows build read
+        // it as no signatures and the check passed.
+        CScript g;
+        g << OP_0 << big << key.GetPubKey() << OP_1 << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript(g, tx, 0), "OP_CHECKMULTISIG with a signature count of 2^32 fails on every platform") ? 0 : 1;
+        CScript c;
+        c << OP_0 << OP_0 << key.GetPubKey() << OP_1 << OP_CHECKMULTISIG;
+        nFail += Check(EvalScript(c, tx, 0), "control: the same with a key count of 1 runs") ? 0 : 1;
+    }
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -14481,6 +14569,8 @@ int RunSelfTest(const std::string& name)
         return RunPoWV2SelfTest();
     if (name == "sigpipe")
         return RunSigpipeSelfTest();
+    if (name == "bignum-int")
+        return RunBigNumIntSelfTest();
     if (name == "script-eval")
         return RunScriptEvalSelfTest();
     if (name == "sighash-reference")
@@ -14595,6 +14685,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }
