@@ -149,7 +149,7 @@ static void PrintUsage()
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
     printf("            consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum,\n");
-    printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, bignum-int, script-opcodes, rules-v2, rules-v5, net-hardening, p2p-dos, orphan-tx, multisig, network-params, socks5-proxy,\n");
+    printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, bignum-int, script-opcodes, rules-v2, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, network-params, socks5-proxy,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
     // suites that exist were not named here, so nobody could find them without
     // reading the source. Kept in step now; a suite that cannot be discovered is

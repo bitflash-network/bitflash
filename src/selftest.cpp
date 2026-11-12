@@ -15339,6 +15339,402 @@ static int RunScriptOpcodesSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- orphan-blocks: ProcessBlock with a parent it does not have -------------
+// A block whose parent is unknown is held, and what is waiting for a block is
+// connected, in order, when it arrives. CheckBlock runs before the block is
+// held, so these are real blocks with RandomX proof of work at the floor
+// (about 4096 hashes each at this chain's minimum difficulty). Mining them on
+// every run would take minutes, so each carries the nonce found when the test
+// was written: the search starts from it, and on a miss (a change to the
+// header, the coinbase or the hash function) it carries on from there, slowly
+// but correctly, and says so. The headers are fixed: they hang off the
+// genesis block and use its time plus a constant.
+
+uint256 GetOrphanRoot(const CBlock* pblock);   // main.cpp, not in a header
+
+static unsigned int OrphanBlocksSumBytes()
+{
+    unsigned int n = 0;
+    for (map<uint256, CBlock*>::iterator mi = mapOrphanBlocks.begin(); mi != mapOrphanBlocks.end(); ++mi)
+        n += ::GetSerializeSize(*(*mi).second, SER_NETWORK);
+    return n;
+}
+
+static CBlock OrphanTestBlock(const uint256& hashPrev, int nHeight, int nTag, unsigned int nTime, unsigned int nHint, const char* pszName)
+{
+    CBlock block;
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << nHeight << nTag;
+    cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+    block.vtx.push_back(cb);
+    block.nVersion = 1;
+    block.hashPrevBlock = hashPrev;
+    block.nTime = nTime;
+    block.nBits = bnProofOfWorkLimit.GetCompact();
+    block.hashMerkleRoot = block.BuildMerkleTree();
+    uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+    block.nNonce = nHint;
+    unsigned int nTries = 0;
+    int64 nStart = GetTime();
+    // A stale hint is a failure, not a quarter of an hour of hashing on every
+    // run: BITFLASH_SELFTEST_MINE=1 lets the search run, and prints the nonce
+    // to put in the table.
+    const unsigned int nMaxTries = getenv("BITFLASH_SELFTEST_MINE") ? 0xffffffffU : 64;
+    while (block.GetPoWHash() > hashTarget)
+    {
+        block.nNonce++;
+        nTries++;
+        if (nTries > nMaxTries)
+            throw std::runtime_error(strprintf("the nonce hint %u for block %s no longer meets the target (the header or the proof of work changed); "
+                                               "run with BITFLASH_SELFTEST_MINE=1 to find new ones", nHint, pszName));
+    }
+    if (nTries)
+        printf("  info %s: the nonce hint %u missed; found %u after %u hashes (%lld s)\n",
+               pszName, nHint, block.nNonce, nTries, (long long)(GetTime() - nStart));
+    return block;
+}
+
+// The blocks every test here builds on: A1 A2 A3 off the genesis block, and
+// their nonces.
+static void OrphanTestChainA(CBlock& A1, CBlock& A2, CBlock& A3)
+{
+    const unsigned int nGenesisTime = pindexGenesisBlock->nTime;
+    A1 = OrphanTestBlock(pindexGenesisBlock->GetBlockHash(), 1, 1, nGenesisTime + 120, 7607, "A1");
+    A2 = OrphanTestBlock(A1.GetHash(), 2, 2, nGenesisTime + 240, 4677, "A2");
+    A3 = OrphanTestBlock(A2.GetHash(), 3, 3, nGenesisTime + 360, 805, "A3");
+}
+
+static bool OrphanTestProcess(const CBlock& block, CNode* pfrom, int* pnDoS)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_main)
+        fOk = ProcessBlock(pfrom, new CBlock(block), pnDoS);
+    return fOk;
+}
+
+// A block that has not been mined and never will be: it fills the pool.
+static CBlock* OrphanTestFiller(int i, size_t nPadding)
+{
+    CBlock* pblock = new CBlock();
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].prevout.SetNull();
+    cb.vin[0].scriptSig = CScript() << 1 << (60000 + i);
+    cb.vout.push_back(CTxOut(0, CScript() << std::vector<unsigned char>(nPadding, (unsigned char)i)));
+    pblock->vtx.push_back(cb);
+    pblock->hashPrevBlock = uint256(70000 + i);
+    pblock->nNonce = i;
+    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+    return pblock;
+}
+
+static int RunOrphanBlocksSelfTest()
+{
+    printf("orphan-blocks self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    CNode* pPeer = NULL;
+    try
+    {
+        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        LimitOrphanBlocks(0);
+        const unsigned int nGenesisTime = pindexGenesisBlock->nTime;
+        const uint256 hashGenesis = pindexGenesisBlock->GetBlockHash();
+        const uint256 hashUnknown1 = uint256(0x0a0b0c01), hashUnknown2 = uint256(0x0a0b0c02), hashUnknown3 = uint256(0x0a0b0c03);
+
+        // The chain A1 A2 A3 off genesis; X1 X2 with a parent nobody has;
+        // C, a child of A1 that AcceptBlock will refuse (dated before genesis).
+        int64 nMineStart = GetTime();
+        CBlock A1, A2, A3;
+        OrphanTestChainA(A1, A2, A3);
+        CBlock X1 = OrphanTestBlock(hashUnknown1, 1, 4, nGenesisTime + 120, 3460, "X1");
+        CBlock X2 = OrphanTestBlock(X1.GetHash(), 2, 5, nGenesisTime + 240, 4130, "X2");
+        CBlock C  = OrphanTestBlock(A1.GetHash(), 2, 6, nGenesisTime - 1000, 6078, "C");
+        CBlock Y1 = OrphanTestBlock(hashUnknown2, 1, 7, nGenesisTime + 120, 4287, "Y1");
+        CBlock Y2 = OrphanTestBlock(hashUnknown3, 1, 8, nGenesisTime + 120, 4270, "Y2");
+        printf("  info the blocks took %lld s\n", (long long)(GetTime() - nMineStart));
+        nFail += Check(A1.CheckBlock(NULL) && A3.CheckBlock(NULL) && X2.CheckBlock(NULL) && C.CheckBlock(NULL),
+                       "the test blocks meet CheckBlock, proof of work included") ? 0 : 1;
+
+        pPeer = P2PDoSPeer();
+        int64 nWithoutParent = nBlocksWithoutParent;
+        int nDoS = -1;
+
+        // ---- one orphan
+        nFail += Check(OrphanTestProcess(A3, pPeer, &nDoS) && nDoS == 0, "a block whose parent is unknown is accepted into the orphan pool") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 1 && mapOrphanBlocks.count(A3.GetHash()) &&
+                       mapOrphanBlocksByPrev.size() == 1 && mapOrphanBlocksByPrev.count(A2.GetHash()) &&
+                       !mapBlockIndex.count(A3.GetHash()) && pindexBest == pindexGenesisBlock,
+                       "it is held under its parent's hash, is not in the block index, and the chain has not moved") ? 0 : 1;
+        nFail += Check(nOrphanBlockBytes == ::GetSerializeSize(A3, SER_NETWORK) && nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "the pool counts its bytes") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&A3) == A3.GetHash() && GetOrphanRoot(mapOrphanBlocks[A3.GetHash()]) == A3.GetHash(),
+                       "GetOrphanRoot of a lone orphan is itself") ? 0 : 1;
+        nFail += Check(pPeer->hashLastGetBlocksEnd == A3.GetHash() && pPeer->pindexLastGetBlocksBegin == pindexBest &&
+                       nBlocksWithoutParent == nWithoutParent + 1,
+                       "the peer is asked for the blocks in between, up to the orphan's root, and the orphan is counted") ? 0 : 1;
+
+        // ---- the same block again
+        unsigned int nBytes = nOrphanBlockBytes;
+        nDoS = -1;
+        nFail += Check(!OrphanTestProcess(A3, NULL, &nDoS) && nDoS == 0, "the same orphan again is refused, with no points") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 1 && mapOrphanBlocksByPrev.size() == 1 && nOrphanBlockBytes == nBytes,
+                       "and nothing is held twice") ? 0 : 1;
+
+        // ---- a chain of orphans: the root is the one with no parent held
+        nFail += Check(OrphanTestProcess(A2, pPeer, &nDoS), "its parent, also unknown parent, is held too") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 2 && mapOrphanBlocksByPrev.size() == 2 && nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "two held, in step") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&A3) == A2.GetHash() && GetOrphanRoot(&A2) == A2.GetHash(),
+                       "GetOrphanRoot of the child is the parent, which has none held above it") ? 0 : 1;
+        nFail += Check(pPeer->hashLastGetBlocksEnd == A2.GetHash(), "the peer is now asked up to A2") ? 0 : 1;
+
+        // ---- an unrelated orphan chain, and a child that will turn out invalid
+        nFail += Check(OrphanTestProcess(X1, pPeer, NULL) && OrphanTestProcess(X2, pPeer, NULL),
+                       "another chain with a parent nobody has") ? 0 : 1;
+        nFail += Check(GetOrphanRoot(&X2) == X1.GetHash() && GetOrphanRoot(&A3) == A2.GetHash(),
+                       "each chain has its own root") ? 0 : 1;
+        nFail += Check(OrphanTestProcess(C, NULL, NULL), "a block dated before its parent's time is held like any other: that is AcceptBlock's check") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 5 && mapOrphanBlocksByPrev.size() == 5 &&
+                       mapOrphanBlocksByPrev.count(A1.GetHash()) == 2 && mapOrphanBlocksByPrev.count(A2.GetHash()) == 1 &&
+                       nOrphanBlockBytes == OrphanBlocksSumBytes(), "five held: A2 and C waiting for A1, A3 for A2, X1 and X2") ? 0 : 1;
+        nFail += Check(pindexBest == pindexGenesisBlock && nBestHeight == 0, "and still nothing connected") ? 0 : 1;
+
+        // ---- the parent arrives
+        nFail += Check(OrphanTestProcess(A1, NULL, &nDoS) && nDoS == 0, "the missing parent arrives and is accepted") ? 0 : 1;
+        nFail += Check(pindexBest != NULL && pindexBest->GetBlockHash() == A3.GetHash() && nBestHeight == 3,
+                       "the whole chain behind it connects: the tip is A3 at height 3") ? 0 : 1;
+        {
+            map<uint256, CBlockIndex*>::iterator m1 = mapBlockIndex.find(A1.GetHash());
+            map<uint256, CBlockIndex*>::iterator m2 = mapBlockIndex.find(A2.GetHash());
+            map<uint256, CBlockIndex*>::iterator m3 = mapBlockIndex.find(A3.GetHash());
+            nFail += Check(m1 != mapBlockIndex.end() && m2 != mapBlockIndex.end() && m3 != mapBlockIndex.end() &&
+                           m1->second->pprev == pindexGenesisBlock && m2->second->pprev == m1->second && m3->second->pprev == m2->second &&
+                           m1->second->nHeight == 1 && m2->second->nHeight == 2 && m3->second->nHeight == 3,
+                           "linked in order: genesis, A1, A2, A3") ? 0 : 1;
+        }
+        nFail += Check(!mapBlockIndex.count(C.GetHash()), "the child AcceptBlock refuses did not connect") ? 0 : 1;
+        nFail += Check(mapOrphanBlocks.size() == 2 && mapOrphanBlocks.count(X1.GetHash()) && mapOrphanBlocks.count(X2.GetHash()) &&
+                       mapOrphanBlocksByPrev.size() == 2 && mapOrphanBlocksByPrev.count(hashUnknown1) == 1 &&
+                       !mapOrphanBlocks.count(C.GetHash()) && !mapOrphanBlocks.count(A2.GetHash()) && !mapOrphanBlocks.count(A3.GetHash()),
+                       "what connected, and the refused child, left the pool; the other chain is still waiting") ? 0 : 1;
+        nFail += Check(nOrphanBlockBytes == ::GetSerializeSize(X1, SER_NETWORK) + ::GetSerializeSize(X2, SER_NETWORK) &&
+                       nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                       "and the byte count followed") ? 0 : 1;
+
+        // ---- blocks already in the index
+        nFail += Check(!OrphanTestProcess(A2, NULL, &nDoS) && nDoS == 0 && !OrphanTestProcess(A1, NULL, &nDoS) && nDoS == 0 &&
+                       pindexBest->GetBlockHash() == A3.GetHash() && mapOrphanBlocks.size() == 2,
+                       "a block that already connected is refused, with no points, and nothing changes") ? 0 : 1;
+        nFail += Check(!OrphanTestProcess(X2, NULL, &nDoS) && nDoS == 0 && mapOrphanBlocks.size() == 2,
+                       "a held orphan sent again too") ? 0 : 1;
+
+        // ---- the bounds on the pool, with fillers that were never mined
+        LimitOrphanBlocks(0);
+        nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0, "the pool emptied") ? 0 : 1;
+        {
+            // 36 blocks of about 900 kB are over the byte ceiling together; one
+            // more real orphan comes through ProcessBlock and the pool is cut.
+            for (int i = 0; i < 36; i++)
+                AddOrphanBlock(OrphanTestFiller(i, 900000));
+            unsigned int nBefore = nOrphanBlockBytes;
+            nFail += Check(nBefore > MAX_ORPHAN_BLOCK_BYTES && mapOrphanBlocks.size() == 36,
+                           "36 blocks of 900 kB are over the 32 MB ceiling (nothing has trimmed them yet)") ? 0 : 1;
+            nFail += Check(OrphanTestProcess(Y1, NULL, NULL), "one more orphan is accepted") ? 0 : 1;
+            nFail += Check(nOrphanBlockBytes <= MAX_ORPHAN_BLOCK_BYTES && nOrphanBlockBytes == OrphanBlocksSumBytes() &&
+                           mapOrphanBlocksByPrev.size() == mapOrphanBlocks.size() &&
+                           mapOrphanBlocks.size() >= 35 && mapOrphanBlocks.size() <= 36,
+                           "and the pool is cut back under the byte ceiling, the maps and the count in step") ? 0 : 1;
+            printf("  info %d orphans held, %u of %u bytes\n", (int)mapOrphanBlocks.size(), nOrphanBlockBytes, MAX_ORPHAN_BLOCK_BYTES);
+            LimitOrphanBlocks(0);
+        }
+        {
+            for (unsigned int i = 0; i < MAX_ORPHAN_BLOCKS; i++)
+                AddOrphanBlock(OrphanTestFiller(100 + i, 10));
+            nFail += Check(mapOrphanBlocks.size() == MAX_ORPHAN_BLOCKS, "200 small orphans fill the count ceiling") ? 0 : 1;
+            nFail += Check(OrphanTestProcess(Y2, NULL, NULL), "the 201st comes through ProcessBlock") ? 0 : 1;
+            nFail += Check(mapOrphanBlocks.size() == MAX_ORPHAN_BLOCKS && mapOrphanBlocksByPrev.size() == MAX_ORPHAN_BLOCKS &&
+                           nOrphanBlockBytes == OrphanBlocksSumBytes(),
+                           "one is dropped at random: 200 held, the maps in step, the bytes right") ? 0 : 1;
+            LimitOrphanBlocks(0);
+            nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0, "emptied, nothing counted") ? 0 : 1;
+        }
+        nFail += Check(pindexBest->GetBlockHash() == A3.GetHash(), "through all of it the chain stayed at A3") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    delete pPeer;
+    LimitOrphanBlocks(0);
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- block-index-load: the restart path ------------------------------------
+// A chain written by one run is read back by the next: LoadBlockIndex rebuilds
+// the links, the heights and the accumulated work, picks the best chain the
+// disk names, verifies the tail of it, and when the tail fails takes the
+// failed blocks off the chain and marks them. The valid blocks are the mined
+// ones of orphan-blocks; the failing ones carry no proof of work (what
+// AcceptBlock stores, and CheckBlock at load refuses).
+
+static int RunBlockIndexLoadSelfTest()
+{
+    printf("block-index-load self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    const int nCheckSaved = nCheckBlocksOnLoad;
+    try
+    {
+        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        const uint256 hashGenesis = pindexGenesisBlock->GetBlockHash();
+        nReorgTestStart = pindexGenesisBlock->nTime;
+        CBlock A1, A2, A3;
+        OrphanTestChainA(A1, A2, A3);
+        const uint256 hA1 = A1.GetHash(), hA2 = A2.GetHash(), hA3 = A3.GetHash();
+        nFail += Check(OrphanTestProcess(A1, NULL, NULL) && OrphanTestProcess(A2, NULL, NULL) && OrphanTestProcess(A3, NULL, NULL) &&
+                       nBestHeight == 3 && pindexBest->GetBlockHash() == hA3,
+                       "three blocks with proof of work connect from genesis") ? 0 : 1;
+        const uint256 workA1 = mapBlockIndex[hA1]->nChainWork, workA2 = mapBlockIndex[hA2]->nChainWork,
+                      workA3 = mapBlockIndex[hA3]->nChainWork;
+        nFail += Check(workA1 > 0 && workA2 > workA1 && workA3 > workA2, "accumulated work grows with each block") ? 0 : 1;
+
+        // ---- a restart with nothing to repair
+        nCheckBlocksOnLoad = 288;
+        if (!ReorgTestReload())
+            throw std::runtime_error("reload failed");
+        {
+            CBlockIndex* p1 = mapBlockIndex.count(hA1) ? mapBlockIndex[hA1] : NULL;
+            CBlockIndex* p2 = mapBlockIndex.count(hA2) ? mapBlockIndex[hA2] : NULL;
+            CBlockIndex* p3 = mapBlockIndex.count(hA3) ? mapBlockIndex[hA3] : NULL;
+            nFail += Check(p1 && p2 && p3 && mapBlockIndex.size() == 4, "the genesis block and the three blocks are read back") ? 0 : 1;
+            if (!p1 || !p2 || !p3)
+                throw std::runtime_error("blocks missing after the restart");
+            nFail += Check(pindexGenesisBlock && pindexGenesisBlock->GetBlockHash() == hashGenesis && pindexGenesisBlock->pprev == NULL,
+                           "the genesis block is found") ? 0 : 1;
+            nFail += Check(pindexBest == p3 && hashBestChain == hA3 && nBestHeight == 3,
+                           "the best chain is the one the disk names: A3, height 3") ? 0 : 1;
+            nFail += Check(p1->pprev == pindexGenesisBlock && p2->pprev == p1 && p3->pprev == p2 &&
+                           pindexGenesisBlock->pnext == p1 && p1->pnext == p2 && p2->pnext == p3 && p3->pnext == NULL &&
+                           p1->nHeight == 1 && p2->nHeight == 2 && p3->nHeight == 3,
+                           "heights, parents and next links are rebuilt") ? 0 : 1;
+            nFail += Check(p1->nChainWork == workA1 && p2->nChainWork == workA2 && p3->nChainWork == workA3,
+                           "the accumulated work, which is not on the disk, comes out the same as before") ? 0 : 1;
+            nFail += Check(p2->IsInMainChain() && p3->IsInMainChain() && !p1->fFailed && !p2->fFailed && !p3->fFailed &&
+                           pindexBadChainFork == NULL && pindexBadChainFirst == NULL,
+                           "all of it in the main chain, nothing failed, no repair pending") ? 0 : 1;
+            CTxDB txdb("r");
+            CTransaction tx;
+            nFail += Check(txdb.ReadDiskTx(A2.vtx[0].GetHash(), tx) && tx.GetHash() == A2.vtx[0].GetHash() &&
+                           txdb.ContainsTx(A3.vtx[0].GetHash()),
+                           "the transaction index still finds the blocks' coinbases") ? 0 : 1;
+        }
+
+        // ---- the best chain is the heaviest, not the last one written; a restart whose
+        // tail fails verification goes back to the fork and marks the failed branch
+        CBlockIndex* pA1 = mapBlockIndex[hA1];
+        CBlockIndex* pF2 = ReorgTestExtend(pA1);
+        CBlockIndex* pF3 = pF2 ? ReorgTestExtend(pF2) : NULL;
+        nFail += Check(pF2 && pF3 && pF3->nHeight == 3 && pF3->nChainWork == workA3 && pindexBest->GetBlockHash() == hA3,
+                       "a branch from A1 to the same height and work is stored, and the first one stays the best") ? 0 : 1;
+        CBlockIndex* pF4 = pF3 ? ReorgTestExtend(pF3) : NULL;
+        nFail += Check(pF4 && pindexBest == pF4 && nBestHeight == 4, "one more block on it has more work: it becomes the best chain") ? 0 : 1;
+        if (!pF4)
+            throw std::runtime_error("could not build the branch");
+        const uint256 hF2 = pF2->GetBlockHash(), hF3 = pF3->GetBlockHash(), hF4 = pF4->GetBlockHash();
+        uint256 hFirstBad = 0;
+        int nExpect = ReorgTestExpectedRollback(pF4, 288, &hFirstBad);
+        printf("  info the load check should roll back to height %d\n", nExpect);
+        if (!ReorgTestReload())
+            throw std::runtime_error("second reload failed");
+        nFail += Check(nExpect == 1 && nBestHeight == nExpect && pindexBest && pindexBest->GetBlockHash() == hA1,
+                       "the branch's blocks fail the check at load: the chain goes back to A1, where it forked") ? 0 : 1;
+        nFail += Check(mapBlockIndex.count(hFirstBad) && mapBlockIndex[hFirstBad]->fFailed &&
+                       mapBlockIndex.count(hF4) && mapBlockIndex[hF4]->fFailed && mapBlockIndex.count(hF3) && mapBlockIndex[hF3]->fFailed,
+                       "the first bad block and everything on top of it are marked failed") ? 0 : 1;
+        nFail += Check(mapBlockIndex.count(hA3) && !mapBlockIndex[hA3]->fFailed && !mapBlockIndex[hA2]->fFailed &&
+                       !IsBetterChain(mapBlockIndex[hF4], mapBlockIndex[hA3]) && IsBetterChain(mapBlockIndex[hA3], pindexBest),
+                       "the valid branch is untouched, and a failed branch is never the better chain") ? 0 : 1;
+        fCheckpointWalkBack = true;
+        nFail += Check(ActivateBestKnownChain() && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "the best of what is left, by work, is A3: it is picked, not the heavier failed branch") ? 0 : 1;
+        nFail += Check(pindexBadChainFork == NULL && pindexBadChainFirst == NULL, "no repair left pending") ? 0 : 1;
+
+        // The failed blocks came off the disk index.
+        if (!ReorgTestReload())
+            throw std::runtime_error("third reload failed");
+        nFail += Check(!mapBlockIndex.count(hF2) && !mapBlockIndex.count(hF3) && !mapBlockIndex.count(hF4) && mapBlockIndex.size() == 4 &&
+                       pindexBest && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "the next restart does not read them back: the chain is A3, four entries") ? 0 : 1;
+        nFail += Check(mapBlockIndex[hA3]->nChainWork == workA3 && mapBlockIndex[hA3]->IsInMainChain(),
+                       "and the work of A3 is what it was") ? 0 : 1;
+
+        // ---- only the tail is checked: with a window of one block, the tip
+        // goes and the block under it, never looked at, stays
+        CBlockIndex* pA4 = ReorgTestExtend(pindexBest);
+        CBlockIndex* pA5 = pA4 ? ReorgTestExtend(pA4) : NULL;
+        if (!pA5)
+            throw std::runtime_error("could not extend the chain");
+        const uint256 hA4 = pA4->GetBlockHash(), hA5 = pA5->GetBlockHash();
+        nCheckBlocksOnLoad = 1;
+        uint256 hBad1 = 0;
+        int nExpect1 = ReorgTestExpectedRollback(pA5, 1, &hBad1);
+        if (!ReorgTestReload())
+            throw std::runtime_error("fourth reload failed");
+        nFail += Check(nExpect1 == 4 && nBestHeight == 4 && pindexBest->GetBlockHash() == hA4 && mapBlockIndex.count(hA5) && mapBlockIndex[hA5]->fFailed &&
+                       !mapBlockIndex[hA4]->fFailed,
+                       "a window of one: only the tip is checked and removed; the unchecked block under it is the new tip") ? 0 : 1;
+        uint256 hBad2 = 0;
+        int nExpect2 = ReorgTestExpectedRollback(pindexBest, 1, &hBad2);
+        if (!ReorgTestReload())
+            throw std::runtime_error("fifth reload failed");
+        nFail += Check(!mapBlockIndex.count(hA5) && nExpect2 == 3 && nBestHeight == 3 && pindexBest->GetBlockHash() == hA3 &&
+                       mapBlockIndex.count(hA4) && mapBlockIndex[hA4]->fFailed,
+                       "the next restart checks that one, finds it bad, and is back on A3 with A4 marked") ? 0 : 1;
+        nFail += Check(IndexHasNoDanglingParent(), "no entry points at a block that is gone") ? 0 : 1;
+        nCheckBlocksOnLoad = 0;
+        if (!ReorgTestReload())
+            throw std::runtime_error("sixth reload failed");
+        nFail += Check(nBestHeight == 3 && pindexBest->GetBlockHash() == hA3 && !mapBlockIndex.count(hA4),
+                       "a window of 0 checks the whole chain: all three blocks pass, nothing to repair") ? 0 : 1;
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    nCheckBlocksOnLoad = nCheckSaved;
+    fCheckpointWalkBack = false;
+    DBFlush(true);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -15417,6 +15813,10 @@ int RunSelfTest(const std::string& name)
         return RunOrphanTxSelfTest();
     if (name == "script-opcodes")
         return RunScriptOpcodesSelfTest();
+    if (name == "orphan-blocks")
+        return RunOrphanBlocksSelfTest();
+    if (name == "block-index-load")
+        return RunBlockIndexLoadSelfTest();
     if (name == "net-hardening")
         return RunNetHardeningSelfTest();
     if (name == "p2p-dos")
@@ -15525,6 +15925,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }
