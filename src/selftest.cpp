@@ -14778,7 +14778,7 @@ static int RunScriptOpcodesSelfTest()
 
     // The transactions the lock opcodes look at.
     enum { TX_PLAIN, TX_LOCK100, TX_LOCKTIME, TX_LOCK100_FINAL, TX_SEQ10, TX_SEQTIME10, TX_V1_SEQ10, TX_SEQ_DISABLED,
-           TX_TWO_OUTS, TX_NEGVERSION, TX_COUNT };
+           TX_TWO_OUTS, TX_NEGVERSION, TX_V2_FINAL, TX_COUNT };
     std::vector<CTransaction> txs(TX_COUNT);
     txs[TX_PLAIN]          = OpTx(1, 0, SEQUENCE_FINAL);
     txs[TX_LOCK100]        = OpTx(1, 100, 0);
@@ -14790,6 +14790,7 @@ static int RunScriptOpcodesSelfTest()
     txs[TX_SEQ_DISABLED]   = OpTx(2, 0, SEQUENCE_LOCKTIME_DISABLE_FLAG | 10);
     txs[TX_TWO_OUTS]       = OpTx(1, 0, SEQUENCE_FINAL, 2);
     txs[TX_NEGVERSION]     = OpTx(-1, 0, 10);
+    txs[TX_V2_FINAL]       = OpTx(2, 0, SEQUENCE_FINAL);
 
     OpTable t;
 
@@ -14820,7 +14821,8 @@ static int RunScriptOpcodesSelfTest()
     t.Add("PUSHDATA4 of 65536 bytes with none behind it", OpRaw({0x4e, 0x00, 0x00, 0x01, 0x00}), ALL, false);
     t.Add("a direct push of one byte with none behind it", OpRaw({0x01}), ALL, false);
     t.Add("a direct push of two bytes with one behind it", OpRaw({0x02, 0xaa}), ALL, false);
-    t.Add("a truncated push inside a branch not taken still fails", OpRaw({0x00, 0x63, 0x4c, 0x05, 0x01}), ALL, false);
+    t.AddS("control: a complete push inside a branch not taken is skipped", OpCat(CScript() << OP_0 << OP_IF, OV({0x4c, 0x01, 0x01})) << OP_ENDIF << OP_1, ALL, true, Stk{T});
+    t.Add("a push cut short inside a branch not taken fails: the script cannot be read (the control above, closed, passes)", OpRaw({0x00, 0x63, 0x4c, 0x05, 0x01}), ALL, false);
     t.AddS("a 520-byte push is allowed", CScript() << OpBytes(520, 7), ALL, true, Stk{OpBytes(520, 7)});
     t.Add("a 521-byte push is refused", CScript() << OpBytes(521, 7), ALL, false);
     t.Add("a 521-byte push in a branch not taken is refused too", CScript() << OP_0 << OP_IF << OpBytes(521, 7) << OP_ENDIF << OP_1, ALL, false);
@@ -14888,6 +14890,12 @@ static int RunScriptOpcodesSelfTest()
     t.Add("OP_VERIF in a branch not taken from v3 fails", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_ENDIF << OP_1, V3UP, false);
     t.Add("OP_VERNOTIF in a branch not taken from v3 fails", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1, V3UP, false);
     t.Add("OP_VERIF with no condition on an empty stack", CScript() << OP_VERIF << OP_ENDIF, PRE, false);
+    // Before v3, in a branch not taken, OP_VERIF and OP_VERNOTIF still open a branch of their own, as OP_IF
+    // does: it takes its own OP_ENDIF (Bitcoin made them invalid everywhere, so the question never arises).
+    t.AddS("OP_VERIF in a branch not taken opens a branch: two ENDIFs close it", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_ENDIF << OP_1, PRE, true, Stk{T});
+    t.Add("and with one ENDIF the outer IF is left open: false", CScript() << OP_0 << OP_IF << OP_VERIF << OP_ENDIF << OP_1, PRE, false);
+    t.AddS("OP_VERNOTIF in a branch not taken opens a branch: two ENDIFs close it", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_ENDIF << OP_1, PRE, true, Stk{T});
+    t.Add("and with one ENDIF the outer IF is left open: false (OP_VERNOTIF)", CScript() << OP_0 << OP_IF << OP_VERNOTIF << OP_ENDIF << OP_1, PRE, false);
     // The limits.
     t.AddS("201 non-push opcodes are allowed", CScript() << OP_1 << OpRun(OP_NOP, 201), ALL, true, Stk{T});
     t.Add("202 are not", CScript() << OP_1 << OpRun(OP_NOP, 202), ALL, false);
@@ -14935,6 +14943,9 @@ static int RunScriptOpcodesSelfTest()
     t.Add("PICK with a negative index", CScript() << OP_1 << OP_1NEGATE << OP_PICK, ALL, false);
     t.Add("ROLL with a negative index", CScript() << OP_1 << OP_1NEGATE << OP_ROLL, ALL, false);
     t.Add("PICK with an index that does not fit an int", CScript() << OP_1 << OV({0xff, 0xff, 0xff, 0xff, 0x00}) << OP_PICK, ALL, false);
+    // 2^32: its low 32 bits are zero, which reads as index 0 where an int is 32 bits (the fix of CBigNum::getint).
+    t.Add("PICK with an index of 2^32 fails (not index 0)", CScript() << OP_1 << OV({0, 0, 0, 0, 1}) << OP_PICK, ALL, false);
+    t.Add("ROLL with an index of 2^32 fails (not index 0)", CScript() << OP_1 << OV({0, 0, 0, 0, 1}) << OP_ROLL, ALL, false);
     t.AddS("ROT", CScript() << OP_1 << OP_2 << OP_3 << OP_ROT, ALL, true, Stk{OV({2}), OV({3}), T});
     t.AddS("SWAP", CScript() << OP_1 << OP_2 << OP_SWAP, ALL, true, Stk{OV({2}), T});
     t.AddS("TUCK", CScript() << OP_1 << OP_2 << OP_TUCK, ALL, true, Stk{OV({2}), T, OV({2})});
@@ -15119,6 +15130,13 @@ static int RunScriptOpcodesSelfTest()
     // operations the block is charged for it.
     t.AddS("21 keys and no signatures before v5", CScript() << OP_0 << OP_0 << OpRun(OP_0, 21) << 21 << OP_CHECKMULTISIG, ALL & ~V5, true, Stk{T});
     t.Add("21 keys under rules v5 fail", CScript() << OP_0 << OP_0 << OpRun(OP_0, 21) << 21 << OP_CHECKMULTISIG, V5, false);
+    t.Add("a key count of 2^32 + 1 fails (not 1)", CScript() << OP_0 << OP_0 << OV({1, 0, 0, 0, 1}) << OP_CHECKMULTISIG, ALL, false);
+    t.Add("a signature count of 2^32 with one key fails (not 0 signatures, which would pass)", CScript() << OP_0 << OV({0, 0, 0, 0, 1}) << OP_0 << OP_1 << OP_CHECKMULTISIG, ALL, false);
+    // Bitcoin adds the key count of an OP_CHECKMULTISIG to the 201-opcode count; this node counts the opcode
+    // alone (the 20 signature operations are charged to the block by GetSigOpCount instead). So 20 keys and
+    // 190 NOPs, 211 by Bitcoin's count, are 191 here and pass; 201 NOPs after it are 202 and fail.
+    t.AddS("20 keys and 190 NOPs pass here (211 by Bitcoin's count)", CScript() << OP_0 << OP_0 << OpRun(OP_0, 20) << 20 << OP_CHECKMULTISIG << OpRun(OP_NOP, 190), ALL, true, Stk{T});
+    t.Add("the multisig opcode itself still counts: 201 NOPs after it are one too many", CScript() << OP_0 << OP_0 << OpRun(OP_0, 20) << 20 << OP_CHECKMULTISIG << OpRun(OP_NOP, 201), ALL, false);
 
     // ---- the NOP bytes and the bytes no rule gives a meaning
     // Bitcoin runs 0xb0 and 0xb3..0xb9 as NOPs and leaves them to soft forks.
@@ -15140,7 +15158,7 @@ static int RunScriptOpcodesSelfTest()
     }
     t.Add("a two-byte opcode (0xf000) run fails", OpRaw({0xf0, 0x00}), ALL, false);
     t.AddS("a two-byte opcode in a branch not taken is skipped", OpCat(CScript() << OP_0 << OP_IF, OV({0xf0, 0x00})) << OP_ENDIF << OP_1, ALL, true, Stk{T});
-    t.Add("a lone 0xf0 cannot be read, even in a branch not taken", OpCat(CScript() << OP_0 << OP_IF, OV({0xf0})), ALL, false);
+    t.Add("a lone 0xf0 as the last byte inside a branch not taken fails: its second byte is missing, so the script cannot be read (the two-byte form above, closed, passes)", OpCat(CScript() << OP_0 << OP_IF, OV({0xf0})), ALL, false);
 
     // ---- OP_CHECKLOCKTIMEVERIFY (rules v3)
     t.cur = "OP_CHECKLOCKTIMEVERIFY";
@@ -15177,7 +15195,7 @@ static int RunScriptOpcodesSelfTest()
     t.Add("transaction version 1 has no relative locks", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_V1_SEQ10);
     t.AddS("a negative transaction version reads as a large one (unsigned, as in Bitcoin)", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10})}, TX_NEGVERSION);
     t.Add("an input with the disable flag set fails", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ_DISABLED);
-    t.Add("a final input has the disable flag", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_PLAIN);
+    t.Add("a final input has the disable flag (version 2, so it is the sequence that refuses it)", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_V2_FINAL);
     t.Add("blocks against a time-based input", CScript() << 10 << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQTIME10);
     t.AddS("time against time", CScript() << OV({10, 0, 0x40}) << OP_CHECKSEQUENCEVERIFY, V4UP, true, Stk{OV({10, 0, 0x40})}, TX_SEQTIME10);
     t.Add("time against blocks", CScript() << OV({10, 0, 0x40}) << OP_CHECKSEQUENCEVERIFY, V4UP, false, TX_SEQ10);
@@ -15318,8 +15336,8 @@ static int RunScriptOpcodesSelfTest()
         nFail += Check(VerifyScriptP2SH(txTo.vin[0].scriptSig, txFrom.vout[0].scriptPubKey, txTo, 0, false, true) &&
                        !VerifyScriptP2SH(CScript() << OP_2 << OP_4 << vchRedeem, txFrom.vout[0].scriptPubKey, txTo, 0, false, true),
                        "VerifyScriptP2SH itself always runs the redeem script") ? 0 : 1;
-        // A redeem script that is OP_TRUE: the OP_1 .. OP_16 pushes carry no data, and the split of the
-        // scriptSig must keep them as they were.
+        // A redeem script with an IF/ELSE, and a scriptSig that picks the branch with OP_TRUE or OP_0 in front of
+        // it: those pushes carry no data (OP_1 .. OP_16), and the split of the scriptSig must keep them as they were.
         CScript redeemIf = CScript() << OP_IF << OP_1 << OP_ELSE << OP_0 << OP_ENDIF;
         OpVal vchIf(redeemIf.begin(), redeemIf.end());
         CTransaction txFrom2;
@@ -15331,6 +15349,15 @@ static int RunScriptOpcodesSelfTest()
         txTo2.vin[0].scriptSig = CScript() << OP_FALSE << vchIf;
         bool fFalse = VerifySignature(txFrom2, txTo2, 0, 0, false, true);
         nFail += Check(fTrue && !fFalse, "OP_TRUE before the redeem script selects the true branch, OP_0 the false one") ? 0 : 1;
+        // VerifyScriptP2SH takes the rule flag too: a redeem script using OP_VER passes without it and fails with it.
+        CScript redeemVer = CScript() << OP_VER << OP_DROP << OP_1;
+        OpVal vchVer(redeemVer.begin(), redeemVer.end());
+        CScript pubVer = CScript() << OP_HASH160 << Hash160(vchVer) << OP_EQUAL;
+        CScript sigVer = CScript() << vchVer;
+        nFail += Check(VerifyScriptP2SH(sigVer, pubVer, txTo, 0, false, false) && !VerifyScriptP2SH(sigVer, pubVer, txTo, 0, false, true),
+                       "VerifyScriptP2SH without the v3 flag runs the redeem script by the old rules (OP_VER passes), with it by v3's (it fails)") ? 0 : 1;
+        nFail += Check(!VerifyScriptP2SH(CScript() << OP_2 << OP_4 << vchRedeem, txFrom.vout[0].scriptPubKey, txTo, 0, false, false),
+                       "and a redeem script that is false is refused without the flag too") ? 0 : 1;
     }
 
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
@@ -15422,7 +15449,19 @@ static CBlock* OrphanTestFiller(int i, size_t nPadding)
     cb.vin.resize(1);
     cb.vin[0].prevout.SetNull();
     cb.vin[0].scriptSig = CScript() << 1 << (60000 + i);
-    cb.vout.push_back(CTxOut(0, CScript() << std::vector<unsigned char>(nPadding, (unsigned char)i)));
+    // One well-formed push: OP_PUSHDATA4, a four-byte length, the bytes (CScript << vector writes a
+    // two-byte length, which a padding of 900 kB does not fit).
+    CScript pad;
+    if (nPadding < 256)
+        pad << std::vector<unsigned char>(nPadding, (unsigned char)i);
+    else
+    {
+        pad.push_back(OP_PUSHDATA4);
+        for (int k = 0; k < 4; k++)
+            pad.push_back((unsigned char)((nPadding >> (8 * k)) & 0xff));
+        pad.insert(pad.end(), nPadding, (unsigned char)i);
+    }
+    cb.vout.push_back(CTxOut(0, pad));
     pblock->vtx.push_back(cb);
     pblock->hashPrevBlock = uint256(70000 + i);
     pblock->nNonce = i;
@@ -15538,6 +15577,24 @@ static int RunOrphanBlocksSelfTest()
         nFail += Check(!OrphanTestProcess(X2, NULL, &nDoS) && nDoS == 0 && mapOrphanBlocks.size() == 2,
                        "a held orphan sent again too") ? 0 : 1;
 
+        // ---- a block that fails CheckBlock is not held
+        {
+            CBlock* pFiller = OrphanTestFiller(500, 100);
+            CBlock bad = *pFiller;
+            delete pFiller;
+            bad.nBits = bnProofOfWorkLimit.GetCompact();
+            bad.nTime = nGenesisTime + 120;
+            unsigned int nBytesBefore = nOrphanBlockBytes;
+            size_t nHeldBefore = mapOrphanBlocks.size();
+            int nDoSBad = 0;
+            bool fBad = OrphanTestProcess(bad, NULL, &nDoSBad);
+            nFail += Check(!fBad && nDoSBad > 0, "an unmined block (an unknown parent, no proof of work) is refused, with DoS points") ? 0 : 1;
+            nFail += Check(mapOrphanBlocks.size() == nHeldBefore && nOrphanBlockBytes == nBytesBefore && !mapOrphanBlocks.count(bad.GetHash()) &&
+                           mapOrphanBlocksByPrev.size() == nHeldBefore,
+                           "and the orphan pool is as it was") ? 0 : 1;
+            printf("  info CheckBlock failure scored %d\n", nDoSBad);
+        }
+
         // ---- the bounds on the pool, with fillers that were never mined
         LimitOrphanBlocks(0);
         nFail += Check(mapOrphanBlocks.empty() && mapOrphanBlocksByPrev.empty() && nOrphanBlockBytes == 0, "the pool emptied") ? 0 : 1;
@@ -15605,6 +15662,7 @@ static int RunBlockIndexLoadSelfTest()
     }
     strSetDataDir = tmp;
     const int nCheckSaved = nCheckBlocksOnLoad;
+    const MapCheckpoints mapCheckpointsSaved = mapCheckpoints;
     try
     {
         if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
@@ -15719,6 +15777,34 @@ static int RunBlockIndexLoadSelfTest()
             throw std::runtime_error("sixth reload failed");
         nFail += Check(nBestHeight == 3 && pindexBest->GetBlockHash() == hA3 && !mapBlockIndex.count(hA4),
                        "a window of 0 checks the whole chain: all three blocks pass, nothing to repair") ? 0 : 1;
+
+        // ---- a best chain that contradicts a checkpoint goes back to the last block that does not
+        nCheckBlocksOnLoad = 288;
+        mapCheckpoints.clear();
+        mapCheckpoints[2] = uint256(0xdeadbeef);   // not A2
+        fCheckpointWalkBack = false;
+        if (!ReorgTestReload())
+            throw std::runtime_error("seventh reload failed");
+        {
+            CBlockIndex* p2 = mapBlockIndex.count(hA2) ? mapBlockIndex[hA2] : NULL;
+            CBlockIndex* p3 = mapBlockIndex.count(hA3) ? mapBlockIndex[hA3] : NULL;
+            nFail += Check(p2 && p3 && p2->fOffCheckpoint && p3->fOffCheckpoint && !mapBlockIndex[hA1]->fOffCheckpoint,
+                           "a checkpoint at height 2 that is not A2: A2 and A3 are off it, A1 is not") ? 0 : 1;
+            nFail += Check(nBestHeight == 1 && pindexBest && pindexBest->GetBlockHash() == hA1 && fCheckpointWalkBack,
+                           "the load goes back to A1 and asks for a walk back to the best chain by work") ? 0 : 1;
+            nFail += Check(p3 && !p2->fFailed && !p3->fFailed && !IsBetterChain(p3, pindexBest),
+                           "A2 and A3 are not marked failed, and a chain off a checkpoint is not the better one") ? 0 : 1;
+        }
+        // The checkpoint now names A2: nothing is off it, and the walk back finds A3 again.
+        mapCheckpoints[2] = hA2;
+        if (!ReorgTestReload())
+            throw std::runtime_error("eighth reload failed");
+        nFail += Check(nBestHeight == 1 && pindexBest->GetBlockHash() == hA1 && !mapBlockIndex[hA3]->fOffCheckpoint &&
+                       IsBetterChain(mapBlockIndex[hA3], pindexBest),
+                       "with a checkpoint A2 meets, A3 is the better chain again") ? 0 : 1;
+        fCheckpointWalkBack = true;
+        nFail += Check(ActivateBestKnownChain() && pindexBest->GetBlockHash() == hA3 && nBestHeight == 3,
+                       "and the walk back returns to it") ? 0 : 1;
     }
     catch (const std::exception& e)
     {
@@ -15726,6 +15812,7 @@ static int RunBlockIndexLoadSelfTest()
         nFail++;
     }
     nCheckBlocksOnLoad = nCheckSaved;
+    mapCheckpoints = mapCheckpointsSaved;
     fCheckpointWalkBack = false;
     DBFlush(true);
     RemoveTree(tmp);
