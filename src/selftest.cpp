@@ -14503,6 +14503,135 @@ static int RunBigNumIntSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- orphan-tx: the orphan transaction pool --------------------------------
+// AddOrphanTx, EraseOrphanTx and LimitOrphanTx keep two maps in step: the
+// orphans by hash, and each input's parent hash to the orphan naming it. A
+// stale entry in the second would point at a freed stream. No self-test
+// reached these before (coverage, November 2026).
+
+extern map<uint256, CDataStream*> mapOrphanTransactions;
+extern multimap<uint256, CDataStream*> mapOrphanTransactionsByPrev;
+
+static CDataStream OrphanTestTx(const vector<pair<uint256, unsigned int> >& vPrev, int nTag)
+{
+    CTransaction tx;
+    for (size_t i = 0; i < vPrev.size(); i++)
+    {
+        CTxIn in;
+        in.prevout = COutPoint(vPrev[i].first, vPrev[i].second);
+        tx.vin.push_back(in);
+    }
+    tx.vout.push_back(CTxOut(COIN + nTag, CScript() << OP_TRUE));
+    CDataStream ss(SER_NETWORK);
+    ss << tx;
+    return ss;
+}
+
+static uint256 OrphanTestHash(const CDataStream& ss)
+{
+    CTransaction tx;
+    CDataStream(ss) >> tx;
+    return tx.GetHash();
+}
+
+// Every parent entry points at a live orphan that names that parent.
+static bool OrphanMapsInStep()
+{
+    for (multimap<uint256, CDataStream*>::const_iterator mi = mapOrphanTransactionsByPrev.begin();
+         mi != mapOrphanTransactionsByPrev.end(); ++mi)
+    {
+        bool fLive = false;
+        for (map<uint256, CDataStream*>::const_iterator it = mapOrphanTransactions.begin();
+             it != mapOrphanTransactions.end(); ++it)
+            if (it->second == mi->second)
+            {
+                CTransaction tx;
+                CDataStream(*it->second) >> tx;
+                for (size_t i = 0; i < tx.vin.size(); i++)
+                    fLive |= tx.vin[i].prevout.hash == mi->first;
+            }
+        if (!fLive)
+            return false;
+    }
+    return true;
+}
+
+static int RunOrphanTxSelfTest()
+{
+    printf("orphan-tx self-test\n");
+    int nFail = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        while (!mapOrphanTransactions.empty())
+            EraseOrphanTx(mapOrphanTransactions.begin()->first);
+        nFail += Check(mapOrphanTransactionsByPrev.empty(), "the orphan pool starts empty") ? 0 : 1;
+
+        uint256 P = Hash(BEGIN("P"), END("P")), Q = Hash(BEGIN("Q"), END("Q")), R = Hash(BEGIN("R"), END("R"));
+        vector<pair<uint256, unsigned int> > v;
+
+        v.assign(1, make_pair(P, 0u));
+        CDataStream a = OrphanTestTx(v, 1);
+        AddOrphanTx(a);
+        AddOrphanTx(a);
+        nFail += Check(mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1,
+                       "an orphan is held once, under its one parent, however often it comes") ? 0 : 1;
+
+        v.clear();
+        v.push_back(make_pair(P, 1u));
+        v.push_back(make_pair(Q, 0u));
+        CDataStream b = OrphanTestTx(v, 2);
+        AddOrphanTx(b);
+        v.clear();
+        v.push_back(make_pair(R, 0u));
+        v.push_back(make_pair(R, 1u));
+        CDataStream c = OrphanTestTx(v, 3);
+        AddOrphanTx(c);
+        nFail += Check(mapOrphanTransactions.size() == 3 && mapOrphanTransactionsByPrev.size() == 5 &&
+                       mapOrphanTransactionsByPrev.count(P) == 2 && mapOrphanTransactionsByPrev.count(R) == 2 &&
+                       OrphanMapsInStep(),
+                       "two parents, and one parent named twice: an entry per input, each pointing at its orphan") ? 0 : 1;
+
+        EraseOrphanTx(OrphanTestHash(b));
+        bool fB = mapOrphanTransactions.size() == 2 && mapOrphanTransactionsByPrev.size() == 3 &&
+                  mapOrphanTransactionsByPrev.count(P) == 1 && mapOrphanTransactionsByPrev.count(Q) == 0;
+        EraseOrphanTx(OrphanTestHash(c));
+        bool fC = mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1 &&
+                  mapOrphanTransactionsByPrev.count(R) == 0;
+        EraseOrphanTx(OrphanTestHash(c));   // gone already: nothing happens
+        nFail += Check(fB && fC && OrphanMapsInStep() && mapOrphanTransactions.size() == 1,
+                       "erasing an orphan removes every parent entry it had and no other; erasing it twice is harmless") ? 0 : 1;
+
+        v.clear();
+        for (unsigned int i = 0; i < 10001; i++)
+            v.push_back(make_pair(Q, i));
+        AddOrphanTx(OrphanTestTx(v, 4));
+        nFail += Check(mapOrphanTransactions.size() == 1 && mapOrphanTransactionsByPrev.size() == 1,
+                       "an orphan with more than 10,000 inputs is not held") ? 0 : 1;
+
+        for (int i = 0; i < (int)MAX_ORPHAN_TRANSACTIONS + 50; i++)
+        {
+            uint256 parent = Hash(BEGIN(i), END(i));
+            v.assign(1, make_pair(parent, 0u));
+            AddOrphanTx(OrphanTestTx(v, 100 + i));
+        }
+        nFail += Check(mapOrphanTransactions.size() == MAX_ORPHAN_TRANSACTIONS &&
+                       mapOrphanTransactionsByPrev.size() == MAX_ORPHAN_TRANSACTIONS && OrphanMapsInStep(),
+                       strprintf("past %u orphans, others are dropped at random and the maps stay in step",
+                                 MAX_ORPHAN_TRANSACTIONS).c_str()) ? 0 : 1;
+
+        LimitOrphanTx(10);
+        bool fTen = mapOrphanTransactions.size() == 10 && mapOrphanTransactionsByPrev.size() == 10 && OrphanMapsInStep();
+        while (!mapOrphanTransactions.empty())
+            EraseOrphanTx(mapOrphanTransactions.begin()->first);
+        nFail += Check(fTen && mapOrphanTransactionsByPrev.empty(),
+                       "a lower limit drops down to it; erasing all leaves both maps empty") ? 0 : 1;
+    }
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     AttachTerminal();
@@ -14577,6 +14706,8 @@ int RunSelfTest(const std::string& name)
         return RunSigHashReferenceSelfTest();
     if (name == "rules-v2")
         return RunRulesV2SelfTest();
+    if (name == "orphan-tx")
+        return RunOrphanTxSelfTest();
     if (name == "net-hardening")
         return RunNetHardeningSelfTest();
     if (name == "p2p-dos")
@@ -14685,6 +14816,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, multisig, socks5-proxy, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
     return 1;
 }
