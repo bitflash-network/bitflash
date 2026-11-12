@@ -120,6 +120,7 @@ static void FuzzExternalIP(const std::string& response)
 static void FuzzRelay(const uint8_t* data, size_t size)
 {
     CFuzzSocketPair sp(data, size);
+    sp.NodeWritesFailWhenFull();   // the pongs are never read (fuzz_socket.h)
     std::vector<std::string> msgs;
     bool fUp = BtfNostrReadRelayStream(sp.fdNode, 16, msgs);
     std::string in((const char*)data, size);

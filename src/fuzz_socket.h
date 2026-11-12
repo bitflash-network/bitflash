@@ -15,6 +15,7 @@
 #ifndef BITFLASH_FUZZ_SOCKET_H
 #define BITFLASH_FUZZ_SOCKET_H
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,6 +58,23 @@ public:
             off += (size_t)n;
         }
         shutdown(fdPeer, SHUT_WR);
+    }
+
+    // What the node writes back is never read here, so a node that answers
+    // every frame (a relay's pings, up to 4096 per read) fills the harness's
+    // end and its next send blocks for good: the input then reads as a hang.
+    // In the node the same socket carries a send timeout (BtfConnectSocket),
+    // and a peer that stops reading makes the write fail. With this, a write
+    // that does not fit fails at once, the same outcome without the wait;
+    // reads are unaffected (the whole input is already queued, then EOF).
+    void NodeWritesFailWhenFull()
+    {
+        int fl = fcntl(fdNode, F_GETFL, 0);
+        if (fl < 0 || fcntl(fdNode, F_SETFL, fl | O_NONBLOCK) != 0)
+        {
+            perror("fuzz: fcntl");
+            abort();
+        }
     }
 
     ~CFuzzSocketPair()
