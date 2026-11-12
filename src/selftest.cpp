@@ -5234,6 +5234,10 @@ static int RunReplyParsersSelfTest()
         nFail += Check(!ParseLoopbackRpcResponse(to, "HTTP/1.1 404 Not Found\r\n\r\n<html>[[[[ no such page</html>", result, err, &nCode) &&
                        err.find("no such wallet") != std::string::npos,
                        "client: an HTML 404 page keeps the unknown-wallet hint") ? 0 : 1;
+        err.clear();
+        nFail += Check(!ParseLoopbackRpcResponse(to, "HTTP/1.1 500 x\r\n\r\n{\"error\":{\"code\":-1,\"message\":\"\"}}", result, err, &nCode) &&
+                       !err.empty(),
+                       "client: an error with an empty message still gives a reason") ? 0 : 1;
 
         nFail += Check(invoice::WebhookAnswerOk("HTTP/1.1 204 No Content\r\n", err) &&
                        !invoice::WebhookAnswerOk("HTTP/1.1 2", err) &&

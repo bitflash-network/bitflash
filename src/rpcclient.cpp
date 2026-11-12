@@ -178,6 +178,11 @@ bool ParseLoopbackRpcResponse(const LoopbackRpc& to, const std::string& resp, js
         errOut = j["error"].is_object() && j["error"].contains("message") && j["error"]["message"].is_string()
                      ? j["error"]["message"].get<std::string>()
                      : j["error"].dump(-1, ' ', false, json::error_handler_t::replace);
+        // An error whose message is empty still says who failed: the caller
+        // shows this string, and an empty one read as no error at all.
+        // Found by fuzz-http-client (AFL++ and honggfuzz on GitHub).
+        if (errOut.empty())
+            errOut = to.strWho + " returned an error with no message";
         // Only a code that is one: get<int>() on 4294967271 gave -25.
         if (pnCodeOut && j["error"].is_object() && j["error"].contains("code") && j["error"]["code"].is_number_integer())
         {
