@@ -4,7 +4,7 @@
 
 # Bitflash
 
-**Bitcoin 0.1.0, revived for the CPU.**<br>
+**A new cryptocurrency built from Bitcoin 0.1.0's code, mined on any CPU.**<br>
 RandomX proof of work, nodes reached only through Tor onion services, no premine.
 
 [Download](https://releases.bitflash.network/) &nbsp;·&nbsp;
@@ -29,9 +29,10 @@ RandomX proof of work, nodes reached only through Tor onion services, no premine
 
 ## Overview
 
-Bitflash starts from the first release of Bitcoin and keeps its model: a fixed supply of
-21 million, a block reward that halves on schedule, and no company, premine or founder
-allocation. Two parts are replaced.
+Bitflash is a separate chain with its own genesis block, built from the code of Bitcoin's
+first release. It is not Bitcoin, and no bitcoin balance carries over to it. It keeps Bitcoin's
+model: a fixed supply of 21 million, a block reward that halves on schedule, and no company,
+premine or founder allocation. Two parts are replaced.
 
 - **Proof of work is RandomX**, the memory-hard algorithm Monero uses. It is designed for
   general-purpose processors, so ordinary computers can mine and ASICs and GPUs gain little.
