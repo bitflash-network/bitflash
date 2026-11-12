@@ -5,8 +5,9 @@
 // docs/inheritance.md): the vault, the CTV batch and the inheritance. The RPCs
 // in jsonrpc.cpp build them with these functions, and so does the
 // fuzz-v4-templates harness, so what it checks is what the wallet funds.
-// Include <nlohmann/json.hpp> before headers_core.h (util.h redefines
-// snprintf), and this after it.
+// This header includes <nlohmann/json.hpp> itself, which must come before
+// headers_core.h (util.h redefines snprintf): in a file that includes both,
+// put <nlohmann/json.hpp> first, then headers_core.h, then this header.
 #ifndef BITFLASH_V4TEMPLATES_H
 #define BITFLASH_V4TEMPLATES_H
 

@@ -8815,19 +8815,87 @@ static int RunScriptSigOpsSelfTest()
 
         nFail += Check(VerifySignature(parent, a, 0, 0, true, true, true) && VerifySignature(parent, c, 0, 0, true, true, true),
                        "both computed-count spends are valid by consensus") ? 0 : 1;
-        nFail += Check(!a.AcceptTransaction(txdb, true), "the pool refuses a bare multisig with a computed key count") ? 0 : 1;
-        nFail += Check(!c.AcceptTransaction(txdb, true), "and a P2SH redeem script with one") ? 0 : 1;
+        bool fMissing = true;
+        nFail += Check(!a.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                       "the pool refuses a bare multisig with a computed key count, and it is not 'missing inputs'") ? 0 : 1;
+        fMissing = true;
+        nFail += Check(!c.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                       "and a P2SH redeem script with one (a computed-count spend is dropped, not kept as an orphan)") ? 0 : 1;
         nFail += Check(b.AcceptTransaction(txdb, true) && d.AcceptTransaction(txdb, true),
                        "a literal count enters, bare or as a redeem script") ? 0 : 1;
 
-        // The miner and a block are not held to it: consensus is unchanged.
-        std::map<uint256, CTxIndex> mapTestPool;
-        mapTestPool[parent.GetHash()] = CTxIndex(CDiskTxPos(1,1,1), parent.vout.size());
-        int64 nFees = 0;
-        nFail += Check(a.ConnectInputs(txdb, mapTestPool, CDiskTxPos(1,1,1), 0, nFees, false, true, 0,
-                                       (unsigned int)GetAdjustedTime()),
-                       "the miner's path still connects it (relay policy, not consensus)") ? 0 : 1;
+        // OP_CHECKMULTISIGVERIFY in a redeem script, count computed.
+        {
+            CScript verifyComputed;
+            verifyComputed << vKeys[0] << vKeys[1] << OP_1 << OP_1 << OP_ADD << OP_CHECKMULTISIGVERIFY << OP_TRUE;
+            CScript p2shVerify;
+            p2shVerify.SetPayToScriptHash(verifyComputed);
+            CTransaction parent2;
+            parent2.vin.push_back(CTxIn(COutPoint(uint256(79), 0)));
+            parent2.vout.push_back(CTxOut(10 * COIN, p2shVerify));
+            FeeTestAddToPool(parent2);
+            CTransaction e = FeeTestChild(parent2, 0, CENT, SEQUENCE_FINAL, scriptTo);
+            e.vin[0].scriptSig = CScript() << OP_0 << OP_0 << std::vector<unsigned char>(verifyComputed.begin(), verifyComputed.end());
+            nFail += Check(VerifySignature(parent2, e, 0, 0, true, true, true),
+                           "the OP_CHECKMULTISIGVERIFY spend is valid by consensus") ? 0 : 1;
+            fMissing = true;
+            nFail += Check(!e.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                           "the pool refuses OP_CHECKMULTISIGVERIFY on a computed count, missing inputs false") ? 0 : 1;
+        }
 
+        // What the wallet makes is never refused: a real signed 2-of-3 P2SH.
+        {
+            CKey k1, k2, k3;
+            k1.MakeNewKey(); k2.MakeNewKey(); k3.MakeNewKey();
+            std::vector<std::vector<unsigned char> > msKeys;
+            msKeys.push_back(k1.GetPubKey()); msKeys.push_back(k2.GetPubKey()); msKeys.push_back(k3.GetPubKey());
+            CScript redeem;
+            redeem.SetMultisig(2, msKeys);
+            CScript p2shReal;
+            p2shReal.SetPayToScriptHash(redeem);
+            CTransaction parent3;
+            parent3.vin.push_back(CTxIn(COutPoint(uint256(80), 0)));
+            parent3.vout.push_back(CTxOut(10 * COIN, p2shReal));
+            FeeTestAddToPool(parent3);
+            CTransaction f = FeeTestChild(parent3, 0, CENT, SEQUENCE_FINAL, scriptTo);
+            uint256 hashSig = SignatureHash(redeem, f, 0, SIGHASH_ALL);
+            std::vector<unsigned char> sig1, sig3;
+            bool fSigned = k1.Sign(hashSig, sig1) && k3.Sign(hashSig, sig3);
+            sig1.push_back((unsigned char)SIGHASH_ALL);
+            sig3.push_back((unsigned char)SIGHASH_ALL);
+            f.vin[0].scriptSig = CScript() << OP_0 << sig1 << sig3 << std::vector<unsigned char>(redeem.begin(), redeem.end());
+            nFail += Check(fSigned && VerifySignature(parent3, f, 0, 0, true, true, true),
+                           "a real 2-of-3 P2SH spend with two signatures verifies") ? 0 : 1;
+            fMissing = true;
+            nFail += Check(f.AcceptTransaction(txdb, true, &fMissing) && !fMissing,
+                           "the pool takes it: the policy cannot refuse what the wallet makes") ? 0 : 1;
+        }
+
+        // A parent the node does not know is still 'missing inputs'.
+        {
+            CTransaction orphan = FeeTestChild(parent, 1, CENT, SEQUENCE_FINAL, scriptTo);
+            orphan.vin[0].prevout.hash = uint256(999);
+            fMissing = false;
+            nFail += Check(!orphan.AcceptTransaction(txdb, true, &fMissing) && fMissing,
+                           "a spend of an unknown prevout still reports missing inputs") ? 0 : 1;
+        }
+
+        // The miner is held to it too, silently; a block is not (the check
+        // is off for fBlock, so consensus is unchanged).
+        {
+            std::map<uint256, CTxIndex> mapTestPool;
+            mapTestPool[parent.GetHash()] = CTxIndex(CDiskTxPos(1,1,1), parent.vout.size());
+            int64 nFees = 0;
+            nFail += Check(!a.ConnectInputs(txdb, mapTestPool, CDiskTxPos(1,1,1), 0, nFees, false, true, 0,
+                                            (unsigned int)GetAdjustedTime()),
+                           "the miner's path refuses a computed count too (relay policy)") ? 0 : 1;
+            std::map<uint256, CTxIndex> mapTestPool2;
+            mapTestPool2[parent.GetHash()] = CTxIndex(CDiskTxPos(1,1,1), parent.vout.size());
+            nFees = 0;
+            nFail += Check(b.ConnectInputs(txdb, mapTestPool2, CDiskTxPos(1,1,1), 0, nFees, false, true, 0,
+                                           (unsigned int)GetAdjustedTime()),
+                           "and connects a literal one") ? 0 : 1;
+        }
         CRITICAL_BLOCK(cs_mapTransactions)
         {
             mapTransactions.clear();

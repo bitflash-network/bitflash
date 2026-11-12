@@ -624,7 +624,7 @@ static void Spend(int nHashTypeUnused, FuzzReader& r)
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     // 4 kB: every script op copies and scans the script code (FindAndDelete)
-    // and each spend is evaluated 27 times. Under honggfuzz, whose memcmp hook
+    // and each spend is evaluated 33 times (11 flag sets, 3 calls each). Under honggfuzz, whose memcmp hook
     // is far slower than memcmp, inputs up to 8 kB ran past its 20 s limit
     // (97 timeouts in a 20-minute run; under libFuzzer the slowest was 0.2 s).
     if (size < 1 || size > 4096)

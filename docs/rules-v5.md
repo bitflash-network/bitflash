@@ -56,6 +56,12 @@ The code: `RulesV5Time()`, `RulesV5ActiveAtMedianTime()` and
 `RulesV5Active(pindexPrev)` in `src/randomx_pow.cpp`, constants in
 `src/consensus.h`.
 
+When v5 get a date, the wallet-side checks must follow: they call
+`VerifySignature` with its default `fRulesV5=false` (`jsonrpc.cpp` in
+`signrawtransaction` near line 1249 and in `spendscript` near line 2076, and
+`main.cpp` near line 3425) and must pass `RulesV5Active(pindexBest)`, or the
+wallet will call a spend good that a v5 block refuses.
+
 ## Retarget time
 
 `GetNextWorkRequired` measures a window as the closing block's time minus the
@@ -169,6 +175,11 @@ Until v5 are scheduled, the relay policy does the same job for honest blocks:
 the memory pool refuses a spend whose scriptPubKey or redeem script runs an
 `OP_CHECKMULTISIG` without a literal `OP_0`..`OP_16` key count right before it
 (`MultisigKeyCountsAreLiteral`), and miners build blocks from the pool.
+
+The policy works together with the rules `IsStandard` already applies to a
+scriptSig: it must be push-only and at most 500 bytes. A scriptSig therefore
+cannot carry a multisig of its own; the only scripts that run one are the
+scriptPubKey and a P2SH redeem script, which is what the policy reads.
 
 ## No subsidy after 64 halvings (BIP42)
 

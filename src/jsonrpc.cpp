@@ -2078,16 +2078,21 @@ static json rpc_spendscript(const json& p)
         throw runtime_error("the spend does not verify under the rules now in force "
                             "(or uses a rules-v4 upgrade hook, which nodes do not relay)");
 
+    if (!InputMultisigKeyCountsAreLiteral(tx.vin[0].scriptSig, txFrom.vout[nOut].scriptPubKey,
+                                          RulesV3Active(nNow)))
+        throw runtime_error("the redeem script runs OP_CHECKMULTISIG on a key count that is not a literal "
+                            "OP_0..OP_16; relay policy refuses it");
+
     uint256 hash = tx.GetHash();
     CDataStream ssTx(SER_NETWORK);
     ssTx << tx;
     CRITICAL_BLOCK(cs_main)
     {
         bool fMissingInputs = false;
-        // AcceptTransaction says "missing inputs" for every input it could not
-        // connect, a relative lock not over yet included.
+        // AcceptTransaction says "missing inputs" only when a parent is not
+        // known to the node.
         if (!tx.AcceptTransaction(true, &fMissingInputs))
-            throw runtime_error(fMissingInputs ? "the node could not connect the input: not known to it, or under a relative lock not over yet"
+            throw runtime_error(fMissingInputs ? "the node could not connect the input: it is not known to this node yet"
                                                : "the node refused it (see debug.log)");
         AddToWalletIfMine(tx, NULL);
         RelayMessage(CInv(MSG_TX, hash), ssTx);
