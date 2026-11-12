@@ -360,3 +360,60 @@ in any of the six jobs (corpora 6.0k and 9.2k inputs for `fuzz-deserialize`,
 8.0k and 11.4k for `fuzz-decoders`, libFuzzer and honggfuzz), and the campaign's own coverage of the
 corpora matched the table above (`serialize.h` 61.4%, `base58.h` 94.2%,
 `btfaddr.cpp` 85.9%, `bip32.cpp` 77.3%, `bip21.cpp` 100%, whole files).
+
+## The script engine under every rule set (`fuzz-script`, `fuzz-v4-templates`)
+
+November 2026, on `main` at `c48f8c8`. `fuzz-script` runs each script and
+each structured spend under eleven flag sets (rules v2, v3, v4 in every
+combination, v5, and the relay policy) and aborts when one rule set changes
+an answer it cannot affect, when rules v4 do more than add, when v5 or the
+policy turn a failure into a pass, or when a spend checks more signatures
+than the block and the pool charged for it. `fuzz-v4-templates` builds the
+vault, CTV batch and inheritance scripts with the wallet's own functions and
+spends them as the RPCs do.
+
+### What they found
+
+| found by | what | where |
+|---|---|---|
+| the signature-count invariant of `fuzz-script` | `OP_CHECKMULTISIG` is charged 20 signature operations but checks one signature per key it is handed, and the key count was bounded only by the stack, so a script that computes its count (say `OP_16 OP_9 OP_ADD`) checked more signatures than it paid for. Relay policy now refuses, in the pool and in the miner, an input whose script or redeem script runs `OP_CHECKMULTISIG(VERIFY)` without a literal `OP_0`..`OP_16` count right before it, before any signature is checked. Rules v5 (unscheduled) cap the keys at 20 in consensus. Blocks are judged as before. | `script.cpp`, `main.cpp`, self-tests `script-sigops`, `rules-v5` |
+| reading `AcceptTransaction` for the above | The pool read the clock twice for one transaction's signature count, and the readings could fall either side of the rules v4 switch. One reading now. | `main.cpp` |
+| independent review of the change | A transaction the pool refused for policy, a bad signature or a relative lock was reported as "missing inputs", so it went to the orphan pool, waiting for a parent it already had, and `spendscript` named the wrong cause. Missing inputs now means a parent neither the chain nor the pool knows; `spendscript` checks the key counts first. | `main.cpp`, `jsonrpc.cpp`, self-test `script-sigops` |
+
+Checked and not a defect: rules v2 strict signatures are not monotone (a
+non-DER signature makes `OP_CHECKSIG` return false, so `CHECKSIG NOT` can
+pass), as in Bitcoin before NULLFAIL, already active consensus; any script
+where that leads to a pass already passes with an empty signature. There is
+no `MAX_SCRIPT_SIZE`; the work per operation grows with the script, bounded
+by the block size (a candidate for a later rule set, not measured as a
+problem).
+
+### Runs and coverage
+
+Actions "Audit campaign" run 43130125511, 2 h 10 min per job with
+AddressSanitizer + UndefinedBehaviorSanitizer, no crash, leak or sanitizer
+report:
+
+| target | libFuzzer | AFL++ (4 instances) | honggfuzz |
+|---|---|---|---|
+| `fuzz-script` | 3.9 M executions, corpus 2572, 0/0/0 | 7.3k items, 0 crashes, 0 timeouts | 0 crashes; 345 processes killed at the 20 s limit (below) |
+| `fuzz-v4-templates` | 30.4 M executions, corpus 1079, 0/0/0 | 4.4k items, 0 crashes, 0 timeouts | 0 crashes, 0 timeouts |
+
+Under honggfuzz alone, `fuzz-script`'s time per input inside one persistent
+process climbs, from about 0.1 s to as much as 14 s, until honggfuzz
+restarts the process ("became too slow", 67 times) or kills one over its
+20 s limit. Nothing in the node accumulates: honggfuzz's own corpus (8519
+inputs) replayed through the libFuzzer build ran every input in under a
+second (peak memory 884 MB with AddressSanitizer), AFL++ saw no timeout, and inputs built to be
+the slowest (4 kB of signature operations) take at most 0.4 s in the
+honggfuzz build run on its own. It is the cost of honggfuzz's comparison
+hooks on a harness that evaluates each spend 33 times, each operation
+copying and scanning the script; inputs are capped at 4 kB for it.
+
+Line coverage of the merged corpora: `script.cpp` 71.6% (the rest is wallet
+signing and solving, outside the target; `EvalScript` 81%, its misses mostly
+the bodies of disabled opcodes), `CheckTemplateHash`, `GetP2SHSigOpCount` and
+the key-count checks 100%. Measured on the 202 from the same corpora: the
+template builders in `v4templates.h` (`VaultUnvaultScript`, `CtvScript`,
+`TemplateHashFor`, `InheritSequence`, `InheritScript`, `ParseInheritScript`)
+100% each, `OutputsFromParam` 87.5%, `CheckCtvSpendPolicy` 87.0%.
