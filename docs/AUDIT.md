@@ -117,6 +117,17 @@ per target: what one engine finds is minimised into the corpus
 (`libFuzzer -merge=1`) before the next starts. Crashes land in
 `crashes/<engine>-<target>-*`; replay one with `./<target> <file>`.
 
+LeakSanitizer settings shared by every harness that links the node are in
+`src/fuzz_datadir.h`: the blocks Berkeley DB allocates for its environment's
+regions (`__env_alloc`) are suppressed, since a heap scan cannot see what
+references them, and there is no leak check at exit, where the node's global
+maps would all read as leaks. libFuzzer still checks after every input. A
+`leak-*` file is replayed as a corpus, `./<target> -runs=0 <dir holding it>`,
+not as a single file. The Actions campaign's `fork` input set to false runs
+libFuzzer as one process that stops at the first finding with its whole
+report (fork mode keeps going but loses the reports' stacks); it then uses
+one core and may end hours before its time.
+
 ### Coverage (`cov`)
 
 **llvm-cov** over the self-tests, and over each fuzz corpus replayed through a

@@ -23,7 +23,7 @@ on:
         type: boolean
         default: true
       fork:
-        description: "libFuzzer in fork mode (one worker per core, keeps going after a finding); off = one process that stops at the first finding with its full stack"
+        description: "libFuzzer in fork mode (one worker per core, keeps going after a finding); off = one process on one core that stops at the first finding with its full stack, often hours early"
         type: boolean
         default: true
 
