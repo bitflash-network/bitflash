@@ -139,6 +139,8 @@ push. What they found is fixed with the self-test `reply-parsers`:
 | `fuzz-http-client` | An error code from another node that does not fit an `int` was passed on truncated (4294967271 read as -25). | `rpcclient.cpp` |
 | `fuzz-http-client` | A relay's upgrade counted as accepted when ` 101 ` appeared anywhere in the headers (a 403 page was then read as frames). Pings over 125 bytes were answered with a corrupt pong; reserved opcodes and RSV bits were taken as text; a relay sending only pings or pongs kept the reading thread forever. | `nostr.cpp` `CWebSocket` |
 | `fuzz-http-client` | A webhook answer was quoted into the log with its control characters. | `invoice.cpp` `WebhookAnswerOk` |
+| `fuzz-http-client`, AFL++ and honggfuzz on GitHub (17 inputs) | An error answer whose message was an empty string came back as a failure with an empty reason, which callers show as no error at all. It now says who failed. | `rpcclient.cpp` `ParseLoopbackRpcResponse` |
+| independent review | The RPC receive timeout had no test; the websocket control-frame bound was per call and low enough to trip on an idle pooled socket (now 4096); the nesting check ran before the HTML fallback and hid the unknown-wallet hint. | `jsonrpc.cpp`, `nostr.cpp`, `rpcclient.cpp` |
 
 Not reached by these, by design: the Nostr events inside a relay's frames
 (JSON handled in the discovery loops of `nostr.cpp`), and the RPC methods
