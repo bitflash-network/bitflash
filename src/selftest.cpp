@@ -14420,7 +14420,11 @@ static int RunP2PDoSSelfTest()
 // Windows, so 2^32 read as 0 there and as INT_MAX on Linux. Script numbers are
 // not limited to 4 bytes here, so OP_PICK, OP_ROLL and OP_CHECKMULTISIG could
 // be handed such a value, and Windows and Linux nodes judged the script
-// differently. Every case below fails on a Windows build of the old code.
+// differently. The cases between 2^32 and 2^64 and the interpreter cases fail
+// on a Windows build of the old code; the others pin the clamping around them.
+// (Neither chain has ever used such a value: no OP_PICK or OP_ROLL, and every
+// multisig count a literal, in all 225,066 mainnet and 28,446 testnet scripts
+// scanned in November 2026.)
 
 static CBigNum BigNumFromLE(const std::vector<unsigned char>& v)
 {
@@ -14443,6 +14447,13 @@ static int RunBigNumIntSelfTest()
         { V{0x05, 0x00, 0x00, 0x00, 0x01}, INT_MAX, "2^32+5 clamps to INT_MAX (read as 5 on Windows before)" },
         { V{0x00, 0x00, 0x00, 0x00, 0x81}, INT_MIN, "-2^32 clamps to INT_MIN (read as 0 on Windows before)" },
         { V{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, INT_MAX, "2^64+1, past 64 bits, clamps to INT_MAX" },
+        { V{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81}, INT_MIN, "-(2^64+1) clamps to INT_MIN" },
+        { V{0x00, 0x00, 0x00, 0x80, 0x80}, INT_MIN, "-2^31 clamps to INT_MIN" },
+        { V{0xff, 0xff, 0xff, 0xff}, -INT_MAX, "-(2^31-1) is itself" },
+        { V{0x80}, 0, "negative zero is 0" },
+        { V{}, 0, "the empty number is 0" },
+        { V{0x05, 0x00, 0x00, 0x00, 0x00}, 5, "a non-minimal 5 is 5" },
+        { V(520, 0x7f), INT_MAX, "a 520-byte number clamps to INT_MAX" },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     {
@@ -14477,6 +14488,11 @@ static int RunBigNumIntSelfTest()
         CScript s;
         s << OP_0 << OP_0 << key.GetPubKey() << V{0x01, 0x00, 0x00, 0x00, 0x01} << OP_CHECKMULTISIG;
         nFail += Check(!EvalScript(s, tx, 0), "OP_CHECKMULTISIG with a key count of 2^32+1 fails on every platform") ? 0 : 1;
+        // A signature count of 2^32 with one key: the old Windows build read
+        // it as no signatures and the check passed.
+        CScript g;
+        g << OP_0 << big << key.GetPubKey() << OP_1 << OP_CHECKMULTISIG;
+        nFail += Check(!EvalScript(g, tx, 0), "OP_CHECKMULTISIG with a signature count of 2^32 fails on every platform") ? 0 : 1;
         CScript c;
         c << OP_0 << OP_0 << key.GetPubKey() << OP_1 << OP_CHECKMULTISIG;
         nFail += Check(EvalScript(c, tx, 0), "control: the same with a key count of 1 runs") ? 0 : 1;

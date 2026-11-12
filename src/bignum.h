@@ -122,14 +122,12 @@ public:
             throw bignum_error("CBigNum conversion from unsigned long : BN_set_word failed");
     }
 
-    unsigned long getulong() const
+    // 64 bits on every platform (see getint): an unsigned long truncated on
+    // Windows. Its script callers are OP_LSHIFT/OP_RSHIFT, disabled for good;
+    // base58 only reads remainders under 58.
+    uint64 getulong() const
     {
-        return BN_get_word(bn);
-    }
-
-    unsigned int getuint() const
-    {
-        return BN_get_word(bn);
+        return (uint64)BN_get_word(bn);
     }
 
     // The script interpreter reads stack items through this (OP_PICK and
