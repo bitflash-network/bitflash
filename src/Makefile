@@ -608,6 +608,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=net-hardening
 	./bitflash-node -selftest=p2p-dos
 	./bitflash-node -selftest=orphan-tx
+	./bitflash-node -selftest=script-opcodes
 	./bitflash-node -selftest=multisig
 	./bitflash-node -selftest=socks5-proxy
 	./bitflash-node -selftest=managed-tor
