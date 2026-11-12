@@ -226,29 +226,8 @@ static void WriteSeeds(const string& strDir)
     }
 }
 
-// The Berkeley DB environment stays open for the whole run, as in a node. Its
-// internal allocations are referenced from memory the library maps for
-// itself, which LeakSanitizer does not scan, so they read as leaks at exit.
-// Closing the environment from an exit handler is no way out: by then some of
-// the globals it logs through are already destroyed. Only allocations made
-// inside libdb are suppressed; a Berkeley DB handle the node itself leaks is
-// allocated from node code and is still reported (that is how the CDB open
-// leak was found).
-extern "C" const char* __lsan_default_suppressions()
-{
-    return "leak:__os_malloc\n";
-}
-
-// The chain this harness builds lives for the whole run (block index entries,
-// orphan blocks and transactions), held in global maps. At exit those maps
-// are destroyed before the final leak check and their pointers are lost, as
-// in the node, which never frees them either. So no leak check at exit;
-// libFuzzer still checks after every input that changed the heap, which is
-// where a leak an input causes shows up.
-extern "C" const char* __asan_default_options()
-{
-    return "leak_check_at_exit=0";
-}
+// The LeakSanitizer settings every node harness shares (the Berkeley DB
+// environment's own allocations, no check at exit) are in fuzz_datadir.h.
 
 static void FuzzP2PInit()
 {

@@ -40,4 +40,47 @@ extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv)
     return 0;
 }
 
+// LeakSanitizer, for every harness that links the node.
+//
+// The Berkeley DB environment is opened once and stays open for the whole
+// run, as in a node. The blocks libdb allocates for its regions when it opens
+// (DbEnv::open -> __env_open -> __memp_open / __lock_open -> __env_alloc ->
+// __os_malloc) are, as far as a heap scan can tell, referenced by nothing:
+// libdb keeps them through its own region bookkeeping, which the scan does
+// not follow (it found them only once no stale copy of a pointer was left on
+// a stack). libFuzzer scans the heap after any input that left more blocks
+// allocated than it found, so they turn up at some input that has nothing to
+// do with them: in November 2026 a 5.5-hour single-process run of
+// fuzz-net-message (22.7 M inputs, the environment opened once) stopped on
+// exactly these two blocks, 136 bytes. The 711 leak reports of the fork-mode
+// campaign before it, whose stacks fork mode does not keep, behaved the same
+// way: none of their inputs reproduces a leak on its own. Allocations made
+// inside libdb are suppressed by its allocator, __os_malloc: libdb is built
+// without frame pointers, so most of its stacks stop there (a narrower
+// pattern, __env_alloc, left the fuzz-p2p-payload smoke stopping on six
+// blocks whose stack ends at __os_malloc). A Db, DbEnv or DbTxn the node
+// leaks is allocated with operator new from node code and is still reported
+// (that is how the CDB open leak was found).
+extern "C" const char* __lsan_default_suppressions()
+{
+    return "leak:__os_malloc\n";
+}
+
+// What a node builds for its whole run (block index entries, orphan blocks
+// and transactions, address and inventory maps) sits in global maps that are
+// destroyed before the final leak check, as in the node, which never frees
+// them either. So no leak check at exit; libFuzzer still checks after every
+// input that changed the heap, which is where a leak an input causes shows up.
+// AFL++ and honggfuzz check no leaks per input, so they check none at all.
+//
+// To replay a leak-* file, run it as a corpus, which gets the check after
+// each input: put it in a directory of its own and run
+// `./fuzz-<name> -runs=0 <dir>`. Run as a single file it is checked only at
+// exit, which this turns off (ASAN_OPTIONS=leak_check_at_exit=1 turns it back
+// on, with the global maps above reported as well).
+extern "C" const char* __asan_default_options()
+{
+    return "leak_check_at_exit=0";
+}
+
 #endif
