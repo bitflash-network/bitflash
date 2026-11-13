@@ -130,7 +130,7 @@ int nDropMessagesTest = 0;
 bool fSoloMineTest = false; // /solomine: mine without requiring a peer (local test)
 
 // Settings
-int fGenerateBitcoins;
+std::atomic<int> fGenerateBitcoins(0);
 // How many threads to hash with. 0 means "decide from the hardware" -- see
 // MinerThreadCount(). This was effectively 1 forever, because Bitcoin 0.1.0
 // started exactly one miner thread and nothing here ever changed that. It made
@@ -141,7 +141,7 @@ int nMinerThreads = 0;
 int64 nTransactionFee = 0;
 int64 nPayTxFeePerKB = 0;
 CAddress addrIncoming;
-int    nMineMode        = MINE_RELAY;
+std::atomic<int> nMineMode(MINE_RELAY);
 bool   fMineModeFromCommandLine = false;
 string strParticipantPool;           // participant mode: pool .btf address
 string strPoolName       = "Bitflash Pool";

@@ -474,12 +474,17 @@ bool RestoreFromPhrase(const std::string& strMnemonic,
             nQuietBatches++;
         else
             nQuietBatches = 0;
-        if (nQuietBatches >= RESTORE_QUIET_BATCHES &&
-            RestoreScanReachedDepth(nHDKeySchema,
-                                    nHDReceiveNext,
-                                    nHDChangeNext,
-                                    fRestoreBIP44 ? nLegacyScanNext : nHDNext,
-                                    nStopDepth))
+        // The counters are read under cs_keyPool, as everything that moves
+        // them does: a key drawn on another thread meanwhile advances them.
+        bool fReachedDepth = false;
+        if (nQuietBatches >= RESTORE_QUIET_BATCHES)
+            CRITICAL_BLOCK(cs_keyPool)
+                fReachedDepth = RestoreScanReachedDepth(nHDKeySchema,
+                                                        nHDReceiveNext,
+                                                        nHDChangeNext,
+                                                        fRestoreBIP44 ? nLegacyScanNext : nHDNext,
+                                                        nStopDepth);
+        if (fReachedDepth)
             break;
     }
 

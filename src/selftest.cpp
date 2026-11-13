@@ -2345,6 +2345,32 @@ static int RunWalletCryptoSelfTest()
         LockWallet();
         nFail += Check(IsWalletLocked(),
                        "locking clears the unlocked state") ? 0 : 1;
+
+        // keyUser was never set above (LoadWallet here does not go through
+        // the startup code that fills it), so that lock forgot the secret of
+        // a key with no material at all. Under OpenSSL 3.0 that read through
+        // a NULL public point and killed the process (AddressSanitizer).
+        {
+            CKey keyEmpty;
+            bool fThrew = false;
+            try { keyEmpty.GetPubKey(); }
+            catch (const key_error&) { fThrew = true; }
+            nFail += Check(fThrew, "a key with no public point throws when asked for it") ? 0 : 1;
+            nFail += Check(keyEmpty.ForgetPrivKey() && !keyEmpty.HasPrivKey(),
+                           "and forgetting the secret of a key that has none is a no-op") ? 0 : 1;
+            CKey keyFull;
+            keyFull.MakeNewKey();
+            vector<unsigned char> vchFullPub = keyFull.GetPubKey();
+            nFail += Check(keyFull.ForgetPrivKey() && !keyFull.HasPrivKey() &&
+                           keyFull.GetPubKey() == vchFullPub,
+                           "a full key forgets its secret and keeps its public key") ? 0 : 1;
+            CKey keySaved = keyUser;
+            keyUser = keyEmpty;
+            nFail += Check(UnlockWallet(strPassphrase, strError), "unlocked again") ? 0 : 1;
+            LockWallet();
+            nFail += Check(IsWalletLocked(), "a wallet whose default key holds nothing locks") ? 0 : 1;
+            keyUser = keySaved;
+        }
     }
     catch (const std::exception& e)
     {
@@ -12631,6 +12657,23 @@ static void V5ForgetRefused(const CBlock& b)
     delete pindex;
 }
 
+// Free the whole block index and forget the chain, as a test that built one
+// on a real data directory leaves. A node keeps its index for the life of
+// the process, so nothing frees it; but at exit mapBlockIndex is destroyed
+// first and LeakSanitizer then sees every entry no global still points to --
+// the side branches, which pindexBest's parent links do not reach -- as
+// leaked.
+static void SelfTestFreeBlockIndex()
+{
+    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        delete (*mi).second;
+    mapBlockIndex.clear();
+    pindexGenesisBlock = NULL;
+    pindexBest = NULL;
+    hashBestChain = 0;
+    nBestHeight = -1;
+}
+
 // -selftest=rules-v5: every rule of rules v5, each one with the rules off
 // (what this chain does today, unchanged) and on (through -benchrulesv5's
 // switch on testnet), and the switch itself.
@@ -13072,6 +13115,8 @@ static int RunRulesV5SelfTest()
     }
     if (!tmp.empty())
     {
+        // The chain built on the data directory, its side branches included.
+        SelfTestFreeBlockIndex();
         DBFlush(true);
         RemoveTree(tmp);
     }
@@ -13338,7 +13383,11 @@ static int WfEncryptedSeed(const std::string&, const std::string&)
                    "the seed the install finished with becomes the wallet's seed, encrypted, plaintext gone") ? 0 : 1;
 
     // A plaintext copy of the very seed that is encrypted: just removed.
-    nFail += Check(CWalletDB().WriteHDMaster(mC.privateKey, mC.chainCode) && WfReloadWallet() &&
+    // The write is its own statement: a temporary CWalletDB lives to the end
+    // of the full expression, and the reload closes the database environment
+    // under its open handle (LeakSanitizer saw Berkeley DB's handle leak).
+    bool fCopyWritten = CWalletDB().WriteHDMaster(mC.privateKey, mC.chainCode);
+    nFail += Check(fCopyWritten && WfReloadWallet() &&
                    UnlockWallet(WF_PASS, err),
                    "a plaintext copy of the encrypted seed loads and unlocks") ? 0 : 1;
     after = WfCountRecords();
@@ -13636,8 +13685,11 @@ static int WfRestoreRace(const std::string&, const std::string&)
     std::vector<std::vector<unsigned char> > vDrawn;
     while (!fDone)
     {
-        if (nHDKeySchema != HD_SCHEMA_BIP44)
-            fSawOtherSchema = true;
+        // Read as the wallet reads it, under cs_keyPool: the phrase install
+        // writes it under that lock (ThreadSanitizer saw this read without it).
+        CRITICAL_BLOCK(cs_keyPool)
+            if (nHDKeySchema != HD_SCHEMA_BIP44)
+                fSawOtherSchema = true;
         std::vector<unsigned char> v = GetKeyFromPool();
         if (!v.empty())
             vDrawn.push_back(v);
@@ -14517,13 +14569,7 @@ static bool IndexHasNoDanglingParent()
 // Forget the in-memory chain and read the index again, as a restart does.
 static bool ReorgTestReload()
 {
-    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
-        delete (*mi).second;
-    mapBlockIndex.clear();
-    pindexGenesisBlock = NULL;
-    pindexBest = NULL;
-    hashBestChain = 0;
-    nBestHeight = -1;
+    SelfTestFreeBlockIndex();
     CRITICAL_BLOCK(cs_mapTransactions)
     {
         mapTransactions.clear();
@@ -14806,6 +14852,9 @@ static int RunReorgSafetySelfTest()
         nFail++;
     }
     fCheckpointWalkBack = false;
+    // The chain and its side branches (the weak blocks above, the marked
+    // branch the loader read back).
+    SelfTestFreeBlockIndex();
     DBFlush(true);
     RemoveTree(tmp);
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",

@@ -1129,8 +1129,8 @@ public:
 
             if (!fMineModeFromCommandLine)
             {
-                if (strKey == "nMineMode")          { ssValue >> nMineMode; fHaveStoredMineMode = true; }
-                if (strKey == "fGenerateBitcoins")  ssValue >> fGenerateBitcoins;
+                if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
+                if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
                 if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
             }
         }
@@ -1484,8 +1484,8 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 // participant cannot work without.
                 if (!fMineModeFromCommandLine)
                 {
-                    if (strKey == "nMineMode")          { ssValue >> nMineMode; fHaveStoredMineMode = true; }
-                    if (strKey == "fGenerateBitcoins")  ssValue >> fGenerateBitcoins;
+                    if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
+                    if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
                     if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
                 }
             }
@@ -1580,7 +1580,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
     printf("nTransactionFee = %lld\n", nTransactionFee);
     printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
     printf("nMineMode = %d, strParticipantPool = %s, fGenerateBitcoins = %d (%s)\n",
-           nMineMode, strParticipantPool.c_str(), fGenerateBitcoins,
+           nMineMode.load(), strParticipantPool.c_str(), fGenerateBitcoins.load(),
            fMineModeFromCommandLine ? "from the command line, wallet.dat ignored"
                                     : "remembered from wallet.dat, or the default");
     printf("strPoolName = %s, dPoolFeePercent = %.2f, strPoolDashboardUrl = %s (from CLI/default, not wallet.dat)\n",
