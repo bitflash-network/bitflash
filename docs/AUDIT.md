@@ -402,6 +402,19 @@ Part C added self-tests for the orphan transaction and orphan block pools, every
 |---|---|---|---|
 | independent review of the `script-opcodes` self-test (High) | `CBigNum::getint()` kept OpenSSL's 64-bit word in an `unsigned long`, 32 bits on Windows: a script number of 2^32 read as 0 there and as `INT_MAX` on Linux. Script numbers have no 4-byte limit here, so `OP_PICK`, `OP_ROLL` and both `OP_CHECKMULTISIG` counts could be handed one, and a block spending such a script would have been valid on one operating system and invalid on the other. Windows nodes now read these numbers as Linux nodes always did. No script on either chain ever used such a value (225,066 mainnet and 28,446 testnet scripts scanned: no `OP_PICK` or `OP_ROLL`, every multisig count a literal), so the fix rejects nothing the network has accepted. | #71 `3980581` | `bignum-int` (6 checks fail on a Windows build of the old code) |
 
+#### Found by the final pass
+
+The self-tests under the three instruments on the merged code (Actions run
+43352384854, on the runners' OpenSSL 3.0) found these. The plain suites passed
+on the same code, because OpenSSL 3.5 (the build server, the other CI jobs and
+the Windows bench) refuses the NULL point that OpenSSL 3.0 reads through.
+
+| finding | what was wrong | fixed in | self-test |
+|---|---|---|---|
+| ASan and TSan, `wallet-crypto` | `LockWallet` called `ForgetPrivKey` (added by #62) on the user key, which asked the key for its public half; a key with no key material at all made OpenSSL 3.0 read a NULL point. The self-test reached it by loading a wallet without the startup code; a running node always sets the user key when an encrypted wallet loads, or the load fails, so no production path was found. `ForgetPrivKey` now leaves a key with no secret alone, and `GetPubKey` throws instead of reading a missing point on every OpenSSL version. | #74 `72c8a6b` | `wallet-crypto` (5 new checks) |
+| TSan, `wallet-relock` | `fGenerateBitcoins` and `nMineMode` were written by the GUI, RPC and miner threads and read by the relock timer and the miners with no lock, and a rerun found `fWalletEncrypted` written under the key lock while `LockWallet` read it without one. All three are atomic now; `wallet.dat` still stores them as integers. | #74 `72c8a6b` | TSan run of the self-tests |
+| TSan, `wallet-restore-race` | The race in the report was the self-test's own unlocked read of the HD schema; while checking the other readers, the restore loop's stop check in `walletcmd.cpp` was found reading the HD key counters without `cs_keyPool` while other threads draw keys. It now takes the lock, with nothing else held. | #74 `72c8a6b` | TSan run of the self-tests |
+
 
 ### Leak reports: which were bugs and which were not
 
@@ -414,7 +427,9 @@ not leaks. Every report, with the evidence:
 | `fuzz-net-message`, first pass: a `Db` handle and the file's use count after a failed Berkeley DB open | **real leak, fixed** | reproduced from its input; the stack runs through node code (`new Db` in `CDB::CDB`), and the fix makes it go away; a failed open threw `DbException` past the cleanup | #56 `3bb7c75`, self-test `db-open-failure` |
 | `fuzz-p2p-payload`: every duplicate block given to `ProcessBlock` | **real leak, fixed** (with a double free of refused blocks in the orphan pool) | reproduced from its input; `ProcessBlock` returned without freeing a block it already had | #57 `a40e674`, self-test `net-hardening` |
 | `fuzz-net-message` campaign 42967191269: 711 reports in fork mode | **not a leak** | fork mode keeps no stacks and none of the 711 inputs reproduces a leak alone. A 5.5-hour single-process run (43093941370, 22.7 M inputs) stopped on exactly one report: two blocks, 136 bytes, allocated once by `DbEnv::open` inside libdb (`__env_alloc` -> `__os_malloc`) when the environment opened, and the environment opened exactly once in the process. Berkeley DB references those regions by offset, which a heap scan cannot follow, so LeakSanitizer sees blocks with no pointer to them. The setting covers only allocations made inside libdb; a handle the node leaks is still reported (the first row shows it is). After the change the fork-mode campaign 43218776499 reported nothing | #69 `dc5fefb` (one LeakSanitizer setting in `fuzz_datadir.h` for every node harness; no node code changed) |
-| self-tests under AddressSanitizer + LeakSanitizer, every pass of this run | none reported | [[FINAL: the final pass reports 0 leaks across every self-test; fill with the count]] | |
+| final pass, self-tests under AddressSanitizer + LeakSanitizer (Actions run 43352384854): `wallet-encrypted-seed`, 16 bytes from `Db::Db` in `CDB::CDB` | **not a production leak; the self-test fixed** | a temporary `CWalletDB` in the self-test stayed open to the end of an expression that reloads the wallet, and the reload closed the database environment under the open handle; outside the self-tests the environment is only closed on the way out of the program, and every path of `CDB` frees its handle | #74 `72c8a6b` |
+| final pass, the same run: `reorg-safety` and `rules-v5`, block index entries | **not a production leak; the self-tests fixed** | the entries are side-branch and refused blocks in the block index, which a running node keeps for its lifetime on purpose (a refused block stays marked failed); at exit nothing points to the side branches, so LeakSanitizer reports them. The self-tests now free the index | #74 `72c8a6b` |
+| self-tests under AddressSanitizer + LeakSanitizer on the final code | **none**: 101 self-tests, 0 with a failure or a report (Actions run 43384426946 on `72c8a6b`) | | |
 
 ### Design differences from Bitcoin that the tests pin
 
@@ -496,8 +511,7 @@ from the self-tests that pin the fixes above.
 The first-pass gap, that `ProcessBlock`, `CheckBlock` and `AlreadyHave` were
 never reached by `fuzz-net-message` because of the envelope checksum, is
 closed by `fuzz-p2p-payload`. The final pass re-measures:
-[[FINAL: whole-node and per-file self-test coverage on `2c86386`, same
-llvm-cov command as above]].
+on `main` at `72c8a6b` (101 self-tests, 0 failures), lines: `main.cpp` 62.17%, `script.cpp` 85.41%, `serialize.h` 73.95%, `db.cpp` 61.05%, whole node 66.52% (regions 58.42%).
 
 ### Checked and not a defect (first pass of the tools)
 
@@ -569,7 +583,8 @@ The final pass repeats all of these on the last commit (next section).
 - **DoS L5, v1 RandomX cache check.** A pre-switch block can make a node that has not allocated the v1 cache build it. The fix is a timestamp check before the hash in `CheckBlock`; that is consensus code, and it is not touched this close to a release.
 - **Swaps M1, remainder.** The per-contract "still scanning" gate and expiry of watches on contracts that were never funded need a change to the light client's state format. The remote trigger is closed.
 - **Wallet: dust rule (I6)**, see the wallet table: an Info item and a policy choice. **Secure allocator for the global seed copies and the `DumpWallet` hex temporaries (the rest of L3):** the other buffers are wiped; these two need a locked, wiping allocator in place of the standard containers, a change across the key and wallet code that was not made in this run.
-- **P2P, from the review of #59.** Per-command message size caps at the header (the effective receive bound is about 37 MB; it needs each owner's maximum message size); a cross-peer ceiling on queued bytes (each peer's queue and the 117 inbound slots are bounded now; a shared ceiling needs a choice of whose data to drop); identifying inbound onion peers by their rendezvous circuit (needs PROXY-header parsing in both listeners); penalties for bad pool submissions (pool operator code).
+- **Pool settings written by the GUI while the miner threads read them.** The independent review of the final-pass fixes found that the GUI's save button writes the participant pool, pool name, dashboard URL, pool fee and treasury share while the mining and pool threads read them, with no lock. The two integer flags in the same group are atomic now; the strings need a small settings lock with copies taken by the readers, a change across the GUI and the miner left for 1.2.34. It needs the local user to press save while mining, so no remote input reaches it.
+- **P2P, from the review of #59.** Per-command message size caps at the header (the effective receive bound is about 37 MB; it needs each owner's maximum message size); a cross-peer ceiling on queued bytes (left out of #59, which bounds each peer's receive and send queues and the number of inbound slots; the per-command caps above would lower each peer's share first, and the review of #59 rated the remaining total Low); identifying inbound onion peers by their rendezvous circuit (needs PROXY-header parsing in both listeners); penalties for bad pool submissions (pool operator code).
 - **Script size.** There is no `MAX_SCRIPT_SIZE`; the work per operation is linear in script size, bounded by the block size. A candidate rule for a later rule set, not measured as a problem (see the script-engine section).
 - **Chat, left for the next release (1.2.34)** (from the second review of #70; none is a way in, each serves an honest user worse than possible): an idempotent receipt for a frame refused only as a replay after a failed save; a "duplicate" answer instead of "slow down" for a record already held; a longer age (8 to 10 s) before a handshake can be evicted; a cut flag on a `chatget` cut by the answer ration; work for records put at a node under half full; per-source sub-budgets. The details are in "Chat, Nostr and swap negotiation" below.
 - **Test gaps, swaps.** A paid-lock case in `swap-rpc` and an automated check of the "paid, unpaid or unknown" answer need a node that accepts inputs and a fake Core RPC server. The testnet proof with coins covers the paid case.
@@ -590,11 +605,11 @@ Pull requests with behaviour users notice. The full lists are in the PR bodies (
 - **#70: chat, Nostr and swap negotiation.** A node asks more work for a chat record once its store is half full (4 and 6 bits more at three quarters and nine tenths), and the chat app of this release mines again to what the node asks. **Chat apps of 1.2.32 and before cannot store a record on a store at or above half full, and cannot replace their own descriptor in a full one**; this happens only while a store is being filled, and only while it stays that full (records are kept 26 hours). The chat app's listener has connection limits and timeouts; Nostr discovery checks event signatures and dates and has ceilings; swap offers are taken one at a time per peer and old finished swaps are pruned. Per-source sub-budgets are not part of this release, and the text says so.
 - **#72: RPC and Tor parsers.** An RPC connection that sends nothing, or stops reading, is closed after 30 s; `Content-Length` must be a plain decimal number; JSON nested deeper than 64 levels is refused; `signrawtransaction` needs an integer prevtx `vout`; a `Bridge #...` line in `bridges.txt` is ignored.
 - **#56: packaging.** Tor Expert Bundle 16.0 (tor 0.4.9.15) in the release packages; RPC cookie and key dump created owner-only.
-- No visible change: #57, #58 (rules v5 unscheduled), #69, #73.
+- No visible change: #57, #58 (rules v5 unscheduled), #69, #73, #74 (the final-pass fixes; a wallet that somehow held a key with no key material no longer crashes when it locks).
 
 ### Final pass
 
-The final full pass on `main` at `2c86386` is GitHub Actions run 43352384854:
+The final full pass ran on `main` at `2c86386` (GitHub Actions run 43352384854), and again on `72c8a6b` after #74 fixed what it found (run 43384426946 for the self-tests, and the build server's phases):
 every harness for 30 minutes per engine as a regression pass, and the
 self-tests under AddressSanitizer + UndefinedBehaviorSanitizer, ThreadSanitizer
 and Valgrind; and on the Debian 13 build server: secrets, dependencies, static
@@ -604,20 +619,20 @@ above; the final pass is a regression run on the merged code.
 
 | phase | result |
 |---|---|
-| secrets (Gitleaks, Trivy) | [[FINAL: hits and verdicts, expected only the known entries listed above]] |
-| dependencies (OSV, Trivy on system libraries) | [[FINAL: advisories, if any, and their status]] |
-| static (cppcheck, flawfinder, Semgrep, clang-tidy, Clang Static Analyzer, CodeQL) | [[FINAL: counts per tool against the first-pass numbers above, new findings if any]] |
-| ASan + UBSan + LSan, every self-test | [[FINAL: self-tests run, reports]] |
-| TSan, every self-test | [[FINAL: self-tests run, reports]] |
-| Valgrind memcheck, every self-test | [[FINAL: self-tests run, reports]] |
-| heaptrack | [[FINAL: heaviest peaks, definite leaks]] |
-| fuzz regression, every harness, 30 min per engine (libFuzzer, AFL++, honggfuzz) | [[FINAL: per harness: executions, corpus, crashes]] |
-| reprotest | [[FINAL: bit for bit identical, or the differences]] |
-| self-test suites | [[FINAL: Windows count, Linux count, failures]] |
+| secrets (Gitleaks, Trivy) | Gitleaks 8 hits, the same 8 as every run and triaged above (the release key's public fingerprint, a test fixture, an old line); Trivy on the tree: nothing |
+| dependencies (OSV, Trivy on system libraries) | OSV on the pinned and vendored commits: nothing known. Trivy on the build server's own system libraries: 162 advisories (134 in the first pass); they concern the host's packages, not anything the release ships, and the host is updated outside the audit |
+| static (cppcheck, flawfinder, Semgrep, clang-tidy, Clang Static Analyzer, CodeQL) | cppcheck 36 errors (23 in the first pass), flawfinder 58 hits at levels 4-5 (48), Semgrep 0, clang-tidy 211 warnings (203), Clang Static Analyzer 45 (39); CodeQL green on every pull request. Every new hit was read: the cppcheck ones are in harness and self-test code, plus two more of the `BEGIN`/`END` macro false positive already triaged (`jsonrpc.cpp`, `net.cpp`); flawfinder's are `snprintf`/`fprintf` with constant formats in harness headers and two `chmod` calls after `lstat` that only tighten the mode of the user's own wallet files (someone who can swap that path already holds the data directory); the analyzer's are dead stores in self-tests and a `fread` loop in `swap.cpp` that it models wrongly (the loop ends on a short read and `ferror` is checked). No defect |
+| ASan + UBSan + LSan, every self-test | 101 self-tests, 0 failures, 0 reports (Actions run 43384426946 on `72c8a6b`). The first final run (43352384854 on `2c86386`) found the items under "Found by the final pass"; #74 fixed them |
+| TSan, every self-test | 101 self-tests, 0 failures, 0 reports (the same run) |
+| Valgrind memcheck, every self-test | 101 self-tests, 0 failures, 0 reports (the same run); four are not run under Valgrind and the phase's summary says so: `orphan-blocks` and `block-index-load` (RandomX hashes differ there, as Valgrind does not reproduce the hardware floating-point rounding modes, so the recorded nonces stop meeting the target) and `chat-dos` and `chat-relay` (per-minute rations on the wall clock run out under Valgrind's slowdown); all four run under ASan and TSan |
+| heaptrack | peaks 41.5 MB (`explorer`), 9.9 MB (`p2pool-chain`), 485 KB (`btc-light`), 424 KB (`rules-v4`); memory still held at exit 4 to 25 KB, objects the node keeps for its lifetime on purpose (LeakSanitizer, which tells leaked from still reachable, reports nothing on the same self-tests) |
+| fuzz regression, every harness, 30 min per engine (libFuzzer, AFL++, honggfuzz) | Actions run 43352384854 on `2c86386`: 19 harnesses x 3 engines, 57 jobs, 0 crash files; merged corpora: `fuzz-p2p-payload` 3,545, `fuzz-rpc-postauth` 2,976, `fuzz-decoders` 2,760, `fuzz-chat-frame` 2,406, `fuzz-script` 2,365, `fuzz-http-client` 2,337, `fuzz-nostr` 2,286, `fuzz-chat-relay` 2,255, `fuzz-swap` 2,175, `fuzz-deserialize` 1,916, `fuzz-p2pool` 1,332, `fuzz-net-message` 1,329, `fuzz-light-peer` 1,155, `fuzz-v4-templates` 1,100, `fuzz-tor-control` 479, `fuzz-light-pow` 228, `fuzz-rpc-preauth` 194, `fuzz-sigcheck` 52, `fuzz-socks5` 34 (the last few have small input spaces). #74 changed no harness and no parser |
+| reprotest | bit for bit identical (two builds under different time, locale, umask and path) |
+| self-test suites | on `72c8a6b`: Windows (UCRT64 CI job) 92 suites passed, 0 failures; Linux (CI job and the build server) 90 passed, 0 failures |
 
 ### Final state
 
-[[FINAL: on `main` at `2c86386`, every self-test under the three instruments, 0 failures and 0 reports; both platforms' suites pass; or what remains]]
+On `main` at `72c8a6b`: every self-test passes under AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer, ThreadSanitizer and Valgrind with no report (four not run under Valgrind, for the stated reasons); the Windows and Linux suites pass; every harness ran clean on three engines; the build is reproducible bit for bit. What is not fixed is listed, each with its reason, under "Open by design or deferred, and why". #60 and #71 must reach every node in a release before 2026-11-21 12:00 UTC.
 
 ## Deserializers and decoders (`fuzz-deserialize`, `fuzz-decoders`)
 
