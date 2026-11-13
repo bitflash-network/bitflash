@@ -1394,7 +1394,140 @@ bool ChatPendingFor(const std::string& peerAddr, std::vector<Pending>& out)
 struct ServeArg
 {
     btf_socket_t sock;
+    uint64_t ticket;
 };
+
+// Inbound connections served at once. Each one is a thread holding a socket
+// for as long as its reads keep arriving inside the timeout, and onion
+// connections cost the other side nothing to open: without a ceiling, idle
+// connections exhaust the app's threads and file descriptors. A person's chat
+// app talks to a handful of contacts at a time; past this, a connection is
+// closed as soon as it is accepted.
+static const int CHAT_MAX_SERVE_THREADS = 32;
+// The handshake is three short flights; a dialler that has not finished it in
+// this long is not going to.
+static const int CHAT_HANDSHAKE_TIMEOUT_SECS = 20;
+// A connection still in its handshake is put out for a new one only once it has
+// had this long: a flood of new connections must not knock real contacts out
+// in the middle of theirs.
+static const int CHAT_EVICT_MIN_AGE = 5;
+// And no connection is served for longer than this, however well it behaves:
+// a contact reconnects, and a slot held for hours by one that never closes is
+// a slot the others cannot have. Checked between frames, so a connection
+// really ends at this plus one I/O timeout.
+static const int CHAT_MAX_CONNECTION_SECS = 5 * 60;
+// A delivered frame saves the store, but not more than once a second: a burst
+// of frames would otherwise rewrite the whole sealed store for each one.
+static const int64_t CHAT_SERVE_SAVE_INTERVAL = 1;
+
+static CCriticalSection cs_serving;
+static int64_t g_nLastServeSave = 0;
+
+// One entry per connection being served. A connection still in its handshake
+// can be put out to make room for a new one when every slot is taken, so a
+// crowd of idle dialers that never finish it cannot keep the app from talking
+// to a contact.
+struct ServeSlot
+{
+    uint64_t ticket;
+    btf_socket_t sock;
+    int64_t nStart;
+    bool fHandshaken;
+};
+static std::vector<ServeSlot> g_vServing;
+static uint64_t g_nNextTicket = 1;
+
+int ChatServeThreadCount()
+{
+    int n = 0;
+    CRITICAL_BLOCK(cs_serving)
+        n = (int)g_vServing.size();
+    return n;
+}
+
+// Take a serving slot for a connection just accepted. When all are busy, the
+// oldest connection still in its handshake is put out and its slot taken; if
+// every one has finished its handshake, false: close the new one.
+bool ChatServeSlotTake(btf_socket_t sock, uint64_t& ticketOut, int64_t nNow)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_serving)
+    {
+        if ((int)g_vServing.size() >= CHAT_MAX_SERVE_THREADS)
+        {
+            size_t nOldest = g_vServing.size();
+            for (size_t i = 0; i < g_vServing.size(); i++)
+                if (!g_vServing[i].fHandshaken && nNow - g_vServing[i].nStart >= CHAT_EVICT_MIN_AGE &&
+                    (nOldest == g_vServing.size() || g_vServing[i].nStart < g_vServing[nOldest].nStart))
+                    nOldest = i;
+            if (nOldest < g_vServing.size())
+            {
+                // Its thread finds the socket dead and ends; its ticket is gone.
+                if (g_vServing[nOldest].sock != INVALID_SOCKET)
+                    shutdown(g_vServing[nOldest].sock, 2);
+                g_vServing.erase(g_vServing.begin() + nOldest);
+            }
+        }
+        if ((int)g_vServing.size() < CHAT_MAX_SERVE_THREADS)
+        {
+            ServeSlot sl;
+            sl.ticket = ticketOut = g_nNextTicket++;
+            sl.sock = sock;
+            sl.nStart = nNow;
+            sl.fHandshaken = false;
+            g_vServing.push_back(sl);
+            fOk = true;
+        }
+    }
+    return fOk;
+}
+
+// The thread is about to close its socket itself: the slot no longer owns a
+// handle the listener could shut down (the number may be somebody else's by then).
+void ChatServeSlotForget(uint64_t ticket)
+{
+    CRITICAL_BLOCK(cs_serving)
+        for (size_t i = 0; i < g_vServing.size(); i++)
+            if (g_vServing[i].ticket == ticket)
+                g_vServing[i].sock = INVALID_SOCKET;
+}
+
+void ChatServeSlotHandshaken(uint64_t ticket)
+{
+    CRITICAL_BLOCK(cs_serving)
+        for (size_t i = 0; i < g_vServing.size(); i++)
+            if (g_vServing[i].ticket == ticket)
+                g_vServing[i].fHandshaken = true;
+}
+
+void ChatServeSlotRelease(uint64_t ticket)
+{
+    CRITICAL_BLOCK(cs_serving)
+        for (size_t i = 0; i < g_vServing.size(); i++)
+            if (g_vServing[i].ticket == ticket)
+            {
+                g_vServing.erase(g_vServing.begin() + i);
+                break;
+            }
+}
+
+// Debounce for the store save after a delivered frame (cs_chat held): true
+// when it is time to save now; otherwise fDirty is set and a later frame, or
+// the end of the connection, saves.
+bool ChatServeSaveDue(int64_t nNow, bool& fDirty)
+{
+    bool fDue = false;
+    CRITICAL_BLOCK(cs_serving)
+    {
+        if (nNow - g_nLastServeSave >= CHAT_SERVE_SAVE_INTERVAL || nNow < g_nLastServeSave)
+        {
+            g_nLastServeSave = nNow;
+            fDue = true;
+        }
+    }
+    fDirty = !fDue;
+    return fDue;
+}
 
 static void ThreadChatServe(void* parg)
 {
@@ -1412,7 +1545,17 @@ static void ThreadChatServe(void* parg)
 
     ServeArg* arg = (ServeArg*)parg;
     btf_socket_t sock = arg->sock;
+    uint64_t ticket = arg->ticket;
     delete arg;
+
+    // The slot the listener took for this connection, given back however this
+    // thread ends.
+    struct SlotGuard
+    {
+        uint64_t t;
+        SlotGuard(uint64_t tIn) : t(tIn) {}
+        ~SlotGuard() { ChatServeSlotRelease(t); }
+    } slotGuard(ticket);
 
     try
     {
@@ -1427,17 +1570,16 @@ static void ThreadChatServe(void* parg)
         if (!fHave)
         {
             // Locked: nothing to answer a handshake with, and nothing to leak.
+            ChatServeSlotForget(ticket);
             closesocket(sock);
             return;
         }
 
-        // Plain printf, not LogPrint: when a connection arrives and nothing
-        // visible happens, the first question is always "did it even reach the
-        // other side", and needing -debug to answer it wastes a round trip with
-        // the person testing.
-        printf("btfchat: inbound connection accepted\n");
+        // LogPrint: anybody can open connections, and each one used to write
+        // two unconditional lines (-debug=btfchat shows them).
+        LogPrint("btfchat", "btfchat: inbound connection accepted\n");
 
-        SocketStream stream(sock);
+        SocketStream stream(sock, CHAT_HANDSHAKE_TIMEOUT_SECS);
         Link link;
         std::string err;
         bool fOk = link.AcceptAsEndpoint(stream, chan_sk, err);
@@ -1446,11 +1588,14 @@ static void ThreadChatServe(void* parg)
         {
             LogPrint("btfchat", "btfchat: handshake refused: %s\n", err.c_str());
             link.Close();
+            ChatServeSlotForget(ticket);
             closesocket(sock);
             return;
         }
+        stream.SetTimeout(CHAT_IO_TIMEOUT_SECS);
+        ChatServeSlotHandshaken(ticket);
 
-        printf("btfchat: inbound handshake complete\n");
+        LogPrint("btfchat", "btfchat: inbound handshake complete\n");
 
         // The dialler proved nothing about itself in the handshake -- it
         // authenticated US. Who it is comes from the first frame's signature, and
@@ -1459,7 +1604,8 @@ static void ThreadChatServe(void* parg)
         // when they appear to speak.
         std::string peer;
 
-        while (!fShutdown && link.IsOpen())
+        const int64_t nConnStart = GetTime();
+        while (!fShutdown && link.IsOpen() && GetTime() - nConnStart < CHAT_MAX_CONNECTION_SECS)
         {
             std::string js;
             if (!link.RecvFrame(stream, js, err))
@@ -1479,20 +1625,37 @@ static void ThreadChatServe(void* parg)
                 inbox.replay = &g_replay;
                 inbox.history = &g_history;
                 fDelivered = inbox.Deliver(js, peer, GetTime(), f, reason);
-                if (fDelivered)
-                    SaveStore();
                 if (fDelivered && !inbox.strAcceptReply.empty())
                     g_setAcceptReplies.insert(inbox.strAcceptReply);
             }
 
             if (fDelivered)
             {
-                printf("btfchat: delivered a frame from %s\n", f.from.c_str());
+                // Saved before the receipt: the sender takes the receipt to
+                // mean the frame is kept, and a frame lost to a crash after a
+                // receipt is lost for good. The first frame on a connection is
+                // saved at once; after it the saves are spaced (a burst of
+                // frames would rewrite the whole sealed store for each), by
+                // holding the next frame until the interval has passed.
+                bool fIgnored = false;
+                bool fDue = ChatServeSaveDue(GetTime(), fIgnored);
+                for (int nWait = 0; !fDue && nWait < 15 && !fShutdown; nWait++)
+                {
+                    Sleep(100);
+                    fDue = ChatServeSaveDue(GetTime(), fIgnored);
+                }
+                bool fSaved = false;
+                CRITICAL_BLOCK(cs_chat)
+                    if (g_fUnlocked)
+                        fSaved = SaveStore();
+                LogPrint("btfchat", "btfchat: delivered a frame from %s\n", f.from.c_str());
                 // The receipt the sender waits for before calling it delivered
                 // (FrameReceipt). Only for a frame we took: a refused one gets
                 // no answer, as before.
                 std::string e3;
-                if (!link.SendFrame(stream, FrameReceipt(js), e3))
+                if (!fSaved)
+                    LogPrint("btfchat", "btfchat: the store was not saved, so no receipt\n");
+                else if (!link.SendFrame(stream, FrameReceipt(js), e3))
                     LogPrint("btfchat", "btfchat: receipt not sent: %s\n", e3.c_str());
                 // They just wrote to us, so they are up right now. If we are
                 // holding anything for them, this is the moment -- not two
@@ -1507,24 +1670,29 @@ static void ThreadChatServe(void* parg)
                 // Logged, never answered. Telling a stranger why they were
                 // refused is telling them which addresses exist and which are
                 // blocked.
+                // The first refusal ends the connection: a peer that sends what
+                // is not taken is not worth a slot, and each slot is scarce.
                 LogPrint("btfchat", "btfchat: frame refused: %s\n", reason.c_str());
-                continue;
+                break;
             }
             if (peer.empty())
                 peer = f.from;
         }
 
         link.Close();
+        ChatServeSlotForget(ticket);
         closesocket(sock);
     }
     catch (std::exception& e)
     {
         PrintException(&e, "ThreadChatServe()");
+        ChatServeSlotForget(ticket);
         closesocket(sock);
     }
     catch (...)
     {
         PrintException(NULL, "ThreadChatServe()");
+        ChatServeSlotForget(ticket);
         closesocket(sock);
     }
 }
@@ -1544,13 +1712,23 @@ static void ThreadChatListener(void* parg)
                 Sleep(200);
                 continue;
             }
+            uint64_t ticket = 0;
+            if (!ChatServeSlotTake(sock, ticket, GetTime()))
+            {
+                LogPrint("btfchat", "btfchat: %d connections already served, one more closed\n",
+                         CHAT_MAX_SERVE_THREADS);
+                closesocket(sock);
+                continue;
+            }
             ServeArg* arg = new ServeArg;
             arg->sock = sock;
+            arg->ticket = ticket;
             if (_beginthread(ThreadChatServe, 0, arg) == -1)
             {
                 printf("btfchat: could not start a serve thread\n");
                 delete arg;
                 closesocket(sock);
+                ChatServeSlotRelease(ticket);
             }
         }
     }

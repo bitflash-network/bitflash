@@ -111,6 +111,9 @@ public:
     // Something changed that has to survive a restart: save now. False when
     // it could not be saved; no new lock is made until it can.
     virtual bool Changed() = 0;
+    // Can the conversations be read? False while the chat is locked, when they
+    // all read back empty and nothing may be concluded from what is missing.
+    virtual bool Unlocked() { return true; }
 };
 
 struct SwapConfig
@@ -128,6 +131,14 @@ struct SwapConfig
     // in seconds on every chain.
     int64_t nBtfInitiatorSecs = 0, nBtfParticipantSecs = 0;
     int64_t nBtcInitiatorSecs = 0, nBtcParticipantSecs = 0;
+    // What the engine keeps and accepts from the other side (review L4). A
+    // contact can send a take with a fresh swap id as often as it likes, and
+    // every swap, and every step id seen, is written out whole on each change.
+    // One take of an offer at a time per peer, and a few takes per peer in all;
+    // a finished swap is kept this long, and no more than this many are kept.
+    int     nMaxPendingTakesPerPeer = 8;
+    int64_t nKeepFinalSecs = 30 * 24 * 3600;
+    size_t  nKeepFinalMax = 100;
 };
 
 struct ChatSwap
@@ -209,6 +220,7 @@ private:
     void Tick(ChatSwap& s);
     void OnStep(const std::string& peer, const SwapStep& st, int64_t nNow, const SwapOffer* pMyOffer);
     void ReadSteps();
+    bool Prune(int64_t nNow, const std::set<std::string>& stepIdsPresent, bool fPruneSteps);
 };
 
 // ---- the chat app's engine ------------------------------------------------------

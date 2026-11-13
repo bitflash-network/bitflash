@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include "btfaddr.h"
 
 // Thread entry point (signature compatible with _beginthread)
 void ThreadNostrSeed(void* parg);
@@ -122,5 +123,79 @@ struct BtfResolvedPeer
 // true if at least one address resolved; check `out` for which ones.
 bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
                      std::map<std::string, BtfResolvedPeer>& out);
+
+// ---- what relays send, checked without a socket ----------------------------
+//
+// The relay threads read through these; the self-tests and fuzz-nostr call
+// them directly.
+
+// Limits on what relays can make this node remember.
+static const size_t NOSTR_MAX_BTF_PEERS            = 2000; // discovered .btf peers, oldest dropped
+static const size_t NOSTR_MAX_NEW_PEERS_PER_ROUND  = 50;   // new addresses one relay adds per round
+static const size_t NOSTR_MAX_POOLS                = 200;  // live pool announcements
+static const int64  NOSTR_MAX_FUTURE               = 600;  // created_at ahead of our clock
+static const size_t NOSTR_MAX_POOL_NAME            = 64;   // bytes, in a pool announcement
+static const size_t NOSTR_MAX_DASHBOARD_URL        = 256;
+
+// At most nMax bytes of text, cut where a character begins.
+std::string NostrClampUtf8(const std::string& str, size_t nMax);
+
+// One NIP-01 event, as checked by NostrVerifyEvent.
+struct NostrEvent
+{
+    std::string id, pubkey, sig, content;
+    int64 created_at;
+    int kind;
+    std::vector<std::vector<std::string> > tags;
+    NostrEvent() : created_at(0), kind(0) {}
+};
+
+// Parse an event and check it: field types, lower-case hex, the id is the
+// SHA-256 of the canonical serialization, and sig is a valid BIP-340
+// signature of the id by pubkey. secpctx may be NULL (a shared context).
+bool NostrVerifyEvent(void* secpctx, const std::string& eventJson, NostrEvent& out, std::string& errOut);
+
+// ["OK", id, accepted, reason] for eventId: 1 taken, 0 refused (reason set),
+// -1 anything else.
+int NostrRelayOk(const std::string& msg, const std::string& eventId, std::string& reasonOut);
+
+// What one relay message for a subscription meant.
+enum
+{
+    NOSTR_MSG_OTHER   = -1,  // not an EVENT or EOSE for this subscription
+    NOSTR_MSG_EOSE    = 0,
+    NOSTR_MSG_EVENT   = 1,   // internal: an event not yet looked at
+    NOSTR_MSG_TAKEN   = 2,   // an event that passed and was used
+    NOSTR_MSG_REFUSED = 3,   // an event that did not pass
+};
+
+// A message on the discovery subscription: a signed .btf descriptor event
+// adds or refreshes a peer (at most NOSTR_MAX_NEW_PEERS_PER_ROUND new ones per
+// round, counted in nNewThisRound; the table is capped at NOSTR_MAX_BTF_PEERS).
+int NostrIngestDiscovery(void* secpctx, const std::string& msg, const std::string& strSub,
+                         const unsigned char selfXonly[32], int64 nNow, int& nNewThisRound);
+
+// A message on the pool subscription: a signed announcement, by the key whose
+// .btf address it names, updates the live pool list.
+int NostrIngestPool(const std::string& msg, const std::string& strSub, int64 nNow);
+size_t NostrDiscoveredPoolCount();
+
+// A message answering a descriptor query: hexToAddr maps the x-only keys asked
+// for (hex) to their .btf addresses. TAKEN when the content is a descriptor
+// signed by one of them; addrOut and descriptorOut say which and what.
+int NostrIngestDescriptor(void* secpctx, const std::string& msg, const std::string& strSub,
+                          const std::map<std::string, std::string>& hexToAddr,
+                          std::string& addrOut, std::string& descriptorOut, btf::Descriptor* pDescOut = NULL);
+
+// What a descriptor or pool event carries on this network (the kind, and the
+// "d" tag the discovery subscription asks for), for the self-tests that build
+// signed events.
+int         NostrDescriptorKind();
+int         NostrPoolKind();
+std::string NostrDescriptorTag();
+
+#ifdef BITFLASH_FUZZ
+void NostrFuzzReset();
+#endif
 
 #endif

@@ -14,6 +14,7 @@
 #include <secp256k1_extrakeys.h>
 #include <openssl/sha.h>
 #include <nlohmann/json.hpp>
+#include "jsonsafe.h"
 
 #include <cstring>
 
@@ -257,7 +258,7 @@ bool Mailbox::FromJson(const std::string& s, std::string& errOut)
         {
             const json& e = a[i];
             EpochKeys k;
-            k.epoch = e.value("e", (int64_t)-1);
+            k.epoch = JsonIntValue<int64_t>(e, "e", -1);
             bool fOk = k.epoch >= 0 &&
                        BoxUnhex(e.value("xp", std::string()), k.x_pk, sizeof(k.x_pk)) &&
                        BoxUnhex(e.value("xs", std::string()), k.x_sk, sizeof(k.x_sk)) &&
@@ -391,9 +392,9 @@ bool VerifyEpochKeys(void* secpctx, const std::string& expectAddress,
     int ver = 0;
     try
     {
-        ver    = j.value("v", 0);
+        ver    = JsonIntValue<int>(j, "v", 0);
         addr   = j.value("addr", std::string());
-        epoch  = j.value("epoch", (int64_t)0);
+        epoch  = JsonIntValue<int64_t>(j, "epoch", 0);
         xHex   = j.value("x", std::string());
         kemHex = j.value("kem", std::string());
         sigHex = j.value("sig", std::string());

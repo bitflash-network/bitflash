@@ -27,6 +27,7 @@
 #undef snprintf
 #endif
 #include <nlohmann/json.hpp>
+#include <limits>
 
 #include "btfaddr.h"
 #include "btfchan.h"
@@ -267,16 +268,27 @@ static string HexEncode(const unsigned char* p, size_t n)
     return s;
 }
 
+// Exactly 2n hex digits, nothing else. This used sscanf("%2x"), which also
+// takes a sign, "0x" and leading spaces: "-1" read as ff, so two different
+// strings off a relay named the same key.
+static int HexNibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static bool HexDecode(const string& s, unsigned char* out, size_t n)
 {
     if (s.size() != n * 2)
         return false;
     for (size_t i = 0; i < n; i++)
     {
-        unsigned int b;
-        if (sscanf(s.c_str() + i * 2, "%2x", &b) != 1)
+        int hi = HexNibble(s[2 * i]), lo = HexNibble(s[2 * i + 1]);
+        if (hi < 0 || lo < 0)
             return false;
-        out[i] = (unsigned char)b;
+        out[i] = (unsigned char)((hi << 4) | lo);
     }
     return true;
 }
@@ -919,16 +931,9 @@ static int WaitForRelayOk(CWebSocket& ws, const string& strEventId, string& strR
             strReasonOut = "no answer";
             return -1;
         }
-        json j;
-        try { j = json::parse(msg); } catch (...) { continue; }
-        if (!j.is_array() || j.size() < 3 || !j[0].is_string()) continue;
-        if (j[0].get<string>() != "OK") continue;
-        if (!j[1].is_string() || j[1].get<string>() != strEventId) continue;
-        if (j[2].is_boolean() && j[2].get<bool>())
-            return 1;
-        strReasonOut = (j.size() >= 4 && j[3].is_string() && !j[3].get<string>().empty())
-                           ? j[3].get<string>() : "refused";
-        return 0;
+        int n = NostrRelayOk(msg, strEventId, strReasonOut);
+        if (n >= 0)
+            return n;
     }
     strReasonOut = "never said whether it took it";
     return -1;
@@ -1077,6 +1082,23 @@ bool BtfPublishPoolAnnouncement(const BtfPoolAnnouncement& ann)
     return fPublished;
 }
 
+// At most nMax bytes, cut where a character begins: what we publish is what
+// PoolFromEvent accepts (a longer name or URL would be refused by every node),
+// and a cut inside a character would not be text.
+string NostrClampUtf8(const string& str, size_t nMax)
+{
+    if (str.size() <= nMax)
+        return str;
+    size_t n = nMax;
+    while (n > 0 && ((unsigned char)str[n] & 0xC0) == 0x80)
+        n--;
+    return str.substr(0, n);
+}
+
+// Defined below, with the rest of what relays send.
+static int NostrSubMessage(const string& msg, const string& strSub, json& evOut);
+static bool PoolFromEvent(const json& ev, int64 nNow, BtfPoolAnnouncement& ann, string& err);
+
 bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncement& out)
 {
     unsigned char pk[32];
@@ -1112,45 +1134,22 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
                 string msg;
                 if (!ws.RecvText(msg))
                     break;
-                json j;
-                try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
-                if (!SubMatches(j, strSub)) continue;
-                string type = j[0].get<string>();
-                if (type == "EVENT" && j.size() >= 3)
-                {
-                    const json& ev = j[2];
-                    if (!ev.contains("content") || !ev["content"].is_string())
-                        continue;
-                    BtfPoolAnnouncement ann;
-                    try
-                    {
-                        json content = json::parse(ev["content"].get<string>());
-                        if (content.contains("btf") && content["btf"].is_string())
-                            ann.btfAddress = content["btf"].get<string>();
-                        if (content.contains("name") && content["name"].is_string())
-                            ann.poolName = content["name"].get<string>();
-                        if (content.contains("dashboard_url") && content["dashboard_url"].is_string())
-                            ann.dashboardUrl = content["dashboard_url"].get<string>();
-                        ann.feePercent = content.value("fee_pct", content.value("fee", 0.0));
-                        ann.connectedMiners = content.value("miners", 0);
-                        ann.blocksFound = content.value("blocks", 0);
-                        ann.hashRate = content.value("hashrate", 0.0);
-                        ann.createdAt = ev.value("created_at", (int64)0);
-                    }
-                    catch (...)
-                    {
-                        continue;
-                    }
-                    if (ann.btfAddress == poolBtfAddr && ann.createdAt >= bestCreatedAt)
-                    {
-                        bestCreatedAt = ann.createdAt;
-                        out = ann;
-                        fFound = true;
-                    }
-                }
-                else if (type == "EOSE")
+                json ev;
+                int n = NostrSubMessage(msg, strSub, ev);
+                if (n == NOSTR_MSG_EOSE)
                     break;
+                if (n != NOSTR_MSG_EVENT)
+                    continue;
+                BtfPoolAnnouncement ann;
+                string err;
+                if (!PoolFromEvent(ev, GetTime(), ann, err))
+                    continue;
+                if (ann.btfAddress == poolBtfAddr && ann.createdAt >= bestCreatedAt)
+                {
+                    bestCreatedAt = ann.createdAt;
+                    out = ann;
+                    fFound = true;
+                }
             }
             CloseSub(ws, strSub);
             lease.fOk = true;
@@ -1161,47 +1160,359 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
     return fFound;
 }
 
-static void HandlePoolAnnouncement(const json& ev)
+// ---- what relays send, checked without a socket ------------------------------
+//
+// A relay is a stranger's server. It can send any JSON it likes, invent events
+// under any public key, date them in the future, and send as many as it likes.
+// Everything a relay hands this node goes through the functions below, which
+// never touch a socket, so the self-tests and the fuzzer can feed them bytes.
+
+// An integer field, read whole. nlohmann converts a float to int with a plain
+// cast, which is undefined behaviour out of range (1e300), so only real
+// integers are taken.
+static bool NostrIntField(const json& j, const char* key, int64& out)
 {
-    if (!ev.contains("content") || !ev["content"].is_string())
-        return;
+    if (!j.is_object() || !j.contains(key))
+        return false;
+    const json& v = j[key];
+    if (v.is_number_unsigned())
+    {
+        uint64_t u = v.get<uint64_t>();
+        if (u > (uint64_t)std::numeric_limits<int64>::max())
+            return false;
+        out = (int64)u;
+        return true;
+    }
+    if (!v.is_number_integer())
+        return false;
+    out = v.get<int64_t>();
+    return true;
+}
 
+static bool NostrStrField(const json& j, const char* key, string& out)
+{
+    if (!j.is_object() || !j.contains(key) || !j[key].is_string())
+        return false;
+    out = j[key].get<string>();
+    return true;
+}
+
+static bool IsLowerHex(const string& s, size_t nBytes)
+{
+    if (s.size() != nBytes * 2)
+        return false;
+    for (size_t i = 0; i < s.size(); i++)
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    return true;
+}
+
+// NIP-01: the id is SHA-256 of [0,pubkey,created_at,kind,tags,content]
+// serialized without whitespace, and sig is a BIP-340 signature of the id by
+// pubkey. Both are checked here; an event that fails either is someone else's
+// words under that key.
+static bool NostrCheckEvent(secp256k1_context* ctx, const json& ev, NostrEvent& out, string& errOut)
+{
+    errOut.clear();
+    if (!ctx) { errOut = "no secp256k1 context"; return false; }
+    if (!ev.is_object()) { errOut = "an event is an object"; return false; }
+    NostrEvent e;
+    int64 nKind = 0;
+    if (!NostrStrField(ev, "id", e.id) || !IsLowerHex(e.id, 32)) { errOut = "bad id"; return false; }
+    if (!NostrStrField(ev, "pubkey", e.pubkey) || !IsLowerHex(e.pubkey, 32)) { errOut = "bad pubkey"; return false; }
+    if (!NostrStrField(ev, "sig", e.sig) || !IsLowerHex(e.sig, 64)) { errOut = "bad sig"; return false; }
+    if (!NostrIntField(ev, "created_at", e.created_at) || e.created_at < 0) { errOut = "bad created_at"; return false; }
+    if (!NostrIntField(ev, "kind", nKind) || nKind < 0 || nKind > 65535) { errOut = "bad kind"; return false; }
+    e.kind = (int)nKind;
+    if (!NostrStrField(ev, "content", e.content)) { errOut = "bad content"; return false; }
+    if (!ev.contains("tags") || !ev["tags"].is_array()) { errOut = "bad tags"; return false; }
+    const json& tags = ev["tags"];
+    for (size_t i = 0; i < tags.size(); i++)
+    {
+        if (!tags[i].is_array()) { errOut = "a tag is an array"; return false; }
+        std::vector<std::string> t;
+        for (size_t k = 0; k < tags[i].size(); k++)
+        {
+            if (!tags[i][k].is_string()) { errOut = "a tag holds strings"; return false; }
+            t.push_back(tags[i][k].get<string>());
+        }
+        e.tags.push_back(t);
+    }
+
+    string ser;
+    try { ser = json::array({ 0, e.pubkey, e.created_at, e.kind, tags, e.content }).dump(); }
+    catch (...) { errOut = "the event does not serialize"; return false; }
+    unsigned char id[32], idClaimed[32], pk[32], sig[64];
+    SHA256((const unsigned char*)ser.data(), ser.size(), id);
+    if (!HexDecode(e.id, idClaimed, 32) || memcmp(id, idClaimed, 32) != 0) { errOut = "the id is not the event's hash"; return false; }
+    if (!HexDecode(e.pubkey, pk, 32) || !HexDecode(e.sig, sig, 64)) { errOut = "bad hex"; return false; }
+    secp256k1_xonly_pubkey xpub;
+    if (!secp256k1_xonly_pubkey_parse(ctx, &xpub, pk)) { errOut = "the pubkey is not a point"; return false; }
+    if (!secp256k1_schnorrsig_verify(ctx, sig, id, 32, &xpub)) { errOut = "the signature does not verify"; return false; }
+    out = e;
+    return true;
+}
+
+static secp256k1_context* NostrVerifyContext()
+{
+    static secp256k1_context* ctx = NULL;
+    static CCriticalSection cs_ctx;
+    CRITICAL_BLOCK(cs_ctx)
+        if (!ctx)
+            ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    return ctx;
+}
+
+bool NostrVerifyEvent(void* secpctx, const std::string& eventJson, NostrEvent& out, std::string& errOut)
+{
+    json ev;
+    try { ev = json::parse(eventJson); }
+    catch (...) { errOut = "not JSON"; return false; }
+    return NostrCheckEvent(secpctx ? (secp256k1_context*)secpctx : NostrVerifyContext(), ev, out, errOut);
+}
+
+int NostrRelayOk(const std::string& msg, const std::string& strEventId, std::string& strReasonOut)
+{
+    json j;
+    try { j = json::parse(msg); } catch (...) { return -1; }
+    if (!j.is_array() || j.size() < 3 || !j[0].is_string()) return -1;
+    if (j[0].get<string>() != "OK") return -1;
+    if (!j[1].is_string() || j[1].get<string>() != strEventId) return -1;
+    if (j[2].is_boolean() && j[2].get<bool>())
+        return 1;
+    strReasonOut = (j.size() >= 4 && j[3].is_string() && !j[3].get<string>().empty())
+                       ? j[3].get<string>() : "refused";
+    return 0;
+}
+
+// A relay message for subscription strSub: NOSTR_MSG_OTHER if it is not an
+// EVENT or EOSE for it, NOSTR_MSG_EOSE, or NOSTR_MSG_EVENT with the event in
+// evOut (not yet checked).
+static int NostrSubMessage(const string& msg, const string& strSub, json& evOut)
+{
+    json j;
+    try { j = json::parse(msg); } catch (...) { return NOSTR_MSG_OTHER; }
+    if (!j.is_array() || j.empty() || !j[0].is_string()) return NOSTR_MSG_OTHER;
+    if (!SubMatches(j, strSub)) return NOSTR_MSG_OTHER;
+    string t = j[0].get<string>();
+    if (t == "EOSE")
+        return NOSTR_MSG_EOSE;
+    if (t == "EVENT" && j.size() >= 3)
+    {
+        evOut = j[2];
+        return NOSTR_MSG_EVENT;
+    }
+    return NOSTR_MSG_OTHER;
+}
+
+static bool EventHasTag(const NostrEvent& e, const string& name, const string& value)
+{
+    for (size_t i = 0; i < e.tags.size(); i++)
+        if (e.tags[i].size() >= 2 && e.tags[i][0] == name && e.tags[i][1] == value)
+            return true;
+    return false;
+}
+
+// Keep g_btfPeers at NOSTR_MAX_BTF_PEERS: the oldest descriptors go first.
+static void TrimBtfPeers()
+{
+    while (g_btfPeers.size() > NOSTR_MAX_BTF_PEERS)
+    {
+        map<string, int64>::iterator oldest = g_btfPeers.begin();
+        for (map<string, int64>::iterator it = g_btfPeers.begin(); it != g_btfPeers.end(); ++it)
+            if (it->second < oldest->second)
+                oldest = it;
+        g_btfPeers.erase(oldest);
+    }
+}
+
+int NostrIngestDiscovery(void* secpctx, const std::string& msg, const std::string& strSub,
+                         const unsigned char selfXonly[32], int64 nNow, int& nNewThisRound)
+{
+    json ev;
+    int n = NostrSubMessage(msg, strSub, ev);
+    if (n != NOSTR_MSG_EVENT)
+        return n;
+    NostrEvent e;
+    string err;
+    if (!NostrCheckEvent(secpctx ? (secp256k1_context*)secpctx : NostrVerifyContext(), ev, e, err))
+    {
+        LogPrint("nostr", "Nostr: discovery event refused: %s\n", err.c_str());
+        return NOSTR_MSG_REFUSED;
+    }
+    if (e.kind != BTF_DESC_KIND || !EventHasTag(e, "d", BtfNetTag(BTF_DESC_DTAG)))
+        return NOSTR_MSG_REFUSED;
+    // A date in the future would sort first forever and never go stale.
+    if (e.created_at > nNow + NOSTR_MAX_FUTURE)
+        return NOSTR_MSG_REFUSED;
+    if (e.created_at < nNow - BTF_PEER_MAX_AGE)
+        return NOSTR_MSG_REFUSED;     // stale already: nothing to dial
+    unsigned char pkb[32];
+    if (!HexDecode(e.pubkey, pkb, 32))
+        return NOSTR_MSG_REFUSED;
+    if (selfXonly && memcmp(pkb, selfXonly, 32) == 0)
+        return NOSTR_MSG_REFUSED;     // ourselves
+    string peerAddr = btf::Address(pkb);
+    bool fNew = false;
+    CRITICAL_BLOCK(cs_btfPeers)
+    {
+        map<string, int64>::iterator it = g_btfPeers.find(peerAddr);
+        if (it != g_btfPeers.end())
+        {
+            if (e.created_at > it->second)
+                it->second = e.created_at;     // refresh
+        }
+        else if (nNewThisRound < (int)NOSTR_MAX_NEW_PEERS_PER_ROUND)
+        {
+            g_btfPeers[peerAddr] = e.created_at;
+            nNewThisRound++;
+            fNew = true;
+            TrimBtfPeers();
+        }
+    }
+    if (fNew && fDebug)
+        LogPrint("nostr", "Nostr: discovered .btf peer %s\n", peerAddr.c_str());
+    return NOSTR_MSG_TAKEN;
+}
+
+// The pool's announcement: signed, of the pool kind, by the key whose .btf
+// address it announces -- a pool speaks only for itself.
+static bool PoolFromEvent(const json& ev, int64 nNow, BtfPoolAnnouncement& ann, string& err)
+{
+    NostrEvent e;
+    if (!NostrCheckEvent(NostrVerifyContext(), ev, e, err))
+        return false;
+    if (e.kind != BTF_POOL_KIND) { err = "not a pool announcement"; return false; }
+    if (e.created_at > nNow + NOSTR_MAX_FUTURE) { err = "dated in the future"; return false; }
+    json content;
+    try { content = json::parse(e.content); }
+    catch (...) { err = "the content is not JSON"; return false; }
+    if (!content.is_object()) { err = "the content is not an object"; return false; }
+    if (!NostrStrField(content, "btf", ann.btfAddress)) NostrStrField(content, "address", ann.btfAddress);
+    if (!NostrStrField(content, "name", ann.poolName)) NostrStrField(content, "pool_name", ann.poolName);
+    if (!NostrStrField(content, "dashboard_url", ann.dashboardUrl)) NostrStrField(content, "dashboard", ann.dashboardUrl);
+    if (ann.btfAddress.empty() || ann.poolName.empty()) { err = "no address or name"; return false; }
+    if (ann.poolName.size() > NOSTR_MAX_POOL_NAME || ann.dashboardUrl.size() > NOSTR_MAX_DASHBOARD_URL) { err = "too long"; return false; }
+    unsigned char pk[32];
+    if (!HexDecode(e.pubkey, pk, 32) || btf::Address(pk) != ann.btfAddress) { err = "announces another key's address"; return false; }
+    // Numbers as numbers, finite and in range; anything else reads as 0.
+    double d = 0;
+    if ((content.contains("fee_pct") && content["fee_pct"].is_number()) ) d = content["fee_pct"].get<double>();
+    else if (content.contains("fee") && content["fee"].is_number()) d = content["fee"].get<double>();
+    ann.feePercent = (d >= 0 && d <= 100) ? d : 0;
+    int64 n = 0;
+    ann.connectedMiners = NostrIntField(content, "miners", n) && n >= 0 && n <= 1000000000 ? (int)n : 0;
+    n = 0;
+    ann.blocksFound = NostrIntField(content, "blocks", n) && n >= 0 && n <= 1000000000 ? (int)n : 0;
+    d = content.contains("hashrate") && content["hashrate"].is_number() ? content["hashrate"].get<double>() : 0;
+    ann.hashRate = (d >= 0 && d <= 1e30) ? d : 0;
+    ann.createdAt = e.created_at;
+    return true;
+}
+
+static void PrunePools(int64 nNow)
+{
+    for (map<string, BtfPoolAnnouncement>::iterator it = g_discoveredPools.begin(); it != g_discoveredPools.end(); )
+    {
+        if (nNow - it->second.createdAt > BTF_POOL_MAX_AGE)
+            it = g_discoveredPools.erase(it);
+        else
+            ++it;
+    }
+}
+
+int NostrIngestPool(const std::string& msg, const std::string& strSub, int64 nNow)
+{
+    json ev;
+    int n = NostrSubMessage(msg, strSub, ev);
+    if (n != NOSTR_MSG_EVENT)
+        return n;
     BtfPoolAnnouncement ann;
-    try
+    string err;
+    if (!PoolFromEvent(ev, nNow, ann, err))
     {
-        json content = json::parse(ev["content"].get<string>());
-        if (content.contains("btf") && content["btf"].is_string())
-            ann.btfAddress = content["btf"].get<string>();
-        else if (content.contains("address") && content["address"].is_string())
-            ann.btfAddress = content["address"].get<string>();
-        if (content.contains("name") && content["name"].is_string())
-            ann.poolName = content["name"].get<string>();
-        else if (content.contains("pool_name") && content["pool_name"].is_string())
-            ann.poolName = content["pool_name"].get<string>();
-        if (content.contains("dashboard_url") && content["dashboard_url"].is_string())
-            ann.dashboardUrl = content["dashboard_url"].get<string>();
-        else if (content.contains("dashboard") && content["dashboard"].is_string())
-            ann.dashboardUrl = content["dashboard"].get<string>();
-        ann.feePercent = content.value("fee_pct", content.value("fee", 0.0));
-        ann.connectedMiners = content.value("miners", 0);
-        ann.blocksFound = content.value("blocks", 0);
-        ann.hashRate = content.value("hashrate", 0.0);
-        ann.createdAt = ev.value("created_at", (int64)0);
+        LogPrint("nostr", "Nostr: pool announcement refused: %s\n", err.c_str());
+        return NOSTR_MSG_REFUSED;
     }
-    catch (...)
-    {
-        return;
-    }
-
-    if (ann.btfAddress.empty() || ann.poolName.empty())
-        return;
-
     CRITICAL_BLOCK(cs_discoveredPools)
     {
+        PrunePools(nNow);
         map<string, BtfPoolAnnouncement>::iterator it = g_discoveredPools.find(ann.btfAddress);
-        if (it == g_discoveredPools.end() || ann.createdAt >= it->second.createdAt)
+        if (it != g_discoveredPools.end())
+        {
+            if (ann.createdAt >= it->second.createdAt)
+                it->second = ann;
+        }
+        else
+        {
+            // Full: the oldest announcement goes, so that a flood of new keys
+            // does not keep a live pool from being listed (each of them still
+            // needs a signature of its own, and goes stale in minutes).
+            if (g_discoveredPools.size() >= NOSTR_MAX_POOLS)
+            {
+                map<string, BtfPoolAnnouncement>::iterator oldest = g_discoveredPools.begin();
+                for (map<string, BtfPoolAnnouncement>::iterator q = g_discoveredPools.begin(); q != g_discoveredPools.end(); ++q)
+                    if (q->second.createdAt < oldest->second.createdAt)
+                        oldest = q;
+                g_discoveredPools.erase(oldest);
+            }
             g_discoveredPools[ann.btfAddress] = ann;
+        }
     }
+    return NOSTR_MSG_TAKEN;
+}
+
+int NostrIngestDescriptor(void* secpctx, const std::string& msg, const std::string& strSub,
+                          const std::map<std::string, std::string>& hexToAddr,
+                          std::string& addrOut, std::string& descriptorOut, btf::Descriptor* pDescOut)
+{
+    json ev;
+    int n = NostrSubMessage(msg, strSub, ev);
+    if (n != NOSTR_MSG_EVENT)
+        return n;
+    // The descriptor in the content is signed by the address's own key
+    // (btf::VerifyDescriptor), which is what makes it trustworthy whatever the
+    // relay did to the event around it. The event is still read with care.
+    string hexpk, content;
+    if (!NostrStrField(ev, "pubkey", hexpk) || !NostrStrField(ev, "content", content))
+        return NOSTR_MSG_REFUSED;
+    std::map<std::string, std::string>::const_iterator ai = hexToAddr.find(hexpk);
+    if (ai == hexToAddr.end())
+        return NOSTR_MSG_REFUSED;
+    unsigned char pk[32];
+    if (!HexDecode(hexpk, pk, 32))
+        return NOSTR_MSG_REFUSED;
+    btf::Descriptor d;
+    if (!btf::VerifyDescriptor(secpctx ? secpctx : (void*)NostrVerifyContext(), content, pk, d))
+        return NOSTR_MSG_REFUSED;
+    addrOut = ai->second;
+    descriptorOut = content;
+    if (pDescOut)
+        *pDescOut = d;
+    return NOSTR_MSG_TAKEN;
+}
+
+#ifdef BITFLASH_FUZZ
+// Fuzzing only: forget what earlier inputs taught the node.
+void NostrFuzzReset()
+{
+    CRITICAL_BLOCK(cs_btfPeers)
+        g_btfPeers.clear();
+    CRITICAL_BLOCK(cs_discoveredPools)
+        g_discoveredPools.clear();
+}
+#endif
+
+int NostrDescriptorKind() { return BTF_DESC_KIND; }
+int NostrPoolKind() { return BTF_POOL_KIND; }
+string NostrDescriptorTag() { return BtfNetTag(BTF_DESC_DTAG); }
+
+size_t NostrDiscoveredPoolCount()
+{
+    size_t n = 0;
+    CRITICAL_BLOCK(cs_discoveredPools)
+        n = g_discoveredPools.size();
+    return n;
 }
 
 // Resolve a `.btf` address via a relay: fetch the descriptor published by that
@@ -1226,30 +1537,24 @@ static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
     // next question asked over it read this answer. Close it on the way out,
     // whichever way out that is.
     bool fFound = false;
+    std::map<std::string, std::string> want;
+    want[HexEncode(pk, 32)] = btfAddr;
     for (;;)
     {
         string msg;
         if (!ws.RecvText(msg))
             break;
-        json j;
-        try { j = json::parse(msg); } catch (...) { continue; }
-        if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
-        if (!SubMatches(j, strSub)) continue;
-        string t = j[0].get<string>();
-        if (t == "EVENT" && j.size() >= 3)
-        {
-            const json& ev = j[2];
-            if (ev.contains("content") &&
-                btf::VerifyDescriptor(ctx, ev["content"].get<string>(), pk, out))
-            {
-                if (rawOut)
-                    *rawOut = ev["content"].get<string>();
-                fFound = true;
-                break;
-            }
-        }
-        else if (t == "EOSE")
+        string addr, content;
+        int n = NostrIngestDescriptor(ctx, msg, strSub, want, addr, content, &out);
+        if (n == NOSTR_MSG_EOSE)
             break;
+        if (n == NOSTR_MSG_TAKEN)
+        {
+            if (rawOut)
+                *rawOut = content;
+            fFound = true;
+            break;
+        }
     }
     CloseSub(ws, strSub);
     return fFound;
@@ -1358,41 +1663,28 @@ bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
                 string msg;
                 if (!ws.RecvText(msg))
                     break;
-                json j;
-                try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
-                if (!SubMatches(j, strSub)) continue;
-                string t = j[0].get<string>();
-                if (t == "EVENT" && j.size() >= 3)
-                {
-                    const json& ev = j[2];
-                    if (!ev.contains("pubkey") || !ev.contains("content"))
-                        continue;
-                    string hexpk = ev["pubkey"].get<string>();
-                    auto ai = hexToAddr.find(hexpk);
-                    if (ai == hexToAddr.end() || !pending.count(ai->second))
-                        continue; // not one we're waiting on (or already resolved)
-
-                    unsigned char pk[32];
-                    if (!HexDecode(hexpk, pk, 32))
-                        continue;
-                    btf::Descriptor d;
-                    if (!btf::VerifyDescriptor(g_nostrKey.ctx, ev["content"].get<string>(), pk, d))
-                        continue;
-                    if ((d.meeting_node.empty() || d.meeting_node == "rendezvous-pending") &&
-                        d.onion.empty())
-                        continue;
-                    BtfResolvedPeer rp;
-                    if (!HexDecode(d.enc, rp.enc_pub, 32))
-                        continue;
-                    rp.meetingHostPort = d.meeting_node;
-                    rp.onionHostPort = d.onion;
-                    rp.descriptor = ev["content"].get<string>();
-                    out[ai->second] = rp;
-                    pending.erase(ai->second);
-                }
-                else if (t == "EOSE")
+                std::map<std::string, std::string> want;
+                for (auto& kv : hexToAddr)
+                    if (pending.count(kv.second))
+                        want.insert(kv);
+                string addr, content;
+                btf::Descriptor d;
+                int n = NostrIngestDescriptor(g_nostrKey.ctx, msg, strSub, want, addr, content, &d);
+                if (n == NOSTR_MSG_EOSE)
                     break;
+                if (n != NOSTR_MSG_TAKEN)
+                    continue;
+                if ((d.meeting_node.empty() || d.meeting_node == "rendezvous-pending") &&
+                    d.onion.empty())
+                    continue;
+                BtfResolvedPeer rp;
+                if (!HexDecode(d.enc, rp.enc_pub, 32))
+                    continue;
+                rp.meetingHostPort = d.meeting_node;
+                rp.onionHostPort = d.onion;
+                rp.descriptor = content;
+                out[addr] = rp;
+                pending.erase(addr);
             }
             CloseSub(ws, strSub);
             lease.fOk = true;
@@ -1498,6 +1790,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
         string strSub = NewSubId("btf-disc");
         json dreq = json::array({ "REQ", strSub, dfilter });
         int nPeers = 0;
+        int nNewThisRound = 0;     // new addresses this relay may add (NOSTR_MAX_NEW_PEERS_PER_ROUND)
         if (ws.SendText(dreq.dump()))
         {
             for (;;)
@@ -1505,34 +1798,12 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                 string msg;
                 if (!ws.RecvText(msg))
                     break;
-                json j;
-                try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
-                if (!SubMatches(j, strSub)) continue;
-                string type = j[0].get<string>();
-                if (type == "EVENT" && j.size() >= 3)
-                {
-                    const json& ev = j[2];
-                    if (!ev.contains("pubkey") || !ev.contains("kind")) continue;
-                    if (ev["kind"].get<int>() != BTF_DESC_KIND) continue;
-                    unsigned char pkb[32];
-                    if (!HexDecode(ev["pubkey"].get<string>(), pkb, 32)) continue;
-                    if (memcmp(pkb, key.xonly, 32) == 0) continue; // not ourselves
-                    string peerAddr = btf::Address(pkb);
-                    int64 createdAt = ev.value("created_at", (int64)0);
-                    bool fNew = false;
-                    CRITICAL_BLOCK(cs_btfPeers)
-                    {
-                        auto it = g_btfPeers.find(peerAddr);
-                        if (it == g_btfPeers.end()) { g_btfPeers[peerAddr] = createdAt; fNew = true; }
-                        else if (createdAt > it->second)  it->second = createdAt; // refresh
-                    }
-                    if (fNew && fDebug)
-                        LogPrint("nostr", "Nostr: discovered .btf peer %s\n", peerAddr.c_str());
-                    if (++nPeers > 500) break;
-                }
-                else if (type == "EOSE")
+                int n = NostrIngestDiscovery(key.ctx, msg, strSub, key.xonly, GetTime(), nNewThisRound);
+                if (n == NOSTR_MSG_EOSE)
                     break;
+                if (n == NOSTR_MSG_OTHER)
+                    continue;
+                if (++nPeers > 500) break;
             }
         }
         // Onion-only: there are no rendezvous relays to discover. Just close the
@@ -1549,6 +1820,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
         pfilter["#d"]    = json::array({ BtfNetTag(BTF_POOL_DTAG) });
         pfilter["limit"]  = 200;
         string strSub = NewSubId("btf-pools");
+        int nPools = 0;
         json preq = json::array({ "REQ", strSub, pfilter });
         if (ws.SendText(preq.dump()))
         {
@@ -1557,14 +1829,10 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                 string msg;
                 if (!ws.RecvText(msg))
                     break;
-                json j;
-                try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
-                if (!SubMatches(j, strSub)) continue;
-                string type = j[0].get<string>();
-                if (type == "EVENT" && j.size() >= 3)
-                    HandlePoolAnnouncement(j[2]);
-                else if (type == "EOSE")
+                int nPool = NostrIngestPool(msg, strSub, GetTime());
+                if (nPool == NOSTR_MSG_EOSE)
+                    break;
+                if (nPool != NOSTR_MSG_OTHER && ++nPools > 500)
                     break;
             }
             CloseSub(ws, strSub);
@@ -1585,8 +1853,8 @@ void ThreadBtfPoolAnnouncer(void*)
         {
             BtfPoolAnnouncement ann;
             ann.btfAddress = BtfLocalAddress();
-            ann.poolName = strPoolName;
-            ann.dashboardUrl = strPoolDashboardUrl;
+            ann.poolName = NostrClampUtf8(strPoolName, NOSTR_MAX_POOL_NAME);
+            ann.dashboardUrl = NostrClampUtf8(strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
             ann.feePercent = dPoolFeePercent;
             uint64 roundShares = 0;
             double totalHashRate = 0.0;
@@ -1669,6 +1937,24 @@ static void ConnectDiscoveredBtfPeers()
                 else
                     ++it;
             }
+        }
+    }
+    // And what we remember about dialling them: an address no longer in the
+    // table has nothing to back off from. These maps used to grow with every
+    // address any relay ever named.
+    {
+        set<string> live;
+        CRITICAL_BLOCK(cs_btfPeers)
+            for (auto& kv : g_btfPeers)
+                live.insert(kv.first);
+        CRITICAL_BLOCK(cs_btfPeerState)
+        {
+            for (map<string, int64>::iterator it = g_btfPeerBackoff.begin(); it != g_btfPeerBackoff.end(); )
+                if (!live.count(it->first)) it = g_btfPeerBackoff.erase(it); else ++it;
+            for (map<string, int>::iterator it = g_btfPeerFails.begin(); it != g_btfPeerFails.end(); )
+                if (!live.count(it->first)) it = g_btfPeerFails.erase(it); else ++it;
+            for (set<string>::iterator it = g_btfPeerEverConnected.begin(); it != g_btfPeerEverConnected.end(); )
+                if (!live.count(*it)) it = g_btfPeerEverConnected.erase(it); else ++it;
         }
     }
 
@@ -1957,8 +2243,8 @@ void ThreadNostrSeed(void* parg)
         {
             BtfPoolAnnouncement ann;
             ann.btfAddress = BtfLocalAddress();
-            ann.poolName = strPoolName;
-            ann.dashboardUrl = strPoolDashboardUrl;
+            ann.poolName = NostrClampUtf8(strPoolName, NOSTR_MAX_POOL_NAME);
+            ann.dashboardUrl = NostrClampUtf8(strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
             ann.feePercent = dPoolFeePercent;
             uint64 roundShares = 0;
             double totalHashRate = 0.0;

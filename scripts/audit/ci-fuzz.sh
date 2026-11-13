@@ -52,10 +52,11 @@ bin=$SRC/src/$t
 
 # Some harnesses write structured seeds of their own (the payload,
 # deserializer, decoder, script, v4-templates, P2Pool, light-peer, Tor,
-# SOCKS5, RPC and HTTP client ones); they join the corpus (a kept one too,
+# SOCKS5, RPC, HTTP client, chat, Nostr and swap
+# ones); they join the corpus (a kept one too,
 # so seeds added later reach it) without replacing anything. The others
 # start from one byte.
-case " fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client " in *" $t "*)
+case " fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap " in *" $t "*)
     sd=$OUT/seeds-$t
     rm -rf "$sd"; mkdir -p "$sd"
     BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true

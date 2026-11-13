@@ -58,6 +58,18 @@ jobs:
       - name: Run fuzz smoke for Tor control, SOCKS5, RPC (before and after authentication) and HTTP-client answers
         run: make fuzz-io-smoke
 
+      - name: Run chat-frame fuzz smoke
+        run: make fuzz-chat-frame-smoke
+
+      - name: Run chat-relay fuzz smoke
+        run: make fuzz-chat-relay-smoke
+
+      - name: Run nostr fuzz smoke
+        run: make fuzz-nostr-smoke
+
+      - name: Run swap fuzz smoke
+        run: make fuzz-swap-smoke
+
   windows-ucrt64:
     name: Windows UCRT64 selftests
     runs-on: windows-latest

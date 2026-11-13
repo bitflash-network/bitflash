@@ -26,6 +26,7 @@
 class CNode;
 class CInv;
 class CDataStream;
+class uint256;
 
 // One question in a "chatget": what is filed under `key` of `kind`, from
 // `nSince` on, at most `nMax` records.
@@ -59,6 +60,22 @@ bool ChatRelayProcessMessage(CNode* pfrom, const std::string& strCommand, CDataS
 
 // For "inv": do we already hold this record.
 bool ChatRelayAlreadyHave(const CInv& inv);
+
+// A peer announced a chat record we do not hold (an inv the node is about to
+// ask it for). Its chatrec for that id is taken; one it was never asked for is
+// not. Called from the message thread, as the chatrec handler is.
+void ChatRelayNoteAnnounced(CNode* pfrom, const uint256& hash);
+
+// The node-wide rations spent this minute (puts, relayed records), and, for the
+// self-tests, spending them all.
+void ChatRelayRations(int& nPuts, int& nRelayed);
+void ChatRelayExhaustRations();
+
+#ifdef BITFLASH_FUZZ
+// Fuzzing only: a fresh store whose work rule is nBits, and fresh node-wide
+// rations (chatrelay.cpp).
+void ChatRelayFuzzReset(unsigned int nBits);
+#endif
 
 // For "getdata": send the record if we hold it. True if it was ours to answer.
 bool ChatRelayServeGetData(CNode* pfrom, const CInv& inv);

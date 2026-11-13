@@ -892,6 +892,12 @@ public:
     int nChatPutsInWindow;
     int nChatQueriesInWindow;
     int64 nLastChatInvAsked;
+    // Answer bytes served to it this minute, and the chat records it
+    // announced that we have not received yet (id -> when), so a chatrec it
+    // was never asked for is not taken. Message thread only.
+    size_t nChatAnswerBytesInWindow;
+    map<uint256, int64> mapChatAsked;
+    int64 nChatAskedPurged;      // when mapChatAsked was last searched for old entries
 
     // Last getblocks we sent this peer, so we do not ask the same question
     // over and over. See CNode::PushGetBlocks.
@@ -963,6 +969,8 @@ public:
         nChatPutsInWindow = 0;
         nChatQueriesInWindow = 0;
         nLastChatInvAsked = 0;
+        nChatAnswerBytesInWindow = 0;
+        nChatAskedPurged = 0;
         pindexLastGetBlocksBegin = NULL;
         hashLastGetBlocksEnd = 0;
         nTimeConnected = GetTime();

@@ -5210,6 +5210,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
             if (!fAlreadyHave)
             {
+                if (inv.type == MSG_CHATREC)
+                    ChatRelayNoteAnnounced(pfrom, inv.hash);
                 if (!pfrom->AskFor(inv))
                     fAskForFull = true;
             }

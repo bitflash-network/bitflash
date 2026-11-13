@@ -679,6 +679,27 @@ bool NetPublish(ChatRecord& r, std::string& errOut)
             std::string why;
             if (!link.Put(r, nResult, why, err))
                 return -1;
+            // A node whose store is filling asks for more work (chatstore.h,
+            // ChatRecordFullnessBits) and says how much. Mine to that once and
+            // ask again; past what one core does in reasonable time, give up.
+            unsigned int nAsk = ChatRecordAskedBits(why);
+            // Never more than an honest node asks of a record this size (the
+            // size rule and the most a full store adds): a hostile node cannot
+            // make the app grind for a long time by naming a big figure.
+            if (nResult == ChatStore::REJECTED && nAsk > ChatRecordWork(r) &&
+                nAsk <= ChatRecordBitsFor(r.payload.size()) + 6)
+            {
+                ChatRecord again = r;
+                if (!ChatRecordMine(again, (volatile bool*)&fShutdown, nAsk))
+                    return -1;
+                if (!link.Put(again, nResult, why, err))
+                    return -1;
+                if (nResult == ChatStore::ACCEPTED || nResult == ChatStore::DUPLICATE)
+                {
+                    r = again;   // the same record with more work: other nodes take it too
+                    return 1;
+                }
+            }
             if (nResult == ChatStore::ACCEPTED || nResult == ChatStore::DUPLICATE)
                 return 1;
             strLastWhy = why;

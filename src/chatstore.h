@@ -106,6 +106,16 @@ static const size_t CHATREC_ENVELOPE_BUDGET = 32 * 1024 * 1024;
 static const size_t CHATREC_EPOCH_BUDGET    = 24 * 1024 * 1024;
 static const size_t CHATREC_DESC_BUDGET     =  8 * 1024 * 1024;
 
+// Extra work asked of a new record while its kind's budget is filling: none
+// below half, then 2 more bits (four times the work) from half, 4 from three
+// quarters, 6 from nine tenths. A store that stays near empty, which is the
+// normal case, costs the same as before; one being filled costs whoever fills
+// it more with every record, and a full one 64 times the base. The chat app
+// reads the figure off the refusal ("asks N bits") and mines again.
+unsigned int ChatRecordFullnessBits(size_t nUsed, size_t nBudget);
+// The bits a node's refusal asks for ("... asks N bits now"), 0 if it names none.
+unsigned int ChatRecordAskedBits(const std::string& why);
+
 // Envelopes kept under one tag. A pair that left more than this for each other
 // in a day is a flood, not a conversation, and the oldest go first.
 static const size_t CHATREC_MAX_PER_TAG = 64;
@@ -171,8 +181,16 @@ public:
 
     // Check everything and keep it if it passes. `secpctx` is a
     // secp256k1_context* able to verify. `idOut` gets the record id.
+    // fRelayed: the record came from another node, not from a chat app. It is
+    // judged by the base work plus the fullness bits less one step: it was made
+    // for the network, against whatever store its maker saw.
     Result Accept(void* secpctx, const ChatRecord& r, int64_t nNow,
-                  std::string& whyOut, unsigned char idOut[32]);
+                  std::string& whyOut, unsigned char idOut[32], bool fRelayed = false);
+
+    // The work, in leading zero bits, a new record of this kind and size has
+    // to show right now: the size rule (or the test override) plus what the
+    // kind's fullness adds (ChatRecordFullnessBits).
+    unsigned int RequiredBits(uint8_t kind, size_t nPayload, bool fRelayed = false) const;
 
     bool Has(const unsigned char id[32]) const;
     bool Get(const unsigned char id[32], ChatRecord& out) const;

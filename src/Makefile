@@ -77,7 +77,7 @@ LIBS = -L$(SECP_LIB) -lsecp256k1 \
 # past -- "duplicate section ... has different size". That is one object
 # indexing a struct by the old layout and another by the new one, in the same
 # binary. Nothing crashed here, and nothing would say so if it had.
-HEADERS = headers_core.h headers.h fuzz_datadir.h fuzz_socket.h jsonrpc.h util.h main.h serialize.h uint256.h \
+HEADERS = headers_core.h headers.h fuzz_datadir.h jsonsafe.h fuzz_socket.h jsonrpc.h util.h main.h serialize.h uint256.h \
           key.h bignum.h script.h db.h base58.h net.h nostr.h \
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
@@ -491,8 +491,62 @@ fuzz-v4-templates-smoke: fuzz-v4-templates
 	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/v4-templates ./fuzz-v4-templates -runs=0
 	./fuzz-v4-templates -runs=2000 ../work/fuzz-corpus/v4-templates
 
+obj-fuzz/fuzz_chat_frame.o: fuzz_chat_frame.cpp $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-chat-frame: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_chat_frame.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-chat-frame"
+
+obj-fuzz/fuzz_chat_relay.o: fuzz_chat_relay.cpp $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-chat-relay: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_chat_relay.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-chat-relay"
+
+obj-fuzz/fuzz_nostr.o: fuzz_nostr.cpp $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-nostr: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_nostr.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-nostr"
+
+obj-fuzz/fuzz_swap.o: fuzz_swap.cpp $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CXX) -c $(FUZZ_CXXFLAGS) -DBITFLASH_FUZZ -o $@ $<
+
+fuzz-swap: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_swap.o
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: fuzz-swap"
+
+# Chat frames and boxes, chat relay messages, Nostr relay messages and the swap
+# negotiation messages; each writes its own structured seeds.
+fuzz-chat-frame-smoke: fuzz-chat-frame
+	@rm -rf ../work/fuzz-corpus/chat-frame && mkdir -p ../work/fuzz-corpus/chat-frame
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/chat-frame ./fuzz-chat-frame -runs=0
+	./fuzz-chat-frame -runs=2000 ../work/fuzz-corpus/chat-frame
+
+fuzz-chat-relay-smoke: fuzz-chat-relay
+	@rm -rf ../work/fuzz-corpus/chat-relay && mkdir -p ../work/fuzz-corpus/chat-relay
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/chat-relay ./fuzz-chat-relay -runs=0
+	./fuzz-chat-relay -runs=2000 ../work/fuzz-corpus/chat-relay
+
+fuzz-nostr-smoke: fuzz-nostr
+	@rm -rf ../work/fuzz-corpus/nostr && mkdir -p ../work/fuzz-corpus/nostr
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/nostr ./fuzz-nostr -runs=0
+	./fuzz-nostr -runs=2000 ../work/fuzz-corpus/nostr
+
+fuzz-swap-smoke: fuzz-swap
+	@rm -rf ../work/fuzz-corpus/swap && mkdir -p ../work/fuzz-corpus/swap
+	BITFLASH_FUZZ_WRITE_SEEDS=../work/fuzz-corpus/swap ./fuzz-swap -runs=0
+	./fuzz-swap -runs=2000 ../work/fuzz-corpus/swap
+
 clean:
-	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer $(FUZZ_IO_TARGETS) test_bip32 test_btfaddr test_btfchan
+	rm -rf obj obj-node obj-fuzz test_light_pow test-light-pow-sanitize fuzz-light-pow bitflash bitflash-node fuzz-net-message fuzz-script fuzz-sigcheck fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap fuzz-p2pool fuzz-light-peer $(FUZZ_IO_TARGETS) test_bip32 test_btfaddr test_btfchan
 
 test_bip32: test_bip32.cpp bip32.cpp bip32.h bip39_english.h
 	$(CXX) $(CXXFLAGS) -o $@ test_bip32.cpp bip32.cpp $(PLATFORM_LIB) -lssl -lcrypto
@@ -661,7 +715,10 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chat-link
 	./bitflash-node -selftest=chat-identity
 	./bitflash-node -selftest=chat-relay
+	./bitflash-node -selftest=chat-dos
+	./bitflash-node -selftest=nostr-relay
+	./bitflash-node -selftest=swap-prune
 	./bitflash-node -selftest=chat-wallet
 
 .PHONY: tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke \
-        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-p2pool-smoke fuzz-light-peer-smoke fuzz-io-smoke
+        fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-chat-frame-smoke fuzz-chat-relay-smoke fuzz-nostr-smoke fuzz-swap-smoke fuzz-p2pool-smoke fuzz-light-peer-smoke fuzz-io-smoke

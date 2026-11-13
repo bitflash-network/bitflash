@@ -47,6 +47,8 @@ public:
 
     bool Write(const unsigned char* p, size_t n);
     bool Read(unsigned char* p, size_t n);
+    // Seconds each read or write may wait from now on.
+    void SetTimeout(int nTimeoutSecs) { nTimeout = nTimeoutSecs; }
 
 private:
     btf_socket_t sock;

@@ -7,6 +7,7 @@
 
 #include <sodium.h>
 
+#include <cstdio>
 #include <cstring>
 
 namespace btfchat
@@ -212,6 +213,31 @@ unsigned int ChatRecordWork(const ChatRecord& r)
     return LeadingZeroBits(id);
 }
 
+unsigned int ChatRecordFullnessBits(size_t nUsed, size_t nBudget)
+{
+    if (nBudget == 0 || nUsed < nBudget / 2)
+        return 0;
+    if (nUsed < nBudget / 4 * 3)
+        return 2;
+    if (nUsed < nBudget / 10 * 9)
+        return 4;
+    return 6;
+}
+
+unsigned int ChatRecordAskedBits(const std::string& why)
+{
+    size_t at = why.find("asks ");
+    if (at == std::string::npos)
+        return 0;
+    unsigned int n = 0;
+    size_t i = at + 5;
+    for (; i < why.size() && i < at + 8 && why[i] >= '0' && why[i] <= '9'; i++)
+        n = n * 10 + (unsigned int)(why[i] - '0');
+    if (i == at + 5 || why.compare(i, 5, " bits") != 0 || n > 256)
+        return 0;
+    return n;
+}
+
 bool ChatRecordHasWork(const ChatRecord& r, unsigned int nBitsOverride)
 {
     unsigned int nNeed = nBitsOverride ? nBitsOverride : ChatRecordBitsFor(r.payload.size());
@@ -379,7 +405,7 @@ void ChatStore::Remove(std::string id)
 }
 
 ChatStore::Result ChatStore::Accept(void* secpctx, const ChatRecord& r, int64_t nNow,
-                                    std::string& whyOut, unsigned char idOut[32])
+                                    std::string& whyOut, unsigned char idOut[32], bool fRelayed)
 {
     whyOut.clear();
     r.Id(idOut);
@@ -400,9 +426,13 @@ ChatStore::Result ChatStore::Accept(void* secpctx, const ChatRecord& r, int64_t 
         whyOut = "record has expired";
         return REJECTED;
     }
-    if (!ChatRecordHasWork(r, nBitsOverride))
+    unsigned int nNeed = RequiredBits(r.kind, r.payload.size(), fRelayed);
+    if (ChatRecordWork(r) < nNeed)
     {
-        whyOut = "not enough proof of work";
+        // The number is what the chat app reads to mine again (btfchatnet.cpp).
+        char buf[96];
+        snprintf(buf, sizeof(buf), "not enough proof of work: this node asks %u bits now", nNeed);
+        whyOut = buf;
         return REJECTED;
     }
 
@@ -486,6 +516,21 @@ ChatStore::Result ChatStore::Accept(void* secpctx, const ChatRecord& r, int64_t 
         Remove(bk->second.begin()->second);
     Insert(r, id);
     return ACCEPTED;
+}
+
+unsigned int ChatStore::RequiredBits(uint8_t kind, size_t nPayload, bool fRelayed) const
+{
+    unsigned int nBase = nBitsOverride ? nBitsOverride : ChatRecordBitsFor(nPayload);
+    // A record relayed by another node was made for the network, against the
+    // store its maker saw, which may be a little emptier than this one: it
+    // needs the base work plus the fullness less one step (two bits). Not the
+    // base alone, or relayed records could fill a budget at the base price.
+    if (fRelayed)
+    {
+        unsigned int nFull = ChatRecordFullnessBits(Bytes(kind), BudgetFor(kind));
+        return nBase + (nFull > 2 ? nFull - 2 : 0);
+    }
+    return nBase + ChatRecordFullnessBits(Bytes(kind), BudgetFor(kind));
 }
 
 bool ChatStore::Has(const unsigned char id[32]) const
