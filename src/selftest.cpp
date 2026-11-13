@@ -8928,7 +8928,9 @@ static int RunChatDosSelfTest()
         r.nTime = nNow;
         r.payload.assign(100, 7);
         btfchat::ChatRecordMine(r, 0, 1);
-        while (btfchat::ChatRecordWork(r) >= 3)
+        // the base work (1 bit) but less than the 3 bits asked: a nonce that
+        // gives 0 bits would make the relayed case below fail by chance
+        while (btfchat::ChatRecordWork(r) >= 3 || btfchat::ChatRecordWork(r) < 1)
             r.nNonce++;
         unsigned char id[32];
         btfchat::ChatStore::Result res = st.Accept(ctx, r, nNow, why, id);
@@ -8943,7 +8945,7 @@ static int RunChatDosSelfTest()
         btfchat::ChatRecord r2 = r;
         r2.payload[0] ^= 1;
         btfchat::ChatRecordMine(r2, 0, 1);
-        while (btfchat::ChatRecordWork(r2) >= 3)
+        while (btfchat::ChatRecordWork(r2) >= 3 || btfchat::ChatRecordWork(r2) < 1)
             r2.nNonce++;
         nFail += Check(st.Accept(ctx, r2, nNow, why, id) == btfchat::ChatStore::REJECTED,
                        "while one put by a chat app with that work is still refused") ? 0 : 1;
