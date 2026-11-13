@@ -214,16 +214,16 @@ check (`docs/release-verification.md`).
 
 ## Last full run
 
-November 2026. Every input the node does not control was fuzzed under AddressSanitizer and UndefinedBehaviorSanitizer with libFuzzer, AFL++ and honggfuzz (the P2P envelope and payloads, scripts and signatures, serialized records, text decoders, light-client proof of work, the share chain, Tor control and SOCKS5 replies, the RPC server, the HTTP client, chat, Nostr and swap negotiation). Consensus, rules v4, denial of service, the wallet and cryptography, and swaps and the light clients were each reviewed by hand, line by line, on 10 November, and every review was followed by an independent review of the fix before it was merged (pull requests #56 to #66 and #69 to #73, merged between 10 and 12 November). Self-test coverage of the consensus files was raised, and a final full pass closes the run. Nothing was built or run for the manual reviews themselves; every finding was traced to code and every fix has a self-test that fails on the old code or, where it cannot (a race, a clock), says so.
+November 2026. Every input the node does not control was fuzzed under AddressSanitizer and UndefinedBehaviorSanitizer with libFuzzer, AFL++ and honggfuzz (the P2P envelope and payloads, scripts and signatures, serialized records, text decoders, light-client proof of work, the share chain, Tor control and SOCKS5 replies, the RPC server, the HTTP client, chat, Nostr and swap negotiation). Consensus, rules v4, denial of service, the wallet and cryptography, and swaps and the light clients were each reviewed by hand, line by line, on 10 November, and the fixes were independently reviewed before merge (#59, #61, #62, #63 and #64 have review notes; the sections below cite independent reviews of #65, #66, #70, #71, #72 and #73). Pull requests #56 to #66 and #69 to #73 were merged between 10 and 12 November, and #67 and #68 in the same days were documentation only. Self-test coverage of the consensus files was raised, and a final full pass closes the run. Nothing was built or run for the manual reviews themselves; every finding was traced to code and every fix has a self-test that fails on the old code or, where it cannot (a race, a clock), says so.
 
 Where each kind of result ran:
 
 | what | where |
 |---|---|
-| builds, short fuzz runs, the instrumented self-test passes, reprotest | the Debian 13 server ("the 202", 4 cores, clang 19), one heavy job at a time |
+| builds, short fuzz runs, the instrumented self-test passes, reprotest | the Debian 13 build server ("the build server", 4 cores, clang 19), one heavy job at a time |
 | long fuzzing, 2 h or more per engine per harness, corpora kept between runs; coverage per harness; the self-tests under ASan+UBSan, TSan and Valgrind | GitHub Actions, "Audit campaign" |
-| the self-test suites | the Windows UCRT64 bench and Linux (the 202, and the CI jobs) |
-| sync compatibility between a release-equivalent node and the new one | testnet nodes on the 202, each with its own data directory and managed Tor |
+| the self-test suites | the Windows UCRT64 bench and Linux (the build server, and the CI jobs) |
+| sync compatibility between a release-equivalent node and the new one | testnet nodes on the build server, each with its own data directory and managed Tor |
 
 Findings are named as in the review that raised them. "Self-test" is the test that pins the fix. Merge commits are shortened. Where a finding was judged not to be a defect, or is deferred, the row says so.
 
@@ -231,7 +231,7 @@ Findings are named as in the review that raised them. "Self-test" is the test th
 
 #### Consensus
 
-Review of `main.cpp`, `script.cpp`, `serialize.h`, `db.cpp` and the block, transaction and chain-selection paths. Findings 2, 4, 8 and 12 would change which blocks are valid, so they ship as rules v5, which is not scheduled (see "Open by design or deferred"). The rest change no block's validity on any live chain and ship without a switch.
+Review of `main.cpp`, `script.cpp`, `serialize.h`, `db.cpp` and the block, transaction and chain-selection paths. Findings 2, 4 and 8 would change which blocks are valid, so they ship as rules v5, which is not scheduled (see "Open by design or deferred"). The rest change no block's validity on any live chain and ship without a switch; finding 12 is among them, because the new subsidy is identical to the old for every height below 64 halvings.
 
 | finding | what was wrong | fixed in | self-test |
 |---|---|---|---|
@@ -246,7 +246,7 @@ Review of `main.cpp`, `script.cpp`, `serialize.h`, `db.cpp` and the block, trans
 | 9 (Low) | The memory pool kept transactions that were not final. | #61 `4751977` | `reorg-safety` |
 | 10 (Low) | Blocks reconnected by `Reorganize` were never re-checked, and the startup repair could be undone by the next child on the bad branch. | #61 `4751977` (the load check marks the first bad block and its descendants; the check ignores the local clock) | `reorg-safety` |
 | 11 (Low) | The orphan-block pool was capped by count only. | #61 `4751977` (32 MB byte cap; once synced, an orphan far easier than the tip is not held; checked before the RandomX hash) | `consensus-safety` |
-| 12 (Info) | The subsidy shift is undefined from 64 halvings (BIP42), height 13,440,000 and later. | #58 `fa5b5db` (subsidy is 0 from 64 halvings; identical for every earlier height, checked for all) | `rules-v5` |
+| 12 (Info) | The subsidy shift is undefined from 64 halvings (BIP42), height 13,440,000 and later. | #58 `fa5b5db` (no switch: subsidy is 0 from 64 halvings, identical for every earlier height, checked for all) | `rules-v5` |
 | 13 (Info) | `OP_VER` and `OP_VERIF` stay version-dependent until rules v3 lock in. | Not a defect: a short, known window that ends at the v3 switch. Listed so the write-up is complete. | none |
 | 14 (Info) | A zero or negative compact `nBits` passed the limit test in `CheckBlock`. | #61 `4751977` | `consensus-safety` |
 | 15 (Info) | An overflow in `ReplacementPaysEnough` at fee levels no real transaction reaches. | #61 `4751977` (big-number comparison) | `consensus-safety` |
@@ -256,7 +256,7 @@ Checked and found correct (no change): `CheckTransaction`, `GetValueOut`, the mo
 
 #### Rules v4 and v5
 
-Review of CSV, CTV, CSFS and the vault, batch and inheritance templates built on them. No consensus bug: the code follows BIP68, BIP112, BIP340 and BIP348, and BIP119 without the scriptSigs field (documented). The defects were in the wallet layer. Rules v5 (#58) is the vehicle for the consensus tightenings above and for the CSFS sigop item below.
+Review of CSV, CTV, CSFS and the vault, batch and inheritance templates built on them. No consensus bug: the code follows BIP68, BIP112, BIP340 and BIP348, and BIP119 without the scriptSigs field (documented). The defects were in the wallet layer. Rules v5 (#58) carries findings 2, 4 and 8 above and the CSFS sigop item below.
 
 | finding | what was wrong | fixed in | self-test |
 |---|---|---|---|
@@ -297,6 +297,8 @@ Review of everything a remote peer can make the node hold, write or compute. Fix
 | L5 (Low) | A pre-switch block can force the v1 RandomX cache to be built on a node that has not allocated it. | Deferred: the fix is a timestamp check before the hash in `CheckBlock`, consensus code, not changed the day before a release (see below). | |
 | L6 (Low) | Fully checked P2Pool shares are capped by count, not by bytes. | #66 `134dc25` | `p2pool-dos`, `p2pool-chain` |
 
+The manual DoS review did not cover `explorer.cpp`, the `jsonrpc.cpp` and `rpc.cpp` handlers, the chat app beyond its listener, `invoice.cpp` or `tor.cpp` control handling. Part of that ground was covered later by harnesses: Tor control, SOCKS5, RPC before and after authentication and the HTTP client by #72, and chat, Nostr and swap negotiation by #70.
+
 Reviewed and found bounded (no change): orphan transactions, the mempool, `mapRelay`, wire message size, deserialization growth, block limits, `btfpeers`, `p2ppeers`, `p2pgetsh`, `p2pshare` and `p2pshares` sizes, share-chain pruning, chat record and query limits, light-client receive budgets, foreign block parsing, stratum line and miner limits, Nostr frame sizes, chat history limits, connection caps, and the legacy order messages.
 
 The independent review of #59 found three further problems in the first version of the fix, all fixed before merge: the shared block budget could be drained by blocks that fail a cheap check (regression), our own `getdata` could still grow a peer's send buffer, and a replaced connection could stall an old node's sync mid-chain (fixed by the tip hint above). A refused block is now asked for again once there is budget.
@@ -328,7 +330,7 @@ Review of keys, encryption, coin selection, fees, restore, dump and import, lock
 | I3 (Info) | Coin selection used an unseeded generator. | #62 `a9406ff` | `wallet-encrypted-seed` |
 | I4 (Info) | The hybrid chat channel authenticates the endpoint with X25519 only; the ML-KEM key is ephemeral. | Not a defect: the design protects against harvest-now-decrypt-later, not against an active quantum impersonator. | none |
 | I5 (Info) | The encrypted HD seed uses a fixed IV per label. | Not a defect: each plaintext is encrypted once per master key. | none |
-| I6 (Info) | No dust rule: change of any size becomes an output. | Deferred. | none |
+| I6 (Info) | No dust rule: change of any size becomes an output. | Deferred: rated Info by the review, and it is a policy choice (what counts as dust), not a defect that loses funds; not part of this run's fixes. | none |
 | extra | `spendscript` signed from the plain key map only, so vaults in encrypted wallets could not be withdrawn. | #62 `a9406ff` | `wallet-rpc-v4` |
 
 Checked and found correct (no change): signing (low-S, strict DER), BIP32 and BIP39 handling, the wallet key derivation and AES use, wrong-passphrase handling, `EncryptWallet`, dump and import, lock order, `CreateTransaction`, RPC authentication and cookie, secret logging, constant-time comparisons, and the whole hybrid chat construction (X25519 low-order rejection, ML-KEM-1024 with implicit rejection, the combiner, the ratchet, sealed envelopes, Argon2id identity, replay guard).
@@ -372,7 +374,7 @@ Checked and found correct (no change): the contract template, hash and preimage 
 | TSan | A lock-order inversion in wallet loading. | #56 `3bb7c75` | the instrumented self-test passes |
 | UBSan, others | Signed shifts in Base64; an out-of-range enum; `delete` on `new[]`; `db.log` created without a mode and in the working directory; a clang 19 compile error. | #56 `3bb7c75` | the instrumented self-test passes |
 | Trivy | The release packages carried Tor 0.4.9.11; 0.4.9.14 fixed high-severity bugs. | #56 `3bb7c75` (Tor Expert Bundle 16.0, tor 0.4.9.15) | release workflow |
-| `fuzz-p2p-payload` | `ProcessBlock` leaked every duplicate block, and the pool freed refused blocks a second time. | #57 `a40e674` (`ProcessBlock` owns the block on every path) | `net-hardening` |
+| `fuzz-p2p-payload` | `ProcessBlock` leaked every duplicate block, and the orphan-block pool freed refused blocks a second time. | #57 `a40e674` (`ProcessBlock` owns the block on every path) | `net-hardening` |
 | `fuzz-net-message`, UBSan | `AddTimeData` overflowed on a peer's version time near the ends of the integer range. | #57 `a40e674` | `net-hardening` |
 | `fuzz-deserialize` | `ReadCompactSize` took any width and callers kept the result in 32 bits, so one transaction had many wire encodings. | #64 `14564fc` (shortest form only, nothing above `MAX_SIZE`; validity of blocks and transactions unchanged) | `serialize-canonical` |
 | `fuzz-deserialize` | A relayed or held orphan `tx` kept the whole payload, including bytes after the transaction. | #64 `14564fc` (held and relayed re-encoded) | `serialize-canonical` |
@@ -420,8 +422,9 @@ These are not bugs. Bitflash descends from Bitcoin 0.1.0, and the self-tests
 (`script-opcodes` has 488 rows) pin the behaviour as it is, so that a change
 to any of them is deliberate and shows up as a failing test.
 
-- **Unassigned NOPs fail the script.** There are no `OP_NOP1` to `OP_NOP10`
-  here, so there is no NOP upgrade path: a new rule needs a new rule set, not
+- **Unassigned NOPs fail the script.** Bitcoin's NOP bytes other than
+  `OP_NOP` (0x61) are not NOPs here: 0xb1 to 0xb3 are CLTV, CSV and CTV, and
+  the others (0xb0, 0xb4 to 0xb9) fail when run. There is no NOP upgrade path: a new rule needs a new rule set, not
   a redefined NOP. Rules v4 is built that way (CSV, CTV and CSFS fail before
   activation).
 - **No 4-byte limit on numeric operands.** Script numbers may be any length.
@@ -565,10 +568,10 @@ The final pass repeats all of these on the last commit (next section).
 - **DoS L3, light-client block storage.** The light client keeps whole foreign blocks and rewrites them on every save. Fixing it needs a new state format for the light clients, the same change that the swaps M1 remainder below needs.
 - **DoS L5, v1 RandomX cache check.** A pre-switch block can make a node that has not allocated the v1 cache build it. The fix is a timestamp check before the hash in `CheckBlock`; that is consensus code, and it is not touched this close to a release.
 - **Swaps M1, remainder.** The per-contract "still scanning" gate and expiry of watches on contracts that were never funded need a change to the light client's state format. The remote trigger is closed.
-- **Wallet: dust rule (I6)** and the secure allocator for the global seed copies and the `DumpWallet` hex temporaries (part of L3).
-- **P2P, from the review of #59.** Per-command message size caps at the header (the effective receive bound is about 37 MB; it needs each owner's maximum message size); a cross-peer ceiling on queued bytes; identifying inbound onion peers by their rendezvous circuit (needs PROXY-header parsing in both listeners); penalties for bad pool submissions (pool operator code).
+- **Wallet: dust rule (I6)**, see the wallet table: an Info item and a policy choice. **Secure allocator for the global seed copies and the `DumpWallet` hex temporaries (the rest of L3):** the other buffers are wiped; these two need a locked, wiping allocator in place of the standard containers, a change across the key and wallet code that was not made in this run.
+- **P2P, from the review of #59.** Per-command message size caps at the header (the effective receive bound is about 37 MB; it needs each owner's maximum message size); a cross-peer ceiling on queued bytes (each peer's queue and the 117 inbound slots are bounded now; a shared ceiling needs a choice of whose data to drop); identifying inbound onion peers by their rendezvous circuit (needs PROXY-header parsing in both listeners); penalties for bad pool submissions (pool operator code).
 - **Script size.** There is no `MAX_SCRIPT_SIZE`; the work per operation is linear in script size, bounded by the block size. A candidate rule for a later rule set, not measured as a problem (see the script-engine section).
-- **Chat, left for 1.2.34** (from the second review of #70; none is a way in, each serves an honest user worse than possible): an idempotent receipt for a frame refused only as a replay after a failed save; a "duplicate" answer instead of "slow down" for a record already held; a longer age (8 to 10 s) before a handshake can be evicted; a cut flag on a `chatget` cut by the answer ration; work for records put at a node under half full; per-source sub-budgets. The details are in "Chat, Nostr and swap negotiation" below.
+- **Chat, left for the next release (1.2.34)** (from the second review of #70; none is a way in, each serves an honest user worse than possible): an idempotent receipt for a frame refused only as a replay after a failed save; a "duplicate" answer instead of "slow down" for a record already held; a longer age (8 to 10 s) before a handshake can be evicted; a cut flag on a `chatget` cut by the answer ration; work for records put at a node under half full; per-source sub-budgets. The details are in "Chat, Nostr and swap negotiation" below.
 - **Test gaps, swaps.** A paid-lock case in `swap-rpc` and an automated check of the "paid, unpaid or unknown" answer need a node that accepts inputs and a fake Core RPC server. The testnet proof with coins covers the paid case.
 
 ### Release notes
@@ -594,7 +597,7 @@ Pull requests with behaviour users notice. The full lists are in the PR bodies (
 The final full pass on `main` at `2c86386` is GitHub Actions run 43352384854:
 every harness for 30 minutes per engine as a regression pass, and the
 self-tests under AddressSanitizer + UndefinedBehaviorSanitizer, ThreadSanitizer
-and Valgrind; and on the Debian 13 server: secrets, dependencies, static
+and Valgrind; and on the Debian 13 build server: secrets, dependencies, static
 analysis, heap, coverage and the reproducible-build check. The 2 h or more per
 engine of evidence per harness is the per-PR campaigns listed under "Fuzzing"
 above; the final pass is a regression run on the merged code.
@@ -753,7 +756,7 @@ copying and scanning the script; inputs are capped at 4 kB for it.
 Line coverage of the merged corpora: `script.cpp` 71.6% (the rest is wallet
 signing and solving, outside the target; `EvalScript` 81%, its misses mostly
 the bodies of disabled opcodes), `CheckTemplateHash`, `GetP2SHSigOpCount` and
-the key-count checks 100%. Measured on the 202 from the same corpora: the
+the key-count checks 100%. Measured on the build server from the same corpora: the
 template builders in `v4templates.h` (`VaultUnvaultScript`, `CtvScript`,
 `TemplateHashFor`, `InheritSequence`, `InheritScript`, `ParseInheritScript`)
 100% each, `OutputsFromParam` 87.5%, `CheckCtvSpendPolicy` 87.0%.
@@ -816,7 +819,7 @@ with tens of megabytes queued and is covered by `p2pool-dos`).
 reach a kept corpus); both were fixed and the harnesses run again.
 
 Self-tests after the last change: Windows suite 83 "ALL TESTS PASSED", 0
-failures; Linux (the 202) 81, 0 failures.
+failures; Linux (the build server) 81, 0 failures.
 
 ## Chat, Nostr and swap negotiation (`fuzz-chat-frame`, `fuzz-chat-relay`, `fuzz-nostr`, `fuzz-swap`)
 
@@ -864,5 +867,5 @@ Corpus after each engine (libFuzzer, AFL++, honggfuzz) and merged:
 `fuzz-chat-frame` 3,996 / 9,103 / 4,618, merged 2,309; `fuzz-chat-relay`
 7,399 / 7,257 / 9,653, merged 2,621; `fuzz-nostr` 8,480 / 8,628 / 10,498,
 merged 2,662; `fuzz-swap` 5,040 / 4,993 / 7,642, merged 2,120. Self-tests on
-the final commit: Linux (the 202) `make tests` 90 passed, 0 failures, and the
+the final commit: Linux (the build server) `make tests` 90 passed, 0 failures, and the
 four smokes; Windows through the CI job.
