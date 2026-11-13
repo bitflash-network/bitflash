@@ -180,7 +180,9 @@ extern int nDropMessagesTest;
 #define MINE_SOLO        1
 #define MINE_OPERATOR    2
 #define MINE_PARTICIPANT 3
-extern int    nMineMode;
+// Atomic: the GUI switches mining on and off while the miner threads and the
+// wallet's relock timer read these (ThreadSanitizer).
+extern std::atomic<int> nMineMode;
 // Set by the startup parser when a flag chose the mode. LoadWallet leaves the
 // stored mode alone when this is true, so a flag is never silently overruled by
 // something a previous session wrote.
@@ -225,7 +227,7 @@ struct PoolWorkerStatView
 };
 
 // Settings
-extern int fGenerateBitcoins;
+extern std::atomic<int> fGenerateBitcoins;   // atomic: see nMineMode
 extern int64 nTransactionFee;
 // The flat fee setting is at most this. Above it is a unit mistake ("1000"
 // meant as satoshis), and it would be paid on every send and pool payout.
@@ -262,7 +264,7 @@ extern unsigned int nWalletMasterKeyMaxID;
 extern CKeyingMaterial vWalletMasterKey;
 extern vector<unsigned char> vchCryptedHDMaster;
 extern vector<unsigned char> vchCryptedHDChainCode;
-extern bool fWalletEncrypted;
+extern std::atomic<bool> fWalletEncrypted;
 extern std::atomic<bool> fWalletLocked;
 bool IsWalletEncrypted();
 bool IsWalletLocked();

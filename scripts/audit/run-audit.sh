@@ -64,18 +64,27 @@ selftest_cmds() { make -s -n -C "$1" tests RANDOMX_DIR="$RANDOMX_DIR" 2>/dev/nul
 # Builds the self-test binaries in $1 with clang and the flags $2, then runs every
 # self-test with the prefix $3 (a wrapper such as valgrind, or nothing).
 # Each self-test gets its own log; one failing does not stop the rest.
+# $5, optional: self-tests not run in this phase, one per line as
+# "name|reason". Each one skipped is named in the summary with its reason.
 run_selftests() {
-    dir=$1; flags=$2; wrap=$3; tag=$4
+    dir=$1; flags=$2; wrap=$3; tag=$4; skip=${5:-}
     (cd "$dir" && make -j "$J" CXX="clang++ $flags" CC="clang $flags" RANDOMX_DIR="$RANDOMX_DIR" \
         bitflash-node btfchat $(selftest_cmds "$dir" | sed -n 's|^\./\(test_[a-z0-9_]*\)$|\1|p' | sort -u) \
         > "$OUT/$tag-build.log" 2>&1)
     rc=$?
     if [ $rc -ne 0 ]; then say "$tag build FAILED (exit $rc), see $tag-build.log"; return; fi
     mkdir -p "$OUT/$tag"
-    fails=0; n=0
+    fails=0; n=0; nskip=0
     while read -r cmd; do
         n=$((n + 1))
         name=$(echo "$cmd" | sed 's|^\./||; s|bitflash-node -selftest=||')
+        why=$(printf '%s\n' "$skip" | awk -F'|' -v n="$name" '$1 == n { print $2; exit }')
+        if [ -n "$why" ]; then
+            nskip=$((nskip + 1))
+            echo "$name: $why" >> "$OUT/$tag/SKIPPED.txt"
+            say "$tag: skipped $name ($why)"
+            continue
+        fi
         (cd "$dir" && timeout 3600 $wrap $cmd) > "$OUT/$tag/$name.log" 2>&1
         r=$?
         if [ $r -ne 0 ] || grep -q 'ERROR: \(Address\|Leak\|Thread\)Sanitizer\|runtime error:\|WARNING: ThreadSanitizer\|ERROR SUMMARY: [1-9]' "$OUT/$tag/$name.log"; then
@@ -83,7 +92,7 @@ run_selftests() {
             echo "$name exit=$r" >> "$OUT/$tag/FAILED.txt"
         fi
     done < <(selftest_cmds "$dir")
-    say "$tag: $n self-tests, $fails with a failure or a sanitizer report (list: $tag/FAILED.txt)"
+    say "$tag: $n self-tests, $fails with a failure or a sanitizer report (list: $tag/FAILED.txt)$([ "$nskip" -gt 0 ] && echo ", $nskip of them skipped in this phase (list: $tag/SKIPPED.txt)")"
 }
 
 phase_secrets() {
@@ -180,7 +189,15 @@ phase_tsan() {
 phase_valgrind() {
     have valgrind || return
     d=$(tree valgrind)
-    run_selftests "$d" "-g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite --suppressions=$SRC/scripts/audit/valgrind.supp" valgrind
+    # Skipped under Valgrind only (ASan and TSan still run them); none is a memory finding.
+    # RandomX under Valgrind does not get the hardware floating-point rounding modes, so the recorded nonce hints stop meeting the target:
+    vgskip="orphan-blocks|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target
+block-index-load|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target"
+    # Per-minute rations on the wall clock, with no test clock to slow down; Valgrind's slowdown runs the minute out mid-test:
+    vgskip="$vgskip
+chat-dos|per-minute rations on the wall clock; Valgrind's slowdown runs the minute out mid-test
+chat-relay|per-minute rations on the wall clock; Valgrind's slowdown runs the minute out mid-test"
+    run_selftests "$d" "-g -O1" "valgrind --quiet --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite --suppressions=$SRC/scripts/audit/valgrind.supp" valgrind "$vgskip"
 }
 
 phase_heap() {

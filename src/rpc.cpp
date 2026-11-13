@@ -1124,7 +1124,7 @@ static void WritePoolStatusJsonLocked()
     j["node"] = {
         {"height", nBestHeight},
         {"poolRunning", (bool)gPoolRunning},
-        {"mode", nMineMode}
+        {"mode", nMineMode.load()}
     };
 
     j["pool"] = {

@@ -76,16 +76,31 @@ public:
     // EC_KEY_copy leaves the destination's private key in place when the
     // source has none. The old object is freed (EC_KEY_free clears the
     // secret) and a new one gets the public key.
+    //
+    // A key with no secret has nothing to forget and is left as it is: the
+    // wallet locks with keyUser in whatever state it is in, including a key
+    // that never received any material (a fresh CKey has neither half). A key
+    // with a secret but no public half loses the secret all the same, and
+    // reports false.
     bool ForgetPrivKey()
     {
+        if (!HasPrivKey())
+            return true;
         vector<unsigned char> vchPub;
+        bool fHavePub = true;
         try { vchPub = GetPubKey(); }
-        catch (...) { return false; }
+        catch (...) { fHavePub = false; }
         EC_KEY* pNew = EC_KEY_new_by_curve_name(NID_secp256k1);
         if (pNew == NULL)
             return false;
         EC_KEY_free(pkey);
         pkey = pNew;
+        if (!fHavePub)
+        {
+            printf("CKey::ForgetPrivKey() : the key had a secret but no readable public half; "
+                   "the secret is dropped and the key is left empty\n");
+            return false;
+        }
         return SetPubKey(vchPub);
     }
 
@@ -164,8 +179,16 @@ public:
         return true;
     }
 
+    // A key with no public point (a fresh CKey, before MakeNewKey, SetPubKey
+    // or SetSecret) throws. It is checked here because no OpenSSL version can
+    // be relied on to check it: i2o_ECPublicKey passes the NULL point on to
+    // EC_POINT_point2oct, and 1.0.2, 1.1.1 and 3.0 read through it and the
+    // process dies (found by AddressSanitizer on OpenSSL 3.0: LockWallet on a
+    // wallet whose keyUser was never set). Newer 3.x return an error instead.
     vector<unsigned char> GetPubKey() const
     {
+        if (EC_KEY_get0_public_key(pkey) == NULL)
+            throw key_error("CKey::GetPubKey() : the key has no public point");
         unsigned int nSize = i2o_ECPublicKey(pkey, NULL);
         if (!nSize)
             throw key_error("CKey::GetPubKey() : i2o_ECPublicKey failed");
