@@ -2364,12 +2364,17 @@ static int RunWalletCryptoSelfTest()
             nFail += Check(keyFull.ForgetPrivKey() && !keyFull.HasPrivKey() &&
                            keyFull.GetPubKey() == vchFullPub,
                            "a full key forgets its secret and keeps its public key") ? 0 : 1;
+            // Assignment would not empty keyUser (EC_KEY_copy leaves the
+            // destination's halves when the source has none): it is rebuilt.
             CKey keySaved = keyUser;
-            keyUser = keyEmpty;
+            keyUser.~CKey();
+            new (&keyUser) CKey();
             nFail += Check(UnlockWallet(strPassphrase, strError), "unlocked again") ? 0 : 1;
             LockWallet();
-            nFail += Check(IsWalletLocked(), "a wallet whose default key holds nothing locks") ? 0 : 1;
-            keyUser = keySaved;
+            nFail += Check(IsWalletLocked() && !keyUser.HasPrivKey(),
+                           "a wallet whose default key holds nothing locks") ? 0 : 1;
+            keyUser.~CKey();
+            new (&keyUser) CKey(keySaved);
         }
     }
     catch (const std::exception& e)
@@ -12670,6 +12675,8 @@ static void SelfTestFreeBlockIndex()
     mapBlockIndex.clear();
     pindexGenesisBlock = NULL;
     pindexBest = NULL;
+    pindexBadChainFork = NULL;
+    pindexBadChainFirst = NULL;
     hashBestChain = 0;
     nBestHeight = -1;
 }

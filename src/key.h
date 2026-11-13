@@ -95,7 +95,13 @@ public:
             return false;
         EC_KEY_free(pkey);
         pkey = pNew;
-        return fHavePub && SetPubKey(vchPub);
+        if (!fHavePub)
+        {
+            printf("CKey::ForgetPrivKey() : the key had a secret but no readable public half; "
+                   "the secret is dropped and the key is left empty\n");
+            return false;
+        }
+        return SetPubKey(vchPub);
     }
 
     bool HasPrivKey() const
@@ -174,10 +180,11 @@ public:
     }
 
     // A key with no public point (a fresh CKey, before MakeNewKey, SetPubKey
-    // or SetSecret) throws. It is checked here because i2o_ECPublicKey does
-    // not check it in every OpenSSL: 3.0 passes the NULL point on to
-    // EC_POINT_point2oct, which reads through it and the process dies (found
-    // by AddressSanitizer: LockWallet on a wallet whose keyUser was never set).
+    // or SetSecret) throws. It is checked here because no OpenSSL version can
+    // be relied on to check it: i2o_ECPublicKey passes the NULL point on to
+    // EC_POINT_point2oct, and 1.0.2, 1.1.1 and 3.0 read through it and the
+    // process dies (found by AddressSanitizer on OpenSSL 3.0: LockWallet on a
+    // wallet whose keyUser was never set). Newer 3.x return an error instead.
     vector<unsigned char> GetPubKey() const
     {
         if (EC_KEY_get0_public_key(pkey) == NULL)
