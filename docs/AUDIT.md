@@ -214,7 +214,7 @@ check (`docs/release-verification.md`).
 
 ## Last full run
 
-November 2026. Every input the node does not control was fuzzed under AddressSanitizer and UndefinedBehaviorSanitizer with libFuzzer, AFL++ and honggfuzz (the P2P envelope and payloads, scripts and signatures, serialized records, text decoders, light-client proof of work, the share chain, Tor control and SOCKS5 replies, the RPC server, the HTTP client, chat, Nostr and swap negotiation). Consensus, rules v4, denial of service, the wallet and cryptography, and swaps and the light clients were each reviewed by hand, line by line, on 10 November, and the fixes were independently reviewed before merge (#59, #61, #62, #63 and #64 have review notes; the sections below cite independent reviews of #65, #66, #70, #71, #72 and #73). Pull requests #56 to #66 and #69 to #73 were merged between 10 and 12 November, and #67 and #68 in the same days were documentation only. Self-test coverage of the consensus files was raised, and a final full pass closes the run. Nothing was built or run for the manual reviews themselves; every finding was traced to code and every fix has a self-test that fails on the old code or, where it cannot (a race, a clock), says so.
+November 2026. Every input the node does not control was fuzzed under AddressSanitizer and UndefinedBehaviorSanitizer with libFuzzer, AFL++ and honggfuzz (the P2P envelope and payloads, scripts and signatures, serialized records, text decoders, light-client proof of work, the share chain, Tor control and SOCKS5 replies, the RPC server, the HTTP client, chat, Nostr and swap negotiation). Consensus, rules v4, denial of service, the wallet and cryptography, and swaps and the light clients were each reviewed by hand, line by line, on 10 November, and the fixes were independently reviewed before merge (#59, #61, #62, #63 and #64 have review notes; the sections below cite independent reviews of #65, #66, #70, #71, #72, #73 and #74). Pull requests #56 to #66 and #69 to #74 were merged between 10 and 13 November, and #67 and #68 in the same days were documentation only. Self-test coverage of the consensus files was raised, and a final full pass closes the run. Nothing was built or run for the manual reviews themselves; every finding was traced to code and every fix has a self-test that fails on the old code or, where it cannot (a race, a clock), says so.
 
 Where each kind of result ran:
 
@@ -406,12 +406,12 @@ Part C added self-tests for the orphan transaction and orphan block pools, every
 
 The self-tests under the three instruments on the merged code (Actions run
 43352384854, on the runners' OpenSSL 3.0) found these. The plain suites passed
-on the same code, because OpenSSL 3.5 (the build server, the other CI jobs and
-the Windows bench) refuses the NULL point that OpenSSL 3.0 reads through.
+on the same code, because OpenSSL 3.5 (the build server and the other CI
+jobs) refuses the NULL point that OpenSSL 3.0 reads through.
 
 | finding | what was wrong | fixed in | self-test |
 |---|---|---|---|
-| ASan and TSan, `wallet-crypto` | `LockWallet` called `ForgetPrivKey` (added by #62) on the user key, which asked the key for its public half; a key with no key material at all made OpenSSL 3.0 read a NULL point. The self-test reached it by loading a wallet without the startup code; a running node always sets the user key when an encrypted wallet loads, or the load fails, so no production path was found. `ForgetPrivKey` now leaves a key with no secret alone, and `GetPubKey` throws instead of reading a missing point on every OpenSSL version. | #74 `72c8a6b` | `wallet-crypto` (5 new checks) |
+| ASan, TSan and Valgrind, `wallet-crypto` | `LockWallet` called `ForgetPrivKey` (added by #62) on the user key, which asked the key for its public half; a key with no key material at all made OpenSSL 3.0 read a NULL point. The self-test reached it by loading a wallet without the startup code; a running node always sets the user key when an encrypted wallet loads, or the load fails, so no production path was found. `ForgetPrivKey` now leaves a key with no secret alone, and drops the secret (instead of keeping it) when the public half cannot be read, which only happens to a key that is already stored encrypted; `GetPubKey` throws instead of reading a missing point on every OpenSSL version. | #74 `72c8a6b` | `wallet-crypto` (5 new checks) |
 | TSan, `wallet-relock` | `fGenerateBitcoins` and `nMineMode` were written by the GUI, RPC and miner threads and read by the relock timer and the miners with no lock, and a rerun found `fWalletEncrypted` written under the key lock while `LockWallet` read it without one. All three are atomic now; `wallet.dat` still stores them as integers. | #74 `72c8a6b` | TSan run of the self-tests |
 | TSan, `wallet-restore-race` | The race in the report was the self-test's own unlocked read of the HD schema; while checking the other readers, the restore loop's stop check in `walletcmd.cpp` was found reading the HD key counters without `cs_keyPool` while other threads draw keys. It now takes the lock, with nothing else held. | #74 `72c8a6b` | TSan run of the self-tests |
 
@@ -419,8 +419,9 @@ the Windows bench) refuses the NULL point that OpenSSL 3.0 reads through.
 ### Leak reports: which were bugs and which were not
 
 Two of the leak reports in this run were real bugs, and both are fixed. The
-rest (711 reports in one fuzz campaign) were Berkeley DB's own memory arena,
-not leaks. Every report, with the evidence:
+711 reports of one fuzz campaign were Berkeley DB's own memory arena, not
+leaks, and the leak reports of the final pass were the self-tests' own, not
+the node's. Every report, with the evidence:
 
 | report | verdict | evidence | where |
 |---|---|---|---|
@@ -510,7 +511,7 @@ block pools, every script opcode in 488 rows, the block index load path) and
 from the self-tests that pin the fixes above.
 The first-pass gap, that `ProcessBlock`, `CheckBlock` and `AlreadyHave` were
 never reached by `fuzz-net-message` because of the envelope checksum, is
-closed by `fuzz-p2p-payload`. The final pass re-measures:
+closed by `fuzz-p2p-payload`. The final pass measured again, after #70 to #74 had also merged:
 on `main` at `72c8a6b` (101 self-tests, 0 failures), lines: `main.cpp` 62.17%, `script.cpp` 85.41%, `serialize.h` 73.95%, `db.cpp` 61.05%, whole node 66.52% (regions 58.42%).
 
 ### Checked and not a defect (first pass of the tools)
@@ -622,13 +623,13 @@ above; the final pass is a regression run on the merged code.
 | secrets (Gitleaks, Trivy) | Gitleaks 8 hits, the same 8 as every run and triaged above (the release key's public fingerprint, a test fixture, an old line); Trivy on the tree: nothing |
 | dependencies (OSV, Trivy on system libraries) | OSV on the pinned and vendored commits: nothing known. Trivy on the build server's own system libraries: 162 advisories (134 in the first pass); they concern the host's packages, not anything the release ships, and the host is updated outside the audit |
 | static (cppcheck, flawfinder, Semgrep, clang-tidy, Clang Static Analyzer, CodeQL) | cppcheck 36 errors (23 in the first pass), flawfinder 58 hits at levels 4-5 (48), Semgrep 0, clang-tidy 211 warnings (203), Clang Static Analyzer 45 (39); CodeQL green on every pull request. Every new hit was read: the cppcheck ones are in harness and self-test code, plus two more of the `BEGIN`/`END` macro false positive already triaged (`jsonrpc.cpp`, `net.cpp`); flawfinder's are `snprintf`/`fprintf` with constant formats in harness headers and two `chmod` calls after `lstat` that only tighten the mode of the user's own wallet files (someone who can swap that path already holds the data directory); the analyzer's are dead stores in self-tests and a `fread` loop in `swap.cpp` that it models wrongly (the loop ends on a short read and `ferror` is checked). No defect |
-| ASan + UBSan + LSan, every self-test | 101 self-tests, 0 failures, 0 reports (Actions run 43384426946 on `72c8a6b`). The first final run (43352384854 on `2c86386`) found the items under "Found by the final pass"; #74 fixed them |
+| ASan + UBSan + LSan, every self-test | 101 self-tests, 0 failures, 0 reports (Actions run 43384426946 on `72c8a6b`, after the merge; run 43376334818 had shown the same on the pull request's last commit). The first final run (43352384854 on `2c86386`) found the items under "Found by the final pass"; #74 fixed them |
 | TSan, every self-test | 101 self-tests, 0 failures, 0 reports (the same run) |
 | Valgrind memcheck, every self-test | 101 self-tests, 0 failures, 0 reports (the same run); four are not run under Valgrind and the phase's summary says so: `orphan-blocks` and `block-index-load` (RandomX hashes differ there, as Valgrind does not reproduce the hardware floating-point rounding modes, so the recorded nonces stop meeting the target) and `chat-dos` and `chat-relay` (per-minute rations on the wall clock run out under Valgrind's slowdown); all four run under ASan and TSan |
 | heaptrack | peaks 41.5 MB (`explorer`), 9.9 MB (`p2pool-chain`), 485 KB (`btc-light`), 424 KB (`rules-v4`); memory still held at exit 4 to 25 KB, objects the node keeps for its lifetime on purpose (LeakSanitizer, which tells leaked from still reachable, reports nothing on the same self-tests) |
 | fuzz regression, every harness, 30 min per engine (libFuzzer, AFL++, honggfuzz) | Actions run 43352384854 on `2c86386`: 19 harnesses x 3 engines, 57 jobs, 0 crash files; merged corpora: `fuzz-p2p-payload` 3,545, `fuzz-rpc-postauth` 2,976, `fuzz-decoders` 2,760, `fuzz-chat-frame` 2,406, `fuzz-script` 2,365, `fuzz-http-client` 2,337, `fuzz-nostr` 2,286, `fuzz-chat-relay` 2,255, `fuzz-swap` 2,175, `fuzz-deserialize` 1,916, `fuzz-p2pool` 1,332, `fuzz-net-message` 1,329, `fuzz-light-peer` 1,155, `fuzz-v4-templates` 1,100, `fuzz-tor-control` 479, `fuzz-light-pow` 228, `fuzz-rpc-preauth` 194, `fuzz-sigcheck` 52, `fuzz-socks5` 34 (the last few have small input spaces). #74 changed no harness and no parser |
 | reprotest | bit for bit identical (two builds under different time, locale, umask and path) |
-| self-test suites | on `72c8a6b`: Windows (UCRT64 CI job) 92 suites passed, 0 failures; Linux (CI job and the build server) 90 passed, 0 failures |
+| self-test suites | on `72c8a6b`: Windows (UCRT64 CI job) 92 suites passed, 0 failures; Linux (CI job and the build server) 90 passed, 0 failures. These count the suites that end with "ALL TESTS PASSED"; the instrumented phases count every command of `make tests` on Linux, the unit-test programs included, which is 101 |
 
 ### Final state
 
