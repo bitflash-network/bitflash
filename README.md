@@ -17,10 +17,16 @@ RandomX proof of work, nodes reached only through Tor onion services, no premine
 </div>
 
 > [!IMPORTANT]
-> **Every node must run 1.2.32 or newer before 2026-12-25 12:00 UTC**, when rules v4 activate on
-> mainnet (testnet: 2026-11-20 12:00 UTC). This applies to wallets, explorers and exchanges as
-> well as miners. A node on 1.2.31 or older stops following the chain at the first block that
-> uses the new opcodes. See [Network upgrades](#network-upgrades).
+> **Every node should run 1.2.33 before 2026-11-21 12:00 UTC**, when rules v3 activate on
+> mainnet. It holds pay-to-script-hash outputs back until the chain's median time has passed the
+> switch, and makes Windows nodes read large script numbers exactly as Linux nodes do, a
+> consensus fix. Windows users in particular should upgrade.
+>
+> **1.2.33 or newer is required before 2026-12-25 12:00 UTC**, when rules v4 activate and atomic
+> swaps open on mainnet (rules v4 on testnet: 2026-11-20 12:00 UTC). This applies to wallets,
+> explorers and exchanges as well as miners. A node on 1.2.31 or older stops following the chain
+> at the first block that uses the new opcodes, and swap offers from 1.2.32 or older are refused.
+> See [Network upgrades](#network-upgrades).
 
 > [!NOTE]
 > The first exchange listing is being crowdfunded on NonKYC until 2027-02-04: 100 backers are
@@ -286,6 +292,21 @@ The build fetches and verifies pinned versions of libsecp256k1, RandomX and Tor.
 licenses are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) and the full set of
 dependencies in [docs/dependencies.md](docs/dependencies.md).
 
+## Security and audit
+
+Before 1.2.33 the code went through an audit in the open. Every finding, every fix, and what
+was deferred and why is published in [docs/AUDIT.md](docs/AUDIT.md).
+
+- Consensus, rules v4, denial of service, the wallet and cryptography, and swaps were reviewed line by line.
+- 19 fuzz targets ran under three engines (libFuzzer, AFL++, honggfuzz); the final pass ended with no crash.
+- 101 self-tests pass under AddressSanitizer, ThreadSanitizer and Valgrind with no report (four skip Valgrind, for reasons given in AUDIT.md).
+- Self-test line coverage of the node rose from 55.0% to 66.5%, and the build is reproducible bit for bit.
+- Of the leak reports, two were real bugs, both fixed; the rest were Berkeley DB's own memory or the self-tests'.
+
+This is a maintainers' audit, not a third-party firm's: don't trust it, verify it. Anyone can rerun
+the full pass on Linux with `scripts/audit/run-audit.sh`. Report vulnerabilities privately, as
+described in [SECURITY.md](SECURITY.md).
+
 ## Documentation
 
 | Topic | Documents |
@@ -295,7 +316,7 @@ dependencies in [docs/dependencies.md](docs/dependencies.md).
 | Mining | [PoW v2](docs/pow-v2.md), [P2Pool](docs/p2pool.md), [pool directory](docs/pool-directory.md), [mining calculator](docs/mining-calculator.md), [Windows Defender](docs/windows-defender.md) |
 | Swaps and chat | [atomic swaps](docs/atomic-swaps.md), [other chains](docs/swaps-multicoin.md), [light clients](docs/light-pow.md), [btfchat](docs/btfchat.md) |
 | Consensus | [rules v2](docs/rules-v2.md), [rules v4](docs/rules-v4.md) |
-| Auditing | [release verification](docs/release-verification.md), [fair launch](docs/fair-launch.md), [UTXO commitments](docs/utxo-commitment.md), [UTXO proofs](docs/utxo-proofs.md), [treasury](docs/treasury.md) |
+| Auditing | [code audit](docs/AUDIT.md), [security policy](SECURITY.md), [release verification](docs/release-verification.md), [fair launch](docs/fair-launch.md), [UTXO commitments](docs/utxo-commitment.md), [UTXO proofs](docs/utxo-proofs.md), [treasury](docs/treasury.md) |
 
 The same documents are published at [docs.bitflash.network](https://docs.bitflash.network/).
 
@@ -304,7 +325,7 @@ The same documents are published at [docs.bitflash.network](https://docs.bitflas
 Bug reports and pull requests are welcome on GitHub. Consensus and wallet changes are expected
 to come with tests, and are proven on testnet before release. Please report security issues
 privately to the maintainers on [Discord](https://bitflash.network/discord) rather than in a
-public issue.
+public issue; [SECURITY.md](SECURITY.md) has the details.
 
 Bitflash is a young network. Keep your node up to date and do not put in more than you can
 afford to lose.
