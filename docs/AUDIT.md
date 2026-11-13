@@ -553,3 +553,35 @@ are fixed here, each with a self-test (`chat-dos`, `nostr-relay`,
 | review L4, `swap-prune` | Every `take` with a fresh swap id from a contact created a swap that stayed for good, and the seen-step ids were never pruned; both are written out whole on every change. | One take of an offer at a time per peer, eight takes per peer; a finished swap is dropped after 30 days, and past the newest 100 only if it never locked anything of ours (one with a contract is kept the 30 days); the seen-step ids are cut to the ones a conversation still holds, and not while the chat is locked; a take older than the time to answer is ignored. |
 | `fuzz-decoders`-style round trip (`chat-dos`) | Integers in frames and epoch announcements were read with nlohmann's `value()`, which casts a float out of range (1e300 as an int) with undefined behaviour and truncates 1.9 to 1. | `JsonIntValue` (`jsonsafe.h`): an integer that fits, or the same refusal as a field of the wrong type. |
 | `fuzz-nostr` (review) | Hex fields were read with `sscanf("%2x")`, which also takes a sign and `0x`, so two spellings named one key. | Exactly two hex digits per byte. |
+
+Left for 1.2.34, from the second independent review (none is a way in; each
+is a case where an honest user is served worse than he could be):
+
+- A frame accepted in memory whose store save then fails (a full disk, or the
+  chat locked between delivery and save) gets no receipt; the sender sends it
+  again, the replay guard refuses the copy, and the sender keeps retrying
+  until the frame expires. The fix is an idempotent receipt for a verified
+  frame refused only as a replay.
+- A record the node already holds, put again after the node-wide ration is
+  spent, is answered "slow down" instead of "already held", so the app may
+  report a stored put as failed.
+- The five seconds a handshake must have had before it can be put out may be
+  short for three flights over a slow onion circuit (8 to 10 s is safer; the
+  20 s handshake timeout still bounds it).
+- A `chatget` cut by an answer-byte ration returns empty answers that the app
+  cannot tell from an empty mailbox; a "cut" flag would let it ask again.
+- A record put at a node under half full carries only the base work, so it no
+  longer reaches a node three quarters full or more; the app could mine two
+  bits over what its node asks.
+- There are no per-source sub-budgets: one source can still fill a kind's
+  budget, at a price that rises as it fills.
+
+Runs: Actions "Audit campaign" 43322910038, on the final production code, 2 h
+10 min per job on each of the three engines with AddressSanitizer +
+UndefinedBehaviorSanitizer: no crash file for any target on any engine.
+Corpus after each engine (libFuzzer, AFL++, honggfuzz) and merged:
+`fuzz-chat-frame` 3,996 / 9,103 / 4,618, merged 2,309; `fuzz-chat-relay`
+7,399 / 7,257 / 9,653, merged 2,621; `fuzz-nostr` 8,480 / 8,628 / 10,498,
+merged 2,662; `fuzz-swap` 5,040 / 4,993 / 7,642, merged 2,120. Self-tests on
+the final commit: Linux (the 202) `make tests` 90 passed, 0 failures, and the
+four smokes; Windows through the CI job.
