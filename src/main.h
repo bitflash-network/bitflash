@@ -264,7 +264,7 @@ extern unsigned int nWalletMasterKeyMaxID;
 extern CKeyingMaterial vWalletMasterKey;
 extern vector<unsigned char> vchCryptedHDMaster;
 extern vector<unsigned char> vchCryptedHDChainCode;
-extern bool fWalletEncrypted;
+extern std::atomic<bool> fWalletEncrypted;
 extern std::atomic<bool> fWalletLocked;
 bool IsWalletEncrypted();
 bool IsWalletLocked();

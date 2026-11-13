@@ -110,7 +110,7 @@ unsigned int nWalletMasterKeyMaxID = 0;
 CKeyingMaterial vWalletMasterKey;
 vector<unsigned char> vchCryptedHDMaster;
 vector<unsigned char> vchCryptedHDChainCode;
-bool fWalletEncrypted = false;
+std::atomic<bool> fWalletEncrypted(false);   // read without a lock by IsWalletEncrypted and LockWallet
 std::atomic<bool> fWalletLocked(true);   // read without a lock by IsWalletLocked
 CCriticalSection cs_mapKeys;
 CKey keyUser;
