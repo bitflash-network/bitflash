@@ -13,7 +13,7 @@
 #   tsan     every self-test, built with ThreadSanitizer
 #   valgrind memcheck over the self-tests that do not need a sanitizer runtime
 #   heap     heaptrack over the heaviest self-tests (peak memory, leaks)
-#   fuzz     every fuzz target under libFuzzer, AFL++ and honggfuzz, one
+#   fuzz     every fuzz target ($TARGETS) under libFuzzer, AFL++ and honggfuzz, one
 #            corpus per target shared by the three engines
 #   cov      line coverage of the self-tests and of every fuzz corpus (llvm-cov)
 #   repro    reprotest: build twice under different time, locale, umask and
@@ -38,7 +38,10 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client"
+# Harnesses that write a structured starting corpus of their own
+# (BITFLASH_FUZZ_WRITE_SEEDS); the rest start from one byte.
+SELF_SEEDING="fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
@@ -250,9 +253,10 @@ phase_fuzz() {
     # (every type), the decoder one (a sample of every format), fuzz-script
     # (signed spends under each rule set) and fuzz-v4-templates (vault,
     # batch, inheritance), fuzz-p2pool (a line of shares) and fuzz-light-peer
-    # (header chains with blocks). They join the corpus without replacing
-    # anything.
-    for t in fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer; do
+    # (header chains with blocks), and the Tor, SOCKS5, RPC and HTTP client
+    # ones (Tor replies, RPC calls, ...). They join the corpus without
+    # replacing anything.
+    for t in $SELF_SEEDING; do
         [ -x "$LF/$t" ] || continue
         sd=$OUT/fuzz-seeds/$t
         rm -rf "$sd"; mkdir -p "$sd"

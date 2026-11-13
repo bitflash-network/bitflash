@@ -30,6 +30,12 @@ std::string BtfSocks5ProxyName();
 
 SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
                         int nSockSite, int nTimeoutSecs);
+// The SOCKS5 exchange on a socket already connected to the proxy: no-auth
+// greeting, CONNECT by domain name, and the proxy's reply with any address
+// type. True when the proxy reports success and every byte of its reply was
+// read, so what follows on the socket is the destination's. Exposed for the
+// self-test and fuzz-socks5, which play the proxy.
+bool BtfSocks5Handshake(SOCKET s, const std::string& destHost, unsigned short destPort);
 // A port on this machine, never through the proxy: Tor refuses loopback.
 SOCKET BtfConnectLoopback(unsigned short destPort, int nTimeoutSecs);
 

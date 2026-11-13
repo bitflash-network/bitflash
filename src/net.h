@@ -36,6 +36,9 @@ enum
 
 
 bool GetMyExternalIP(unsigned int& ipRet);
+// The IPv4 address (network byte order) in an IP echo service's HTTP
+// response: a body that is exactly a public dotted quad, or false.
+bool ParseExternalIPResponse(const string& response, unsigned int& ipOut);
 bool IsTestNet();
 unsigned short GetDefaultPort();
 void SelectNetworkParams(bool fTestNetIn);

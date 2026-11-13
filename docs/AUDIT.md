@@ -99,7 +99,8 @@ A self-test passes only if it exits 0 *and* its log has no sanitizer report.
 
 ### Fuzzing (`fuzz`, and ClusterFuzzLite on GitHub)
 
-Ten harnesses in `src/`:
+The harnesses in `src/` (the full list is `TARGETS` in
+`scripts/audit/run-audit.sh`):
 
 | target | what it feeds |
 |---|---|
@@ -113,6 +114,58 @@ Ten harnesses in `src/`:
 | `fuzz-decoders` | text into the decoders, each with its encoder where there is one: base58 and base58check, Bitflash key and script addresses (`AddressToHash160`, `DecodeAnyAddress`, which must agree), `.btf` names and onion endpoints, signed service descriptors (`VerifyDescriptor`), BIP39 phrases (checksum recomputed independently) and seeds, BIP32 derivation (path against step by step), payment links (`ParsePaymentLink`/`MakePaymentLink`), the three amount parsers against each other (`ParseMoney`, `ParseCoinAmount`, the payment link's), `ParseHex` and `uint256::SetHex`, the invoice webhook URL, cashaddr, and other chains' addresses (`btclight::Destination`) |
 | `fuzz-p2pool` | every P2Pool message (`p2pshare`, `p2ppeers`, `p2pgetsh`, `p2psync`, `p2pshares`) through `P2PoolProcessMessage()` from an inbound or dialled peer, proven or not, with reconnects and history asks, and raw shares through the share chain's acceptance (`P2PoolSubmitShare`, `ShareChain::Add`/`AddHistory`/`AddTrusted`). Flags fix a share's link, payouts and commitment so mutated shares get past each check. The share chain, orphans and budgets live for the whole run; in this binary alone (`fFuzzShareWorkStandIn`) a rule on `nNonce` stands in for the RandomX comparison, after the shared work budget is asked. `ShareChain::CheckInvariants` (tip held and checked in full, byte counts, trusted index, caps) and the orphan cap are checked after every input |
 | `fuzz-light-peer` | what a foreign chain's peer sends the light clients, per chain and network (Bitcoin, Litecoin, Dogecoin, DigiByte, Ravencoin, Bitcoin Cash, eCash; regtest, test and main): the handshake, `addr`, `headers` (AuxPoW included), `cfheaders`, `cfilter`, `block`, and unsolicited `ping`/`reject`/`notfound`, framed with a correct checksum or as raw bytes, through `Peer::Receive` into the worker's own `Round` (`PullHeaders`, `Headers::Add`, `ScanBlocks`, `VerifyBlock`, the filter checks) and then `Find`/`Call`. A merkle mode is a differential: a block `VerifyBlock` accepts must give the root Bitflash's `CBlock` computes, every branch must climb to it, its re-encoding must pass and a copy with a repeated tail (same root, CVE-2012-2459) must fail. A filter mode round-trips `EncodeFilter`/`MatchFilter` |
+| `fuzz-tor-control` | what the node's own Tor answers: control-port replies through `BtfTorReadReply` (over a socketpair) and `BtfTorReadReplyBuffer`, which must agree; the bootstrap answer through `BtfTorParseBootstrap`, which may only report a real percentage from a positive reply; an onion service's hostname file through `BtfTorHostnameEndpoint`; bridge lines through `BtfParseBridgeLines` |
+| `fuzz-socks5` | a SOCKS5 proxy's side of `BtfSocks5Handshake`, the function every proxied connection goes through: method selection, CONNECT replies with every address type, truncation. Checks that the node asks by name only, succeeds only on a full success reply, and reads nothing past it |
+| `fuzz-rpc-preauth` | one connection to the JSON-RPC port from a caller without credentials: `JsonRpcRecvRequest` (request line, headers, Content-Length) over a socketpair, then `JsonRpcHandleRequest`, in cookie mode with a password the harness never sees. Any answer but 401 aborts; the socket reader must agree with `JsonRpcRequestLength` |
+| `fuzz-rpc-postauth` | request bodies, correctly authenticated, through `JsonRpcHandleRequest`: the JSON parser, batches, the dispatcher, and the parameter decoding of the methods that take hex, amounts, addresses and objects (`createrawtransaction`, `signrawtransaction`, `decoderawtransaction`, `createmultisig`, `templatehash`, `swapauditcontract`, ...); swap-chain addresses through `btclight::Destination`. In this binary only, the dispatcher runs nothing outside an allowlist: no spending, no writes, no outgoing calls |
+| `fuzz-http-client` | the answers to the node's own requests: `ParseLoopbackRpcResponse` (the wallet asking Bitcoin Core and the other swap chains' nodes, the chat asking the wallet), webhook answers, the IP echo service's answer (`ParseExternalIPResponse`), a Nostr relay's WebSocket upgrade and frames through the node's own `CWebSocket` (`BtfNostrReadRelayStream`, over a socketpair), the webhook URL |
+
+The last five play the other end of a connection over a socketpair
+(`src/fuzz_socket.h`), so the node's own socket loops run, and write their own
+starting corpus (`BITFLASH_FUZZ_WRITE_SEEDS=<dir> ./<target> -runs=0`).
+`make fuzz-io-smoke` runs all five briefly from those seeds; CI does on every
+push. What they found is fixed with the self-test `reply-parsers`:
+
+| found by | what | where |
+|---|---|---|
+| `fuzz-http-client` seed review | An IP echo answer of a bare `"\n\n\r"` made `substr()` throw `std::out_of_range` in a detached thread that catches nothing: the node exited. The answer comes over plain HTTP. | `net.cpp` `ParseExternalIPResponse` |
+| (same) | `999.1.1.1` passed `CAddress`'s parser, `inet_addr` failed with `INADDR_NONE`, and 255.255.255.255 became the node's external address. Now only a public dotted quad. | `net.cpp` |
+| `fuzz-tor-control` | A bootstrap percentage was read with `atoi` from any line that held `PROGRESS=`, even an error reply: negative, over 100, or overflowing numbers were taken, and 100 ends the bridge ladder. The summary went to the log and the screen with control characters. A positive reply was judged by its first line only, leaving the rest of a multi-line reply to be read as the next command's. | `tor.cpp` `BtfTorReplyParser`, `BtfTorParseBootstrap` |
+| `fuzz-tor-control` | The chat's onion address was taken from Tor's hostname file unchecked (the node's own was checked). | `tor.cpp` `BtfTorHostnameEndpoint` |
+| `fuzz-tor-control` | `Bridge # ...` in bridges.txt became a torrc line `Bridge #...` with no bridge, and Tor refused to start. | `tor.cpp` `BtfParseBridgeLines` |
+| `fuzz-rpc-preauth` | `Content-Length: -1` wrapped the length sum and ended the read before the body; other non-numbers were read by `atoi`. The credentials were looked for anywhere in the headers, the request line included. A caller that connected and sent nothing held the single-threaded RPC server for good: no receive timeout. | `jsonrpc.cpp` `JsonRpcRequestLength`, `JsonRpcRecvRequest`, `Authorised` |
+| `fuzz-rpc-postauth`, `fuzz-http-client` | JSON nested a few hundred thousand levels parses without recursion, but copying the request's `id` into the reply, and printing an error object from another node, recursed once per level and ran the stack out. Requests and answers nested deeper than 64 levels are refused before parsing. | `util.cpp` `JsonNestingWithin`, `jsonrpc.cpp`, `rpcclient.cpp` |
+| `fuzz-rpc-postauth` (UBSan, 10 min run) | `signrawtransaction` read a prevtx's `vout` with `get<int>()`: a JSON float such as `1e70` is a double-to-int conversion out of range, undefined behaviour. Now only a non-negative integer that fits is taken. | `jsonrpc.cpp` `rpc_signrawtransaction` |
+| `fuzz-http-client` | An error code from another node that does not fit an `int` was passed on truncated (4294967271 read as -25). | `rpcclient.cpp` |
+| `fuzz-http-client` | A relay's upgrade counted as accepted when ` 101 ` appeared anywhere in the headers (a 403 page was then read as frames). Pings over 125 bytes were answered with a corrupt pong; reserved opcodes and RSV bits were taken as text; a relay sending only pings or pongs kept the reading thread forever. | `nostr.cpp` `CWebSocket` |
+| `fuzz-http-client` | A webhook answer was quoted into the log with its control characters. | `invoice.cpp` `WebhookAnswerOk` |
+| `fuzz-http-client`, AFL++ and honggfuzz on GitHub (17 inputs) | An error answer whose message was an empty string came back as a failure with an empty reason, which callers show as no error at all. It now says who failed. | `rpcclient.cpp` `ParseLoopbackRpcResponse` |
+| independent review | The RPC receive timeout had no test; the websocket control-frame bound was per call and low enough to trip on an idle pooled socket (now 4096); the nesting check ran before the HTML fallback and hid the unknown-wallet hint. | `jsonrpc.cpp`, `nostr.cpp`, `rpcclient.cpp` |
+
+Not reached by these, by design: the Nostr events inside a relay's frames
+(JSON handled in the discovery loops of `nostr.cpp`), and the RPC methods
+that spend, write, or call another chain's node (their parameter decoding is
+the same `AmountFromValue`, `ScriptForAddress` and hex helpers the allowed
+methods use). The node never sends Tor PROTOCOLINFO, AUTHCHALLENGE or
+ADD_ONION, and subscribes to no events: cookie authentication, GETINFO and
+SIGNAL are the whole conversation, and onion services come from the torrc.
+
+Runs: Actions "Audit campaign" 43236831520, 2 h 10 min per job on each of
+the three engines with AddressSanitizer + UndefinedBehaviorSanitizer:
+`fuzz-tor-control` (181.6 M libFuzzer executions), `fuzz-socks5` (443.9 M),
+`fuzz-rpc-preauth` (379.4 M) and `fuzz-rpc-postauth` clean; `fuzz-http-client`
+found the empty error message above, and 21 libFuzzer timeouts that were the
+harness's own (it never read the node's pongs; in the node a full socket
+fails at its send timeout, and `fuzz_socket.h` now does the same). After
+those fixes, run 43313720157 ran `fuzz-http-client` again on the final commit, 2 h
+10 min per engine: no crash file on any engine (corpus 8,862 inputs after
+libFuzzer, 8,774 after AFL++, 10,768 after honggfuzz; 2,648 merged). Function
+coverage of the corpora: `BtfTorReadReply`, `BtfTorParseBootstrap`,
+`BtfTorHostnameEndpoint` and `BtfParseBridgeLines` 100%,
+`BtfTorReadReplyBuffer` 95%, `BtfSocks5Handshake` 88%, `JsonRpcRecvRequest`
+94%, `JsonRpcRequestLength` 96%, `JsonRpcHandleRequest` 92% (post-auth),
+`ParseLoopbackRpcResponse` 98%, `CWebSocket::RecvText`,
+`ParseExternalIPResponse` and `WebhookAnswerOk` 100%.
 
 Each runs under **libFuzzer**, **AFL++** and **honggfuzz** in turn, all three
 with AddressSanitizer and UndefinedBehaviorSanitizer. They share one corpus

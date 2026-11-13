@@ -504,6 +504,35 @@ bool FileExists(const char* psz)
 #endif
 }
 
+bool JsonNestingWithin(const string& s, size_t nMax)
+{
+    // Brackets inside strings do not count; a backslash in a string escapes
+    // the character after it. Invalid JSON is the parser's to reject.
+    size_t nDepth = 0;
+    bool fString = false;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        char c = s[i];
+        if (fString)
+        {
+            if (c == '\\')
+                i++;
+            else if (c == '"')
+                fString = false;
+        }
+        else if (c == '"')
+            fString = true;
+        else if (c == '[' || c == '{')
+        {
+            if (++nDepth > nMax)
+                return false;
+        }
+        else if ((c == ']' || c == '}') && nDepth > 0)
+            nDepth--;
+    }
+    return true;
+}
+
 FILE* OpenPrivateFile(const char* psz, bool fExclusive, bool fText)
 {
 #ifdef WIN32

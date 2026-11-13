@@ -36,5 +36,10 @@ bool ReadRpcCookie(const std::string& path, std::string& authOut, std::string& e
 // given) its code.
 bool LoopbackRpcCall(const LoopbackRpc& to, const std::string& method, const nlohmann::json& params,
                      nlohmann::json& resultOut, std::string& errOut, int* pnCodeOut = NULL);
+// The HTTP response LoopbackRpcCall received, read the same way: what the
+// other program answered, whatever it is. Exposed for the self-test and
+// fuzz-http-client.
+bool ParseLoopbackRpcResponse(const LoopbackRpc& to, const std::string& resp, nlohmann::json& resultOut,
+                              std::string& errOut, int* pnCodeOut = NULL);
 
 #endif

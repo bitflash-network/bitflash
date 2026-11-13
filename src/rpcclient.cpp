@@ -6,6 +6,7 @@
 #include "headers.h"
 #include "rpcclient.h"
 
+#include <climits>
 #include <cstdio>
 
 using json = nlohmann::json;
@@ -133,7 +134,14 @@ bool LoopbackRpcCall(const LoopbackRpc& to, const std::string& method, const jso
         errOut = to.strWho + " sent more than this call expects";
         return false;
     }
+    return ParseLoopbackRpcResponse(to, resp, resultOut, errOut, pnCodeOut);
+}
 
+bool ParseLoopbackRpcResponse(const LoopbackRpc& to, const std::string& resp, json& resultOut,
+                              std::string& errOut, int* pnCodeOut)
+{
+    if (pnCodeOut)
+        *pnCodeOut = 0;
     size_t p = resp.find("\r\n\r\n");
     if (p == std::string::npos)
     {
@@ -145,8 +153,19 @@ bool LoopbackRpcCall(const LoopbackRpc& to, const std::string& method, const jso
         errOut = to.strWho + " refused the cookie or password (was it restarted? a cookie changes every start)";
         return false;
     }
+    std::string body = resp.substr(p + 4);
+    // An answer of nothing but '[' parses without recursion, but the copies
+    // and the dump() below recurse once per level and ran the stack out.
+    // Only a body that can be JSON: an HTML error page keeps its 404 hint.
+    size_t nFirst = body.find_first_not_of(" \t\r\n");
+    if (nFirst != std::string::npos && (body[nFirst] == '{' || body[nFirst] == '[') &&
+        !JsonNestingWithin(body, MAX_JSON_NESTING))
+    {
+        errOut = to.strWho + "'s answer nests too deeply";
+        return false;
+    }
     json j;
-    try { j = json::parse(resp.substr(p + 4)); }
+    try { j = json::parse(body); }
     catch (...)
     {
         // Bitcoin Core answers an unknown /wallet/<name> with a plain 404 page.
@@ -157,9 +176,21 @@ bool LoopbackRpcCall(const LoopbackRpc& to, const std::string& method, const jso
     if (j.contains("error") && !j["error"].is_null())
     {
         errOut = j["error"].is_object() && j["error"].contains("message") && j["error"]["message"].is_string()
-                     ? j["error"]["message"].get<std::string>() : j["error"].dump();
+                     ? j["error"]["message"].get<std::string>()
+                     : j["error"].dump(-1, ' ', false, json::error_handler_t::replace);
+        // An error whose message is empty still says who failed: the caller
+        // shows this string, and an empty one read as no error at all.
+        // Found by fuzz-http-client (AFL++ and honggfuzz on GitHub).
+        if (errOut.empty())
+            errOut = to.strWho + " returned an error with no message";
+        // Only a code that is one: get<int>() on 4294967271 gave -25.
         if (pnCodeOut && j["error"].is_object() && j["error"].contains("code") && j["error"]["code"].is_number_integer())
-            *pnCodeOut = j["error"]["code"].get<int>();
+        {
+            const json& code = j["error"]["code"];
+            if (code.is_number_unsigned() ? code.get<uint64_t>() <= (uint64_t)INT_MAX
+                                          : (code.get<int64_t>() >= INT_MIN && code.get<int64_t>() <= INT_MAX))
+                *pnCodeOut = (int)code.get<int64_t>();
+        }
         return false;
     }
     resultOut = j.contains("result") ? j["result"] : json(nullptr);

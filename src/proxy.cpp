@@ -290,8 +290,8 @@ static SOCKET ConnectDirect(const std::string& host, unsigned short port,
     return s;
 }
 
-static bool Socks5Connect(SOCKET s, const std::string& destHost,
-                          unsigned short destPort)
+bool BtfSocks5Handshake(SOCKET s, const std::string& destHost,
+                        unsigned short destPort)
 {
     if (destHost.empty() || destHost.size() > 255)
         return false;
@@ -418,7 +418,7 @@ SOCKET BtfConnectSocket(const std::string& destHost, unsigned short destPort,
     SOCKET s = ConnectDirect(proxyHost, proxyPort, nSockSite, nTimeoutSecs);
     if (s == INVALID_SOCKET)
         return INVALID_SOCKET;
-    if (!Socks5Connect(s, destHost, destPort))
+    if (!BtfSocks5Handshake(s, destHost, destPort))
     {
         BtfCloseSocket(s);
         return INVALID_SOCKET;
