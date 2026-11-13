@@ -150,6 +150,23 @@ methods use). The node never sends Tor PROTOCOLINFO, AUTHCHALLENGE or
 ADD_ONION, and subscribes to no events: cookie authentication, GETINFO and
 SIGNAL are the whole conversation, and onion services come from the torrc.
 
+Runs: Actions "Audit campaign" 43236831520, 2 h 10 min per job on each of
+the three engines with AddressSanitizer + UndefinedBehaviorSanitizer:
+`fuzz-tor-control` (181.6 M libFuzzer executions), `fuzz-socks5` (443.9 M),
+`fuzz-rpc-preauth` (379.4 M) and `fuzz-rpc-postauth` clean; `fuzz-http-client`
+found the empty error message above, and 21 libFuzzer timeouts that were the
+harness's own (it never read the node's pongs; in the node a full socket
+fails at its send timeout, and `fuzz_socket.h` now does the same). After
+those fixes, run 43313720157 ran `fuzz-http-client` again on the final commit, 2 h
+10 min per engine: no crash file on any engine (corpus 8,862 inputs after
+libFuzzer, 8,774 after AFL++, 10,768 after honggfuzz; 2,648 merged). Function
+coverage of the corpora: `BtfTorReadReply`, `BtfTorParseBootstrap`,
+`BtfTorHostnameEndpoint` and `BtfParseBridgeLines` 100%,
+`BtfTorReadReplyBuffer` 95%, `BtfSocks5Handshake` 88%, `JsonRpcRecvRequest`
+94%, `JsonRpcRequestLength` 96%, `JsonRpcHandleRequest` 92% (post-auth),
+`ParseLoopbackRpcResponse` 98%, `CWebSocket::RecvText`,
+`ParseExternalIPResponse` and `WebhookAnswerOk` 100%.
+
 Each runs under **libFuzzer**, **AFL++** and **honggfuzz** in turn, all three
 with AddressSanitizer and UndefinedBehaviorSanitizer. They share one corpus
 per target: what one engine finds is minimised into the corpus
