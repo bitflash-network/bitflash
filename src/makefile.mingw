@@ -411,6 +411,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=invoice
 	./bitflash.exe -selftest=net-hardening
 	./bitflash.exe -selftest=p2p-dos
+	./bitflash.exe -selftest=sync-stall
 	./bitflash.exe -selftest=orphan-tx
 	./bitflash.exe -selftest=script-opcodes
 	./bitflash.exe -selftest=orphan-blocks

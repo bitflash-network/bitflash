@@ -4077,6 +4077,50 @@ bool CBlock::AcceptBlock(int* pnDoS)
     return true;
 }
 
+// While this node catches up, blocks are fetched from one peer at a time, as
+// 1.2.32 and earlier did. 1.2.33 peers announce their tip when we connect
+// and at the end of every batch they serve, and each such inv names a block
+// we hold as an orphan, which used to send getblocks to that peer: every
+// peer at the tip became a second, third, ninth download of the same few
+// hundred blocks, arriving interleaved, most of them orphans, the orphan
+// pool evicting at random what the next block needed. A fresh node synced
+// at a fraction of the speed and then stalled for good.
+//
+// The getblocks that follow a block or an inv (orphan path, the inv's
+// orphan, a cut whole-chain inv, version time) go to the sync peer only.
+// Another peer takes over when the sync peer is gone, or when no block has
+// connected for SYNC_STALL_SECONDS (SendMessages asks one then, so a stall
+// does not wait for the next block to be announced). Once caught up, every
+// peer is asked as before. Under cs_main.
+static int64 nSyncLastProgress = 0;
+static const int64 SYNC_STALL_SECONDS = 60;
+
+static bool SyncPeerMayAsk(CNode* pfrom)
+{
+    if (pfrom->fSyncPeer || !IsInitialBlockDownload())
+        return true;
+    bool fSyncAlive = false;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode->fSyncPeer && !pnode->fDisconnect)
+                fSyncAlive = true;
+    if (fSyncAlive && GetTime() - nSyncLastProgress < SYNC_STALL_SECONDS)
+        return false;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            pnode->fSyncPeer = false;
+    pfrom->fSyncPeer = true;
+    nSyncLastProgress = GetTime();
+    LogPrint("net", "sync: blocks from %s now%s\n", pfrom->addr.ToString().c_str(),
+             fSyncAlive ? " (the last sync peer stalled)" : "");
+    return true;
+}
+
+void SyncPeerResetForTest(int64 nProgressAge)
+{
+    nSyncLastProgress = GetTime() - nProgressAge;
+}
+
 bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
 {
     if (pnDoS)
@@ -4115,7 +4159,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
     {
         uint256 hashOrphanRoot = GetOrphanRoot(pblock);
         delete pblock;
-        if (pfrom)
+        if (pfrom && SyncPeerMayAsk(pfrom))
             pfrom->PushGetBlocks(pindexBest, hashOrphanRoot);
         return error("ProcessBlock() : orphan block %s has a target far easier than the tip's, not held",
                      hash.ToString().substr(0,14).c_str());
@@ -4143,8 +4187,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
 
         LimitOrphanBlocks(MAX_ORPHAN_BLOCKS);
 
-        // Ask this guy to fill in what we're missing
-        if (pfrom)
+        // Ask this guy to fill in what we're missing (the sync peer, while
+        // catching up: SyncPeerMayAsk)
+        if (pfrom && SyncPeerMayAsk(pfrom))
             pfrom->PushGetBlocks(pindexBest, hashOrphanRoot);
         return true;
     }
@@ -4156,6 +4201,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
         return error("ProcessBlock() : AcceptBlock FAILED");
     }
     delete pblock;
+    nSyncLastProgress = GetTime();
 
     // Recursively process any orphan blocks that depended on this one
     vector<uint256> vWorkQueue;
@@ -5094,7 +5140,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // not download that once per peer.
         bool fAhead = pfrom->nStartingHeight > nBestHeight + AHEAD_GETBLOCKS_MIN_GAP &&
                       GetTime() - nLastAheadGetBlocks >= AHEAD_GETBLOCKS_INTERVAL;
-        if ((!fAskedForBlocks || fOnlyPeer || fAhead) && !pfrom->fClient)
+        if ((!fAskedForBlocks || fOnlyPeer || fAhead) && !pfrom->fClient && SyncPeerMayAsk(pfrom))
         {
             if (fAskedForBlocks && !fOnlyPeer)
                 nLastAheadGetBlocks = GetTime();
@@ -5186,6 +5232,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                 pfrom->nTxInvRefilled = nNow;
             }
         }
+        uint256 hashFirstOrphanRoot = 0;
         foreach(const CInv& inv, vInv)
         {
             if (fShutdown)
@@ -5215,9 +5262,17 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                 if (!pfrom->AskFor(inv))
                     fAskForFull = true;
             }
-            else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash))
-                pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(mapOrphanBlocks[inv.hash]));
+            else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash) && hashFirstOrphanRoot == 0)
+                hashFirstOrphanRoot = GetOrphanRoot(mapOrphanBlocks[inv.hash]);
         }
+
+        // An inv that names blocks we hold as orphans asks once for what
+        // they are missing, not once per orphan: with the orphans in pieces,
+        // each named a different root, and a getblocks answer of 500 hashes
+        // brought back dozens of getblocks, each answered with 500 more.
+        // The first orphan named is the lowest in a getblocks answer.
+        if (hashFirstOrphanRoot != 0 && SyncPeerMayAsk(pfrom))
+            pfrom->PushGetBlocks(pindexBest, hashFirstOrphanRoot);
     }
 
 
@@ -5436,7 +5491,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (fContinue)
         {
             pfrom->hashInvContinue = 0;
-            pfrom->PushGetBlocks(pindexBest, uint256(0));
+            if (SyncPeerMayAsk(pfrom))
+                pfrom->PushGetBlocks(pindexBest, uint256(0));
         }
     }
 
@@ -5597,6 +5653,19 @@ bool SendMessages(CNode* pto)
         }
 
         //
+        // Catching up and no block has connected for SYNC_STALL_SECONDS:
+        // a peer that said it is ahead of us takes over the download
+        // (SyncPeerMayAsk), one per stall.
+        //
+        if (GetTime() - nSyncLastProgress >= SYNC_STALL_SECONDS && !pto->fSyncPeer && !pto->fClient &&
+            !pto->fDisconnect && pto->nStartingHeight > nBestHeight && IsInitialBlockDownload() &&
+            SyncPeerMayAsk(pto))
+        {
+            pto->pindexLastGetBlocksBegin = NULL;      // the same question may be due again
+            pto->PushGetBlocks(pindexBest, uint256(0));
+        }
+
+        //
         // Message: getdata
         //
         // Not while the send buffer is full: a peer that announces and does
@@ -5617,6 +5686,7 @@ bool SendMessages(CNode* pto)
                 if (LogAcceptsCategory("net")) printf("sending getdata: %s\n", inv.ToString().c_str());
                 if (!AlreadyHave(txdb, inv))
                     vAskFor.push_back(inv);
+                pto->setAskFor.erase(inv);
                 pto->mapAskFor.erase(pto->mapAskFor.begin());
             }
             if (!vAskFor.empty())

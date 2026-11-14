@@ -2106,6 +2106,7 @@ void CNode::Disconnect()
             if (nPushPos == (unsigned int)-1)
                 vSend.release();
             mapAskFor.clear();
+            setAskFor.clear();
             vector<uint256>().swap(vGetBlocksHave);
             fGetBlocksPending = false;
             vector<uint256>().swap(vBlocksRefused);

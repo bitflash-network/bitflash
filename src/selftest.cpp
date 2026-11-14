@@ -15506,7 +15506,7 @@ static int RunP2PDoSSelfTest()
                 nFail += Check(fHeld, "with cs_vSend held elsewhere, Disconnect leaves the pending getblocks alone") ? 0 : 1;
                 x->Disconnect();
                 nFail += Check(!x->fGetBlocksPending && x->vGetBlocksHave.empty() && x->vBlocksRefused.empty() &&
-                               x->mapAskFor.empty() && x->vSend.empty(),
+                               x->mapAskFor.empty() && x->setAskFor.empty() && x->vSend.empty(),
                                "and frees it all when it can take both locks") ? 0 : 1;
                 delete x;
             }
@@ -15551,6 +15551,7 @@ static int RunP2PDoSSelfTest()
             P2PDoSProcess(c, "inv", ss);
             bool fKept = c->hashInvContinue == vInv[MAX_INV_SZ - 1].hash;
             c->mapAskFor.clear();
+            c->setAskFor.clear();
             // When that block arrives (here one refused for its timestamp,
             // which costs nothing), the same peer is asked for the rest.
             CBlock block = P2PDoSBlock(3000, 24 * 60 * 60);
@@ -15771,6 +15772,192 @@ static int RunP2PDoSSelfTest()
     }
     if (pindexBestSaved)
         pindexBest = pindexBestSaved;
+    DBFlush(true);
+    strSetDataDir = strOldDataDir;
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
+// ---- sync-stall: a fresh node syncing on 1.2.33 stalled for good ----
+// 1.2.33 peers announce their tip on connect and after every batch they
+// serve. A fresh 1.2.33 node turned each such inv, and every inv naming an
+// orphan, into a getblocks to that peer: every peer at the tip ran its own
+// download of the same blocks, most arrived as orphans, and each getblocks
+// answer named the next block again, pushing its retry slot two minutes on
+// each time. On testnet it was scheduled 38 hours ahead three minutes into
+// the sync. Each check marked so passes on 1.2.33 too; the rest fail there.
+static int CountCommand(CNode& node, const char* pszCommand)
+{
+    std::vector<std::string> v = P2PDoSSent(node);
+    return (int)std::count(v.begin(), v.end(), std::string(pszCommand));
+}
+
+static void SyncStallInv(CNode* p, const std::vector<uint256>& vHashes)
+{
+    std::vector<CInv> vInv;
+    for (size_t i = 0; i < vHashes.size(); i++)
+        vInv.push_back(CInv(MSG_BLOCK, vHashes[i]));
+    CDataStream ss(SER_NETWORK);
+    ss << vInv;
+    P2PDoSProcess(p, "inv", ss);
+}
+
+static int RunSyncStallSelfTest()
+{
+    fflush(stdout);
+    printf("sync-stall self-test\n");
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    std::string strOldDataDir = strSetDataDir;
+    strSetDataDir = tmp;
+    int nFail = 0;
+    std::vector<CNode*> vSavedNodes;
+    std::vector<CNode*> vPeers;
+    bool fSwapped = false;
+    try
+    {
+        if (!LoadBlockIndex())
+            throw std::runtime_error("LoadBlockIndex failed");
+
+        // Twenty orphans, each missing a different parent: the orphan pool in
+        // pieces, as random eviction left it.
+        std::vector<uint256> vOrphans;
+        for (int i = 0; i < 20; i++)
+        {
+            CBlock* pblock = new CBlock(P2PDoSBlock(5100 + i, 0));
+            pblock->hashPrevBlock = uint256(0x5170000 + i);
+            vOrphans.push_back(pblock->GetHash());
+            AddOrphanBlock(pblock);
+        }
+
+        // ---- a peer naming the same block over and over
+        {
+            mapAlreadyAskedFor.clear();
+            CNode* x = P2PDoSPeer();
+            std::vector<uint256> vNext(1, uint256(0x5171111));
+            for (int i = 0; i < 50; i++)
+                SyncStallInv(x, vNext);
+            int64 nSlot = mapAlreadyAskedFor[CInv(MSG_BLOCK, vNext[0])];
+            int64 nNow = GetTime() * 1000000LL;
+            nFail += Check(x->mapAskFor.size() == 1,
+                           "a block named in 50 invs by one peer is asked of it once") ? 0 : 1;
+            nFail += Check(nSlot <= nNow + 2 * 60 * 1000000LL,
+                           "and its retry slot stays within two minutes, not 100 minutes ahead") ? 0 : 1;
+            CRITICAL_BLOCK(x->cs_vSend)
+                SendMessages(x);
+            SyncStallInv(x, vNext);
+            nFail += Check(CountCommand(*x, "getdata") == 1 && x->mapAskFor.size() == 1,
+                           "once the getdata went out, the next inv may queue a retry") ? 0 : 1;
+            delete x;
+            mapAlreadyAskedFor.clear();
+        }
+
+        // Catching up: three peers 5000 blocks ahead of a node at genesis.
+        CRITICAL_BLOCK(cs_vNodes)
+            vSavedNodes.swap(vNodes);
+        fSwapped = true;
+        for (int i = 0; i < 3; i++)
+        {
+            CNode* p = P2PDoSPeer();
+            p->nStartingHeight = nBestHeight + 5000;
+            vPeers.push_back(p);
+        }
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes = vPeers;
+        CNode* a = vPeers[0];
+        CNode* b = vPeers[1];
+        CNode* c = vPeers[2];
+        nFail += Check(IsInitialBlockDownload(), "three peers 5000 blocks ahead: catching up (passes on 1.2.33 too)") ? 0 : 1;
+
+        // ---- one getblocks per inv, not one per orphan
+        {
+            SyncStallInv(a, std::vector<uint256>(1, vOrphans[0]));
+            bool fFirst = CountCommand(*a, "getblocks") == 1 && a->fSyncPeer;
+            a->vSend.clear();
+            SyncStallInv(a, std::vector<uint256>(vOrphans.begin() + 1, vOrphans.end()));
+            int nGetBlocks = CountCommand(*a, "getblocks");
+            a->vSend.clear();
+            nFail += Check(fFirst, "the first peer to name an orphan becomes the sync peer and is asked") ? 0 : 1;
+            nFail += Check(nGetBlocks == 1,
+                           "an inv naming 19 orphans with 19 roots sends one getblocks, not 19") ? 0 : 1;
+        }
+
+        // ---- the tip inv of another peer starts no second download
+        {
+            SyncStallInv(b, std::vector<uint256>(1, vOrphans[5]));
+            nFail += Check(CountCommand(*b, "getblocks") == 0 && !b->fSyncPeer && a->fSyncPeer,
+                           "while the sync peer makes progress, another peer naming an orphan is not asked") ? 0 : 1;
+            CRITICAL_BLOCK(b->cs_vSend)
+                SendMessages(b);
+            nFail += Check(CountCommand(*b, "getblocks") == 0,
+                           "nor by SendMessages") ? 0 : 1;
+            b->vSend.clear();
+        }
+
+        // ---- a stalled sync peer is replaced, once per stall
+        {
+            SyncPeerResetForTest(61);
+            CRITICAL_BLOCK(c->cs_vSend)
+                SendMessages(c);
+            bool fTook = CountCommand(*c, "getblocks") == 1 && c->fSyncPeer && !a->fSyncPeer;
+            CRITICAL_BLOCK(b->cs_vSend)
+                SendMessages(b);
+            bool fOnce = CountCommand(*b, "getblocks") == 0 && !b->fSyncPeer;
+            nFail += Check(fTook, "no block for a minute: SendMessages asks a peer ahead of us, which takes over") ? 0 : 1;
+            nFail += Check(fOnce, "and only that one") ? 0 : 1;
+            c->vSend.clear();
+
+            SyncPeerResetForTest(61);
+            SyncStallInv(b, std::vector<uint256>(1, vOrphans[6]));
+            nFail += Check(CountCommand(*b, "getblocks") == 1 && b->fSyncPeer && !c->fSyncPeer,
+                           "a stall is also ended by the next peer that names an orphan") ? 0 : 1;
+            b->vSend.clear();
+
+            b->fDisconnect = true;
+            SyncStallInv(c, std::vector<uint256>(1, vOrphans[7]));
+            nFail += Check(CountCommand(*c, "getblocks") == 1 && c->fSyncPeer,
+                           "and a sync peer on its way out is replaced at once") ? 0 : 1;
+            c->vSend.clear();
+            b->fDisconnect = false;
+        }
+
+        // ---- caught up: every peer is asked, as before (passes on 1.2.33 too)
+        {
+            for (size_t i = 0; i < vPeers.size(); i++)
+                vPeers[i]->nStartingHeight = nBestHeight;
+            SyncStallInv(a, std::vector<uint256>(1, vOrphans[8]));
+            SyncStallInv(b, std::vector<uint256>(1, vOrphans[9]));
+            nFail += Check(!IsInitialBlockDownload() && CountCommand(*a, "getblocks") == 1 &&
+                           CountCommand(*b, "getblocks") == 1,
+                           "once caught up, any peer naming an orphan is asked for its parents") ? 0 : 1;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+
+    LimitOrphanBlocks(0);
+    mapAlreadyAskedFor.clear();
+    if (fSwapped)
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.swap(vSavedNodes);
+    for (size_t i = 0; i < vPeers.size(); i++)
+        delete vPeers[i];
+    SyncPeerResetForTest(0);
     DBFlush(true);
     strSetDataDir = strOldDataDir;
     RemoveTree(tmp);
@@ -17271,6 +17458,8 @@ int RunSelfTest(const std::string& name)
         return RunBlockIndexLoadSelfTest();
     if (name == "net-hardening")
         return RunNetHardeningSelfTest();
+    if (name == "sync-stall")
+        return RunSyncStallSelfTest();
     if (name == "p2p-dos")
         return RunP2PDoSSelfTest();
     if (name == "multisig")
