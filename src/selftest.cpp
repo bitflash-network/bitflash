@@ -15911,7 +15911,7 @@ static int RunSyncStallSelfTest()
                 SendMessages(b);
             bool fOnce = CountCommand(*b, "getblocks") == 0 && !b->fSyncPeer;
             nFail += Check(fTook, "no block for a minute: SendMessages asks a peer ahead of us, which takes over") ? 0 : 1;
-            nFail += Check(fOnce, "and only that one") ? 0 : 1;
+            nFail += Check(fOnce, "and only that one (passes on 1.2.33 too)") ? 0 : 1;
             c->vSend.clear();
 
             SyncPeerResetForTest(61);
