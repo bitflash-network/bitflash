@@ -1611,6 +1611,17 @@ static json BtfLock(const json& p, bool fInitiator)
         // "failed": nothing paid that contract. A new one below.
     }
 
+    // From the time the lock is judged by: the tip's median time, normally
+    // about 12 minutes behind the clock, plus that lag. Refused while the
+    // node is catching up (swap::BtfLockTime): before a key is drawn, a
+    // secret made or anything journaled.
+    int64 nLockTime = 0;
+    {
+        string errLock;
+        if (!swap::BtfLockTime(GetTime(), BtfMedianTimePast(), nLockSecs, nLockTime, errLock))
+            throw runtime_error(errLock);
+    }
+
     vector<unsigned char> vchRefund = GetKeyFromPool();
     if (vchRefund.empty())
         throw runtime_error("could not draw a key from the wallet");
@@ -1624,15 +1635,9 @@ static json BtfLock(const json& p, bool fInitiator)
     }
     else
         c.secretHash = ParseHex(strHash);
-    // From the time the lock is judged by: the tip's median time, normally
-    // about 12 minutes behind the clock, plus that lag. Peers can move the
-    // adjusted time; they cannot move this, and a taker's refund is not
-    // pushed later by an offset nobody chose.
-    {
-        int64 nNow = GetTime(), nMedian = BtfMedianTimePast();
-        int64 nBase = nMedian > 0 ? std::min<int64>(nNow, nMedian + 20 * 60) : nNow;
-        c.nLockTime = nBase + nLockSecs;
-    }
+    // Peers can move the adjusted time; they cannot move the median, and a
+    // taker's refund is not pushed later by an offset nobody chose.
+    c.nLockTime = nLockTime;
 
     CScript contract = swap::BuildContract(c);
     json j = ContractJson(c, contract);

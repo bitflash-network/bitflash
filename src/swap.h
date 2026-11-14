@@ -113,6 +113,18 @@ static const int64_t BTF_PARTICIPANT_LOCK_SECS = 18 * 3600;
 // block takes it once nLockTime < that median (IsFinalAt).
 int64_t SecondsUntilRefund(int64_t nLockTime, int64_t nMedianTimePast);
 
+// The lock time of a new Bitflash contract (swapinitiate, swapparticipate):
+// nLockSecs on from the tip's median time plus its usual lag, never later
+// than the clock. The lock is judged by the median time, so it is counted
+// from it; but a node still catching up has a median days behind the clock,
+// and a lock counted from there is already open when it is paid: the other
+// side could refund at once (found on the public eCash testnet swap,
+// 2026-11-14). False, with the reason in err, when the median time is more
+// than BTF_LOCK_MAX_MEDIAN_LAG behind the clock -- the same hour a chat taker
+// giving BTF waits on (SwapConfig::nBtfMaxMedianLag).
+static const int64_t BTF_LOCK_MAX_MEDIAN_LAG = 3600;
+bool BtfLockTime(int64_t nNow, int64_t nMedianTimePast, int64_t nLockSecs, int64_t& nLockTimeOut, std::string& err);
+
 // The secret of a new swap and its hash. False, and nothing usable in either,
 // when the system's random generator fails: an all-zero secret is one
 // anybody could guess, and its hash is public in the contract.

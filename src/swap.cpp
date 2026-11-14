@@ -97,6 +97,23 @@ int64_t SecondsUntilRefund(int64_t nLockTime, int64_t nMedianTimePast)
     return nMedianTimePast > nLockTime ? 0 : nLockTime - nMedianTimePast + 1;
 }
 
+bool BtfLockTime(int64_t nNow, int64_t nMedianTimePast, int64_t nLockSecs, int64_t& nLockTimeOut, std::string& err)
+{
+    nLockTimeOut = 0;
+    if (nMedianTimePast <= 0 || nNow - nMedianTimePast > BTF_LOCK_MAX_MEDIAN_LAG)
+    {
+        long long nMinutes = nMedianTimePast > 0 ? (long long)((nNow - nMedianTimePast) / 60) : 0;
+        err = "this node is behind the chain: its tip's median time is " + std::to_string(nMinutes) +
+              " minutes behind the clock, and a lock counted from it would already be open; "
+              "wait until the node has caught up";
+        return false;
+    }
+    // About 12 minutes behind the clock normally, so plus 20 minutes is the
+    // clock; peers can move the adjusted time, they cannot move this.
+    nLockTimeOut = std::min<int64_t>(nNow, nMedianTimePast + 20 * 60) + nLockSecs;
+    return true;
+}
+
 bool NewSecret(valtype& secretOut, valtype& hashOut)
 {
     secretOut.assign(SECRET_BYTES, 0);
