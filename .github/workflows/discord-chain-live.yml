@@ -1,0 +1,48 @@
+name: Discord chain live
+
+# Posts the chain's state to the community Discord: a daily summary, and a
+# note when the height crosses a milestone. It reads only public data (the
+# explorer's tip.json and GitHub's latest release). The webhook URL lives in
+# the repository secret DISCORD_CHAIN_WEBHOOK; without it the job posts nothing.
+
+on:
+  schedule:
+    - cron: '0 12 * * *'      # daily summary
+    - cron: '30 */6 * * *'    # milestone check
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily or milestone'
+        required: true
+        default: 'daily'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-chain-live
+  cancel-in-progress: false
+
+jobs:
+  post:
+    if: github.repository == 'bitflash-network/bitflash'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_CHAIN_WEBHOOK }}
+          MODE_INPUT: ${{ github.event.inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ -n "$MODE_INPUT" ]; then
+            mode="$MODE_INPUT"
+          elif [ "$SCHEDULE" = "0 12 * * *" ]; then
+            mode=daily
+          else
+            mode=milestone
+          fi
+          case "$mode" in daily|milestone) ;; *) echo "unknown mode"; exit 1 ;; esac
+          python3 scripts/discord-chain-live.py "$mode"
