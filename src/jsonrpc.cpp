@@ -1614,8 +1614,8 @@ static json BtfLock(const json& p, bool fInitiator)
     // From the time the lock is judged by: the tip's median time, normally
     // about 12 minutes behind the clock, plus that lag. Refused while the
     // node is catching up (swap::BtfLockTime): before a key is drawn, a
-    // secret made or anything journaled.
-    int64 nLockTime = 0;
+    // secret made or a new intent journaled.
+    int64_t nLockTime = 0;
     {
         string errLock;
         if (!swap::BtfLockTime(GetTime(), BtfMedianTimePast(), nLockSecs, nLockTime, errLock))
