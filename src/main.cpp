@@ -4102,9 +4102,14 @@ static const int64 SYNC_STALL_SECONDS = 2 * 60;
 
 static void SyncPeerSet(CNode* pfrom)
 {
+    bool fStalled = GetTime() - nSyncLastProgress >= SYNC_STALL_SECONDS;
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
+        {
+            if (pnode->fSyncPeer && pnode != pfrom && fStalled)
+                pnode->nSyncStalledTime = GetTime();
             pnode->fSyncPeer = false;
+        }
     pfrom->fSyncPeer = true;
     nSyncLastProgress = GetTime();
     // The question the caller is about to ask may be the one this peer last
@@ -4130,12 +4135,23 @@ static bool SyncPeerCanServe(const CNode* pnode)
            pnode->nStartingHeight > nBestHeight;
 }
 
-static bool SyncPeerUnthrottledExists(const CNode* pExcept)
+// A sync peer that has stalled does not count: it may be the only peer off
+// the budget and have stopped answering.
+// A peer that just lost the role for stalling does not take it straight back
+// from a peer on the budget, or the two would trade it every two minutes and
+// the inbound peer would never get to deliver.
+static bool SyncPeerStalledLately(const CNode* pnode)
+{
+    return pnode->nSyncStalledTime != 0 && GetTime() - pnode->nSyncStalledTime < 2 * SYNC_STALL_SECONDS;
+}
+
+static bool SyncPeerUnthrottledExists(const CNode* pExcept, bool fSkipSyncPeer)
 {
     bool fFound = false;
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
-            if (pnode != pExcept && SyncPeerCanServe(pnode) && !PeerNeedsBlockBudget(pnode))
+            if (pnode != pExcept && !(fSkipSyncPeer && pnode->fSyncPeer) &&
+                SyncPeerCanServe(pnode) && !PeerNeedsBlockBudget(pnode))
                 fFound = true;
     return fFound;
 }
@@ -4149,14 +4165,16 @@ static bool SyncPeerMayAsk(CNode* pfrom)
         foreach(CNode* pnode, vNodes)
             if (pnode->fSyncPeer && !pnode->fDisconnect)
             {
-                fSyncAlive = true;
+                fSyncAlive = true;   // SyncPeerSet leaves one at most
                 fSyncThrottled = PeerNeedsBlockBudget(pnode);
             }
+    bool fStalled = GetTime() - nSyncLastProgress >= SYNC_STALL_SECONDS;
     bool fThrottled = PeerNeedsBlockBudget(pfrom);
-    if (fThrottled && SyncPeerUnthrottledExists(pfrom))
+    if (fThrottled && SyncPeerUnthrottledExists(pfrom, fStalled))
         return false;
-    bool fReplaceThrottled = fSyncAlive && fSyncThrottled && !fThrottled && SyncPeerCanServe(pfrom);
-    if (fSyncAlive && !fReplaceThrottled && GetTime() - nSyncLastProgress < SYNC_STALL_SECONDS)
+    bool fReplaceThrottled = fSyncAlive && fSyncThrottled && !fThrottled && SyncPeerCanServe(pfrom) &&
+                             !SyncPeerStalledLately(pfrom);
+    if (fSyncAlive && !fReplaceThrottled && !fStalled)
         return false;
     SyncPeerSet(pfrom);
     LogPrint("net", "sync: blocks from %s now%s\n", pfrom->addr.ToString().c_str(),
@@ -4177,8 +4195,14 @@ static bool SyncPeerAskOnStall(CNode* pto)
         return false;
     int64 nStall = GetTime() - nSyncLastProgress;
     bool fThrottled = PeerNeedsBlockBudget(pto);
+    // Without a stall only a peer off the budget replacing a sync peer on it
+    // is asked: nothing else to look at.
+    if (nStall < SYNC_STALL_SECONDS && (fThrottled || pto->fSyncPeer))
+        return false;
+    if (!IsInitialBlockDownload())
+        return false;
     bool fReplaceThrottled = false;
-    if (!fThrottled && !pto->fSyncPeer)
+    if (!fThrottled && !pto->fSyncPeer && !SyncPeerStalledLately(pto))
         CRITICAL_BLOCK(cs_vNodes)
             foreach(CNode* pnode, vNodes)
                 if (pnode->fSyncPeer && !pnode->fDisconnect && PeerNeedsBlockBudget(pnode))
@@ -4190,9 +4214,7 @@ static bool SyncPeerAskOnStall(CNode* pto)
         if (pto->fSyncPeer && nStall < 2 * SYNC_STALL_SECONDS)
             return false;
     }
-    if (!IsInitialBlockDownload())
-        return false;
-    if (fThrottled && SyncPeerUnthrottledExists(pto))
+    if (fThrottled && SyncPeerUnthrottledExists(pto, true))
         return false;
     SyncPeerSet(pto);
     if (fReplaceThrottled)

@@ -15999,7 +15999,10 @@ static int RunSyncStallSelfTest()
         {
             CRITICAL_BLOCK(cs_vNodes)
                 foreach(CNode* pnode, vNodes)
+                {
                     pnode->fSyncPeer = false;
+                    pnode->nSyncStalledTime = 0;
+                }
             c->fInbound = true;
             c->nGoodBlocks = 0;
             c->nTimeConnected = GetTime();
@@ -16026,12 +16029,26 @@ static int RunSyncStallSelfTest()
             c->vSend.clear();
             nFail += Check(fOnly, "with no other peer able to serve, a new inbound peer is taken on a stall") ? 0 : 1;
 
-            // An outbound peer comes back: it takes over at once, no stall.
+            // An outbound peer comes back (as a new connection, nothing held
+            // against it): it takes over at once, no stall.
             a->fClient = false;
+            a->nSyncStalledTime = 0;
             ProcessMessages(a);
             nFail += Check(CountCommand(*a, "getblocks") == 1 && a->fSyncPeer && !c->fSyncPeer,
                            "a sync peer on the inbound budget gives way at once to a peer that is not") ? 0 : 1;
             a->vSend.clear();
+
+            // That peer stops answering and is the only one off the budget:
+            // the inbound peer is not locked out, it takes the stall.
+            SyncPeerResetForTest(121);
+            ProcessMessages(c);
+            nFail += Check(CountCommand(*c, "getblocks") == 1 && c->fSyncPeer && !a->fSyncPeer,
+                           "a stalled sync peer off the budget does not keep a new inbound peer out") ? 0 : 1;
+            c->vSend.clear();
+            ProcessMessages(a);
+            nFail += Check(CountCommand(*a, "getblocks") == 0 && c->fSyncPeer,
+                           "and does not take the role straight back from it") ? 0 : 1;
+            a->nSyncStalledTime = 0;
             b->fClient = false;
 
             // Once it has sent a block that connected, it is like any peer.
