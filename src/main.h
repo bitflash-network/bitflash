@@ -504,6 +504,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
 // Self-test only: the version-time getblocks state (already asked; no extra
 // request to a peer ahead of us yet).
 void VersionGetBlocksResetForTest();
+// Self-test only: pretend the last block connected nProgressAge seconds ago.
+void SyncPeerResetForTest(int64 nProgressAge);
 bool SendMessages(CNode* pto);
 int64 GetBalance();
 struct WalletRecoveryAudit

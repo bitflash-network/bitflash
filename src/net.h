@@ -839,6 +839,13 @@ public:
     vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
     multimap<int64, CInv> mapAskFor;
+    // What is waiting in mapAskFor, so a peer that names an item again while
+    // its request for it is still waiting adds nothing (Bitcoin's setAskFor).
+    // Same locks as mapAskFor.
+    set<CInv> setAskFor;
+    // The one peer blocks are fetched from while this node catches up
+    // (SyncPeerMayAsk, main.cpp). Under cs_main.
+    bool fSyncPeer;
 
     // getdata entries not served yet because the send buffer was full; served
     // from the front as it drains (ProcessGetData in main.cpp). Message thread
@@ -934,6 +941,7 @@ public:
     CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
         : setInventoryKnown(MAX_INVENTORY_KNOWN)
     {
+        fSyncPeer = false;
         fGetBlocksPending = false;
         hashGetBlocksStop = 0;
         hashBatchLastBlock = 0;
@@ -1076,6 +1084,13 @@ public:
     {
         if (mapAskFor.size() >= MAX_ASKFOR_PER_PEER)
             return false;
+        // Already waiting with this peer: nothing to add. Every AskFor moves
+        // the shared retry slot two minutes on, so a peer that named a block
+        // again in every getblocks answer used to push the next request for
+        // it out without bound; a node syncing on 1.2.33 was seen scheduled
+        // 38 hours ahead for the one block its chain needed next.
+        if (!setAskFor.insert(inv).second)
+            return true;
 
         // Make sure not to reuse time indexes to keep things in the same order
         int64 nNow = (GetTime() - 1) * 1000000;

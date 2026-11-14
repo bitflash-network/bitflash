@@ -272,6 +272,7 @@ static void SendRecord(CNode& node, const ChatRecord& r, bool fRelay, unsigned i
         ss << std::vector<CInv>(1, CInv(MSG_CHATREC, h));
         Handle(node, "inv", ss);
         node.mapAskFor.clear();   // nothing here sends the getdata
+        node.setAskFor.clear();
     }
     CDataStream ss(SER_NETWORK, VERSION);
     ss << blob;
@@ -553,6 +554,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
             ss << std::vector<CInv>(1 + rd.U8() % 3, CInv(MSG_CHATREC, h));
             Handle(node, (rd.U8() & 1) ? "inv" : "getdata", ss);
             node.mapAskFor.clear();
+            node.setAskFor.clear();
             CheckOutput(node, NULL, NULL);
             break;
         }
