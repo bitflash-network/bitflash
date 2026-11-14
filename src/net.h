@@ -846,6 +846,9 @@ public:
     // The one peer blocks are fetched from while this node catches up
     // (SyncPeerMayAsk, main.cpp). Under cs_main.
     bool fSyncPeer;
+    // When this peer last lost the sync role for stalling (0: never). It does
+    // not take the role back from a peer on the inbound budget for a while.
+    int64 nSyncStalledTime;
 
     // getdata entries not served yet because the send buffer was full; served
     // from the front as it drains (ProcessGetData in main.cpp). Message thread
@@ -942,6 +945,7 @@ public:
         : setInventoryKnown(MAX_INVENTORY_KNOWN)
     {
         fSyncPeer = false;
+        nSyncStalledTime = 0;
         fGetBlocksPending = false;
         hashGetBlocksStop = 0;
         hashBatchLastBlock = 0;
