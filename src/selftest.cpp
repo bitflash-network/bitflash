@@ -15994,6 +15994,60 @@ static int RunSyncStallSelfTest()
             a->fDisconnect = false;
         }
 
+        // ---- a new inbound peer, whose blocks draw on the inbound budget,
+        // is not the sync peer while another peer can serve
+        {
+            CRITICAL_BLOCK(cs_vNodes)
+                foreach(CNode* pnode, vNodes)
+                    pnode->fSyncPeer = false;
+            c->fInbound = true;
+            c->nGoodBlocks = 0;
+            c->nTimeConnected = GetTime();
+            bool fNeeds = PeerNeedsBlockBudget(c) && !PeerNeedsBlockBudget(a);
+
+            SyncPeerResetForTest(121);
+            SyncStallInv(c, std::vector<uint256>(1, vOrphans[10]));
+            bool fNotByInv = CountCommand(*c, "getblocks") == 0 && !c->fSyncPeer;
+            ProcessMessages(c);
+            bool fNotOnStall = CountCommand(*c, "getblocks") == 0 && !c->fSyncPeer;
+            ProcessMessages(a);
+            nFail += Check(fNeeds && fNotByInv && fNotOnStall,
+                           "a new inbound peer naming an orphan, or on a stall, is not made the sync peer while an outbound one can serve") ? 0 : 1;
+            nFail += Check(CountCommand(*a, "getblocks") == 1 && a->fSyncPeer,
+                           "the outbound peer is asked instead") ? 0 : 1;
+            a->vSend.clear();
+
+            // Only c can serve: it is taken after a stall all the same.
+            a->fClient = true;
+            b->fClient = true;
+            SyncPeerResetForTest(121);
+            ProcessMessages(c);
+            bool fOnly = CountCommand(*c, "getblocks") == 1 && c->fSyncPeer;
+            c->vSend.clear();
+            nFail += Check(fOnly, "with no other peer able to serve, a new inbound peer is taken on a stall") ? 0 : 1;
+
+            // An outbound peer comes back: it takes over at once, no stall.
+            a->fClient = false;
+            ProcessMessages(a);
+            nFail += Check(CountCommand(*a, "getblocks") == 1 && a->fSyncPeer && !c->fSyncPeer,
+                           "a sync peer on the inbound budget gives way at once to a peer that is not") ? 0 : 1;
+            a->vSend.clear();
+            b->fClient = false;
+
+            // Once it has sent a block that connected, it is like any peer.
+            CRITICAL_BLOCK(cs_vNodes)
+                foreach(CNode* pnode, vNodes)
+                    pnode->fSyncPeer = false;
+            c->nGoodBlocks = 1;
+            SyncPeerResetForTest(121);
+            SyncStallInv(c, std::vector<uint256>(1, vOrphans[11]));
+            nFail += Check(CountCommand(*c, "getblocks") == 1 && c->fSyncPeer,
+                           "an inbound peer that has sent a good block may be the sync peer") ? 0 : 1;
+            c->vSend.clear();
+            c->fInbound = false;
+            c->nGoodBlocks = 0;
+        }
+
         // ---- caught up: every peer is asked, as before (passes on 1.2.33 too)
         {
             for (size_t i = 0; i < vPeers.size(); i++)

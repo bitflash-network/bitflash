@@ -4112,19 +4112,55 @@ static void SyncPeerSet(CNode* pfrom)
     pfrom->pindexLastGetBlocksBegin = NULL;
 }
 
+// A new inbound peer's blocks draw on the shared inbound budget
+// (PeerNeedsBlockBudget: about 15 a minute for all such peers together), and
+// only a block that connects makes it good. As the sync peer it crawls: the
+// blocks the budget refuses are asked again later, out of order, the ones
+// after them arrive as orphans, which do not make it good, and the trickle
+// that does connect keeps the stall timer from ever running out. Seen on the
+// public testnet (2026-11-14): a wallet 3,400 blocks behind made 16 blocks in
+// 3 minutes, 95% of what it received orphans, with an inbound onion peer
+// (they all look like 127.0.0.1) as its sync peer; restarted, it took an
+// outbound peer and reached the tip in 6 minutes. So while a peer that does
+// not need the budget can serve, a new inbound peer is not made the sync
+// peer, and one that is gives way to it at once.
+static bool SyncPeerCanServe(const CNode* pnode)
+{
+    return !pnode->fClient && !pnode->fDisconnect && pnode->nVersion != 0 &&
+           pnode->nStartingHeight > nBestHeight;
+}
+
+static bool SyncPeerUnthrottledExists(const CNode* pExcept)
+{
+    bool fFound = false;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode != pExcept && SyncPeerCanServe(pnode) && !PeerNeedsBlockBudget(pnode))
+                fFound = true;
+    return fFound;
+}
+
 static bool SyncPeerMayAsk(CNode* pfrom)
 {
     if (pfrom->fSyncPeer || !IsInitialBlockDownload())
         return true;
-    bool fSyncAlive = false;
+    bool fSyncAlive = false, fSyncThrottled = false;
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
             if (pnode->fSyncPeer && !pnode->fDisconnect)
+            {
                 fSyncAlive = true;
-    if (fSyncAlive && GetTime() - nSyncLastProgress < SYNC_STALL_SECONDS)
+                fSyncThrottled = PeerNeedsBlockBudget(pnode);
+            }
+    bool fThrottled = PeerNeedsBlockBudget(pfrom);
+    if (fThrottled && SyncPeerUnthrottledExists(pfrom))
+        return false;
+    bool fReplaceThrottled = fSyncAlive && fSyncThrottled && !fThrottled && SyncPeerCanServe(pfrom);
+    if (fSyncAlive && !fReplaceThrottled && GetTime() - nSyncLastProgress < SYNC_STALL_SECONDS)
         return false;
     SyncPeerSet(pfrom);
     LogPrint("net", "sync: blocks from %s now%s\n", pfrom->addr.ToString().c_str(),
+             fReplaceThrottled ? " (the last sync peer was on the inbound budget)" :
              fSyncAlive ? " (the last sync peer stalled)" : "");
     return true;
 }
@@ -4132,19 +4168,37 @@ static bool SyncPeerMayAsk(CNode* pfrom)
 // The best chain has not grown for SYNC_STALL_SECONDS while catching up: a
 // peer that said it is ahead of us takes over and is asked, one per stall.
 // The sync peer itself is asked again only after twice that, when no other
-// peer took over: it may be the only one ahead.
+// peer took over: it may be the only one ahead. A sync peer on the inbound
+// budget is replaced at once by a peer ahead that is not; a peer on the
+// budget takes over a stall only when no other peer can.
 static bool SyncPeerAskOnStall(CNode* pto)
 {
+    if (!SyncPeerCanServe(pto))
+        return false;
     int64 nStall = GetTime() - nSyncLastProgress;
-    if (nStall < SYNC_STALL_SECONDS || pto->fClient || pto->fDisconnect || pto->nVersion == 0 ||
-        pto->nStartingHeight <= nBestHeight)
-        return false;
-    if (pto->fSyncPeer && nStall < 2 * SYNC_STALL_SECONDS)
-        return false;
+    bool fThrottled = PeerNeedsBlockBudget(pto);
+    bool fReplaceThrottled = false;
+    if (!fThrottled && !pto->fSyncPeer)
+        CRITICAL_BLOCK(cs_vNodes)
+            foreach(CNode* pnode, vNodes)
+                if (pnode->fSyncPeer && !pnode->fDisconnect && PeerNeedsBlockBudget(pnode))
+                    fReplaceThrottled = true;
+    if (!fReplaceThrottled)
+    {
+        if (nStall < SYNC_STALL_SECONDS)
+            return false;
+        if (pto->fSyncPeer && nStall < 2 * SYNC_STALL_SECONDS)
+            return false;
+    }
     if (!IsInitialBlockDownload())
         return false;
+    if (fThrottled && SyncPeerUnthrottledExists(pto))
+        return false;
     SyncPeerSet(pto);
-    LogPrint("net", "sync: no block for %d s, asking %s\n", (int)nStall, pto->addr.ToString().c_str());
+    if (fReplaceThrottled)
+        LogPrint("net", "sync: asking %s, the last sync peer was on the inbound budget\n", pto->addr.ToString().c_str());
+    else
+        LogPrint("net", "sync: no block for %d s, asking %s\n", (int)nStall, pto->addr.ToString().c_str());
     return true;
 }
 
