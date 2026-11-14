@@ -15894,38 +15894,60 @@ static int RunSyncStallSelfTest()
             SyncStallInv(b, std::vector<uint256>(1, vOrphans[5]));
             nFail += Check(CountCommand(*b, "getblocks") == 0 && !b->fSyncPeer && a->fSyncPeer,
                            "while the sync peer makes progress, another peer naming an orphan is not asked") ? 0 : 1;
-            CRITICAL_BLOCK(b->cs_vSend)
-                SendMessages(b);
+            ProcessMessages(b);
             nFail += Check(CountCommand(*b, "getblocks") == 0,
-                           "nor by SendMessages") ? 0 : 1;
+                           "nor on its next pass") ? 0 : 1;
             b->vSend.clear();
         }
 
         // ---- a stalled sync peer is replaced, once per stall
         {
-            SyncPeerResetForTest(61);
-            CRITICAL_BLOCK(c->cs_vSend)
-                SendMessages(c);
+            SyncPeerResetForTest(121);
+            ProcessMessages(c);
             bool fTook = CountCommand(*c, "getblocks") == 1 && c->fSyncPeer && !a->fSyncPeer;
-            CRITICAL_BLOCK(b->cs_vSend)
-                SendMessages(b);
-            bool fOnce = CountCommand(*b, "getblocks") == 0 && !b->fSyncPeer;
-            nFail += Check(fTook, "no block for a minute: SendMessages asks a peer ahead of us, which takes over") ? 0 : 1;
+            ProcessMessages(b);
+            ProcessMessages(a);
+            bool fOnce = CountCommand(*b, "getblocks") == 0 && CountCommand(*a, "getblocks") == 0 && !b->fSyncPeer;
+            nFail += Check(fTook, "no block for two minutes: a peer ahead of us is asked on its next pass, and takes over") ? 0 : 1;
             nFail += Check(fOnce, "and only that one (passes on 1.2.33 too)") ? 0 : 1;
             c->vSend.clear();
 
-            SyncPeerResetForTest(61);
+            SyncPeerResetForTest(121);
             SyncStallInv(b, std::vector<uint256>(1, vOrphans[6]));
             nFail += Check(CountCommand(*b, "getblocks") == 1 && b->fSyncPeer && !c->fSyncPeer,
                            "a stall is also ended by the next peer that names an orphan") ? 0 : 1;
             b->vSend.clear();
 
-            b->fDisconnect = true;
+            // a last heard getblocks(best, root of orphan 1): taking over with
+            // the same question, it is asked all the same.
+            SyncPeerResetForTest(121);
+            SyncStallInv(a, std::vector<uint256>(1, vOrphans[1]));
+            nFail += Check(CountCommand(*a, "getblocks") == 1 && a->fSyncPeer,
+                           "a peer that takes over is asked even what it was last asked") ? 0 : 1;
+            a->vSend.clear();
+
+            a->fDisconnect = true;
             SyncStallInv(c, std::vector<uint256>(1, vOrphans[7]));
-            nFail += Check(CountCommand(*c, "getblocks") == 1 && c->fSyncPeer,
+            nFail += Check(CountCommand(*c, "getblocks") == 1 && c->fSyncPeer && !a->fSyncPeer,
                            "and a sync peer on its way out is replaced at once") ? 0 : 1;
             c->vSend.clear();
-            b->fDisconnect = false;
+            a->fDisconnect = false;
+
+            // c is the only peer that can serve (b is a client, a on its way
+            // out): after a stall it is asked again itself, but only after twice
+            // as long, so another peer gets the first chance.
+            b->fClient = true;
+            a->fDisconnect = true;
+            SyncPeerResetForTest(121);
+            ProcessMessages(c);
+            bool fNotYet = CountCommand(*c, "getblocks") == 0;
+            SyncPeerResetForTest(241);
+            ProcessMessages(c);
+            nFail += Check(fNotYet && CountCommand(*c, "getblocks") == 1 && c->fSyncPeer,
+                           "a stalled sync peer that is the only one ahead is asked again after four minutes") ? 0 : 1;
+            c->vSend.clear();
+            b->fClient = false;
+            a->fDisconnect = false;
         }
 
         // ---- caught up: every peer is asked, as before (passes on 1.2.33 too)

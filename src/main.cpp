@@ -4088,12 +4088,29 @@ bool CBlock::AcceptBlock(int* pnDoS)
 //
 // The getblocks that follow a block or an inv (orphan path, the inv's
 // orphan, a cut whole-chain inv, version time) go to the sync peer only.
-// Another peer takes over when the sync peer is gone, or when no block has
-// connected for SYNC_STALL_SECONDS (SendMessages asks one then, so a stall
-// does not wait for the next block to be announced). Once caught up, every
-// peer is asked as before. Under cs_main.
+// Another peer takes over when the sync peer is gone, or when the best
+// chain has not grown for SYNC_STALL_SECONDS; ProcessMessages asks one then
+// (SyncPeerAskOnStall), so a stall does not wait for the next block to be
+// announced. Two minutes: AskFor staggers a retry from another peer by as
+// much, so a new sync peer may wait that long for blocks the last one was
+// asked for. Only the best chain growing counts, not any block accepted: a
+// sync peer feeding a cheap fork below the last checkpoint would otherwise
+// hold the role for good. Once caught up, every peer is asked as before.
+// Under cs_main.
 static int64 nSyncLastProgress = 0;
-static const int64 SYNC_STALL_SECONDS = 60;
+static const int64 SYNC_STALL_SECONDS = 2 * 60;
+
+static void SyncPeerSet(CNode* pfrom)
+{
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            pnode->fSyncPeer = false;
+    pfrom->fSyncPeer = true;
+    nSyncLastProgress = GetTime();
+    // The question the caller is about to ask may be the one this peer last
+    // heard (PushGetBlocks drops a repeat); it is due again.
+    pfrom->pindexLastGetBlocksBegin = NULL;
+}
 
 static bool SyncPeerMayAsk(CNode* pfrom)
 {
@@ -4106,13 +4123,28 @@ static bool SyncPeerMayAsk(CNode* pfrom)
                 fSyncAlive = true;
     if (fSyncAlive && GetTime() - nSyncLastProgress < SYNC_STALL_SECONDS)
         return false;
-    CRITICAL_BLOCK(cs_vNodes)
-        foreach(CNode* pnode, vNodes)
-            pnode->fSyncPeer = false;
-    pfrom->fSyncPeer = true;
-    nSyncLastProgress = GetTime();
+    SyncPeerSet(pfrom);
     LogPrint("net", "sync: blocks from %s now%s\n", pfrom->addr.ToString().c_str(),
              fSyncAlive ? " (the last sync peer stalled)" : "");
+    return true;
+}
+
+// The best chain has not grown for SYNC_STALL_SECONDS while catching up: a
+// peer that said it is ahead of us takes over and is asked, one per stall.
+// The sync peer itself is asked again only after twice that, when no other
+// peer took over: it may be the only one ahead.
+static bool SyncPeerAskOnStall(CNode* pto)
+{
+    int64 nStall = GetTime() - nSyncLastProgress;
+    if (nStall < SYNC_STALL_SECONDS || pto->fClient || pto->fDisconnect || pto->nVersion == 0 ||
+        pto->nStartingHeight <= nBestHeight)
+        return false;
+    if (pto->fSyncPeer && nStall < 2 * SYNC_STALL_SECONDS)
+        return false;
+    if (!IsInitialBlockDownload())
+        return false;
+    SyncPeerSet(pto);
+    LogPrint("net", "sync: no block for %d s, asking %s\n", (int)nStall, pto->addr.ToString().c_str());
     return true;
 }
 
@@ -4195,13 +4227,13 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
     }
 
     // Store to disk
+    const int nHeightBefore = nBestHeight;
     if (!pblock->AcceptBlock(pnDoS))
     {
         delete pblock;
         return error("ProcessBlock() : AcceptBlock FAILED");
     }
     delete pblock;
-    nSyncLastProgress = GetTime();
 
     // Recursively process any orphan blocks that depended on this one
     vector<uint256> vWorkQueue;
@@ -4222,6 +4254,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
         }
         mapOrphanBlocksByPrev.erase(hashPrev);
     }
+    if (nBestHeight > nHeightBefore)
+        nSyncLastProgress = GetTime();
 
     printf("ProcessBlock: ACCEPTED\n");
     return true;
@@ -4876,6 +4910,14 @@ bool ProcessMessages(CNode* pfrom)
     // What an earlier getdata asked for and did not fit yet.
     if (!pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom);
+
+    // A stalled sync asks a peer ahead of us (SyncPeerAskOnStall). Here and
+    // not in SendMessages: that runs holding this peer's cs_vSend, this takes
+    // cs_vNodes, and a thread holding cs_vNodes may wait for a cs_vSend
+    // (RelayShare). The order here, cs_vRecv then cs_main, is ProcessGetData's.
+    TRY_CRITICAL_BLOCK(cs_main)
+        if (SyncPeerAskOnStall(pfrom))
+            pfrom->PushGetBlocks(pindexBest, uint256(0));
 
     if (vRecv.empty())
         return true;
@@ -5650,19 +5692,6 @@ bool SendMessages(CNode* pto)
             foreach(const uint256& hash, vRefused)
                 if (!mapBlockIndex.count(hash) && !mapOrphanBlocks.count(hash))
                     pto->AskFor(CInv(MSG_BLOCK, hash));
-        }
-
-        //
-        // Catching up and no block has connected for SYNC_STALL_SECONDS:
-        // a peer that said it is ahead of us takes over the download
-        // (SyncPeerMayAsk), one per stall.
-        //
-        if (GetTime() - nSyncLastProgress >= SYNC_STALL_SECONDS && !pto->fSyncPeer && !pto->fClient &&
-            !pto->fDisconnect && pto->nStartingHeight > nBestHeight && IsInitialBlockDownload() &&
-            SyncPeerMayAsk(pto))
-        {
-            pto->pindexLastGetBlocksBegin = NULL;      // the same question may be due again
-            pto->PushGetBlocks(pindexBest, uint256(0));
         }
 
         //
