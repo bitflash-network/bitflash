@@ -11387,6 +11387,35 @@ static int RunSwapTimelockSelfTest()
     nFail += Check(cfg.nBtfMaxMedianLag > 0 && cfg.nBtfMaxMedianLag <= 3600,
                    "a taker giving BTF waits while the chain's median time is over an hour behind") ? 0 : 1;
 
+    // A new Bitflash lock is counted from the median time and refused while
+    // the node is catching up (swap::BtfLockTime). On the public eCash
+    // testnet swap of 2026-11-14 a wallet four days behind made an 18 hour
+    // participant lock that had opened three days before it was paid.
+    {
+        const int64_t nNow = 1800000000, P = swap::BTF_PARTICIPANT_LOCK_SECS;
+        int64_t L = -1;
+        std::string err;
+        nFail += Check(swap::BtfLockTime(nNow, nNow - 12 * 60, P, L, err) && L == nNow + P,
+                       "a synced node: the lock is the clock plus the lock seconds") ? 0 : 1;
+        nFail += Check(swap::BtfLockTime(nNow, nNow - 59 * 60, P, L, err) && L == nNow - 59 * 60 + 20 * 60 + P,
+                       "a median 59 minutes behind: counted from the median plus 20 minutes") ? 0 : 1;
+        nFail += Check(swap::BtfLockTime(nNow, nNow + 600, P, L, err) && L == nNow + P,
+                       "a median ahead of the clock: never later than the clock") ? 0 : 1;
+        err.clear();
+        nFail += Check(!swap::BtfLockTime(nNow, nNow - 61 * 60, P, L, err) && L == 0 && err.find("behind") != std::string::npos,
+                       "a median 61 minutes behind: refused, and says why") ? 0 : 1;
+        err.clear();
+        const int64_t nMedianFound = nNow - 4 * 86400;
+        const int64_t nOldLock = std::min<int64_t>(nNow, nMedianFound + 20 * 60) + P;   // the 1.2.33 formula
+        nFail += Check(nOldLock < nNow && !swap::BtfLockTime(nNow, nMedianFound, P, L, err) && !err.empty(),
+                       "four days behind, which 1.2.33 made into a lock already open: refused") ? 0 : 1;
+        err.clear();
+        nFail += Check(!swap::BtfLockTime(nNow, 0, P, L, err) && !err.empty(),
+                       "no chain: refused") ? 0 : 1;
+        nFail += Check(swap::BTF_LOCK_MAX_MEDIAN_LAG == cfg.nBtfMaxMedianLag,
+                       "the same hour a chat taker giving BTF waits on") ? 0 : 1;
+    }
+
     // Both sides agree on the contract form: an offer or a take from a
     // version that locks BTF by height is refused before anything moves.
     {
@@ -12387,6 +12416,21 @@ static int RunSwapRpcSelfTest()
         if (v[i].value("tag", "") == "rpc-t4" && v[i].value("state", "") == "intent")
             nLock4 = v[i].value("lockTime", (int64_t)0);
     nFail += Check(nLock4 >= nNow + 600 - 60 && nLock4 <= GetTime() + 600, "on the test network a shorter lock, in seconds") ? 0 : 1;
+
+    // A node still catching up: its median time two hours behind the clock.
+    // Refused before a key, a secret or a journal line (swap::BtfLockTime).
+    pTip->nTime = (unsigned int)(GetTime() - 2 * 3600);
+    fOk = call("swapparticipate", nlohmann::json::array({ addr, "1", hash, nullptr, "rpc-t5" }), r, err);
+    v = lines();
+    bool fT5 = false;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t5")
+            fT5 = true;
+    nFail += Check(!fOk && err.find("behind the chain") != std::string::npos && !fT5,
+                   "a node two hours behind makes no lock and writes nothing") ? 0 : 1;
+    if (fOk || err.find("behind the chain") == std::string::npos)
+        printf("       (%s)\n", fOk ? "it was made" : err.c_str());
+    pTip->nTime = (unsigned int)GetTime();
 
     // swaps.log cannot be replaced: refused before any send.
     std::string blocker = swap::JournalPath() + ".new";
