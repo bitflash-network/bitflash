@@ -12417,6 +12417,21 @@ static int RunSwapRpcSelfTest()
             nLock4 = v[i].value("lockTime", (int64_t)0);
     nFail += Check(nLock4 >= nNow + 600 - 60 && nLock4 <= GetTime() + 600, "on the test network a shorter lock, in seconds") ? 0 : 1;
 
+    // A node still catching up: its median time two hours behind the clock.
+    // Refused before a key, a secret or a journal line (swap::BtfLockTime).
+    pTip->nTime = (unsigned int)(GetTime() - 2 * 3600);
+    fOk = call("swapparticipate", nlohmann::json::array({ addr, "1", hash, nullptr, "rpc-t5" }), r, err);
+    v = lines();
+    bool fT5 = false;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].value("tag", "") == "rpc-t5")
+            fT5 = true;
+    nFail += Check(!fOk && err.find("behind the chain") != std::string::npos && !fT5,
+                   "a node two hours behind makes no lock and writes nothing") ? 0 : 1;
+    if (fOk || err.find("behind the chain") == std::string::npos)
+        printf("       (%s)\n", fOk ? "it was made" : err.c_str());
+    pTip->nTime = (unsigned int)GetTime();
+
     // swaps.log cannot be replaced: refused before any send.
     std::string blocker = swap::JournalPath() + ".new";
 #ifdef _WIN32
