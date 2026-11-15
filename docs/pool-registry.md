@@ -78,12 +78,12 @@ All integers are little-endian, fixed width, unsigned.
 | 0 | 4 | magic | `"BTFP"` |
 | 4 | 1 | record format | `1` |
 | 5 | 1 | share rules version | `1` (section 5) |
-| 6 | 2 | share spacing, seconds | 20 to 120; and below 40, uncle depth at least 2 (section 17). Pool zero's 10 is valid only in pool zero's own record |
+| 6 | 2 | share spacing, seconds | 20 to 120, and spacing x uncle depth at least 60 (section 17). Pool zero's 10 is valid only in pool zero's own record |
 | 8 | 2 | PPLNS window, shares | 360 to 2160 |
 | 10 | 2 | retarget window, shares | 120 to 720, and no more than the PPLNS window |
 | 12 | 4 | share floor, compact target | canonical (below), above 0, no easier than the network floor `0x1f0fffff` |
-| 16 | 1 | uncle depth | 0 to 3 |
-| 17 | 1 | uncle share, percent | 50 to 100 when the depth is above 0; exactly 0 when the depth is 0 |
+| 16 | 1 | uncle depth | 1 to 3 (pool zero's 3) |
+| 17 | 1 | uncle share, percent | 80 to 100 (pool zero's 80) |
 | 18 | 2 | creator fee, basis points | 0 to 300 (3%) |
 | 20 | 1 | fee script type | 0 none, 1 P2PKH, 2 P2SH |
 | 21 | 20 | fee script hash | the HASH160 of the address; twenty zero bytes when the type is 0 |
@@ -106,19 +106,20 @@ entry, and nothing about it is an error) when any of these holds:
 - the fee is 0 and the fee type is not 0 or the hash is not all zero, or the
   fee is above 0 and the type is 0 (a fee with nowhere to go, or a destination
   with no fee, would also be two ids for one behaviour);
-- the uncle depth is 0 and the uncle share is not 0;
-- the spacing is below 20 and the record is not pool zero's own (section 4),
-  or the spacing is below 40 and the uncle depth is below 2;
+- the spacing is below 20 and the record is not pool zero's own (section 4);
+- the spacing times the uncle depth is below 60 (so depth 3 below 30 s, depth
+  2 from 30 to 59 s, depth 1 from 60 s), pool zero's own record excepted;
 - the name breaks the name rule.
 
 So every pool has exactly one record, and every record exactly one pool.
 
 **Why these ranges.** A short spacing multiplies orphaned shares over Tor's
-latency, and over a bridge (Snowflake, meek) far more: registered pools start
-at 20 s, with uncles kept at least two shares deep below 40 s, so a miner
-behind a bridge is paid for a late share rather than orphaned out (section
-17). Pool zero keeps its 10 s, which it cannot change; above 120 s a share is
-as rare as a block. The window cap of 2160 is
+latency, and over a bridge (Snowflake, meek) far more. Registered pools start
+at 20 s, always keep uncles, keep them at least 60 s of shares deep, and pay
+an uncle at least 80% of its work, so a miner behind a bridge is paid for a
+late share rather than orphaned out; section 17 gives the loss each allowed
+combination still has. Pool zero keeps its 10 s, which it cannot change;
+above 120 s a share is as rare as a block. The window cap of 2160 is
 pool zero's: every coinbase pays one output per distinct address in the
 window, and the bounds on share size, block space for the coinbase and memory
 (`MAX_SHARE_BYTES`, `P2POOL_COINBASE_BYTES`, `MAX_CHAIN_BYTES`) were all sized
@@ -290,7 +291,7 @@ nothing else. With pool zero's parameters and no fee it is 1.2.34 exactly:
 | `WINDOW_SHARES = 2160` | PPLNS window |
 | `RETARGET_SHARES = 720` | retarget window |
 | `bnProofOfWorkLimit` as the floor | share floor |
-| `MAX_UNCLE_DEPTH = 3` | uncle depth (0 turns uncles off) |
+| `MAX_UNCLE_DEPTH = 3` | uncle depth (1 to 3) |
 | uncle paid 80%, includer 20% | uncle share p%: the uncle is paid `floor(work * p / 100)` (computed as `work / 100 * p + (work % 100) * p / 100`, exact without overflow; for p = 80 it equals today's `work / 5 * 4 + (work % 5) * 4 / 5`), the includer the rest |
 | `HISTORY_SHARES` | window + retarget + 2 x uncle depth + 10 |
 | chain choice over lines that do not meet: last 2160 shares | last *window* shares |
@@ -425,7 +426,7 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 | `poolinv` | up to 32 pool ids | the registered pools this node can serve now (below). Sent after `version`, and again when the set changes (at most once a minute; a peer that sends them faster is not scored, since that is judged on the receiver's clock, and the receiver simply acts on the latest one at most once a minute) |
 | `p2xshare` | pool id, `ShareX` | a share, as `p2pshare` |
 | `p2xgetsh` | pool id, up to 500 share ids | ask for shares by id, as `p2pgetsh` |
-| `p2xsync` | pool id, resume point (a share id, or 0) | ask for a line, as `p2psync`; with a resume point, only the part of the line after that share (section 17) |
+| `p2xsync` | pool id, resume point (a share id, or 0) | ask for a line, as `p2psync`; with a resume point the server holds, only the shares of its history at or above that share's height (section 17) |
 | `p2xshares` | pool id, tip height, up to 400 shares | a part of a line, as `p2pshares`, only in answer to `p2xsync` for that pool |
 | `p2xnone` | pool id | "I hold nothing of this pool": the answer to `p2xsync` or `p2xgetsh` for a pool this node does not carry, or carries with no shares |
 | `pooltkt` | an epoch, the ticket seed hash the sender checked them against, up to 512 guardian tickets | tickets, relayed or in answer to `poolgettkt` (section 10, Phase C) |
@@ -485,6 +486,10 @@ asks, "one history in the life of an unproven connection",
 with at most 8 registered pools served per connection per
 `SYNC_SERVE_INTERVAL`. One connection can then hand over several pools, which
 handoff needs (section 10), and no pool's history counts against another's.
+Resumed requests stay inside these limits (section 17, *Resumable fetches*):
+one serve in flight per (connection, pool), at most 3 asks of any kind per
+(connection, pool) per `SYNC_SERVE_INTERVAL`, and at most one history's worth
+of shares served per (connection, pool) per interval.
 
 **Pool zero is isolated from everything registered pools do.** The rule is
 that nothing an honest peer, or a 1.2.34 node, does with registered pools,
@@ -580,12 +585,23 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   `pools/<poolid>.dat`, relays it, announces it), plus pool zero, plus what the
   draw gives it (section 10), plus any given with `-poolcarry=<poolid>`
   (at most 8).
+- **A late share is named as soon as it arrives.** Today the job is rebuilt
+  only when the share tip changes (`rpc.cpp`, step 1.5 of the stratum loop),
+  so a share that arrives late, as a sibling of the tip or of a share just
+  below it, waits for the next tip before any template names it as an uncle,
+  and loses one share interval of its uncle depth. The node also rebuilds the
+  job when a share arrives that the next share on the tip could name as an
+  uncle (it passes the uncle checks of share rules v1 against the tip), at
+  most once every 2 s, and sends it to miners without asking them to drop
+  their current work (the old job stays valid). This is local template
+  building, not a share rule, so it applies to every pool, pool zero
+  included, and needs no other node to upgrade.
 
 RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
-| `poolcreate {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take pool zero's values. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
+| `poolcreate {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take these defaults, which always make a valid record: spacing 30, window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values except the spacing, which pool zero alone may have at 10). A record that breaks a rule of section 1 is refused with the rule it breaks, `dryrun` or not. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
 | `poollist [all]` | active pools (with `all`, pending ones too): id, fingerprint, name, rules, fee, first height, confirmations, anchors in the last 720 blocks, whether carried, and the share chain's height and work when carried. Ordered by recent share work for carried pools, then by anchors, never by name |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, its share chain if carried, its guardians this epoch (Phase C) |
 
@@ -933,12 +949,14 @@ reviving node which offered line is the real one.
 ### Opting out
 
 Guarding is **on by default** on every node of a release with the registry,
-mining or not, because pools travel only if ordinary nodes carry them; the one
-exception is a node whose Tor reaches the network through Snowflake or meek,
-where it is off by default (section 17). What
+mining or not, because pools travel only if ordinary nodes carry them. It is
+on through bridges too: a node on Snowflake or meek makes its ticket like any
+other, and only its local budget is smaller (section 17). What
 that costs a node that never touches an option: one ticket a day (a few
 minutes of one core at idle priority), at most 128 MB of guarded share chains,
-at most 64 KB/s serving them, and under 1 MB of tickets a day (section 11).
+at most 64 KB/s serving them, and the ticket traffic of section 11 (about
+0.5 MB of relayed tickets a day, plus up to 1.9 MB when it asks peers for a
+set, 5.8 MB at start).
 
 `-poolguard=0`: no tickets, never drawn, carries only pool zero, the pool it
 mines and `-poolcarry` pools. Mining is unaffected.
@@ -951,12 +969,14 @@ mines and `-poolcarry` pools. Mining is unaffected.
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
 | guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
+| on Snowflake or meek | the defaults above become 32 MB, 2 pools with shares and 16 KB/s, unless set explicitly; handoff pulls stop at that budget (section 17) |
 | a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s for serving histories of guarded pools; past it a `p2xsync` waits (`DeferSync`), never refused for good |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
-| tickets | at most 4096 per epoch, 118 bytes each: under 1 MB a day |
+| tickets | at most 4096 per epoch, 118 bytes each: about 0.5 MB a day relayed; an asked set adds up to 4 answers of 480 KB, about 1.9 MB per epoch, 5.8 MB at start (section 10) |
 | RandomX | three budgets: pool zero's (unchanged), one for all registered pools together, one for tickets; never one per pool |
-| requests from one connection | at most 8 registered pools' histories per `SYNC_SERVE_INTERVAL` (section 8) |
+| requests from one connection | at most 8 registered pools' histories per `SYNC_SERVE_INTERVAL`; per pool one serve in flight, 3 asks and one history's worth of shares per interval, resumed asks included (section 8) |
+| a fetch in progress | `pools/<poolid>.part`, within the pool's byte cap; deleted when the line is whole, after 24 hours without a new share, or when the pool is no longer wanted (section 17) |
 
 What it costs in practice: an honest pool's line is about 2900 shares with
 their uncles; with a few dozen miners a share is 1 to 3 KB, so a line is 3 to
@@ -983,13 +1003,13 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | a fake anchor (a solo block labelled `"p2x" + id`) | a pool looks more successful than it is | anchors are shown as claims; a node that carries the pool shows the blocks its share chain confirms, and orders by share work, not anchors |
 | a malicious guardian withholds | a new miner cannot fetch the line from it | reserve, lingering set, miners, every announcing peer, `poolwho`; at worst a restart, no coins lost |
 | a malicious guardian serves an old or private line | a reviving node mines on the wrong line | chain choice by work, `TIP_MAX_AGE`, and the anchor check (section 10); a forged heavier line needs real PoW |
-| a forged deep history | displaces an honest line | unchanged from pool zero: the deep end of a history is trusted on work alone, so a forgery needs as much work as the honest line, and is taken only right after asking |
+| a forged deep history | displaces an honest line | unchanged from pool zero: the deep end of a history is trusted on work alone, so a forgery needs as much work as the honest line, and is taken only from a peer this node asked: for pool zero within 5 minutes of asking, as today; for a registered pool within 5 minutes of the last full part, never more than 60 minutes after asking, and never more shares than one history (section 17) |
 | Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; the score depends on the work hash, so aiming at one pool after seeing the seed costs a ticket per try; the held set is the 4096 lowest work hashes, so an attacker's share of it, and of every pool's places, follows its share of all ticket work; and capture only buys withholding, which the rows above bound |
 | Sybil: flooding the ticket set to switch guardians off everywhere | every node's 4096 places filled by attacker tickets | the attacker must out-work honest tickets slot by slot (lowest hash wins, not first arrival); honest guardians whose tickets fall out still hold what they held, miners hold their pools, `poolwho` still finds announcing peers |
 | grinding the draw seed | a miner withholds a block to change the draw | the seed is one block two hours before the epoch; each retry costs a block reward and gives one random redraw; tickets are fixed a whole epoch before; and the prize is withholding |
 | flooding `p2x*` for pools not carried | CPU, memory | dropped at the pool id, unread and unhashed, nobody scored (section 8: scoring would punish honest races and change how pool zero treats the peer); requests rationed by the registered budgets |
 | flooding shares of a carried pool | CPU | the shared RandomX budget, the orphan queue cap, scoring of invalid shares, as pool zero |
-| a pool whose shares are as big as rules allow | memory | per-pool and total guard caps (a line that does not fit is not guarded, never kept in part); a pool's own miners carry it at pool zero's caps |
+| a pool whose shares are as big as rules allow | memory | per-pool and total guard caps (a line that does not fit is not guarded, never kept in part to be served); a fetch in progress is kept in part only by the node fetching it, within the pool's cap, never announced or served (section 17); a pool's own miners carry it at pool zero's caps |
 | flooding tickets | CPU, memory | the work, the signature, the deadline, the same-body check before any hash, one per key per epoch, 4096 per epoch, the tickets' own RandomX budget, scoring only for bad framing, bad signatures and failed work against a buried seed |
 | registered pools crowding out pool zero | a starting 1.2.34 node cannot get pool zero's line | pool zero keeps its 1.2.34 budgets and queues for itself alone (section 8) |
 | lies in `poolinv` / `poolwho` | wasted dials | hints only, never passed on; a lie costs one dial, as `p2ppeers` |
@@ -1081,9 +1101,13 @@ Two things would need consensus and are deliberately left out:
 
 - Record: encode and parse round-trip; every rule of section 1 rejected one at
   a time (non-canonical compact, fee with no destination, destination with no
-  fee, uncle share with depth 0, bad name, push with `OP_PUSHDATA1`, trailing
-  opcode, a later format, a burn under 1 BTF); pool zero's record and both ids
-  above as fixed vectors.
+  fee, bad name, push with `OP_PUSHDATA1`, trailing opcode, a later format, a
+  burn under 1 BTF); the spacing rules (19 s refused, 20 s with depth 3
+  taken and with depth 2 refused, 30 s with depth 2 taken, 59 s with depth 1
+  refused, 60 s with depth 1 taken, depth 0 refused at any spacing, uncle
+  share 79 refused, a copy of pool zero's record at 10 s with another name
+  refused while pool zero's own is taken); `poolcreate`'s defaults make a
+  valid record; pool zero's record and both ids above as fixed vectors.
 - Index: synthetic chains with records at and around 30 confirmations; a
   reorg that removes an appearance before and after 30; a record appearing on
   both branches; a duplicate registration; deleting the index file and
@@ -1107,6 +1131,21 @@ Two things would need consensus and are deliberately left out:
   request is still served at once), and a peer that sent only registered
   shares is not proven for pool zero.
 - The `p2x*` and `pool*` commands take the lock-free path.
+- Late shares: a share that becomes an uncle candidate of the tip rebuilds the
+  job (once per 2 s at most) and the next template names it.
+- Resumable fetches (section 17): a resume point the server holds on its
+  line, one it holds only as an uncle, and one it does not hold (the whole
+  line, counted as a full serve); a fourth ask in an interval refused; a
+  second ask while a serve is in flight refused; zero-byte answers counted; a
+  resumed serve that would pass one history's worth cut there; the answer
+  window restarted by a full part, ended by a short part, and closed at 60
+  minutes while full parts keep coming; a partial fetch written to
+  `pools/<poolid>.part`, read back after a restart through `AddHistory`, and
+  resumed from its newest share; the file deleted when the line is whole.
+- Transport (section 17): `gettorinfo` `transports` for bundled rungs and for
+  user lines of each kind, `meek_lite` reported as meek; the smaller budget
+  on Snowflake or meek, the ticket made the same way, and the budget
+  following a change of rung while the node runs.
 - Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
   rule for duplicates and for the 4096 cap, the deadline for relays and not
   for answers, the same-body check before the hash, a bad-signature copy
@@ -1149,17 +1188,31 @@ on the same network the whole time:
    it out before 30 confirmations, and show it disappears from `poollist` and
    comes back when re-mined.
 7. **Through bridges.** Two testnet nodes run behind the bridge ladder for the
-   whole proof: one forced onto Snowflake with `-torbridges`, one on a bundled
-   obfs4 bridge (`settorbridges`), both confirmed by `gettorinfo` (its
-   `transport`). Each mines pool A, and the share chain shows its shares taken,
-   as shares or as paid uncles, with the uncle rate measured against the
-   direct-Tor nodes; the obfs4 node is drawn as a guardian and serves A's
-   line; the Snowflake node, as a fresh guardian client, fetches A's dormant
-   window with its connection cut halfway, and the fetch resumes from where it
-   stopped. The Snowflake node made no ticket under its default (section 17)
-   and made no connection outside Tor (its firewall log, or `netstat` showing
-   only the managed Tor's sockets). The measured round-trip times go into the
-   PR and into section 17.
+   whole proof, in this order:
+   1. One node is forced onto Snowflake with `-torbridges`; the other is moved
+      to the bundled obfs4 rung with `settorbridges "now"` (or given a user
+      obfs4 line). Both are confirmed by `gettorinfo` (`transport` and
+      `transports`, section 17), and the Snowflake node reports the smaller
+      budget.
+   2. Both mine pool A (spacing 20 s, depth 3) until each has found at least
+      200 shares. One-way delays are measured both ways against a direct-Tor
+      node (share found in the bridge node's log against arrival in the direct
+      node's, and the reverse) and written into section 17. **Pass mark:** each
+      bridge node loses at most 5% of its shares (neither on the line nor named
+      as an uncle), and its paid fraction (work credited, uncles at their
+      share, over work found) is within 3 points of what the model of section
+      17 gives for its measured delays.
+   3. Both make tickets with default settings. On testnet's few tickets both
+      are drawn for A within an epoch or two (the step waits for that); the
+      Snowflake node, drawn, serves A's line to a fresh node with its
+      16 KB/s budget, and the obfs4 node serves it too.
+   4. With A dormant, a fresh Snowflake node with an empty data directory
+      fetches A's window from guardians; its managed Tor is killed halfway
+      and the node restarted; it reloads `pools/<A>.part` and resumes from its
+      newest share, and the shares asked for again after the restart are at
+      most one part's worth.
+   5. Neither bridge node made a connection outside Tor: its firewall log, or
+      `netstat` showing only the managed Tor's sockets, for the whole step.
 
 Each step's proof goes into the PR with explorer links, and the public proofs
 become text for the #dev channel.
@@ -1175,7 +1228,7 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 |---|---|---|
 | A | this design, reviewed | done (PR #82); bridges and the name added by a follow-up |
 | B | the record, `poolcreate`/`poollist`/`poolinfo`, the index with reorgs, pool zero as entry zero, share rules v1 as parameters, share format 1, the anchor, `NODE_POOLREG` and the `p2x*` messages with resumable fetches, mining a chosen pool on testnet; self-tests and fuzz | in progress (PR #83) |
-| C | guardians: tickets, the draw, handoff, revival, budgets, the bridge defaults of section 17 | after B |
+| C | guardians: tickets, the draw, handoff, revival, budgets, the transport classification and bridge budgets of section 17 | after B |
 | D | the testnet proof of section 15 | after C |
 
 ## 17. Networks where Tor is blocked
@@ -1196,73 +1249,160 @@ a second or more. This design plans for **10 s one way** between a bridge
 user and the rest of the network in the worst case, and Phase D replaces that
 figure with measurements (section 15, step 7).
 
-**What latency costs a miner.** A share is late by its propagation delay `d`.
-While it travels, another miner may extend the line; the late share is then
-not lost but can be named as an uncle by a later share, up to the pool's
-uncle depth `D` shares above its parent, and is paid its uncle share of its
-work. So a share is paid in full or as an uncle as long as it reaches the
-other miners within roughly `D` share intervals, and the cost of latency is
-about `d / spacing` of a miner's shares paid at the uncle percentage instead of
-in full.
+**A bridge user is late twice.** It hears a new share `d` seconds after the
+others, and keeps mining on the old tip meanwhile; then its own share reaches
+the others `d` seconds after it is found. A share it finds can therefore meet
+a competing share at the same height if another share appeared within about
+`L = 2d` seconds around it (20 s in the planned worst case). With shares
+arriving at random at one per `S` seconds (spacing), that happens to a
+fraction `1 - e^(-L/S)` of its shares: this is the **contested** fraction.
 
-- Pool zero: 10 s spacing, depth 3, about 30 s of grace. It works for a bridge
-  user today, with more uncles; its rules cannot change.
-- Registered pools: **spacing of at least 20 s, and below 40 s an uncle depth of
-  at least 2** (section 1), so at least 40 s of grace, three times the planned
-  worst case even after an uncle fetch (a missing uncle costs the includer one
-  more round trip, `p2xgetsh`). With pool zero's depth of 3 at 20 s, 60 s.
-- The time rules need no change: a share may run 120 s ahead of a node's
-  clock, and a line counts as live for 180 share intervals.
+**A contested share is an uncle, not a loss, if it is named in time.** It can
+be named by a share on the line at most `D` (uncle depth) heights above it.
+With the job rebuilt as soon as an uncle candidate arrives (section 9), the
+next share found after it arrives names it, so it is lost only when the line
+has already grown `D` or more shares past it by then. The delay from the
+competing share to the late one's arrival is between 0 and `L`; with `N` the
+number of line shares found in that delay (Poisson, mean delay over `S`), the
+share is lost when `N >= D`. Without the rebuild it would be lost at
+`N >= D - 1`, since only a template built at the next tip change could name
+it: for pool zero at the planned worst case that is 23% of a bridge user's
+shares lost instead of 9%.
 
-**Histories over slow links.** A line of 3 to 9 MB takes minutes over meek. The
-pool zero rule that takes a history only within 5 minutes of asking
+**What it costs, at the planned worst case (`L` = 20 s) and at a typical
+obfs4 or webtunnel link (`L` = 6 s), with the uncle share at 80%.** Lost
+shares earn nothing; contested shares that are named earn 80% of their work;
+the rest earn in full. "Paid" is the work credited over the work found. A
+direct-Tor miner, at `L` of 2 to 3 s, is paid 97 to 99% at 20 s or more.
+
+| spacing, depth | contested at 20 s | lost at 20 s | paid at 20 s | paid at 6 s |
+|---|---|---|---|---|
+| 10 s, 3 (pool zero) | 87% | 9.4% | 75% | 91% |
+| 20 s, 3 | 63% | 1.5% | 86% | 95% |
+| 30 s, 2 | 49% | 2.6% | 88% | 96% |
+| 40 s, 2 | 39% | 1.3% | 91% | 97% |
+| 60 s, 1 | 28% | 4.2% | 91% | 98% |
+| 90 s, 1 | 20% | 2.1% | 94% | 98% |
+| 120 s, 1 | 15% | 1.2% | 96% | 99% |
+
+So the record rule (section 1) is set on the loss: **spacing times depth of
+at least 60 s, no depth 0, uncle share of at least 80%** keeps a bridge user's
+lost shares under 5% in the planned worst case, for every registered pool.
+What remains is the uncle discount on contested shares. A creator who expects
+many miners behind Snowflake or meek can lower it with a longer spacing, or
+with a higher uncle share; the uncle share is also what an includer gives up
+by naming uncles, and pool zero's 80% is a balance between the two. Pool zero
+stays usable through bridges, at the cost the first row shows, and its rules
+cannot change; a miner on a slow bridge does better in a pool with a longer
+spacing, and `poollist` shows every pool's spacing and depth.
+
+The model is approximate (it takes the share rate as steady and every delay
+as the worst one), and Phase D checks it: the pass mark of step 7 is a lost
+fraction of at most 5% and a paid fraction within 3 points of what this model
+gives for the delays measured on the same run.
+
+The time rules need no change: a share may run 120 s ahead of a node's clock,
+and a line counts as live for 180 share intervals.
+
+**Histories over slow links.** A line of 3 to 9 MB takes minutes over meek.
+The pool zero rule that takes a history only within 5 minutes of asking
 (`SYNC_ANSWER_WINDOW`) stays as it is for pool zero (section 8: pool zero is
-untouched). For registered pools the window **slides**: each part received
-restarts it, while the part count stays under the history cap, so a slow but
-moving transfer is never cut off, and a stalled one ends 5 minutes after its
-last part.
+untouched). For registered pools the window **slides, with a ceiling**:
+
+- it is counted in shares, not in parts: a **full** part (`SHARES_PER_MESSAGE`
+  shares, or within `MAX_SHARE_BYTES` of `HISTORY_PART_BYTES`) restarts the
+  5 minutes; a **short** part is the last one and ends the window;
+- the shares taken for one ask stay under one history's worth
+  (`3 x HISTORY_SHARES + 2 x SHARES_PER_MESSAGE` of the pool), as today;
+- the window closes **60 minutes after asking** whatever arrives: a fetch still
+  moving then is resumed with a new ask (below), which the request limits
+  count.
+
+So a slow but moving transfer is not cut off, a stalled one ends 5 minutes
+after its last full part, and no peer can keep a window open longer than an
+hour or push more than one history into it. The same sliding window would be
+local to the receiver for pool zero too, and changes nothing a server sees;
+whether pool zero needs it is measured over meek in Phase D before any change.
 
 ### Bandwidth
 
-**The node knows its transport.** Managed Tor reports the rung that reached the
-network (`gettorinfo` → `transport`, remembered in `managed-tor/last-working`).
-With an external Tor the node cannot tell, and treats it as direct unless told
-otherwise with `-poollowbw`.
+**What the node knows about its transport.** `BtfTorTransportMode()`
+(`tor.cpp`) gives the rung for the bundled ladder, but only "user" for the
+operator's own lines (`settorbridges`, `-torbridge`, `bridges.txt`), and
+"direct" with an external Tor. So the node also classifies the bridge lines it
+gave Tor, by their first word (`BtfBridgeTransport` over the configured
+lines: `snowflake`, `obfs4`, `webtunnel`, `meek_lite` reported as meek), and
+`gettorinfo` gains a field **`transports`**: the sorted list of the kinds in
+the lines Tor has now, empty when Tor runs without bridges. The node counts as
+**on a slow bridge** when that list holds Snowflake or meek (Tor may use any
+line it was given, so the slowest kind decides). With an external Tor the node
+cannot tell, and counts as direct unless told otherwise with `-poollowbw`.
+The transport can change while the node runs (the ladder climbs, the operator
+calls `settorbridges`): the classification is redone each time Tor is
+restarted on new lines, and the budget below follows it.
 
-**Defaults by transport.**
+**Guarding through bridges is on, with a smaller budget.** Tickets are public,
+so a node that stopped making them on Snowflake or meek would tell everyone
+which nodes sit on censored networks. A node on a slow bridge therefore makes
+its ticket exactly like any other and can be drawn like any other; only its
+**local** guard budget changes, when the operator has not set it:
 
-| transport | guarding by default | guard budget by default |
-|---|---|---|
-| direct, obfs4, webtunnel | on | as section 11 (128 MB, 8 pools with shares, 64 KB/s) |
-| Snowflake, meek, or `-poollowbw` | **off**: no ticket, never drawn | with `-poolguard=1`: 32 MB, 2 pools with shares, 16 KB/s |
+| | guard budget by default |
+|---|---|
+| direct, obfs4, webtunnel | as section 11: 128 MB, 8 pools with shares, 64 KB/s |
+| Snowflake, meek, or `-poollowbw` | 32 MB, 2 pools with shares, 16 KB/s |
 
-So being a guardian works through bridges: obfs4 and webtunnel nodes guard as
-any node, and Snowflake or meek nodes can choose to. They are not drawn by
-default because their links are slow and sometimes metered, and the draw
-should not hand a pool's only copies to the slowest nodes.
+Handoff pulls stop at that budget: a drawn node that cannot fit a pool's line
+does not pull it and does not announce it, and the next in the ranking and the
+reserve hold it (section 11), as for any node whose budget is full. A pool
+that fits is served at 16 KB/s, so a fetch from such a guardian is slower,
+and a new miner fetches from several guardians and from miners at once.
 
 **No "low-bandwidth" flag on the wire.** A flag in tickets or in `poolinv`
 would tell every node which nodes sit on censored networks. So a node never
-says so: declining duty looks like any node with `-poolguard=0` or without a
-listening onion, and serving slowly looks like any slow circuit. The ticket's
-capacity field carries only an explicit `-poolguardmb`, or the same default
-for everybody, never a value derived from the transport.
+says so. The ticket's capacity field carries only an explicit `-poolguardmb`,
+or the same default for everybody, never a value derived from the transport.
+What an observer can infer is that some guardians hold fewer pools and serve
+slowly, which is also what any node with `-poolguardmb` set low, a full
+budget or a slow circuit looks like.
 
-**Bounded handoff.** A guarded line is at most 64 MB (section 11), and a
-low-bandwidth guardian holds at most 32 MB in all. A ticket set is at most
-480 KB per epoch.
+**Bounded handoff.** A guarded line is at most 64 MB (section 11), and a guard
+budget on a slow bridge holds 32 MB in all. Ticket traffic is about 0.5 MB a
+day relayed, plus up to 1.9 MB per epoch when the node asks peers for a set,
+5.8 MB at start (section 10).
 
 **Resumable fetches.** A history arrives oldest first, in parts, and each part
-is kept as it arrives (`AddHistory` per part), in memory and in
-`pools/<poolid>.dat`. When a fetch breaks (a dropped circuit, a restart), the
-node asks again with `p2xsync` naming its resume point: the newest share it
-holds of that history. A peer that has that share on its line sends only what
-follows it; one that does not sends the whole line. A resumed request counts as
-the continuation of the same serve for the per-connection rules of section 8:
-what a peer is limited to per `SYNC_SERVE_INTERVAL` is one history's bytes,
-not one request, so resuming costs it only the rest. `poolgettkt` answers are
-resumable for free: asking again re-sends the set, and tickets already held
-are dropped before any hash.
+is taken as it arrives (`AddHistory` per part).
+
+- **Kept across a restart.** A history in progress has no usable tip yet, and
+  `pools/<poolid>.dat` is written from the tip (`WriteShares` writes
+  `History()`), so a partial fetch is kept in its own file,
+  `pools/<poolid>.part`: the shares taken so far, oldest first, and the tip
+  height the server stated. At start it is read back through `AddHistory`
+  with that height (clamped as a received part is), and the fetch resumes.
+  It counts against the pool's byte cap; it is never announced, never served
+  and never relayed; it is deleted when the line is whole (the chain then has
+  a tip and is written to `pools/<poolid>.dat`), after 24 hours without a new
+  share, or when the pool is no longer mined, carried or guarded. This is not
+  the "never kept in part" of section 12, which is about a guardian keeping
+  part of a line to serve.
+- **The resume point.** When a fetch breaks (a dropped circuit, a window
+  closed, a restart), the node asks again with `p2xsync` naming its resume
+  point: the newest share it holds of that history. A server that holds that
+  share, on its line or as an uncle, sends every share of its history at or
+  above that share's height (at, so that uncles at the same height come too),
+  and builds only that part, never the whole history first. A server that
+  does not hold it sends the whole line.
+- **Request limits stay.** Per (connection, pool), as section 8: one serve in
+  flight (an ask while one is being sent is refused, unscored); at most 3
+  asks of any kind per `SYNC_SERVE_INTERVAL`, counted whether the answer is
+  shares, the empty answer `p2xnone` or nothing; and at most one history's
+  worth of shares sent per interval, a resumed serve continuing the count of
+  the serve it resumes. A whole-line answer to a resume point the server does
+  not hold is a full serve and counts in full. So resuming saves a peer the
+  part already sent, and never lets anyone ask more often than today.
+- `poolgettkt` answers are resumable for free: asking again re-sends the set,
+  and tickets already held are dropped before any hash.
 
 **Metered links.** A node that only mines a pool pays for one history and then
 one share in and out per share interval, plus the share relay of pool zero as
@@ -1274,24 +1414,31 @@ today. `-poolguard=0` and no `-poolcarry` keep it there.
   else; Everpool adds no connection of its own. Inside Tor every message is
   carried in fixed 514-byte cells, so what shows is volume and timing.
 - The messages and the behaviour are the same on every transport. The only
-  transport-dependent choices are local (whether to make a ticket, how fast to
-  serve) and look like other nodes' settings.
-- **Timing.** A miner's own share leaves mixed with relayed ones: every node
-  that carries a pool relays every share of it, so a burst every share
-  interval is the pattern of every carrier, not of a miner. No padding beyond
-  Tor's cells is added: it would cost bridge users the bandwidth they have
-  least of, and Tor already quantizes.
+  transport-dependent choices are local (the guard budget, how fast to serve)
+  and look like other nodes' settings; every node makes its ticket the same
+  way.
+- **Timing.** A node relays every share of every pool it carries, so a burst
+  every share interval is the pattern of every carrier, not of a miner. That
+  does not hide a miner's own shares from the peers it sends them to: a share
+  that a node sends before it received it from anyone came from that node or
+  from a miner behind it. What protects the miner is Tor, as for pool zero
+  today: its peers see an onion, never an address. No padding beyond Tor's
+  cells is added: it would cost bridge users the bandwidth they have least
+  of, and would not change what a peer learns.
 - **Bulk.** A history fetch looks like pool zero's line sync and like block
   download, which every node does.
 - **Never the clear net.** The pool protocol has no path outside Tor: no DNS,
-  no HTTP, no fallback of any kind, and `-notorfallback` is honoured as
-  everywhere (`docs/censored-networks.md`). Guardians are found from the peer
-  cache and descriptors first, and a Nostr lookup, when needed, goes through
-  Tor as it does today. The stratum stays on 127.0.0.1 and the private
-  addresses of `-p2poolbind`, as today.
+  no HTTP, no direct connection of any kind. (`-notorfallback` is a different
+  thing: it stops the node from climbing to the bundled bridges; with or
+  without it, nothing ever leaves Tor, `docs/censored-networks.md`.)
+  Guardians are found from the peer cache and descriptors first, and a Nostr
+  lookup, when needed, goes through Tor as it does today. The stratum stays
+  on 127.0.0.1 and the private addresses of `-p2poolbind`, as today.
 
 ### Testing
 
-Section 15, Phase D step 7: a Snowflake node and an obfs4 node on testnet mine
-a registered pool, guard and fetch a resumed window, with the round-trip times
-measured and written back here.
+Section 15: the Phase B self-tests for the spacing rules, the job rebuild,
+resumable fetches, the sliding window and `transports`; and Phase D step 7,
+where a Snowflake node and an obfs4 node on testnet mine a registered pool
+against the pass mark above, guard it, and fetch a dormant window across a
+restart, with the measured delays written back here.
