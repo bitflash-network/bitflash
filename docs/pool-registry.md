@@ -79,7 +79,7 @@ All integers are little-endian, fixed width, unsigned.
 | 18 | 2 | creator fee, basis points | 0 to 300 (3%) |
 | 20 | 1 | fee script type | 0 none, 1 P2PKH, 2 P2SH |
 | 21 | 20 | fee script hash | the HASH160 of the address; twenty zero bytes when the type is 0 |
-| 41 | 1 to 32 | name | letters, digits, `-` and `_`, the community name rule (`community::NameOk`) |
+| 41 | 1 to 32 | name | ASCII `A`-`Z`, `a`-`z`, `0`-`9`, `-` and `_`, tested as byte ranges (not with `isalnum`, which depends on the C locale) |
 
 The name's length is what is left of the push: there is no length byte, so a
 record is 42 to 73 bytes.
@@ -218,14 +218,27 @@ zero of the registry with its current rules written as a record:
 
 ```
 record (49 bytes):
-4254465001010a007008d002ffff0f1f0350000000000000000000000000000000000000000000000000626974666c617368
+4254465001010a007008d002ffff0f1f03500000000000000000000000000000000000000000000000626974666c617368
 
-pool zero id, mainnet: d925f36f20d98092d034dc083e46040fcb292c5f5437bc834130da088b197c8a
-pool zero id, testnet: a97d439cb065f828545a5b45f098297ca79adebba56a80a87cb0b095fddb2736
+pool zero id, mainnet
+  shown (GetHex):  d925f36f20d98092d034dc083e46040fcb292c5f5437bc834130da088b197c8a
+  internal order:  8a7c198b08da304183bc37545f2c29cb0f04463e08dc34d09280d9206ff325d9
+pool zero id, testnet
+  shown (GetHex):  a97d439cb065f828545a5b45f098297ca79adebba56a80a87cb0b095fddb2736
+  internal order:  3627dbfd95b0b07ca8806aa5bbde9aa77c2998f0455b5a5428f865b09c437da9
 ```
 
-(Computed from the definitions above; Phase B pins them in a self-test, and
-the code and this page must agree before anything merges.)
+(Computed from the definitions above and recomputed by the review; Phase B
+pins all of them in a self-test, and the code and this page must agree before
+anything merges.)
+
+**The floor is the same target.** Pool zero today uses `bnProofOfWorkLimit`
+(`~uint256(0) >> 12`) as its floor, not `SetCompact(0x1f0fffff)`, which is
+slightly harder (`0x0fffff * 2^224`). No compact value lies strictly between
+the two, and every share target and retarget result is compact, so the floor
+check (`CheckShareCheap`) and the clamp in `NextShareBits` give identical
+answers with either. v1 uses `SetCompact(record floor)`; Phase B pins this
+equivalence in a self-test.
 
 - It is **fixed in the code**, present at height zero on every node, and needs
   no burn. A record with exactly these bytes, if somebody burns it, is pool
@@ -254,7 +267,8 @@ with another id, and miners choose. That is the point.
 
 A share rules version is a complete, frozen definition of share validity and
 chain choice, given a record's parameters. **Version 1 is the code of
-1.2.34 with its constants made parameters**, and nothing else:
+1.2.34 with its constants made parameters, plus the creator fee** (below), and
+nothing else. With pool zero's parameters and no fee it is 1.2.34 exactly:
 
 | today's constant | v1 parameter |
 |---|---|
@@ -267,6 +281,15 @@ chain choice, given a record's parameters. **Version 1 is the code of
 | `HISTORY_SHARES` | window + retarget + 2 x uncle depth + 10 |
 | chain choice over lines that do not meet: last 2160 shares | last *window* shares |
 | `TIP_MAX_AGE = 30 min` | 180 x spacing (30 min for pool zero) |
+| coinbase outputs at most `3 * WINDOW_SHARES` (`CheckShareCheap`) | at most 3 x window, plus 1 when the fee is above 0 |
+| `MAX_CHAIN_SHARES = 4 * HISTORY_SHARES` | 4 x the pool's `HISTORY_SHARES` |
+| `NEAR_TIP_SHARES = 2 * MAX_UNCLE_DEPTH + 10` | 2 x uncle depth + 10 |
+| `SYNC_GAP = 2 * MAX_UNCLE_DEPTH + 10` (`p2pool_net.cpp`) | 2 x uncle depth + 10 |
+| history shares a peer may send, `3 * HISTORY_SHARES + 2 * SHARES_PER_MESSAGE` | the same with the pool's `HISTORY_SHARES` |
+
+Outside validity, the template reserve for the coinbase
+(`P2POOL_COINBASE_SIGOPS`, `P2POOL_COINBASE_BYTES` in `rpc.cpp`) follows the
+same output count, plus one for the fee.
 
 Unchanged in v1, for every pool: at most 2 uncles; payout scripts are P2PKH or
 P2SH only; 120 s of future time; the median-of-11 lower bound on time; the
@@ -280,7 +303,9 @@ pay, out of its total value `T` (subsidy plus fees, at least the subsidy, as
 today):
 
 1. `fee = floor(T * bps / 10000)` to the fee script (P2PKH or P2SH of the
-   record's hash), computed in 128-bit integers;
+   record's hash), computed in 128-bit integers. A P2SH fee address is safe
+   because rules v3 (P2SH spending) is active on mainnet from 2026-11-21,
+   before this ships;
 2. `T - fee` over the window with `ComputePayouts`, unchanged;
 3. if the fee script is also in the window (the creator mines too), its two
    amounts are one output; otherwise the fee output takes its place in the
@@ -322,17 +347,25 @@ merkle branch.
 
 On top of the v1 rules, a format 1 share is valid only if:
 
-- its `poolId` is the pool whose rules it is checked against;
-- its coinbase carries **exactly one** `"p2x"` commitment (section 7), whose
-  pool id is `poolId` and whose hash is `SerializeHash(ShareDataX)`;
+- its `poolId` is the pool whose rules it is checked against, and is not pool
+  zero's id;
+- its whole coinbase scriptSig parses: it is read push by push with `GetOp`,
+  exactly as `FindCommitment` reads it today, and any `GetOp` failure makes
+  the share invalid. A push is recognised by its data alone, whatever opcode
+  carried it (a direct push or `OP_PUSHDATA1` alike);
+- its coinbase carries **exactly one** `"p2x"` commitment (section 7): a
+  67-byte push starting `"p2x"`, whose pool id is `poolId` and whose hash is
+  `SerializeHash(ShareDataX)`;
 - its coinbase carries **no** `"p2p"` commitment (a 35-byte push starting
-  `"p2p"`), and no second `"p2x"` push of any pool.
+  `"p2p"`) and no second `"p2x"` push of any pool.
 
-So one PoW counts on at most one share chain. A pool zero share cannot be a
-format 1 share (it has no `"p2x"` push), and a format 1 share cannot be a pool
-zero share: pool zero's frozen rule takes a coinbase with exactly one `"p2p"`
-push, and a format 1 coinbase has none. Two registered pools cannot share a
-PoW either, since the push names one pool id.
+So one PoW counts on at most one share chain. Pool zero's frozen rule
+(`FindCommitment` in 1.2.34) counts only 35-byte `"p2p"` pushes, so a pool
+zero coinbase may also carry a `"p2x"` push; that is why the exclusion has to
+sit on the format 1 side. A format 1 share cannot be a pool zero share, since
+it has no `"p2p"` push, and a pool zero share cannot be a format 1 share,
+since format 1 refuses any coinbase with a `"p2p"` push. Two registered pools
+cannot share a PoW either, since the push names one pool id.
 
 ## 7. The coinbase anchor
 
@@ -352,7 +385,10 @@ scriptSig would pass 100 bytes is no share, as for pool zero.
 
 The anchor names the pool, so **anyone can count, from the main chain alone,
 how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
-a `"p2x"` push names its pool in full. The index keeps these counts (section
+a `"p2x"` push names its pool in full. The count reads a coinbase the way a
+share is read: the scriptSig must parse fully, and it counts for pool zero
+with exactly one `"p2p"` push and no `"p2x"` push, for a registered pool with
+exactly one `"p2x"` push and no `"p2p"` push; anything else counts for no pool. The index keeps these counts (section
 3). They are *claims*: anybody can put a `"p2x"` push in a solo block's
 coinbase. Only a node that carries the pool can tell a real one (the coinbase
 pays that pool's window, the share data is in its share chain) from a label,
@@ -371,35 +407,80 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 
 | message | carries | what it does |
 |---|---|---|
-| `poolinv` | up to 64 pool ids | the registered pools this node carries now. Sent after `version`, and again when the set changes (at most once a minute) |
+| `poolinv` | up to 32 pool ids | the registered pools this node can serve now (below). Sent after `version`, and again when the set changes (at most once a minute) |
 | `p2xshare` | pool id, `ShareX` | a share, as `p2pshare` |
 | `p2xgetsh` | pool id, up to 500 share ids | ask for shares by id, as `p2pgetsh` |
 | `p2xsync` | pool id | ask for a line, as `p2psync` |
-| `p2xshares` | pool id, tip height, up to 400 shares | a part of a line, as `p2pshares`, only in answer to `p2xsync` |
+| `p2xshares` | pool id, tip height, up to 400 shares | a part of a line, as `p2pshares`, only in answer to `p2xsync` for that pool |
+| `p2xnone` | pool id | "I hold nothing of this pool": the answer to `p2xsync` or `p2xgetsh` for a pool this node does not carry, or carries with no shares |
 | `pooltkt` | guardian tickets | section 10 (Phase C) |
 | `poolwho` / `poolat` | a pool id / up to 32 `.btf` addresses | ask a peer who carries a pool; the answer is hints, as `p2ppeers` (Phase C) |
 
-**Routing.** A node sends `p2x*` messages for pool P only to peers whose
-latest `poolinv` names P. An honest node therefore never receives a share for
-a pool it did not announce. Each message starts with its pool id, so the
-receiver decides before reading the rest:
+**What `poolinv` names.** Only pools this node holds shares of, or mines, or
+carries by `-poolcarry`: at most 1 mined, 8 by `-poolcarry` and 8 guarded with
+shares (section 11), so 17, within the 32 the message allows. A guarded pool
+with no shares is not announced: there is nothing to send for it, and
+announcing every empty pool a node is drawn for would let cheap registrations
+crowd real pools out of the message.
+
+**Routing.**
+
+- *Pushes* (`p2xshare` sent unasked) for pool P go only to peers whose latest
+  `poolinv` names P. An honest node never pushes a share of a pool the
+  receiver did not announce.
+- *Requests* (`p2xsync`, `p2xgetsh`, `poolwho`) may go to any `NODE_POOLREG`
+  peer: that is how a node finds a pool nobody announced to it. A request for
+  a pool not carried, or carried with no shares, gets `p2xnone`, at the cost
+  of one map lookup, and scores nobody. Requests are rationed by the budgets
+  below, as `p2psync` is today.
+- *Answers* (`p2xshares`, and `p2xshare` sent in answer to `p2xgetsh`) are taken
+  only for the pool asked, from the peer asked, soon after asking (the rule
+  `p2pshares` has today, kept per pool).
+
+Every message starts with its pool id, so the receiver decides before reading
+the rest. For a pushed `p2xshare`:
 
 - pool id carried: the share goes through the same pipeline as pool zero's
-  (cheap checks first, the shared RandomX budget for unproven peers, the
-  orphan queue, scoring for invalid shares), on that pool's own share chain;
-- pool id announced by this node in the last 10 minutes but not carried now
-  (it just stopped): dropped, nobody scored;
+  (cheap checks first, the RandomX budget for unproven peers, the orphan
+  queue, scoring for invalid shares), on that pool's own share chain. The pool
+  id at the head of the message must equal `ShareDataX.poolId`; a mismatch is
+  an invalid share and scored as one;
+- pool id announced by this node in the last 10 minutes but not now (it just
+  stopped carrying it): dropped, nobody scored;
+- pool zero's id: a protocol violation, `Misbehaving(20)`. Pool zero travels
+  only on its own messages;
 - otherwise: dropped unread, no hash, `Misbehaving(1)`. The sender broke the
   routing rule, and it costs this node one map lookup.
 
 A share of a carried pool refused because it waits on its parent, or on this
 node's own clock, scores nobody (`InnocentRefusal`), as today.
 
-**Budgets are shared, not per pool.** The RandomX budget for shares from
-unproven peers, the history serve and ask budgets and the send queue caps of
-`p2pool_net.cpp` are one pool of tokens for all share chains together.
-Carrying more pools never multiplies what a peer can make this node hash or
-send.
+**Per connection, per pool.** The per-connection P2Pool state of today
+(`nP2PoolSyncAskedAt`, `nP2PoolHistoryRecv`, `nP2PoolSyncServed`, the deferred
+asks, "one history in the life of an unproven connection",
+`SYNC_SERVE_INTERVAL`) is kept per (connection, pool) for registered pools,
+with at most 8 registered pools served per connection per
+`SYNC_SERVE_INTERVAL`. One connection can then hand over several pools, which
+handoff needs (section 10), and no pool's history counts against another's.
+
+**Budgets: pool zero keeps its own.** Pool zero's budgets and caps stay
+exactly as in 1.2.34 and are used by pool zero alone: `budgetShareWork`,
+`budgetHistoryServe`, `budgetHistoryAsk`, `MAX_SEND_QUEUED`,
+`MAX_HISTORY_QUEUED`, `MAX_HISTORIES_QUEUED` and its slowest-reader rule. All
+registered pools together get a **second, separate set** of the same shape,
+with the guard bandwidth cap of section 11 on top; tickets get a third RandomX
+budget of their own (section 10). Carrying registered pools and guarding them
+can therefore never delay or drop pool zero's traffic: a starting 1.2.34 node
+asking an upgraded node for pool zero's line is served exactly as it would be
+by a 1.2.34 node. The worst a peer can make an upgraded node hash or send is
+bounded by the sum of the sets, a small constant multiple of today's, never by
+the number of pools.
+
+**The lock-free path.** Today `ProcessMessages` hands commands starting with
+`"p2p"` to `P2PoolProcessMessage` without `cs_main` (`main.cpp`, near the
+version check), because a RandomX check under `cs_main` stalls the node. The
+`p2x*`, `pool*` and `pooltkt` commands must take the same path; Phase B
+changes that test to the full list of P2Pool commands.
 
 **Version of the protocol.** `NODE_POOLREG` with share rules version 1 is the
 whole negotiation. A later format adds a later bit or a later record format;
@@ -408,11 +489,14 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
 
 ## 9. Mining a chosen pool
 
-- `-p2pool` alone, or `-p2pool=1`, as today: pool zero. Existing configs keep
-  their meaning.
-- `-p2pool=<poolid>` (64 hex digits): that pool. A value that looks like an id
-  but is not 64 hex digits makes the node refuse to start, so a typo does not
-  quietly mine pool zero.
+- `-p2pool` alone, or with any value that is not a pool id, as today: pool
+  zero. In 1.2.34 any `-p2pool=...` turns P2Pool on, `-p2pool=0` included, and
+  existing configs keep that meaning.
+- `-p2pool=<poolid>` (64 hex digits): that pool. Pool zero's own id means pool
+  zero. A value of 40 to 80 hex digits that is not exactly 64 makes the node
+  refuse to start, so a mistyped id does not quietly mine pool zero.
+- A node downgraded to 1.2.34 with `-p2pool=<poolid>` in its config mines pool
+  zero (its parser sees only "-p2pool"). The release notes say so.
 - One node mines one pool at a time; the stratum, the miner and
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
@@ -459,13 +543,24 @@ in the window, and a block that was found has paid.
 - The **ticket seed** of epoch `e` is the hash of block `720(e - 1)`, the first
   block of the epoch before. It is known a whole epoch in advance, so tickets
   for `e` are made during `e - 1`.
+- The **ticket deadline** of epoch `e` is block `720e - 120`. A node that has
+  that block on its active chain takes no more tickets for `e` (refused
+  innocently, nobody scored).
 - The **draw seed** of epoch `e` is the hash of block `720e - 60`, two hours
-  before the epoch starts. The draw is *settled* when that block has 30
-  confirmations, at height `720e - 31`; a reorg deeper than that redraws, and
-  both sets keep the chains (see *Handoff*).
+  before the epoch starts and sixty blocks after the deadline. The draw is
+  *settled* when that block has 30 confirmations, at height `720e - 31`; a
+  reorg deeper than that redraws, and both sets keep the chains (see
+  *Handoff*).
 
-Tickets are made before the draw seed exists, so nobody can make a ticket that
-wins a known draw.
+Nothing in a ticket can prove when it was made, so the deadline is enforced by
+each node on its own view, and the draw is built so that a ticket made after
+the seed is known gains nothing for free: a ticket's score depends on its
+RandomX work hash (see *The draw*), so every try at a good score costs a whole
+ticket of work. Were the score to depend on the `.btf` key alone, an attacker
+who saw the seed could generate keys for free until 16 of them topped one
+pool, and pay for only those 16 tickets. The deadline matters for nodes that
+were online before it; a node that starts later takes the tickets its peers
+hold, and the work in the score is what protects it.
 
 ### Who can be drawn: candidates and tickets
 
@@ -473,32 +568,55 @@ A **candidate** for epoch `e` is a node with a `.btf` identity (every node on
 this network has one: the ed25519 key its address encodes,
 `docs/rendezvous.md`) that publishes a **guardian ticket** for `e`:
 
-```
-ticket {
-    network magic (4) | "BTFG" (4) | epoch e (4) | btf public key (32)
-  | guard capacity in MB (2) | nonce (8)
-  | ed25519 signature by the btf key over everything before it (64)
-}
-```
+A ticket is 118 bytes. Its body is the first 54:
+
+| offset | bytes | field |
+|---|---|---|
+| 0 | 4 | network magic (`pchMessageStart`) |
+| 4 | 4 | `"BTFG"` |
+| 8 | 4 | epoch `e`, little-endian |
+| 12 | 32 | the node's `.btf` ed25519 public key |
+| 44 | 2 | guard capacity in MB, little-endian (what it offers; informative) |
+| 46 | 8 | nonce, little-endian |
+| 54 | 64 | ed25519 signature by that key over the 54 bytes of the body |
+
+Its **work** is the main chain's PoW v2 RandomX hash (`GetPoWHash`, with no
+new hash code) of this 80-byte header:
+
+| header field | value |
+|---|---|
+| `nVersion` | `0x47465442` (the bytes `"BTFG"`); no block or share uses it, which keeps a ticket from ever being a block or a share |
+| `hashPrevBlock` | the ticket seed of epoch `e` |
+| `hashMerkleRoot` | `SHA256d` of the 54-byte body |
+| `nTime` | the network's PoW v2 switch time (`PoWV2Time()`), so the v2 key and layout are always the ones used |
+| `nBits` | the ticket target, a fixed compact value per network |
+| `nNonce` | the low 32 bits of the body's nonce |
+
+The ticket is valid when that hash is at or under the ticket target, the
+signature verifies, the magic is this network's and the epoch is the current
+or the next one. The **work hash** is that RandomX hash.
 
 - The **signature** proves the ticket belongs to that `.btf` identity, the one
   whose signed descriptor tells everybody which onion reaches it. Reaching the
   onion is the authentication of the node (`docs/rendezvous.md`), so a ticket
-  names a node anyone can dial and check.
-- The ticket carries **RandomX work**: the main chain's own PoW v2 hash, with
-  no new code, of an 80-byte header-shaped message whose previous-block field
-  is the ticket seed and whose merkle field is `SHA256d` of the ticket's first
-  56 bytes, under a fixed ticket target. The target is set in Phase C from
-  measurement; the aim is a few minutes of one core per node per day, run at
-  idle priority. The work makes a ticket cost something to make and something
-  to check, so tickets cannot be minted by the million and cannot be used to
-  flood.
-- One ticket per `.btf` key per epoch. Tickets travel in `pooltkt` between
-  `NODE_POOLREG` peers; a node checks one (format, epoch, signature, then the
-  work, under the shared RandomX budget) before keeping or relaying it, and
-  scores a peer that sends a bad one. A node holds at most 4096 tickets per
-  epoch, preferring the ones of nodes it has itself reached in the last epochs,
-  then the rest in arrival order.
+  names a node anyone can dial and check. (The signature is not part of the
+  work or the score, so a second signature over the same body gains nothing.)
+- The **ticket target** is set in Phase C from measurement on this bench and
+  the 202; the aim is a few minutes of one core per node per day, at idle
+  priority. The work makes a ticket cost something to make and something to
+  check, so tickets cannot be minted by the million or used to flood.
+- **One ticket per `.btf` key per epoch.** If a key has more than one valid
+  ticket for an epoch, the one with the lowest work hash is the ticket; every
+  node keeps that one, so views converge.
+- Tickets travel in `pooltkt` between `NODE_POOLREG` peers. A node checks one
+  (magic, epoch, deadline, signature, then the work, under a RandomX budget of
+  its own, separate from both share budgets) before keeping or relaying it,
+  and scores a peer that sends an invalid one.
+- **At most 4096 tickets per epoch are held; past that, the 4096 with the
+  lowest work hashes.** Arrival order would let whoever floods first fill the
+  set; lowest hash makes every node converge on the same set whatever the
+  order, and an attacker's place in it is proportional to the work spent, slot
+  by slot, against honest tickets.
 
 A node that does not listen on an onion cannot be dialled and does not make
 tickets. A node with `-poolguard=0` makes none either.
@@ -509,11 +627,13 @@ For every **active** registered pool P except pool zero, and every ticket t of
 epoch `e`:
 
 ```
-score(t, P) = SHA256d( "Bitflash/guard/1" || draw seed of e || poolId of P || btf key of t )
+score(t, P) = SHA256d( "Bitflash/guard/1" || draw seed of e || poolId of P || work hash of t )
 ```
 
 Lowest score first. The **guardians** of P in epoch `e` are the **8** tickets
-with the lowest scores; ranks 9 to 16 are its **reserve**.
+with the lowest scores; ranks 9 to 16 are its **reserve**. With 16 tickets or
+fewer, every candidate is a guardian or reserve of every pool, within its
+budget.
 
 This is rendezvous hashing: every pool gets its own random order of all
 candidates, so an attacker cannot aim at one pool without winning that pool's
@@ -540,8 +660,10 @@ more somewhere, never a share judged differently.
 this order: pools with main-chain anchors in the last two epochs, then pools
 whose share chain it already holds, then the rest by age of registration. A
 pool that has never had a share costs nothing to guard (there is nothing to
-store), so a guardian of a never-mined pool only has to say "empty" when
-asked; spam registrations cost guardians nothing but a line in `poolinv`.
+store and nothing to announce), so a guardian of a never-mined pool only
+answers `p2xnone` when asked and checks, at handoff, whether the old guardians
+hold anything. Spam registrations cost guardians a `p2xsync` per pool per
+epoch, within the request budgets, and nothing more.
 
 ### Handoff
 
@@ -578,9 +700,17 @@ A pool is dormant when nobody mines it: its newest share is older than its
    it was given does not: that is the sign of a guardian serving a stale or
    private line. (It is a preference, not a validity rule: an honest guardian
    may not hold a share that was a block on a side line.)
-3. The node mines on the tip. The first shares after a long gap retarget
-   easier, by at most 4x per share over the window (v1 rules), so a lone
-   miner can wake a pool that had more hashrate.
+3. The node mines on the tip. The retarget is slow to ease after a long gap:
+   the first share after it is at the old difficulty (its retarget window does
+   not contain the gap), and from then on each share's target is the mean of
+   the last *retarget window* targets times a factor clamped to 4, so the
+   easing does not compound per share. A lone miner with 1% of the pool's old
+   hashrate needs on the order of a day to bring the line back to its pace.
+   That miner may instead start a new line from a first share (step 4): a
+   live line replaces a dormant one (`Heavier`, `TIP_MAX_AGE`), its first
+   *retarget window* shares are at the floor, and the pool is the same pool.
+   The choice is the cost of the old window: continuing pays the old window's
+   miners from the reviver's blocks, starting over does not.
 4. **If no copy is left anywhere,** the node waits as long as a starting pool
    zero node waits for history, then starts P's chain from a new first share
    (`hashPrevShare = 0`), exactly as a pool zero node does with no peers. The
@@ -609,13 +739,14 @@ mines and `-poolcarry` pools. Mining is unaffected.
 |---|---|
 | registry index | a few hundred bytes per pool, on disk and in memory; grows only by burns of 1 BTF |
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
-| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools; at most 32 MB per guarded pool (a pool whose line is bigger keeps its newest shares) |
+| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
 | a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s for serving histories of guarded pools; past it a `p2xsync` waits (`DeferSync`), never refused for good |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
-| tickets | at most 4096 per epoch, about 150 bytes each: under 1 MB a day |
-| RandomX | one shared budget for every share chain and for tickets |
+| tickets | at most 4096 per epoch, 118 bytes each: under 1 MB a day |
+| RandomX | three budgets: pool zero's (unchanged), one for all registered pools together, one for tickets; never one per pool |
+| requests from one connection | at most 8 registered pools' histories per `SYNC_SERVE_INTERVAL` (section 8) |
 
 What it costs in practice: an honest pool's line is about 2900 shares with
 their uncles; with a few dozen miners a share is 1 to 3 KB, so a line is 3 to
@@ -643,12 +774,14 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | a malicious guardian withholds | a new miner cannot fetch the line from it | reserve, lingering set, miners, every announcing peer, `poolwho`; at worst a restart, no coins lost |
 | a malicious guardian serves an old or private line | a reviving node mines on the wrong line | chain choice by work, `TIP_MAX_AGE`, and the anchor check (section 10); a forged heavier line needs real PoW |
 | a forged deep history | displaces an honest line | unchanged from pool zero: the deep end of a history is trusted on work alone, so a forgery needs as much work as the honest line, and is taken only right after asking |
-| Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; rendezvous hashing spreads an attacker's tickets over all pools at random, so taking all 16 places of one pool needs most of all tickets; and capture only buys withholding, which the rows above bound |
+| Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; the score depends on the work hash, so aiming at one pool after seeing the seed costs a ticket per try; the held set is the 4096 lowest work hashes, so an attacker's share of it, and of every pool's places, follows its share of all ticket work; and capture only buys withholding, which the rows above bound |
+| Sybil: flooding the ticket set to switch guardians off everywhere | every node's 4096 places filled by attacker tickets | the attacker must out-work honest tickets slot by slot (lowest hash wins, not first arrival); honest guardians whose tickets fall out still hold what they held, miners hold their pools, `poolwho` still finds announcing peers |
 | grinding the draw seed | a miner withholds a block to change the draw | the seed is one block two hours before the epoch; each retry costs a block reward and gives one random redraw; tickets are fixed a whole epoch before; and the prize is withholding |
 | flooding `p2x*` for pools not announced | CPU, memory | dropped at the pool id, unread and unhashed, `Misbehaving(1)` |
 | flooding shares of a carried pool | CPU | the shared RandomX budget, the orphan queue cap, scoring of invalid shares, as pool zero |
-| a pool whose shares are as big as rules allow | memory | per-pool and total guard caps; a pool's own miners carry it at pool zero's caps |
-| flooding tickets | CPU, memory | the work, the signature, one per key per epoch, 4096 per epoch, the shared budget, scoring |
+| a pool whose shares are as big as rules allow | memory | per-pool and total guard caps (a line that does not fit is not guarded, never kept in part); a pool's own miners carry it at pool zero's caps |
+| flooding tickets | CPU, memory | the work, the signature, the deadline, one per key per epoch, 4096 per epoch, the tickets' own RandomX budget, scoring |
+| registered pools crowding out pool zero | a starting 1.2.34 node cannot get pool zero's line | pool zero keeps its 1.2.34 budgets and queues for itself alone (section 8) |
 | lies in `poolinv` / `poolwho` | wasted dials | hints only, never passed on; a lie costs one dial, as `p2ppeers` |
 | PoW reused on two chains | double credit | exactly one commitment, of one pool, per coinbase (section 6) |
 | a share replayed across networks | double credit | the network magic is in the pool id |
@@ -666,6 +799,16 @@ node that announces a pool is asked, and a pool that loses every copy restarts
 with the same id and rules, losing no coins already paid. The ticket work is
 there to make capture cost something and to bound the traffic, not to carry
 safety.
+
+**What capture costs, with the cap.** Say honest nodes make H tickets an epoch
+and an attacker A, all at the same target. The held set is the 4096 lowest
+work hashes of all H + A, so while H + A stays under 4096 everybody holds
+everything, and past it the attacker's share of the set is about A / (H + A).
+Each place of each pool then goes to the attacker with about that
+probability, independently, so holding all 16 places of one chosen pool takes
+about (A / (H + A))^16 per epoch: with A = H, one pool in 65,536 per epoch;
+taking a chosen pool with even odds takes A around 22 times H. Raising H is
+the honest answer: every guarding node makes one ticket a day.
 
 ## 13. What stays out of consensus, and why
 
@@ -729,8 +872,18 @@ Two things would need consensus and are deliberately left out:
 - Format 1: the commitment rules of section 6 (missing `"p2x"`, two of them,
   wrong pool id, a `"p2p"` alongside), the 85-byte scriptSig bound, the fee
   split vectors (fee script in the window or not, rounding, fee 0).
-- Routing: no `p2x*` message to a peer without `NODE_POOLREG` or that did not
-  announce the pool; a share for an unannounced pool dropped before any hash.
+- Routing: no `p2x*` message to a peer without `NODE_POOLREG`; no pushed share
+  to a peer that did not announce the pool; a pushed share for an unannounced
+  pool dropped before any hash; `p2xnone` for a request about a pool not
+  carried; a message whose pool id differs from `ShareDataX.poolId` scored;
+  pool zero's id in a `p2x*` message scored.
+- Pool zero isolation: registered-pool traffic that drains its own budgets
+  leaves pool zero's budgets, queues and per-connection state untouched (a
+  1.2.34-style history request is still served at once).
+- The `p2x*` and `pool*` commands take the lock-free path.
+- Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
+  rule for duplicates and for the 4096 cap, the deadline, the draw over a
+  fixed ticket set.
 - Fuzz targets for the record parser and for `ShareX` (`fuzz_p2pool` extended).
 
 ### Testnet proof with real coins (Phase D)
