@@ -701,15 +701,22 @@ Phase C pins vectors for the body, the header, the work hash and the score.
      the answers this node asked for.
 
   **The checked set.** A body (`SHA256d` of its 54 bytes) enters this
-  epoch's checked set **only once its signature has verified**, and stays
-  whether its work then passes or fails, and whether a passing ticket is kept
-  or loses (outranked for its key, or past the cap). Up to 16384 body hashes
-  per epoch. So a replay of a body whose signature verified never costs a
-  second hash, and a copy of an honest body with a bad signature costs this
-  node one signature check, scores its sender, and leaves nothing behind: it
-  cannot keep the real ticket out. (Once the signature holds, whether the work
-  passes depends on the body and the named seed alone, so remembering a work
-  failure is safe.)
+  epoch's checked set **only once its signature has verified and its work has
+  passed**, and stays whether the ticket is then kept or loses (outranked for
+  its key, or past the cap). So:
+  - a replay of a valid ticket never costs a second hash;
+  - a copy of an honest body with a bad signature costs this node one
+    signature check, scores its sender, and leaves nothing behind: it cannot
+    keep the real ticket out;
+  - a body whose work fails is not remembered: every copy of it can only come
+    from a dishonest sender (failed work against the seed the sender named is
+    never honest), so every copy is checked and scored again, and nothing
+    about it needs room;
+  - the set fills only with bodies that each cost a ticket of work. It holds
+    up to 16384 per epoch; when full, the body with the highest work hash
+    leaves to make room, and a new body is never refused for want of room;
+  - the set belongs to one seed: it is emptied with the held set when the
+    epoch's seed block leaves the active chain.
 
   A ticket that passes is kept and relayed. Only a failure in step 1 or 3
   scores the sender. A bad signature is never honest, and neither is work that
@@ -727,15 +734,17 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   command, and stops sending, without scoring anyone, a version it no longer
   takes.
 - **When a seed block leaves the active chain** (a reorg at least 30 blocks
-  deep through height `720(e - 1)`), the node drops its held set for `e`,
+  deep through height `720(e - 1)`), the node drops its held set and its
+  checked set for `e`,
   makes its own ticket for `e` again on the new seed, and fills the set again
   by relay and `poolgettkt`. It never sends a ticket checked against a seed
   that is no longer its own. A ticket a node makes
   after its own deadline travels only in answers to `poolgettkt`; a node makes
   its ticket for `e` as soon as the seed is buried, well before.
-- **Getting the set.** A node that starts, restarts, or finds it holds few
-  tickets for an epoch sends `poolgettkt` for the previous, current and next
-  epochs to a few `NODE_POOLREG` peers. The answer is the peer's held set for
+- **Getting the set.** A node that starts, restarts, finds it holds few
+  tickets for an epoch, or has just buried a seed it was dropping relays for
+  (step 2), sends `poolgettkt` for the epochs concerned (previous, current and
+  next at start) to a few `NODE_POOLREG` peers. The answer is the peer's held set for
   that epoch, at most 4096 tickets (about 480 KB) in parts of 512. A peer
   serves a given epoch to a given connection at most once per
   `SYNC_SERVE_INTERVAL`, from the ticket class's own budget. A `pooltkt` counts
@@ -743,12 +752,19 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   `SYNC_ANSWER_WINDOW` of asking; anything else is a relay. Every ticket in an
   answer is checked as above, except for the deadline, and the 4096 cap
   applies. Checking a full answer costs up to 4096 hashes per epoch, more than
-  the ticket budget gives at once, so answered tickets wait in a bounded queue
-  (the 4096 cap per epoch) and are checked as the budget refills, never dropped
-  for want of budget; Phase C sizes the budget so a fresh node sees the draw
-  within an hour.
+  the ticket budget gives at once, so answered tickets wait in a queue and are
+  checked as the budget refills. Each asked peer's answer has its own queue
+  (at most 4096 tickets, and at most 4 peers asked per epoch at a time),
+  deduplicated by body as tickets enter (a body already in the checked set or
+  in another queue never enters), and the queues are drained in turn, one
+  ticket from each, so one peer's answer of junk cannot crowd out another's
+  real tickets; a peer whose answer turns out to hold invalid tickets is
+  scored for each and its queue dropped. Tickets that arrive beyond a full
+  queue are dropped, unscored. Phase C
+  sizes the budget so a fresh node sees the draw within an hour.
 - **Persistence.** A node keeps its own tickets and its held sets for the
-  previous, current and next epochs in `pool-tickets.dat`, read back at start
+  previous, current and next epochs, each with the seed hash it was checked
+  against, in `pool-tickets.dat`, read back at start
   and checked again through the ticket budget queue like an answer (up to
   3 x 4096 hashes, never blocking the start), so a restart does not leave it
   blind for the rest of an epoch.
@@ -1062,7 +1078,10 @@ Two things would need consensus and are deliberately left out:
 - The `p2x*` and `pool*` commands take the lock-free path.
 - Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
   rule for duplicates and for the 4096 cap, the deadline for relays and not
-  for answers, the same-body check before the hash, a message naming another
+  for answers, the same-body check before the hash, a bad-signature copy
+  arriving before the real ticket (the real one is still held), a checked set
+  filled to its limit (no body refused), a failing body sent twice (checked
+  and scored twice), answer queues drained in turn, a message naming another
   seed dropped unscored, a held set dropped and rebuilt when its seed is
   reorged out, a restart that reads
   `pool-tickets.dat` back and a fresh node that fills its set by
