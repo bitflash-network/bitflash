@@ -379,9 +379,10 @@ registered pool's coinbase carries instead a **67-byte push**:
 
 The template's scriptSig is then the height (at most 5 bytes with its push
 opcode, up to `MAX_BLOCK_HEIGHT`), `nBits` (at most 6), the extra nonce (at
-most 6) and this push (68 with its opcode): at most 85 bytes, inside the 100 a
-coinbase scriptSig may have (`CheckTransaction`). A format 1 share whose
-scriptSig would pass 100 bytes is no share, as for pool zero.
+most 6), this push (68 with its opcode), and the stratum's `extranonce2`,
+which `BuildMinerBlock` appends after it (at most 6): at most 91 bytes, inside
+the 100 a coinbase scriptSig may have (`CheckTransaction`). A format 1 share
+whose scriptSig would pass 100 bytes is no share, as for pool zero.
 
 The anchor names the pool, so **anyone can count, from the main chain alone,
 how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
@@ -413,13 +414,16 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 | `p2xsync` | pool id | ask for a line, as `p2psync` |
 | `p2xshares` | pool id, tip height, up to 400 shares | a part of a line, as `p2pshares`, only in answer to `p2xsync` for that pool |
 | `p2xnone` | pool id | "I hold nothing of this pool": the answer to `p2xsync` or `p2xgetsh` for a pool this node does not carry, or carries with no shares |
-| `pooltkt` | an epoch, up to 512 guardian tickets | tickets, relayed or in answer to `poolgettkt` (section 10, Phase C) |
+| `pooltkt` | an epoch, the ticket seed hash the sender checked them against, up to 512 guardian tickets | tickets, relayed or in answer to `poolgettkt` (section 10, Phase C) |
 | `poolgettkt` | an epoch | ask a peer for the tickets it holds for that epoch; answered with `pooltkt` parts, at most 4096 tickets in all (section 10, Phase C) |
 | `poolwho` / `poolat` | a pool id / up to 32 `.btf` addresses | ask a peer who carries a pool; the answer is hints, as `p2ppeers` (Phase C) |
 
-**What `poolinv` names.** Only pools this node holds shares of, or mines, or
-carries by `-poolcarry`: at most 1 mined, 8 by `-poolcarry` and 8 guarded with
-shares (section 11), so 17, within the 32 the message allows. A guarded pool
+**What `poolinv` names.** Only active pools this node carries now (mines,
+carries by `-poolcarry`, or guards) and holds shares of, plus the pool it mines
+even before it has shares: at most 1 mined, 8 by `-poolcarry` and 8 guarded
+with shares (section 11), so 17, within the 32 the message allows. A chain
+kept on disk after a reorg or after a guard slot ended is not carried and not
+announced. In what follows, "announced" and "carried" mean the same set. A guarded pool
 with no shares is not announced: there is nothing to send for it, and
 announcing every empty pool a node is drawn for would let cheap registrations
 crowd real pools out of the message.
@@ -436,7 +440,8 @@ crowd real pools out of the message.
   below, as `p2psync` is today.
 - *Answers* (`p2xshares`, and `p2xshare` sent in answer to `p2xgetsh`) are taken
   only for the pool asked, from the peer asked, soon after asking (the rule
-  `p2pshares` has today, kept per pool).
+  `p2pshares` has today, kept per pool). An answer for a pool this node
+  stopped carrying between the ask and the answer is dropped silently.
 
 Every message starts with its pool id, so the receiver decides before reading
 the rest. For a pushed `p2xshare`:
@@ -467,9 +472,12 @@ with at most 8 registered pools served per connection per
 handoff needs (section 10), and no pool's history counts against another's.
 
 **Pool zero is isolated from everything registered pools do.** The rule is
-that nothing a registered pool, a guardian or a ticket does may change how
-pool zero's traffic is treated, so that a 1.2.34 node asking an upgraded node
-for pool zero's line is served exactly as a 1.2.34 node would serve it. Every
+that nothing an honest peer, or a 1.2.34 node, does with registered pools,
+guardians or tickets may change how pool zero's traffic is treated, so that a
+1.2.34 node asking an upgraded node for pool zero's line is served exactly as
+a 1.2.34 node would serve it. (A peer that sends invalid registered shares or
+forged tickets is scored, and like any scored peer it loses its standing for
+pool zero too; only a dishonest peer can get there.) Every
 piece of shared P2Pool state in `p2pool_net.cpp` is split into two classes,
 *pool zero* and *registered*:
 
@@ -540,8 +548,8 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
 
 ## 9. Mining a chosen pool
 
-- `-p2pool` alone, or with any value that is not a pool id, as today: pool
-  zero. In 1.2.34 any `-p2pool=...` turns P2Pool on, `-p2pool=0` included, and
+- `-p2pool` (or `/p2pool`, the other spelling the parser takes) alone, or with
+  any value that is not a pool id, as today: pool zero. In 1.2.34 any `-p2pool=...` turns P2Pool on, `-p2pool=0` included, and
   existing configs keep that meaning.
 - `-p2pool=<poolid>` (64 hex digits): that pool. Pool zero's own id means pool
   zero. A value of 40 to 80 hex digits that is not exactly 64 makes the node
@@ -562,7 +570,7 @@ RPC:
 
 | call | does |
 |---|---|
-| `poolcreate {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. Unset fields take pool zero's values |
+| `poolcreate {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take pool zero's values. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
 | `poollist [all]` | active pools (with `all`, pending ones too): id, fingerprint, name, rules, fee, first height, confirmations, anchors in the last 720 blocks, whether carried, and the share chain's height and work when carried. Ordered by recent share work for carried pools, then by anchors, never by name |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, its share chain if carried, its guardians this epoch (Phase C) |
 
@@ -676,16 +684,27 @@ Phase C pins vectors for the body, the header, the work hash and the score.
      previous, current and next by this node's tip; a ticket seed block this
      node does not have on its active chain with at least 30 confirmations
      (a syncing node, or one on the other side of a reorg at an epoch
-     boundary, judges such a ticket on a view the sender may not share); the
-     deadline (unasked relays only); a body it already holds (`SHA256d` of the
-     54 bytes: a second signature over the same body gains a key owner
-     nothing, and cannot make this node hash one ticket many times);
-  3. the signature, then the work against the buried seed, under a RandomX
-     budget of its own, separate from both share budgets.
+     boundary, judges such a ticket on a view the sender may not share); a
+     message whose stated seed hash is not that block's hash (the sender is on
+     another branch, however deep the reorg); the deadline (unasked relays
+     only); a body it already holds (`SHA256d` of the 54 bytes: a second
+     signature over the same body gains a key owner nothing, and cannot make
+     this node hash one ticket many times);
+  3. the signature, then the work against the seed the message names, which
+     step 2 made sure is also this node's, under a RandomX budget of its own,
+     separate from both share budgets, and spent on older connections first
+     (the `OlderHeld` order), so tickets from fresh connections cannot starve
+     the answers this node asked for.
 
   A ticket that passes is kept and relayed. Only a failure in step 1 or 3
-  scores the sender: a bad signature, or work that fails against a seed both
-  sides have buried, is never an honest peer's doing. A ticket a node makes
+  scores the sender. A bad signature is never honest, and neither is work that
+  fails against the seed the sender itself named: whatever the two nodes'
+  views of the chain, that check gives the same answer on both.
+- **When a seed block leaves the active chain** (a reorg at least 30 blocks
+  deep through height `720(e - 1)`), the node drops its held set for `e`,
+  makes its own ticket for `e` again on the new seed, and fills the set again
+  by relay and `poolgettkt`. It never sends a ticket checked against a seed
+  that is no longer its own. A ticket a node makes
   after its own deadline travels only in answers to `poolgettkt`; a node makes
   its ticket for `e` as soon as the seed is buried, well before.
 - **Getting the set.** A node that starts, restarts, or finds it holds few
@@ -767,8 +786,9 @@ pool.
 
 **A pool that starts mid-epoch.** A guardian of P that holds nothing of it
 does not announce it, so nobody pushes it shares. So when a guardian sees a
-`poolinv` naming a pool it guards and holds less of (no line, or a lighter
-one), it sends that peer `p2xsync` for it, within its budgets. A pool started
+`poolinv` naming a pool it guards and holds no line of, it sends that peer
+`p2xsync` for it, within its budgets. Once it holds the line, it announces the
+pool and shares are pushed to it like to any carrier. A pool started
 the morning after a draw has guardian copies within minutes, not at the next
 epoch.
 
@@ -859,7 +879,7 @@ mines and `-poolcarry` pools. Mining is unaffected.
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
 | guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
-| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own |
+| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s for serving histories of guarded pools; past it a `p2xsync` waits (`DeferSync`), never refused for good |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
 | tickets | at most 4096 per epoch, 118 bytes each: under 1 MB a day |
@@ -895,7 +915,7 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; the score depends on the work hash, so aiming at one pool after seeing the seed costs a ticket per try; the held set is the 4096 lowest work hashes, so an attacker's share of it, and of every pool's places, follows its share of all ticket work; and capture only buys withholding, which the rows above bound |
 | Sybil: flooding the ticket set to switch guardians off everywhere | every node's 4096 places filled by attacker tickets | the attacker must out-work honest tickets slot by slot (lowest hash wins, not first arrival); honest guardians whose tickets fall out still hold what they held, miners hold their pools, `poolwho` still finds announcing peers |
 | grinding the draw seed | a miner withholds a block to change the draw | the seed is one block two hours before the epoch; each retry costs a block reward and gives one random redraw; tickets are fixed a whole epoch before; and the prize is withholding |
-| flooding `p2x*` for pools not announced | CPU, memory | dropped at the pool id, unread and unhashed, nobody scored (section 8: scoring would punish honest races and change how pool zero treats the peer); requests rationed by the registered budgets |
+| flooding `p2x*` for pools not carried | CPU, memory | dropped at the pool id, unread and unhashed, nobody scored (section 8: scoring would punish honest races and change how pool zero treats the peer); requests rationed by the registered budgets |
 | flooding shares of a carried pool | CPU | the shared RandomX budget, the orphan queue cap, scoring of invalid shares, as pool zero |
 | a pool whose shares are as big as rules allow | memory | per-pool and total guard caps (a line that does not fit is not guarded, never kept in part); a pool's own miners carry it at pool zero's caps |
 | flooding tickets | CPU, memory | the work, the signature, the deadline, the same-body check before any hash, one per key per epoch, 4096 per epoch, the tickets' own RandomX budget, scoring only for bad framing, bad signatures and failed work against a buried seed |
@@ -926,8 +946,11 @@ everything, and past it the attacker's share of the set is about A / (H + A).
 Each place of each pool then goes to the attacker with about that
 probability, independently, so holding all 16 places of one chosen pool takes
 about (A / (H + A))^16 per epoch: with A = H, one pool in 65,536 per epoch;
-taking a chosen pool with even odds takes A around 22 times H. Raising H is
-the honest answer: every guarding node makes one ticket a day.
+taking a chosen pool with even odds takes A around 22 times H. Aiming instead,
+grinding tickets after the draw seed is known until 16 of them top one pool,
+costs about 16 times H tickets for near-certain capture of that one pool: the
+same order. Raising H is the honest answer: every guarding node makes one
+ticket a day.
 
 ## 13. What stays out of consensus, and why
 
@@ -990,7 +1013,7 @@ Two things would need consensus and are deliberately left out:
   built by the new code for pool zero is byte-identical to one built by 1.2.34
   for the same template.
 - Format 1: the commitment rules of section 6 (missing `"p2x"`, two of them,
-  wrong pool id, a `"p2p"` alongside), the 85-byte scriptSig bound, the fee
+  wrong pool id, a `"p2p"` alongside), the 91-byte scriptSig bound, the fee
   split vectors (fee script in the window or not, rounding, fee 0).
 - Routing: no `p2x*` message to a peer without `NODE_POOLREG`; no pushed share
   to a peer that did not announce the pool; a pushed share for an unannounced
@@ -1006,7 +1029,9 @@ Two things would need consensus and are deliberately left out:
 - The `p2x*` and `pool*` commands take the lock-free path.
 - Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
   rule for duplicates and for the 4096 cap, the deadline for relays and not
-  for answers, the same-body check before the hash, a restart that reads
+  for answers, the same-body check before the hash, a message naming another
+  seed dropped unscored, a held set dropped and rebuilt when its seed is
+  reorged out, a restart that reads
   `pool-tickets.dat` back and a fresh node that fills its set by
   `poolgettkt`, the draw over a fixed ticket set, guard ranking by line work,
   and a guardian pulling a pool it sees announced mid-epoch.
