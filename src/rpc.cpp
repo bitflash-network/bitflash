@@ -2830,9 +2830,13 @@ static bool P2PoolParseBind(const std::string& strAddr, struct sockaddr_storage&
 {
     memset(&ss, 0, sizeof(ss));
     nLen = 0;
-    if (strAddr.empty() || strAddr.size() > 64)
+    // Brackets and blanks are refused here, not left to the parser: Windows'
+    // getaddrinfo takes "[fd00::10]", glibc's does not, and an option should
+    // mean the same on both.
+    if (strAddr.empty() || strAddr.size() > 64 ||
+        strAddr.find_first_of("[] \t\r\n\f\v") != std::string::npos)
     {
-        strWhyNot = "it is not an IP address";
+        strWhyNot = "it is not a numeric IPv4 or IPv6 address (no names, no port)";
         return false;
     }
 #ifdef _WIN32
