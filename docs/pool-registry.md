@@ -11,6 +11,12 @@ travel between nodes. Inside the code and in the rest of this page it is the
 It works the same on a network that blocks Tor, through the bridges the node
 already uses there (section 17).
 
+A pool can also be private: **P2Pool local** (section 18) uses the same share
+rules for a group that wants nothing published, with no record on the chain,
+no burn, and its share chain only on its members' nodes. At creation the user
+picks one or the other; pool zero, the default P2Pool, stays as it is for
+whoever picks neither.
+
 ## What it is for
 
 P2Pool inside the node (`docs/p2pool.md`) removed the pool operator: no
@@ -61,6 +67,7 @@ mining it with no change.
 15. Test plan
 16. Phases
 17. Networks where Tor is blocked
+18. P2Pool local: a private pool
 
 ## 1. The record
 
@@ -373,7 +380,8 @@ On top of the v1 rules, a format 1 share is valid only if:
   67-byte push starting `"p2x"`, whose pool id is `poolId` and whose hash is
   `SerializeHash(ShareDataX)`;
 - its coinbase carries **no** `"p2p"` commitment (a 35-byte push starting
-  `"p2p"`) and no second `"p2x"` push of any pool.
+  `"p2p"`), no `"p2l"` commitment (a 35-byte push starting `"p2l"`, a local
+  pool's anchor, section 18) and no second `"p2x"` push of any pool.
 
 So one PoW counts on at most one share chain. Pool zero's frozen rule
 (`FindCommitment` in 1.2.34) counts only 35-byte `"p2p"` pushes, so a pool
@@ -405,7 +413,7 @@ how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
 a `"p2x"` push names its pool in full. The count reads a coinbase the way a
 share is read: the scriptSig must parse fully, and it counts for pool zero
 with exactly one `"p2p"` push and no `"p2x"` push, for a registered pool with
-exactly one `"p2x"` push and no `"p2p"` push; anything else counts for no pool. The index keeps these counts (section
+exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). The index keeps these counts (section
 3). They are *claims*: anybody can put a `"p2x"` push in a solo block's
 coinbase. Only a node that carries the pool can tell a real one (the coinbase
 pays that pool's window, the share data is in its share chain) from a label,
@@ -620,7 +628,8 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
-| `poolcreate {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, `dryrun` or not. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
+| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, `dryrun` or not. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
+| `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
 | `poollist [all]` | active pools (with `all`, pending ones too): id, fingerprint, name, rules, fee, first height, confirmations, anchors in the last 720 blocks, whether carried, and the share chain's height and work when carried. Ordered by recent share work for carried pools, then by anchors, never by name |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, its share chain if carried, its guardians this epoch (Phase C) |
 
@@ -1193,7 +1202,8 @@ Two things would need consensus and are deliberately left out:
   `pool-tickets.dat` back and a fresh node that fills its set by
   `poolgettkt`, the draw over a fixed ticket set, guard ranking by line work,
   and a guardian pulling a pool it sees announced mid-epoch.
-- Fuzz targets for the record parser and for `ShareX` (`fuzz_p2pool` extended).
+- P2Pool local: the self-tests of section 18.
+- Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended).
 
 ### Testnet proof with real coins (Phase D)
 
@@ -1261,6 +1271,10 @@ on the same network the whole time:
       first template is on the same tip as the miners'.
    6. Neither bridge node made a connection outside Tor: its firewall log, or
       `netstat` showing only the managed Tor's sockets, for the whole step.
+8. **A local pool.** The proof of section 18 (*Tests and proof*): two
+   members mine a password-protected local pool to a block whose coinbase
+   pays both, a wrong-password peer gets nothing, nothing public names the
+   pool, one member behind Snowflake.
 
 Each step's proof goes into the PR with explorer links, and the public proofs
 become text for the #dev channel.
@@ -1274,9 +1288,10 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 
 | phase | content | status |
 |---|---|---|
-| A | this design, reviewed | done (PR #82); bridges and the name added by a follow-up |
-| B | the record, `poolcreate`/`poollist`/`poolinfo`, the index with reorgs, pool zero as entry zero, share rules v1 as parameters, share format 1, the anchor, `NODE_POOLREG` and the `p2x*` messages with resumable fetches, mining a chosen pool on testnet; self-tests and fuzz | in progress (PR #83) |
-| C | guardians: tickets, the draw, handoff, revival, budgets, the transport classification and bridge budgets of section 17 | after B |
+| A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
+| B1 | the record checks (both magics), share rules v1 as parameters, share format 1, the `"p2l"` anchor, P2Pool local (section 18: code, password, id, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
+| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | after B1 |
+| C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | after B2 |
 | D | the testnet proof of section 15 | after C |
 
 ## 17. Networks where Tor is blocked
@@ -1561,3 +1576,214 @@ and `transports`; and Phase D step 7,
 where a Snowflake node and an obfs4 node on testnet mine a registered pool
 against the pass mark above, guard it, and fetch a dormant window and a live
 line across a restart, with the measured delays written back here.
+
+## 18. P2Pool local: a private pool
+
+Everpool is public on purpose: anyone can find a pool, join it and keep it
+alive. Some groups want the opposite: the machines of one home, one office or
+a few friends, mining together and paying each other fairly, with nothing
+published anywhere. That is **P2Pool local**. At creation the user picks one
+of the two:
+
+| | Everpool | P2Pool local |
+|---|---|---|
+| where the pool is defined | an `OP_RETURN` record on the chain, 1 BTF burned | a pool code the members share among themselves; nothing on the chain, nothing burned |
+| who can find it | everyone (`poollist`) | only who is given the code (and the password, if it has one) |
+| who carries its share chain | its miners, guardians drawn at random, anyone with `-poolcarry` | only its members' nodes |
+| who it talks to | every `NODE_POOLREG` peer that carries it | only the peers its members listed |
+| when its nodes all go away | it lives on in guardians, and the record restarts it | it is gone, by design |
+
+Pool zero, the default P2Pool, stays as it is for whoever picks neither.
+
+### What a local pool is
+
+A local pool has the same parameters as an Everpool pool and obeys the same
+share rules v1 (section 5) and share format 1 (section 6): it is the same code
+with a different identity and a different reach. Its parameters are a record
+in the format of section 1, with three differences:
+
+- the magic is `"BTFL"` instead of `"BTFP"`, so a local record can never be
+  read as a registry entry (and nothing on the chain is read as a local
+  record);
+- it is never put on the chain: there is no burn and no confirmation, and
+  the registry index never sees it;
+- the name is a label for the members, and is part of the identity below
+  (two groups with the same parameters and no password still get two pools).
+
+Every other rule of section 1 applies unchanged, the canonical encoding
+included (spacing 20 to 120, spacing times depth at least 60, uncle share 80
+to 100, the fee rules), so the share rules code has one path, and a local
+group whose members sit behind bridges gets the same latency margins as any
+pool (section 17).
+
+### Identity: the pool code and the password
+
+- **The pool code** is what members share: the text `btfl1:` followed by the
+  hex of the local record and the first 4 bytes of its SHA256d as a checksum.
+  It holds the parameters and the name, never the password.
+- **The password** is optional. It is stretched with Argon2id (libsodium
+  `crypto_pwhash`, `ALG_ARGON2ID13`, 3 passes, 64 MiB), salted with the first
+  16 bytes of `SHA256d("Bitflash/localpool/1/salt" || network magic ||
+  record)`, into a 32-byte key `K`. With no password the same function runs
+  on the empty string, so there is one path.
+- **The local pool id** is `SHA256d("Bitflash/localpool/1/id" || network
+  magic || record || K)`. It names the pool on the member's own node
+  (`-p2pool=<id>`, `pools/local/<id>.*`, `poolinfo`) and inside its shares
+  (`ShareDataX.poolId`), and is never sent to anyone who is not already a
+  member.
+- **The pool key** is `A = HMAC-SHA256(K, "Bitflash/localpool/1/auth" ||
+  id)`. It authenticates members to each other (below).
+
+A node stores the record, `K` and the listed peers in `pools/local/<id>.conf`,
+never the password. Whoever reads that file can join the pool, as whoever
+has the code and the password can: membership is the only thing it protects.
+
+**What a password buys.** Without one, the pool is private only as long as
+its code is: anyone who has the code, or guesses it (a default record with a
+common name is easy to guess), computes the same id and key. With one, the
+code can be shared openly and the pool is still closed. The only material
+that lets anyone test passwords offline is a member's hello (below), which
+only the peers a member chose ever see; each guess then costs one Argon2id
+run. Nothing on the chain lets anyone test a password, since the anchor
+commits to share data that never leaves the members.
+
+### The coinbase anchor
+
+A local pool's coinbase carries a **35-byte push**: `"p2l"` and
+`SerializeHash(ShareDataX)` (the share data, `poolId` included). It carries
+no pool id, so:
+
+- each block of the pool shows a different hash, and nothing in the anchors
+  ties one block of the pool to another;
+- the members are linked by the coinbase outputs, which pay the PPLNS window,
+  exactly as any P2Pool coinbase links the miners it pays (pool zero's
+  included), and by nothing more;
+- the tag says that the block came from some local pool, not which: that is
+  as much as the `"p2p"` tag says about pool zero, and far less than a
+  `"p2x"` anchor, which names its pool.
+
+The share rules of section 6 extend to it, so that one PoW counts on at most
+one share chain:
+
+- a local share is valid only if its coinbase parses fully and carries
+  exactly one `"p2l"` push, whose hash is `SerializeHash(ShareDataX)` with
+  `poolId` equal to this local pool's id, and no `"p2p"` push and no `"p2x"`
+  push;
+- a registered pool's share (format 1) also refuses any `"p2l"` push (added
+  to section 6's list);
+- pool zero's frozen rule counts only `"p2p"` pushes, so a pool zero coinbase
+  may carry a `"p2l"` push; the exclusion sits on the local side, as it does
+  for `"p2x"`. Two local pools cannot share a PoW either, since the hash
+  commits to one pool id.
+
+The scriptSig is at most 59 bytes (the anchor is 32 bytes shorter than
+`"p2x"`). The anchor counts of section 3 ignore `"p2l"` pushes: there is no
+pool to count them for.
+
+### Members find each other, and nobody else finds them
+
+There is no discovery. A local pool is never announced in `poolinv`, never
+named in `poolwho`, never given a ticket or drawn for guardians, never
+relayed to a peer that did not prove membership, and never listed by
+`poollist` on any node but its members' own. Members exchange, out of band:
+the pool code, the password if any, and the onion addresses of the member
+nodes that accept connections.
+
+- **Listed peers.** Each member lists the onions of other members
+  (`poolpeers`, below; at most 16 per local pool). The node keeps an ordinary
+  outbound Bitflash connection to each listed onion that answers, through
+  Tor, like any other peer: it relays blocks and transactions as usual, and
+  nothing on the wire says it was dialled for a pool.
+- **The hello.** On a connection to or from a peer (inbound onion
+  connections are anonymous, so the listing alone proves nothing), a member
+  proves membership with three messages, after the version handshake:
+  1. `p2lhello`: a random 32-byte nonce `nA` and `tA = HMAC(A, "hello" ||
+     nA)`, first 16 bytes. Sent only to listed peers.
+  2. The receiver tries `tA` against each local pool it is a member of (at
+     most 4). On a match it answers `p2lhello` with its own nonce `nB` and
+     `tB = HMAC(A, "reply" || nA || nB)`; on no match it answers nothing,
+     which is what a node without local pools, or a 1.2.34 node that does
+     not know the command, also does.
+  3. The first side checks `tB` and sends `p2lack` with `HMAC(A, "ack" || nA
+     || nB)`. Only then does either side send anything about the pool.
+
+  A replayed `p2lhello` gets at most a reply, never pool data: the ack needs
+  `A` and the fresh `nB`. The session is named on that connection by `h =
+  HMAC(A, "session" || nA || nB)`, first 8 bytes, and every later message of
+  the pool carries `h`, never the pool id. A receiver checks at most one
+  `p2lhello` per connection per minute and 8 in the life of a connection;
+  the rest are dropped unread, and nobody is scored for a hello that matches
+  nothing (a non-member listing this node by mistake is not an attack).
+- **The messages.** After the ack, the pool runs over `p2lshare`, `p2lgetsh`,
+  `p2lsync` and `p2lshares`, which are `p2xshare`, `p2xgetsh`, `p2xsync` and
+  `p2xshares` (sections 8 and 17) with `h` in place of the pool id: the same
+  share relay, paced serves, resume points, receiving window, complete state
+  and partial file. A message with an unknown `h` is dropped unread,
+  unscored.
+- **The LAN.** Machines on the same network do not need a node each: they
+  mine through one member node's stratum with `-p2poolbind` (#81), whose
+  limits stay as they are: 48 miners on the local network, 8 per address,
+  login within 30 s, private addresses only. A second node on the LAN, for
+  redundancy, is a member like any other and talks to the first through Tor,
+  as every node does; nothing of a local pool ever leaves Tor or the
+  private-address stratum.
+
+### Limits
+
+A local pool spends from the registered class of section 8, never from pool
+zero's: its shares are checked through the registered RandomX budget, its
+orphans wait in the registered queue, its serves take the 8 registered slots
+and the per-(connection, pool) limits of sections 8 and 17, with the session
+in place of the pool. On top of that: at most 4 local pools per node, at most
+16 listed peers each, at most 8 hello sessions per local pool at once, and
+the byte caps pool zero has (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`) for each.
+A peer that sends an invalid share in a session is scored, as for any pool.
+
+### When the members go away
+
+The share chain lives in `pools/<id>.dat` on each member node. When every
+member stops, the pool stops; when one comes back with its file, the pool
+goes on from there, and when none has the file any more, starting again from
+the same code and password gives the same id and a fresh chain. Nothing is
+left anywhere else to clean up.
+
+### Using it
+
+| call | does |
+|---|---|
+| `poolcreate everpool {params} [dryrun]` | an Everpool pool: the record of section 1, burned on the chain (section 9) |
+| `poolcreate local {params} [password]` | a local pool: checks the record as section 1 does, with the defaults of section 9, derives the id, saves `pools/local/<id>.conf`, and returns the id, the pool code and the note below. Nothing is sent anywhere |
+| `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the id and the note |
+| `poolpeers <id> ["onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows them and which have proven membership |
+| `poolleave <id>` | forgets a local pool: deletes its files after the node stops mining it |
+| `poollist`, `poolinfo` | show this node's local pools too, marked `"local": true`, with their sessions; never any other node's |
+
+`poolcreate` with no mode is refused with a message that names the two, so
+nobody burns 1 BTF by default. Mining a local pool is `-p2pool=<id>`, as for
+any pool (section 9). The password is read from the RPC call, never from the
+command line, where other users of the machine could see it.
+
+The result of `poolcreate local` and `pooljoin`, the GUI, and the release
+notes carry the same informative note, without alarm:
+
+> A local pool finds blocks in proportion to your machines' hashrate: rarer
+> but larger payouts; the average is the same as any pool.
+
+### Tests and proof
+
+- Self-tests (Phase B): the local record round-trip and every section 1 rule
+  under `"BTFL"`; a `"BTFL"` record in an `OP_RETURN` not indexed; the code's
+  checksum; fixed vectors for `K`, the id and `A` with and without a password;
+  the anchor rules (`"p2l"` with the wrong hash, two of them, alongside a
+  `"p2p"` or a `"p2x"`; a format 1 share refusing `"p2l"`); the hello (a
+  match, no match answered by silence, a replayed hello getting no pool
+  data, the rate limit, an unknown `h` dropped); a local pool never in
+  `poolinv`, tickets or another node's `poollist`; the limits above.
+- Testnet proof with real coins (Phase D, step 8): two nodes on different
+  machines join one local pool with a password and list each other; a third
+  node lists one of them with the wrong password and gets nothing; both mine
+  until a block is found, its coinbase pays both to the satoshi, the coins
+  mature and are spent; the block's anchor is a `"p2l"` push and nothing on
+  the chain or in any other node's `poollist` names the pool; one node goes
+  away and comes back from its file; then both go away, and the pool is
+  gone. One of the two runs behind Snowflake for the whole step.
