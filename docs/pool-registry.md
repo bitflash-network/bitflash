@@ -758,8 +758,8 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   applies. Checking a full answer costs up to 4096 hashes per epoch, more than
   the ticket budget gives at once, so answered tickets wait in a queue and are
   checked as the budget refills. Each asked peer's answer has its own queue
-  (at most 4096 tickets, and at most 4 peers asked per epoch at a time,
-  about 1.9 MB at most), deduplicated **only within that queue and against
+  (at most 4096 tickets, and at most 4 peers asked per epoch at a time:
+  about 1.9 MB per epoch, 5.8 MB at start when three epochs are asked for), deduplicated **only within that queue and against
   the checked set**, never against another peer's queue: a body two peers
   sent waits in both queues, and whichever copy is reached second is dropped
   for free by step 2 (the first one's body is in the checked set by then).
