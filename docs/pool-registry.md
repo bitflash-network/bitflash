@@ -431,8 +431,8 @@ crowd real pools out of the message.
   receiver did not announce.
 - *Requests* (`p2xsync`, `p2xgetsh`, `poolwho`) may go to any `NODE_POOLREG`
   peer: that is how a node finds a pool nobody announced to it. A request for
-  a pool not carried, or carried with no shares, gets `p2xnone`, at the cost
-  of one map lookup, and scores nobody. Requests are rationed by the budgets
+  a pool not carried, or carried with no shares, or naming pool zero's id,
+  gets `p2xnone`, at the cost of one map lookup, and scores nobody. Requests are rationed by the budgets
   below, as `p2psync` is today.
 - *Answers* (`p2xshares`, and `p2xshare` sent in answer to `p2xgetsh`) are taken
   only for the pool asked, from the peer asked, soon after asking (the rule
@@ -502,6 +502,24 @@ piece of shared P2Pool state in `p2pool_net.cpp` is split into two classes,
   never score a peer for routing (above); a peer that sends an invalid share of
   a registered pool is scored, as it would be for an invalid pool zero share,
   because only a dishonest peer does that.
+
+The rule covers every other piece of shared state too, and Phase B lists each
+in the code: the global cap on deferred entries (`MAX_DEFERRED`) and the
+`OlderHeld` order used by `PeerWorkGate` and `HistoryServeDecision`;
+`setOrphanSeen` and `setOrphanBadWork`; the history-waiting state
+(`nFirstHistoryAsk`, `P2PoolAwaitingHistory`), which becomes per pool; and
+`nP2PoolLastGood`, which only a pool zero share sets, so that a floor share of
+some unmined registered pool never makes a peer proven for pool zero (the
+registered class keeps its own "last good" per connection). Two limits stay
+shared because they are the socket's: the hard send buffer cap
+(`MAX_SEND_BUFFER_HARD`, 64 MB) is the whole `vSend`, so the registered caps
+are set to keep pool zero's largest queue plus the registered one under it;
+and a connection dropped by the registered slow-reader rule loses pool zero
+on that connection too, which is acceptable (it was reading nothing).
+
+The tip height and the seed hashes the ticket and registry checks need are
+read without `cs_main`, from a snapshot updated under `cs_main` when the tip
+changes and read under `cs_p2pool`, so the lock-free path stays lock-free.
 
 The worst a peer can make an upgraded node hash or send is bounded by the sum
 of the classes, a small constant multiple of today's, never by the number of
@@ -651,20 +669,39 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   ticket for an epoch, the one with the lowest work hash is the ticket; every
   node keeps that one, so views converge.
 - Tickets travel in `pooltkt` between `NODE_POOLREG` peers. A node checks one
-  in this order: magic and epoch, the deadline (unasked relays only), whether
-  it already holds a ticket with the same body (`SHA256d` of the 54 bytes: a
-  second signature over the same body is dropped before any hash, so a key
-  owner cannot make this node hash one ticket many times), the signature, then
-  the work, under a RandomX budget of its own, separate from both share
-  budgets. It keeps and relays a valid one and scores a peer that sends an
-  invalid one.
+  in this order:
+  1. framing and magic; a malformed message or another network's magic is
+     the sender's fault and scored;
+  2. **innocent drops, before any hash, nobody scored:** an epoch outside
+     previous, current and next by this node's tip; a ticket seed block this
+     node does not have on its active chain with at least 30 confirmations
+     (a syncing node, or one on the other side of a reorg at an epoch
+     boundary, judges such a ticket on a view the sender may not share); the
+     deadline (unasked relays only); a body it already holds (`SHA256d` of the
+     54 bytes: a second signature over the same body gains a key owner
+     nothing, and cannot make this node hash one ticket many times);
+  3. the signature, then the work against the buried seed, under a RandomX
+     budget of its own, separate from both share budgets.
+
+  A ticket that passes is kept and relayed. Only a failure in step 1 or 3
+  scores the sender: a bad signature, or work that fails against a seed both
+  sides have buried, is never an honest peer's doing. A ticket a node makes
+  after its own deadline travels only in answers to `poolgettkt`; a node makes
+  its ticket for `e` as soon as the seed is buried, well before.
 - **Getting the set.** A node that starts, restarts, or finds it holds few
   tickets for an epoch sends `poolgettkt` for the previous, current and next
   epochs to a few `NODE_POOLREG` peers. The answer is the peer's held set for
-  that epoch, at most 4096 tickets (about 480 KB) in parts of 512, served at
-  most once per peer per epoch per `SYNC_SERVE_INTERVAL` from the ticket
-  class's own budget. Every ticket in an answer is checked as above, except for
-  the deadline, and the 4096 cap applies.
+  that epoch, at most 4096 tickets (about 480 KB) in parts of 512. A peer
+  serves a given epoch to a given connection at most once per
+  `SYNC_SERVE_INTERVAL`, from the ticket class's own budget. A `pooltkt` counts
+  as an answer only for the epoch this node asked that peer for, within
+  `SYNC_ANSWER_WINDOW` of asking; anything else is a relay. Every ticket in an
+  answer is checked as above, except for the deadline, and the 4096 cap
+  applies. Checking a full answer costs up to 4096 hashes per epoch, more than
+  the ticket budget gives at once, so answered tickets wait in a bounded queue
+  (the 4096 cap per epoch) and are checked as the budget refills, never dropped
+  for want of budget; Phase C sizes the budget so a fresh node sees the draw
+  within an hour.
 - **Persistence.** A node keeps its own tickets and its held sets for the
   previous, current and next epochs in `pool-tickets.dat`, read back (and
   checked again) at start, so a restart does not leave it blind for the rest of
@@ -716,7 +753,10 @@ more somewhere, never a share judged differently.
 **When a node is drawn for more pools than its budget holds,** it ranks them
 by the work of the line it holds or was offered, over the pool's last window,
 heaviest first, and keeps the top 8 that fit (section 11). It learns that work
-by pulling at handoff, and a pool that turns out empty takes no slot. Anchors
+by pulling at handoff, and a pool that turns out empty takes no slot. Pulls
+are paced by the registered request budget (on a small network every node is
+drawn for every pool, and pulls them all); a pool whose work is not known yet
+ranks last. Anchors
 and registration age do not rank: anyone mining a block can add an anchor, and
 age would let old spam outrank a new real pool. Work cannot be faked: a spam
 pool with a few floor shares (seconds of CPU each) ranks below any pool that
@@ -855,10 +895,10 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; the score depends on the work hash, so aiming at one pool after seeing the seed costs a ticket per try; the held set is the 4096 lowest work hashes, so an attacker's share of it, and of every pool's places, follows its share of all ticket work; and capture only buys withholding, which the rows above bound |
 | Sybil: flooding the ticket set to switch guardians off everywhere | every node's 4096 places filled by attacker tickets | the attacker must out-work honest tickets slot by slot (lowest hash wins, not first arrival); honest guardians whose tickets fall out still hold what they held, miners hold their pools, `poolwho` still finds announcing peers |
 | grinding the draw seed | a miner withholds a block to change the draw | the seed is one block two hours before the epoch; each retry costs a block reward and gives one random redraw; tickets are fixed a whole epoch before; and the prize is withholding |
-| flooding `p2x*` for pools not announced | CPU, memory | dropped at the pool id, unread and unhashed, `Misbehaving(1)` |
+| flooding `p2x*` for pools not announced | CPU, memory | dropped at the pool id, unread and unhashed, nobody scored (section 8: scoring would punish honest races and change how pool zero treats the peer); requests rationed by the registered budgets |
 | flooding shares of a carried pool | CPU | the shared RandomX budget, the orphan queue cap, scoring of invalid shares, as pool zero |
 | a pool whose shares are as big as rules allow | memory | per-pool and total guard caps (a line that does not fit is not guarded, never kept in part); a pool's own miners carry it at pool zero's caps |
-| flooding tickets | CPU, memory | the work, the signature, the deadline, one per key per epoch, 4096 per epoch, the tickets' own RandomX budget, scoring |
+| flooding tickets | CPU, memory | the work, the signature, the deadline, the same-body check before any hash, one per key per epoch, 4096 per epoch, the tickets' own RandomX budget, scoring only for bad framing, bad signatures and failed work against a buried seed |
 | registered pools crowding out pool zero | a starting 1.2.34 node cannot get pool zero's line | pool zero keeps its 1.2.34 budgets and queues for itself alone (section 8) |
 | lies in `poolinv` / `poolwho` | wasted dials | hints only, never passed on; a lie costs one dial, as `p2ppeers` |
 | PoW reused on two chains | double credit | exactly one commitment, of one pool, per coinbase (section 6) |
@@ -954,12 +994,15 @@ Two things would need consensus and are deliberately left out:
   split vectors (fee script in the window or not, rounding, fee 0).
 - Routing: no `p2x*` message to a peer without `NODE_POOLREG`; no pushed share
   to a peer that did not announce the pool; a pushed share for an unannounced
-  pool dropped before any hash; `p2xnone` for a request about a pool not
-  carried; a message whose pool id differs from `ShareDataX.poolId` scored;
-  pool zero's id in a `p2x*` message scored.
+  pool dropped before any hash and nobody scored, pool zero's id included;
+  `p2xnone` for a request about a pool not carried or about pool zero's id; a
+  share whose message pool id differs from `ShareDataX.poolId` scored as
+  invalid.
 - Pool zero isolation: registered-pool traffic that drains its own budgets
-  leaves pool zero's budgets, queues and per-connection state untouched (a
-  1.2.34-style history request is still served at once).
+  leaves pool zero's budgets, queues, orphan and deferred state, history
+  waiting state and per-connection state untouched (a 1.2.34-style history
+  request is still served at once), and a peer that sent only registered
+  shares is not proven for pool zero.
 - The `p2x*` and `pool*` commands take the lock-free path.
 - Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
   rule for duplicates and for the 4096 cap, the deadline for relays and not
