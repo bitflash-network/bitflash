@@ -1230,7 +1230,7 @@ static const double VARDIFF_STALL_CUT         = 4.0; // divide difficulty by thi
 struct Miner {
     btf_socket_t fd;
     std::string  peer;                   // numeric address it connected from
-    std::string  peerKey;                // what the per-address quota counts (IPv6: the /64)
+    std::string  peerKey;                // what the per-address quota counts
     bool         fLoopback     = false;  // from this machine (or Tor, for the central pool)
     bool         authorised    = false;
     std::string  address;
@@ -1277,8 +1277,11 @@ static std::deque<FoundBlock> gFoundBlocks;
 // ---------------------------------------------------------------------------
 // Accept queue -- accept threads push; event loop pops at top of each tick
 // ---------------------------------------------------------------------------
-// peerKey: what the per-address quota counts by. An IPv6 machine picks new
-// addresses inside its /64 at will, so IPv6 peers count by /64.
+// peerKey: what the per-address quota counts by, the numeric address. An
+// IPv6 machine can pick new addresses at will, so on IPv6 that quota is weak;
+// the local network's 48 and the 12 slots kept for 127.0.0.1 still hold.
+// Counting by /64 would put a whole home network (one ULA /64, or every
+// link-local peer) under one quota of 8.
 struct ReadyConn { btf_socket_t fd; std::string peer; std::string peerKey; bool fLoopback; };
 static std::vector<ReadyConn> gReadyQueue;
 static std::mutex             gReadyMutex;
@@ -1395,21 +1398,23 @@ static bool RecvLine(btf_socket_t fd, std::string& buf,
     disconnected = false;
     char tmp[4096];
 
+    // Miner sockets are non-blocking (StratumSetNonBlocking), so recv() is
+    // asked every time. Windows used to ask only when FIONREAD showed bytes,
+    // which never sees a peer that closed without sending: select() kept
+    // reporting it readable and the slot stayed taken.
 #ifdef _WIN32
-    u_long avail = 0;
-    ioctlsocket(fd, FIONREAD, &avail);
-    if (avail > 0) {
-        int r = recv(fd, tmp, (int)std::min((u_long)(sizeof(tmp)-1), avail), 0);
-        if (r > 0)      { tmp[r] = 0; buf += tmp; }
-        else if (r == 0){ disconnected = true; return false; }
-        // r < 0: WSAEWOULDBLOCK -- fall through with what we have
+    {
+        int r = recv(fd, tmp, (int)sizeof(tmp) - 1, 0);
+        if (r > 0)       { tmp[r] = 0; buf += tmp; }
+        else if (r == 0) { disconnected = true; return false; }
+        else if (WSAGetLastError() != WSAEWOULDBLOCK) { disconnected = true; return false; }
     }
 #else
     {
         int r = recv(fd, tmp, sizeof(tmp) - 1, MSG_DONTWAIT);
         if (r > 0)       { tmp[r] = 0; buf += tmp; }
         else if (r == 0) { disconnected = true; return false; }
-        // r < 0: EAGAIN/EWOULDBLOCK -- fall through with what we have
+        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { disconnected = true; return false; }
     }
 #endif
 
@@ -3058,22 +3063,21 @@ static void AcceptLoopFn(void*)
     int64 nLanTried = 0;
     int nLanWarned = 0;
 
-    if (fP2PoolMode)
-        LogPrint("pool", "[p2pool] point XMRig at 127.0.0.1:%u -- shares go to the share chain, "
-                 "blocks pay the window\n", (unsigned)poolPort);
-    else
-        LogPrint("pool", "[pool] miners connect at %s (pool port %u) over onion\n",
-                 BtfLocalAddress().c_str(), (unsigned)poolPort);
-
     int64 nRefusedLogged = 0;
     while (!fShutdown && gPoolRunning) {
         if (lsock == INVALID_SOCKET && GetTime() - nLoopTried >= 10) {
             nLoopTried = GetTime();
             int nErr = 0;
             lsock = StratumListen(loopAddr, sizeof(struct sockaddr_in), poolPort, &nErr);
-            if (lsock != INVALID_SOCKET && nLoopWarned)
-                LogPrint("pool", "[pool] listening on 127.0.0.1:%u now\n", (unsigned)poolPort);
-            else if (lsock == INVALID_SOCKET && nErr != nLoopWarned) {
+            if (lsock != INVALID_SOCKET) {
+                if (fP2PoolMode)
+                    LogPrint("pool", "[p2pool] point XMRig at 127.0.0.1:%u -- shares go to the share chain, "
+                             "blocks pay the window\n", (unsigned)poolPort);
+                else
+                    LogPrint("pool", "[pool] miners connect at %s (pool port %u) over onion\n",
+                             BtfLocalAddress().c_str(), (unsigned)poolPort);
+            }
+            else if (nErr != nLoopWarned) {
                 LogPrint("pool", "[pool] could not listen on 127.0.0.1:%u (socket error %d)"
                          " -- trying again every 10 s\n", (unsigned)poolPort, nErr);
                 nLoopWarned = nErr ? nErr : -1;
@@ -3160,12 +3164,7 @@ static void AcceptLoopFn(void*)
                 sock_close(c);
                 continue;
             }
-            std::string strPeerKey = strPeer;
-            if (peer.ss_family == AF_INET6) {
-                const unsigned char* a = (const unsigned char*)&((struct sockaddr_in6*)&peer)->sin6_addr;
-                strPeerKey = HexStr(a, a + 8, false) + "/64";
-            }
-            if (!PushReady(c, strPeer, strPeerKey, fLoopback)) {
+            if (!PushReady(c, strPeer, strPeer, fLoopback)) {
                 LogPrint("worker", "[pool] dropping a miner connection from %s: the event loop is behind\n",
                          strPeer.c_str());
                 sock_close(c);

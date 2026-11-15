@@ -218,9 +218,9 @@ What to know before turning it on:
   is only a label in the log, and nothing a miner sends can change where the
   node is paid. A stranger on the network can add hashrate that pays you, or
   get in the way of your mining: take up the connection slots the local
-  network gets (48 in all, 8 per IPv4 address or IPv6 /64; 12 more are kept
-  for 127.0.0.1, so the node's own machine always gets in) and make the node
-  check bogus shares. A connection that does not log in within 30 s, or does not read
+  network gets (48 in all, 8 per address; 12 more are kept for 127.0.0.1, so
+  the node's own machine always gets in) and make the node check bogus
+  shares. A connection that does not log in within 30 s, or does not read
   what the node sends, is dropped.
 - **Trust every private network this machine is on.** "Local network" means
   any network that reaches this machine from a private address: a VPN, a
