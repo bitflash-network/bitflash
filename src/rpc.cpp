@@ -32,6 +32,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #endif
 
@@ -44,6 +45,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -1227,6 +1229,9 @@ static const double VARDIFF_STALL_CUT         = 4.0; // divide difficulty by thi
 
 struct Miner {
     btf_socket_t fd;
+    std::string  peer;                   // numeric address it connected from
+    std::string  peerKey;                // what the per-address quota counts
+    bool         fLoopback     = false;  // from this machine (or Tor, for the central pool)
     bool         authorised    = false;
     std::string  address;
     std::string  worker;
@@ -1272,13 +1277,26 @@ static std::deque<FoundBlock> gFoundBlocks;
 // ---------------------------------------------------------------------------
 // Accept queue -- accept threads push; event loop pops at top of each tick
 // ---------------------------------------------------------------------------
-static std::vector<btf_socket_t> gReadyQueue;
-static std::mutex                gReadyMutex;
+// peerKey: what the per-address quota counts by, the numeric address. An
+// IPv6 machine can pick new addresses at will, so on IPv6 that quota is weak;
+// the local network's 48 and the 12 slots kept for 127.0.0.1 still hold.
+// Counting by /64 would put a whole home network (one ULA /64, or every
+// link-local peer) under one quota of 8.
+struct ReadyConn { btf_socket_t fd; std::string peer; std::string peerKey; bool fLoopback; };
+static std::vector<ReadyConn> gReadyQueue;
+static std::mutex             gReadyMutex;
+// Accepted sockets waiting for the event loop. Bounded so that a stalled loop
+// cannot turn a connection flood into every descriptor of the process.
+static const size_t MAX_READY_QUEUE = 64;
 
-static void PushReady(btf_socket_t s)
+// False when the queue is full; the caller closes the socket.
+static bool PushReady(btf_socket_t s, const std::string& strPeer, const std::string& strPeerKey, bool fLoopback)
 {
     std::lock_guard<std::mutex> lk(gReadyMutex);
-    gReadyQueue.push_back(s);
+    if (gReadyQueue.size() >= MAX_READY_QUEUE)
+        return false;
+    gReadyQueue.push_back(ReadyConn{s, strPeer, strPeerKey, fLoopback});
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,16 +1307,36 @@ static void PushReady(btf_socket_t s)
 // would have sent from here instead.
 static std::string* gSelfTestCapture = NULL;
 
-// Blocking send of a complete JSON line. Called only from the event loop so
-// no other thread is writing to the same fd concurrently.
+// Sockets a send failed on. The event loop drops their miners at the end of
+// the tick: a line that went out in part leaves the stream unusable anyway.
+static std::set<btf_socket_t> gSendFailed;
+
+// Accepted miner sockets are non-blocking. A miner that never reads fills
+// its socket's send buffer; a blocking send would then hold this thread, and
+// every other miner with it, for as long as that miner liked. A line that
+// does not go out at once marks the socket failed and its miner is dropped.
+static bool StratumSetNonBlocking(btf_socket_t fd)
+{
+#ifdef _WIN32
+    u_long nOne = 1;
+    return ioctlsocket(fd, FIONBIO, &nOne) == 0;
+#else
+    int fl = fcntl(fd, F_GETFL, 0);
+    return fl != -1 && fcntl(fd, F_SETFL, fl | O_NONBLOCK) != -1;
+#endif
+}
+
+// Send of a complete JSON line, or false at once. Called only from the
+// event loop so no other thread is writing to the same fd concurrently.
 static bool SendLine(btf_socket_t fd, const json& j)
 {
     std::string s = j.dump() + "\n";
     if (gSelfTestCapture) { *gSelfTestCapture += s; return true; }
+    if (gSendFailed.count(fd)) return false;
     int off = 0, total = (int)s.size();
     while (off < total) {
         int r = send(fd, s.c_str() + off, total - off, SEND_FLAGS);
-        if (r <= 0) return false;
+        if (r <= 0) { gSendFailed.insert(fd); return false; }
         off += r;
     }
     return true;
@@ -1309,6 +1347,42 @@ static bool SendLine(btf_socket_t fd, const json& j)
 // anything near a thousand miners.
 static const size_t MAX_STRATUM_LINE = 64 * 1024;
 static const size_t MAX_POOL_MINERS  = 1000;
+// P2Pool serves one person's own rigs, now possibly from the local network
+// (-p2poolbind). The event loop watches them with one select() set, which
+// holds 64 sockets on Windows; past that, miners would sit unheard.
+static const size_t MAX_P2POOL_MINERS = 60;
+// Of those, what the local network may take, all its machines together and
+// one address alone. The rest is kept for 127.0.0.1, so a stranger on the
+// network cannot lock out the XMRig on the node's own machine.
+static const size_t MAX_P2POOL_LAN_MINERS = 48;
+static const size_t MAX_P2POOL_PER_PEER   = 8;
+// A P2Pool connection that has not logged in by then is dropped: XMRig logs
+// in as soon as it connects. Idle sockets only hold slots.
+static const int64  P2POOL_LOGIN_SECS     = 30;
+
+// What a miner calls itself (login, worker, agent), and anything else it
+// sends that the log repeats, is shown short and printable: a JSON string can
+// carry line breaks, and the log would print them as forged lines of its own.
+// In P2Pool mode the login is only a label anyway; a real payment address is
+// short and printable, so the central pool's payouts see the same string.
+static std::string StratumLabel(const std::string& s, size_t nMax = 64)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size() && out.size() < nMax; i++)
+        out += (s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : '?';
+    return out;
+}
+
+// A login as a payment address: the base58 decoder skips whitespace around
+// it, so an address sent with a trailing newline was paid before labels were
+// cleaned, and still is.
+static std::string StratumAddress(const std::string& s)
+{
+    size_t a = s.find_first_not_of(" \t\r\n\f\v");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n\f\v");
+    return StratumLabel(s.substr(a, b - a + 1));
+}
 
 // Non-blocking recv: pull whatever bytes are available now into buf, then
 // return one complete line if one is ready. Three outcomes:
@@ -1324,21 +1398,23 @@ static bool RecvLine(btf_socket_t fd, std::string& buf,
     disconnected = false;
     char tmp[4096];
 
+    // Miner sockets are non-blocking (StratumSetNonBlocking), so recv() is
+    // asked every time. Windows used to ask only when FIONREAD showed bytes,
+    // which never sees a peer that closed without sending: select() kept
+    // reporting it readable and the slot stayed taken.
 #ifdef _WIN32
-    u_long avail = 0;
-    ioctlsocket(fd, FIONREAD, &avail);
-    if (avail > 0) {
-        int r = recv(fd, tmp, (int)std::min((u_long)(sizeof(tmp)-1), avail), 0);
-        if (r > 0)      { tmp[r] = 0; buf += tmp; }
-        else if (r == 0){ disconnected = true; return false; }
-        // r < 0: WSAEWOULDBLOCK -- fall through with what we have
+    {
+        int r = recv(fd, tmp, (int)sizeof(tmp) - 1, 0);
+        if (r > 0)       { tmp[r] = 0; buf += tmp; }
+        else if (r == 0) { disconnected = true; return false; }
+        else if (WSAGetLastError() != WSAEWOULDBLOCK) { disconnected = true; return false; }
     }
 #else
     {
         int r = recv(fd, tmp, sizeof(tmp) - 1, MSG_DONTWAIT);
         if (r > 0)       { tmp[r] = 0; buf += tmp; }
         else if (r == 0) { disconnected = true; return false; }
-        // r < 0: EAGAIN/EWOULDBLOCK -- fall through with what we have
+        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { disconnected = true; return false; }
     }
 #endif
 
@@ -1505,7 +1581,7 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
     catch (...) {
         LogPrint("worker", "[worker] JSON parse error from %s: %.80s\n",
                  m->address.empty() ? "(unauth)" : m->address.c_str(),
-                 rawLine.c_str());
+                 StratumLabel(rawLine, 80).c_str());
         return true; // don't disconnect on bad JSON, just ignore the line
     }
 
@@ -1515,7 +1591,7 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
     if (!req.is_object() || (req.contains("method") && !req["method"].is_string())) {
         LogPrint("worker", "[worker] malformed request from %s: %.80s\n",
                  m->address.empty() ? "(unauth)" : m->address.c_str(),
-                 rawLine.c_str());
+                 StratumLabel(rawLine, 80).c_str());
         return true;
     }
 
@@ -1548,7 +1624,7 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         if (!SendLine(m->fd, msg))
             LogPrint("worker", "[pool->worker] reply send FAILED for %s (method=%s)\n",
                      m->address.empty() ? "(unauth)" : m->address.c_str(),
-                     method.c_str());
+                     StratumLabel(method).c_str());
     };
 
     // Shared by both dialects' first message. A pool that is still catching
@@ -1607,6 +1683,9 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         m->address = p["login"].get<std::string>();
         m->worker  = (p.contains("pass") && p["pass"].is_string()) ? p["pass"].get<std::string>() : "worker";
         m->agent   = (p.contains("agent") && p["agent"].is_string()) ? p["agent"].get<std::string>() : "";
+        m->address = StratumAddress(m->address);
+        m->worker  = StratumLabel(m->worker);
+        m->agent   = StratumLabel(m->agent);
         uint160 h160; bool validAddr = AddressToHash160(m->address, h160);
         // P2Pool pays the node's own address, whatever this miner logs in
         // as: the name is only a label in the log.
@@ -1666,7 +1745,7 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         // Workers built before this send no params; those are still accepted.
         auto& ps = req["params"];
         if (ps.is_array() && ps.size() > 0 && ps[0].is_string()) {
-            std::string strTheirs = ps[0].get<std::string>();
+            std::string strTheirs = StratumLabel(ps[0].get<std::string>());
             if (strTheirs != BtfNetworkName()) {
                 LogPrint("worker", "[pool] refusing fd=%d: worker is on '%s', this pool is on '%s'\n",
                          (int)m->fd, strTheirs.c_str(), BtfNetworkName());
@@ -1691,6 +1770,10 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         bool fArr = p.is_array();
         m->address = (fArr && p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : "";
         m->worker  = (fArr && p.size() > 1 && p[1].is_string()) ? p[1].get<std::string>() : "worker";
+        // In P2Pool mode only a label here as well: P2PoolPayoutScript pays
+        // this node.
+        m->address = StratumAddress(m->address);
+        m->worker  = StratumLabel(m->worker);
 
         // Validate address before authorising
         uint160 h160; bool validAddr = AddressToHash160(m->address, h160);
@@ -1751,10 +1834,10 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
                 reply(false, "bad params");
                 return true;
             }
-            submitJobId = p["job_id"].get<std::string>();
-            nonceHex    = p["nonce"].get<std::string>();
+            submitJobId = StratumLabel(p["job_id"].get<std::string>());
+            nonceHex    = StratumLabel(p["nonce"].get<std::string>());
             if (p.contains("result") && p["result"].is_string())
-                resultHex = p["result"].get<std::string>();
+                resultHex = StratumLabel(p["result"].get<std::string>(), 128);
         } else {
             // Check the shape as well as the length: a submit carrying
             // "params":[1,2,3] would otherwise reach get<std::string>() and throw
@@ -1766,8 +1849,8 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
                 reply(false, "bad params");
                 return true;
             }
-            submitJobId = p[1].get<std::string>();
-            nonceHex    = p[2].get<std::string>();
+            submitJobId = StratumLabel(p[1].get<std::string>());
+            nonceHex    = StratumLabel(p[2].get<std::string>());
         }
 
         if (!gHaveJob) {
@@ -2008,7 +2091,7 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
 
     // Unknown method -- log it (can reveal miner software quirks)
     LogPrint("worker", "[worker->pool] unknown method '%s' from %s\n",
-             method.c_str(),
+             StratumLabel(method).c_str(),
              m->address.empty() ? "(unauth)" : m->address.c_str());
     reply(nullptr, "unknown method");
     return true;
@@ -2089,6 +2172,27 @@ int RunPoolStratumSelfTest()
     };
     HandleLine(&miner, stale.dump(), roundShareCount, roundShareTotal, blocksFound);
     check(roundShareTotal == 1, "stale submit does not increment shares");
+
+    // What a miner calls itself reaches the log only short and printable.
+    {
+        std::string lbl = StratumLabel(std::string("ab\ncd\r\x01\x7f\xc3\xa9") + std::string(100, 'x'));
+        bool fPrintable = true;
+        for (char c : lbl)
+            if (c < 0x20 || c >= 0x7f) fPrintable = false;
+        check(fPrintable && lbl.size() == 64 && lbl.compare(0, 6, "ab?cd?") == 0,
+              "a miner's label is cut to 64 printable characters");
+        check(StratumLabel("BJZ48selftestaddressxxxxxxxxxxxxxx") == "BJZ48selftestaddressxxxxxxxxxxxxxx",
+              "a payment address passes through unchanged");
+        std::string capturedAuth;
+        gSelfTestCapture = &capturedAuth;
+        Miner lm(INVALID_SOCKET);
+        json auth = {{"id", 3}, {"method", "mining.authorize"},
+                     {"params", json::array({"fake\n[pool] BLOCK ACCEPTED", "w\r\nx"})}};
+        HandleLine(&lm, auth.dump(), roundShareCount, roundShareTotal, blocksFound);
+        gSelfTestCapture = NULL;
+        check(lm.address == "fake?[pool] BLOCK ACCEPTED" && lm.worker == "w??x",
+              "mining.authorize keeps no line break in the miner's name");
+    }
 
     // ---- The CryptoNote dialect (XMRig, SRBMiner) against a PoW v2 job ----
     // A template whose nTime is past the switch, so it has a v2 input.
@@ -2251,6 +2355,64 @@ int RunPoolStratumSelfTest()
     strPoolRoundsFile = savedRoundsFile;
     gPoolRounds = savedRounds;
 
+    // A miner that never reads costs the event loop nothing: its socket is
+    // non-blocking, so the send that finds the buffer full fails at once and
+    // marks it, and every later send to it returns at once.
+    {
+#ifdef _WIN32
+        WSADATA wsadata;
+        WSAStartup(MAKEWORD(2, 2), &wsadata);
+#endif
+        std::string* savedCapture = gSelfTestCapture;
+        auto StMillis = []() -> int64 {
+            return (int64)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        gSelfTestCapture = NULL;
+        bool fSetUp = false;
+        btf_socket_t ls = (btf_socket_t)socket(AF_INET, SOCK_STREAM, 0);
+        btf_socket_t cl = (btf_socket_t)socket(AF_INET, SOCK_STREAM, 0);
+        btf_socket_t sv = INVALID_SOCKET;
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t alen = sizeof(a);
+        int nSmall = 4096;
+        if (ls != INVALID_SOCKET && cl != INVALID_SOCKET &&
+            ::bind(ls, (struct sockaddr*)&a, sizeof(a)) == 0 && listen(ls, 1) == 0 &&
+            getsockname(ls, (struct sockaddr*)&a, &alen) == 0)
+        {
+            setsockopt(cl, SOL_SOCKET, SO_RCVBUF, (const char*)&nSmall, sizeof(nSmall));
+            if (connect(cl, (struct sockaddr*)&a, sizeof(a)) == 0)
+            {
+                sv = (btf_socket_t)accept(ls, NULL, NULL);
+                fSetUp = sv != INVALID_SOCKET && StratumSetNonBlocking(sv);
+            }
+        }
+        check(fSetUp, "a loopback miner that never reads is set up");
+        if (fSetUp)
+        {
+            json big = {{"id", nullptr}, {"pad", std::string(16384, 'x')}};
+            int64 t0 = StMillis();
+            bool fOk = true;
+            int n = 0;
+            while (n < 100000 && (fOk = SendLine(sv, big)))
+                n++;
+            int64 dt = StMillis() - t0;
+            check(!fOk && gSendFailed.count(sv) && dt < 2000,
+                  "a miner that never reads fails a send at once and is marked");
+            t0 = StMillis();
+            bool fAgain = SendLine(sv, big);
+            check(!fAgain && StMillis() - t0 < 100, "every later send to it returns at once");
+        }
+        gSendFailed.clear();
+        if (sv != INVALID_SOCKET) sock_close(sv);
+        if (cl != INVALID_SOCKET) sock_close(cl);
+        if (ls != INVALID_SOCKET) sock_close(ls);
+        gSelfTestCapture = savedCapture;
+    }
+
     gCurrentJob = savedJob;
     gHaveJob = savedHaveJob;
 
@@ -2342,18 +2504,38 @@ static void PoolEventLoop()
         // 1. Drain accept queue
         {
             std::lock_guard<std::mutex> lk(gReadyMutex);
-            for (btf_socket_t fd : gReadyQueue) {
+            for (const ReadyConn& rc : gReadyQueue) {
+                btf_socket_t fd = rc.fd;
                 // Connecting costs nothing and every accepted socket carries a
                 // read buffer, so an unbounded miner list is an unbounded
                 // allocation for whoever runs the pool.
-                if (gMiners.size() >= MAX_POOL_MINERS) {
+                if (gMiners.size() >= (fP2PoolMode ? MAX_P2POOL_MINERS : MAX_POOL_MINERS)) {
                     LogPrint("worker", "[pool] refusing miner fd=%d --"
                              " already at %zu connections\n",
                              (int)fd, gMiners.size());
                     sock_close(fd);
                     continue;
                 }
-                gMiners.push_back(new Miner(fd));
+                if (fP2PoolMode && !rc.fLoopback) {
+                    size_t nLan = 0, nSame = 0;
+                    for (Miner* o : gMiners) {
+                        if (o->fLoopback) continue;
+                        nLan++;
+                        if (o->peerKey == rc.peerKey) nSame++;
+                    }
+                    if (nLan >= MAX_P2POOL_LAN_MINERS || nSame >= MAX_P2POOL_PER_PEER) {
+                        LogPrint("worker", "[p2pool] refusing miner from %s -- %s\n", rc.peer.c_str(),
+                                 nSame >= MAX_P2POOL_PER_PEER ? "that address already holds its share of connections"
+                                                              : "the local network already holds its share of connections");
+                        sock_close(fd);
+                        continue;
+                    }
+                }
+                Miner* nm = new Miner(fd);
+                nm->peer = rc.peer;
+                nm->peerKey = rc.peerKey;
+                nm->fLoopback = rc.fLoopback;
+                gMiners.push_back(nm);
                 LogPrint("worker", "[pool] miner fd=%d entered event loop"
                          " -- awaiting subscribe/authorize\n", (int)fd);
             }
@@ -2525,7 +2707,7 @@ static void PoolEventLoop()
                     // thrown here would reach the top of the thread and
                     // terminate the whole node -- not just the pool. Every
                     // line arrives from an unauthenticated socket.
-                    while (RecvLine(m->fd, m->readBuf, line, disc)) {
+                    while (!gSendFailed.count(m->fd) && RecvLine(m->fd, m->readBuf, line, disc)) {
                         try {
                             HandleLine(m, line, roundShareCount,
                                        roundShareTotal, blocksFoundThisSession);
@@ -2544,7 +2726,7 @@ static void PoolEventLoop()
                             break;
                         }
                     }
-                    if (disc) dead.push_back(m);
+                    if (disc || gSendFailed.count(m->fd)) dead.push_back(m);
                 }
                 for (Miner* m : dead) {
                     LogPrint("worker", "[pool] miner %s disconnected"
@@ -2561,6 +2743,27 @@ static void PoolEventLoop()
             Sleep(50);
         }
 
+        // 4.5. Miners a send failed on, and P2Pool connections that never
+        // logged in.
+        {
+            std::vector<Miner*> dead;
+            int64 now = GetTime();
+            for (Miner* m : gMiners)
+                if (gSendFailed.count(m->fd) ||
+                    (fP2PoolMode && !m->authorised && now - m->connectTime > P2POOL_LOGIN_SECS))
+                    dead.push_back(m);
+            for (Miner* m : dead) {
+                LogPrint("worker", "[pool] dropping miner %s from %s -- %s\n",
+                         m->worker.empty() ? "(never authorized)" : m->worker.c_str(),
+                         m->peer.c_str(),
+                         gSendFailed.count(m->fd) ? "a send did not complete" : "no login in time");
+                sock_close(m->fd);
+                gMiners.erase(std::find(gMiners.begin(), gMiners.end(), m));
+                delete m;
+            }
+            gSendFailed.clear();
+        }
+
         // 5. Refresh GUI stats every 2s
         if (GetTime() - lastStatsRefresh >= 2) {
             RefreshStats(blocksFoundThisSession, roundShareTotal);
@@ -2570,6 +2773,224 @@ static void PoolEventLoop()
 
     for (Miner* m : gMiners) { sock_close(m->fd); delete m; }
     gMiners.clear();
+}
+
+// ---------------------------------------------------------------------------
+// -p2poolbind: the P2Pool stratum on the local network
+// ---------------------------------------------------------------------------
+// The stratum has no login: whoever reaches it mines, and every share pays
+// this node's address (P2PoolPayoutScript), whatever name the miner gives.
+// So it may face a network the owner's own machines share, never the
+// internet: the address it binds must be private, and so must every peer.
+
+// 127/8 loopback, 10/8, 172.16/12 and 192.168/16 (RFC 1918), 169.254/16
+// link-local.
+static bool PrivateV4(const unsigned char* a)
+{
+    return a[0] == 127
+        || a[0] == 10
+        || (a[0] == 172 && (a[1] & 0xf0) == 16)
+        || (a[0] == 192 && a[1] == 168)
+        || (a[0] == 169 && a[1] == 254);
+}
+
+static bool MappedV4(const unsigned char* a)
+{
+    static const unsigned char prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    return memcmp(a, prefix, 12) == 0;
+}
+
+// ::1 loopback, fc00::/7 unique local, fe80::/10 link-local.
+static bool PrivateV6(const unsigned char* a)
+{
+    static const unsigned char loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    return memcmp(a, loopback, 16) == 0
+        || (a[0] & 0xfe) == 0xfc
+        || (a[0] == 0xfe && (a[1] & 0xc0) == 0x80);
+}
+
+bool P2PoolPeerAllowed(const struct sockaddr* pAddr, size_t nAddrLen)
+{
+    if (!pAddr)
+        return false;
+    if (pAddr->sa_family == AF_INET && nAddrLen >= sizeof(struct sockaddr_in))
+        return PrivateV4((const unsigned char*)&((const struct sockaddr_in*)pAddr)->sin_addr);
+    if (pAddr->sa_family == AF_INET6 && nAddrLen >= sizeof(struct sockaddr_in6))
+    {
+        const unsigned char* a = (const unsigned char*)&((const struct sockaddr_in6*)pAddr)->sin6_addr;
+        return MappedV4(a) ? PrivateV4(a + 12) : PrivateV6(a);
+    }
+    return false;
+}
+
+// Parses -p2poolbind into a socket address. Numeric only: a name would be
+// looked up, and could resolve to anything.
+static bool P2PoolParseBind(const std::string& strAddr, struct sockaddr_storage& ss,
+                            socklen_t& nLen, std::string& strWhyNot)
+{
+    memset(&ss, 0, sizeof(ss));
+    nLen = 0;
+    // Brackets and blanks are refused here, not left to the parser: Windows'
+    // getaddrinfo takes "[fd00::10]", glibc's does not, and an option should
+    // mean the same on both.
+    if (strAddr.empty() || strAddr.size() > 64 ||
+        strAddr.find_first_of("[] \t\r\n\f\v") != std::string::npos)
+    {
+        strWhyNot = "it is not a numeric IPv4 or IPv6 address (no names, no port)";
+        return false;
+    }
+#ifdef _WIN32
+    // Command-line parsing runs before the node starts Winsock; the reference
+    // count makes this pair harmless later too.
+    WSADATA wsadata;
+    bool fWsa = WSAStartup(MAKEWORD(2, 2), &wsadata) == 0;
+#endif
+    bool fParsed = false;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, strAddr.c_str(), &a4) == 1)
+    {
+        // inet_pton, not getaddrinfo, for IPv4: it takes only the plain
+        // dotted quad, not "10.1" or "0x0a000001".
+        struct sockaddr_in* sin = (struct sockaddr_in*)&ss;
+        sin->sin_family = AF_INET;
+        sin->sin_addr = a4;
+        nLen = sizeof(struct sockaddr_in);
+        fParsed = true;
+    }
+    else if (strAddr.find(':') != std::string::npos)
+    {
+        // getaddrinfo for IPv6, which also reads a link-local zone
+        // ("fe80::1%eth0", or "%12" on Windows).
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET6;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
+        if (getaddrinfo(strAddr.c_str(), NULL, &hints, &res) == 0 && res)
+        {
+            if (res->ai_family == AF_INET6 && res->ai_addrlen <= sizeof(ss))
+            {
+                memcpy(&ss, res->ai_addr, res->ai_addrlen);
+                nLen = (socklen_t)res->ai_addrlen;
+                fParsed = true;
+            }
+            freeaddrinfo(res);
+        }
+    }
+#ifdef _WIN32
+    if (fWsa)
+        WSACleanup();
+#endif
+    if (!fParsed)
+    {
+        strWhyNot = "it is not a numeric IPv4 or IPv6 address (no names, no port)";
+        return false;
+    }
+    if (ss.ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)&ss;
+        const unsigned char* a = (const unsigned char*)&sin6->sin6_addr;
+        static const unsigned char any[16] = {0};
+        if (memcmp(a, any, 16) == 0)
+        {
+            strWhyNot = ":: listens on every interface, including any that face the internet";
+            return false;
+        }
+        if (MappedV4(a))
+        {
+            strWhyNot = "give the IPv4 address itself, not its IPv6-mapped form";
+            return false;
+        }
+        if (!PrivateV6(a))
+        {
+            strWhyNot = "it is not a private address (loopback, link-local fe80::/10 or unique local fc00::/7)";
+            return false;
+        }
+        if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80 && sin6->sin6_scope_id == 0)
+        {
+            strWhyNot = "a link-local IPv6 address needs its interface, e.g. fe80::1%eth0";
+            return false;
+        }
+        return true;
+    }
+    const unsigned char* a = (const unsigned char*)&((const struct sockaddr_in*)&ss)->sin_addr;
+    if (a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0)
+    {
+        strWhyNot = "0.0.0.0 listens on every interface, including any that face the internet";
+        return false;
+    }
+    if (!PrivateV4(a))
+    {
+        strWhyNot = "it is not a private address (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, "
+                    "192.168.0.0/16 or link-local 169.254.0.0/16)";
+        return false;
+    }
+    return true;
+}
+
+bool P2PoolBindAllowed(const std::string& strAddr, std::string& strWhyNot)
+{
+    struct sockaddr_storage ss;
+    socklen_t nLen;
+    return P2PoolParseBind(strAddr, ss, nLen, strWhyNot);
+}
+
+static std::string SockAddrString(const struct sockaddr* pAddr, socklen_t nLen)
+{
+    char host[NI_MAXHOST];
+    if (getnameinfo(pAddr, nLen, host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0)
+        return "?";
+    return host;
+}
+
+static int LastSocketError()
+{
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+// A listening socket on addr:port, or INVALID_SOCKET with the error in
+// *pnErr.
+static btf_socket_t StratumListen(const struct sockaddr_storage& ss, socklen_t nLen, unsigned short nPort,
+                                  int* pnErr = NULL)
+{
+    struct sockaddr_storage addr = ss;
+    if (addr.ss_family == AF_INET)
+        ((struct sockaddr_in*)&addr)->sin_port = htons(nPort);
+    else
+        ((struct sockaddr_in6*)&addr)->sin6_port = htons(nPort);
+    btf_socket_t s = (btf_socket_t)socket(addr.ss_family, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) {
+        if (pnErr) *pnErr = LastSocketError();
+        return s;
+    }
+    int one = 1;
+#ifndef _WIN32
+    // POSIX: rebind at once over connections still in TIME_WAIT. On Windows
+    // that is the default, and SO_REUSEADDR there would instead let another
+    // socket bind the same address and port and take the miners.
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+#endif
+    if (addr.ss_family == AF_INET6)
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&one, sizeof(one));
+    if (::bind(s, (struct sockaddr*)&addr, nLen) != 0 || listen(s, SOMAXCONN) != 0)
+    {
+        if (pnErr) *pnErr = LastSocketError();
+        sock_close(s);
+        return INVALID_SOCKET;
+    }
+#ifndef _WIN32
+    // The accept loop puts it in an fd_set.
+    if ((int)s >= FD_SETSIZE) {
+        if (pnErr) *pnErr = EMFILE;
+        sock_close(s);
+        return INVALID_SOCKET;
+    }
+#endif
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,8 +3005,9 @@ static void AcceptLoopFn(void*)
 {
     unsigned short poolPort;
     if (fP2PoolMode) {
-        // P2Pool: this node's own miners only, on 127.0.0.1 -- no onion,
-        // nothing announced. Everyone else runs their own node.
+        // P2Pool: this node's own miners only, on 127.0.0.1 and, with
+        // -p2poolbind, one private address -- no onion, nothing announced.
+        // Everyone else runs their own node.
         poolPort = nP2PoolPort;
     } else {
         // The pool shares the node's .btf identity; wait for it (so the log can name
@@ -2613,49 +3035,155 @@ static void AcceptLoopFn(void*)
         poolPort = (unsigned short)(p2p + 1);
     }
 
-    btf_socket_t lsock = (btf_socket_t)socket(AF_INET, SOCK_STREAM, 0);
-    if (lsock == INVALID_SOCKET) {
-        LogPrint("pool", "[pool] could not create pool listener socket\n");
-        return;
-    }
-    int one = 1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // loopback only -- reached via Tor
-    addr.sin_port = htons(poolPort);
-    if (::bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        LogPrint("pool", "[pool] could not bind pool listener 127.0.0.1:%u\n", (unsigned)poolPort);
-        sock_close(lsock);
-        return;
-    }
-    if (listen(lsock, SOMAXCONN) != 0) {
-        LogPrint("pool", "[pool] could not listen on pool port %u\n", (unsigned)poolPort);
-        sock_close(lsock);
-        return;
-    }
-    if (fP2PoolMode)
-        LogPrint("pool", "[p2pool] point XMRig at 127.0.0.1:%u -- shares go to the share chain, "
-                 "blocks pay the window\n", (unsigned)poolPort);
-    else
-        LogPrint("pool", "[pool] miners connect at %s (pool port %u) over onion\n",
-                 BtfLocalAddress().c_str(), (unsigned)poolPort);
+    struct sockaddr_storage loopAddr;
+    memset(&loopAddr, 0, sizeof(loopAddr));
+    ((struct sockaddr_in*)&loopAddr)->sin_family = AF_INET;
+    ((struct sockaddr_in*)&loopAddr)->sin_addr.s_addr = htonl(INADDR_LOOPBACK); // reached via Tor, or this machine's miners
+    // Retried every 10 s like the LAN one below: a port still held (another
+    // program, or a pool restarted a moment ago) is not a reason to leave the
+    // pool deaf for good.
+    btf_socket_t lsock = INVALID_SOCKET;
+    int64 nLoopTried = 0;
+    int nLoopWarned = 0;
 
+    // -p2poolbind, checked at startup. The loopback listener stays: this
+    // machine's own XMRig keeps pointing at 127.0.0.1. An address that is not
+    // up yet (DHCP late at boot) is tried again every 10 s.
+    struct sockaddr_storage lan;
+    socklen_t nLanLen = 0;
+    bool fLan = false;
+    std::string strLan;
+    if (fP2PoolMode && !strP2PoolBind.empty()) {
+        std::string strWhyNot;
+        if (!P2PoolParseBind(strP2PoolBind, lan, nLanLen, strWhyNot))
+            LogPrint("pool", "[p2pool] -p2poolbind=%s refused: %s\n", strP2PoolBind.c_str(), strWhyNot.c_str());
+        else if (!(lan.ss_family == AF_INET &&
+                   ((struct sockaddr_in*)&lan)->sin_addr.s_addr == htonl(INADDR_LOOPBACK))) {
+            fLan = true;
+            strLan = lan.ss_family == AF_INET6 ? "[" + strP2PoolBind + "]" : strP2PoolBind;
+        }
+    }
+    btf_socket_t lanSock = INVALID_SOCKET;
+    int64 nLanTried = 0;
+    int nLanWarned = 0;
+
+    int64 nRefusedLogged = 0;
     while (!fShutdown && gPoolRunning) {
+        if (lsock == INVALID_SOCKET && GetTime() - nLoopTried >= 10) {
+            nLoopTried = GetTime();
+            int nErr = 0;
+            lsock = StratumListen(loopAddr, sizeof(struct sockaddr_in), poolPort, &nErr);
+            if (lsock != INVALID_SOCKET) {
+                if (fP2PoolMode)
+                    LogPrint("pool", "[p2pool] point XMRig at 127.0.0.1:%u -- shares go to the share chain, "
+                             "blocks pay the window\n", (unsigned)poolPort);
+                else
+                    LogPrint("pool", "[pool] miners connect at %s (pool port %u) over onion\n",
+                             BtfLocalAddress().c_str(), (unsigned)poolPort);
+            }
+            else if (nErr != nLoopWarned) {
+                LogPrint("pool", "[pool] could not listen on 127.0.0.1:%u (socket error %d)"
+                         " -- trying again every 10 s\n", (unsigned)poolPort, nErr);
+                nLoopWarned = nErr ? nErr : -1;
+            }
+        }
+        if (fLan && lanSock == INVALID_SOCKET && GetTime() - nLanTried >= 10) {
+            nLanTried = GetTime();
+            int nErr = 0;
+            lanSock = StratumListen(lan, nLanLen, poolPort, &nErr);
+            if (lanSock != INVALID_SOCKET)
+                LogPrint("pool", "[p2pool] also serving the local network at %s:%u -- anyone who can "
+                         "reach it mines to this node's address\n", strLan.c_str(), (unsigned)poolPort);
+            else if (nErr != nLanWarned) {
+                // Once per distinct error: an address that is not up yet
+                // (EADDRNOTAVAIL) says something different from a port in use.
+                LogPrint("pool", "[p2pool] could not listen on %s:%u (socket error %d: is that address on "
+                         "this machine, and the port free?) -- trying again every 10 s\n",
+                         strLan.c_str(), (unsigned)poolPort, nErr);
+                nLanWarned = nErr;
+            }
+        }
+
+        if (lsock == INVALID_SOCKET && lanSock == INVALID_SOCKET) {
+            Sleep(1000);
+            continue;
+        }
         fd_set rs;
         FD_ZERO(&rs);
-        FD_SET(lsock, &rs);
+        int maxfd = 0;
+        if (lsock != INVALID_SOCKET) {
+            FD_SET(lsock, &rs);
+            maxfd = (int)lsock;
+        }
+        if (lanSock != INVALID_SOCKET) {
+            FD_SET(lanSock, &rs);
+            if ((int)lanSock > maxfd) maxfd = (int)lanSock;
+        }
         struct timeval tv;
         tv.tv_sec = 1; tv.tv_usec = 0;
-        int r = select((int)lsock + 1, &rs, NULL, NULL, &tv);
+        int r = select(maxfd + 1, &rs, NULL, NULL, &tv);
         if (r <= 0) continue;           // timeout or interrupt -> re-check shutdown
-        btf_socket_t c = (btf_socket_t)accept(lsock, NULL, NULL);
-        if (c == INVALID_SOCKET) continue;
-        LogPrint("worker", "[pool] miner connected over onion -- pushing to event loop\n");
-        PushReady(c);
+        btf_socket_t ls[2] = {lsock, lanSock};
+        for (int i = 0; i < 2; i++) {
+            if (ls[i] == INVALID_SOCKET || !FD_ISSET(ls[i], &rs))
+                continue;
+            struct sockaddr_storage peer;
+            socklen_t nPeerLen = sizeof(peer);
+            memset(&peer, 0, sizeof(peer));
+            btf_socket_t c = (btf_socket_t)accept(ls[i], (struct sockaddr*)&peer, &nPeerLen);
+            if (c == INVALID_SOCKET) {
+                // Out of descriptors (EMFILE) leaves the connection pending,
+                // and select() reports it again at once: do not spin on it.
+                Sleep(100);
+                continue;
+            }
+#ifndef _WIN32
+            // The event loop puts every miner in an fd_set; a descriptor past
+            // FD_SETSIZE would be written outside it.
+            if ((int)c >= FD_SETSIZE) {
+                LogPrint("pool", "[pool] dropping a miner connection: descriptor %d is past FD_SETSIZE\n", (int)c);
+                sock_close(c);
+                continue;
+            }
+#endif
+            // Defence in depth behind the bind check: a router forwarding a
+            // public port to this address would otherwise open the stratum to
+            // the internet.
+            if (!P2PoolPeerAllowed((struct sockaddr*)&peer, (size_t)nPeerLen)) {
+                if (GetTime() - nRefusedLogged >= 60) {
+                    LogPrint("pool", "[p2pool] dropped a stratum connection from %s: not a private address\n",
+                             SockAddrString((struct sockaddr*)&peer, nPeerLen).c_str());
+                    nRefusedLogged = GetTime();
+                }
+                sock_close(c);
+                continue;
+            }
+            std::string strPeer = SockAddrString((struct sockaddr*)&peer, nPeerLen);
+            // Loopback: this machine's own miners, or Tor delivering the
+            // central pool's onion connections.
+            bool fLoopback = (peer.ss_family == AF_INET &&
+                              ((const unsigned char*)&((struct sockaddr_in*)&peer)->sin_addr)[0] == 127) ||
+                             (peer.ss_family == AF_INET6 && strPeer == "::1");
+            if (!StratumSetNonBlocking(c)) {
+                sock_close(c);
+                continue;
+            }
+            if (!PushReady(c, strPeer, strPeer, fLoopback)) {
+                LogPrint("worker", "[pool] dropping a miner connection from %s: the event loop is behind\n",
+                         strPeer.c_str());
+                sock_close(c);
+                continue;
+            }
+            if (fP2PoolMode)
+                LogPrint("worker", "[p2pool] miner connected from %s\n", strPeer.c_str());
+            else
+                LogPrint("worker", "[pool] miner connected over onion -- pushing to event loop\n");
+        }
     }
-    sock_close(lsock);
+    if (lanSock != INVALID_SOCKET)
+        sock_close(lanSock);
+    if (lsock != INVALID_SOCKET)
+        sock_close(lsock);
     LogPrint("pool", "[pool] pool listener stopped\n");
 }
 

@@ -6773,6 +6773,123 @@ static int RunP2PoolPeersSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-lan: which addresses the P2Pool stratum may face ---------------
+// -p2poolbind takes one private address (loopback, RFC 1918, link-local, IPv6
+// unique local) and nothing that could face the internet; every connection
+// that reaches the stratum is checked against the same ranges.
+
+static bool P2PoolLanPeer4(const char* psz)
+{
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    if (inet_pton(AF_INET, psz, &sin.sin_addr) != 1)
+        return false;
+    return P2PoolPeerAllowed((struct sockaddr*)&sin, sizeof(sin));
+}
+
+static bool P2PoolLanPeer6(const char* psz)
+{
+    struct sockaddr_in6 sin6;
+    memset(&sin6, 0, sizeof(sin6));
+    sin6.sin6_family = AF_INET6;
+    if (inet_pton(AF_INET6, psz, &sin6.sin6_addr) != 1)
+        return false;
+    return P2PoolPeerAllowed((struct sockaddr*)&sin6, sizeof(sin6));
+}
+
+static int RunP2PoolLanSelfTest()
+{
+    printf("p2pool-lan self-test\n");
+#ifdef _WIN32
+    WSADATA wsadata;
+    WSAStartup(MAKEWORD(2, 2), &wsadata);
+#endif
+    int nFail = 0;
+    std::string why;
+
+    const char* const vBindOk[] = {
+        "127.0.0.1", "127.0.0.2", "10.0.0.1", "10.255.255.254", "172.16.0.1", "172.31.255.254",
+        "192.168.1.10", "169.254.10.20", "::1", "fd00::10", "fc00::1", "fdff:ffff::1", "fe80::1%1",
+    };
+    for (size_t i = 0; i < sizeof(vBindOk) / sizeof(vBindOk[0]); i++)
+    {
+        why.clear();
+        bool f = P2PoolBindAllowed(vBindOk[i], why);
+        printf("  %s bind %s accepted%s%s\n", f ? "PASS" : "FAIL", vBindOk[i], f ? "" : ": ", why.c_str());
+        if (!f) nFail++;
+    }
+
+    const char* const vBindBad[] = {
+        "0.0.0.0", "::", "0:0:0:0:0:0:0:0", "8.8.8.8", "1.1.1.1", "172.15.255.255", "172.32.0.1",
+        "192.169.0.1", "100.64.0.1", "169.255.0.1", "224.0.0.1", "255.255.255.255", "11.0.0.1",
+        "2001:db8::1", "2606:4700::1111", "ff02::1", "fec0::1", "::ffff:192.168.1.10", "::ffff:8.8.8.8",
+        "fe80::1", "192.168.1.10:3333", "[fd00::10]", "localhost", "10.1", "0x0a000001",
+        "192.168.1.10 ", " 192.168.1.10", "", "192.168.1.256",
+    };
+    for (size_t i = 0; i < sizeof(vBindBad) / sizeof(vBindBad[0]); i++)
+    {
+        why.clear();
+        bool f = P2PoolBindAllowed(vBindBad[i], why);
+        printf("  %s bind '%s' refused%s%s\n", !f && !why.empty() ? "PASS" : "FAIL", vBindBad[i],
+               f ? "" : ": ", why.c_str());
+        if (f || why.empty()) nFail++;
+    }
+
+    // The two that listen everywhere say so.
+    why.clear();
+    P2PoolBindAllowed("0.0.0.0", why);
+    bool fAnyV4 = why.find("every interface") != std::string::npos;
+    why.clear();
+    P2PoolBindAllowed("::", why);
+    bool fAnyV6 = why.find("every interface") != std::string::npos;
+    printf("  %s 0.0.0.0 and :: are refused as listening on every interface\n", fAnyV4 && fAnyV6 ? "PASS" : "FAIL");
+    if (!fAnyV4 || !fAnyV6) nFail++;
+
+    struct { const char* psz; bool fV6; bool fOk; } vPeer[] = {
+        {"127.0.0.1", false, true}, {"10.1.2.3", false, true}, {"172.20.0.5", false, true},
+        {"192.168.1.20", false, true}, {"169.254.3.4", false, true},
+        {"8.8.8.8", false, false}, {"0.0.0.0", false, false}, {"100.64.1.1", false, false},
+        {"172.32.0.1", false, false}, {"203.0.113.9", false, false},
+        {"::1", true, true}, {"fd12:3456::9", true, true}, {"fe80::abcd", true, true},
+        {"::ffff:192.168.1.20", true, true}, {"::ffff:127.0.0.1", true, true},
+        {"::ffff:8.8.8.8", true, false}, {"2001:db8::1", true, false}, {"::", true, false},
+        {"ff02::1", true, false}, {"64:ff9b::808:808", true, false},
+    };
+    for (size_t i = 0; i < sizeof(vPeer) / sizeof(vPeer[0]); i++)
+    {
+        bool f = vPeer[i].fV6 ? P2PoolLanPeer6(vPeer[i].psz) : P2PoolLanPeer4(vPeer[i].psz);
+        printf("  %s peer %s %s\n", f == vPeer[i].fOk ? "PASS" : "FAIL", vPeer[i].psz, f ? "let in" : "dropped");
+        if (f != vPeer[i].fOk) nFail++;
+    }
+
+    // Malformed input to the peer check: no address, a short length, a family
+    // that is neither IPv4 nor IPv6.
+    {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        inet_pton(AF_INET, "192.168.1.20", &sin.sin_addr);
+        struct sockaddr_in6 sin6;
+        memset(&sin6, 0, sizeof(sin6));
+        sin6.sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "fd00::1", &sin6.sin6_addr);
+        struct sockaddr_storage other;
+        memset(&other, 0, sizeof(other));
+        other.ss_family = AF_UNSPEC;
+        bool fNull = P2PoolPeerAllowed(NULL, 0);
+        bool fShort4 = P2PoolPeerAllowed((struct sockaddr*)&sin, sizeof(sin) - 1);
+        bool fShort6 = P2PoolPeerAllowed((struct sockaddr*)&sin6, sizeof(struct sockaddr_in));
+        bool fOther = P2PoolPeerAllowed((struct sockaddr*)&other, sizeof(other));
+        bool fOk = !fNull && !fShort4 && !fShort6 && !fOther;
+        printf("  %s no address, a short one, or an unknown family is dropped\n", fOk ? "PASS" : "FAIL");
+        if (!fOk) nFail++;
+    }
+
+    printf("%s\n", nFail ? "p2pool-lan: FAILED" : "p2pool-lan: all passed");
+    return nFail ? 1 : 0;
+}
+
 // ---- p2pool-dos: what peers can make the share chain spend ----------------
 // H4 (share side), M6 and L6 of the DoS review: one budget for the RandomX
 // hashes unproven peers cause, asked only after every cheap check; history
@@ -17621,6 +17738,8 @@ int RunSelfTest(const std::string& name)
         return RunP2PoolSyncSelfTest();
     if (name == "p2pool-peers")
         return RunP2PoolPeersSelfTest();
+    if (name == "p2pool-lan")
+        return RunP2PoolLanSelfTest();
     if (name == "p2pool-dos")
         return RunP2PoolDosSelfTest();
     if (name == "p2pool-chain")
@@ -17711,6 +17830,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan\n");
     return 1;
 }
