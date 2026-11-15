@@ -678,6 +678,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=p2pool-sync
 	./bitflash-node -selftest=p2pool-peers
 	./bitflash-node -selftest=p2pool-dos
+	./bitflash-node -selftest=p2pool-lan
 	./bitflash-node -selftest=sigcheck
 	./bitflash-node -selftest=btc-swap
 	./bitflash-node -selftest=btc-light

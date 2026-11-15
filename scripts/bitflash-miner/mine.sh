@@ -27,15 +27,18 @@ EOF
     exit 1
 fi
 
-# P2Pool: XMRig talks to this machine's own node; there is nobody to reach
-# over Tor. P2POOL_PORT if the node was started with another -p2poolport.
+# P2Pool: XMRig talks to your own node; there is nobody to reach over Tor.
+# P2POOL_PORT if the node was started with another -p2poolport. P2POOL_HOST
+# when the node runs on another machine of your local network and was started
+# with -p2poolbind=THAT_ADDRESS (P2POOL_HOST=192.168.1.10 ./mine.sh p2pool).
 if [ "$1" = "p2pool" ]; then
     shift
+    HOST=${P2POOL_HOST:-127.0.0.1}
     PORT=${P2POOL_PORT:-3333}
-    echo "P2Pool: mining through your own node at 127.0.0.1:$PORT"
+    echo "P2Pool: mining through your own node at $HOST:$PORT"
     echo "(start it first: bitflash-node -p2pool, or the wallet with -p2pool)"
     echo
-    exec ./xmrig/xmrig -a rx/0 -o "127.0.0.1:$PORT" -u p2pool -p x --retries=100000 --retry-pause=5 "$@"
+    exec ./xmrig/xmrig -a rx/0 -o "$HOST:$PORT" -u p2pool -p x --retries=100000 --retry-pause=5 "$@"
 fi
 ADDR=$1; shift
 if [ "$1" = "testnet" ]; then

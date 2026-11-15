@@ -124,6 +124,8 @@ exit /b 0
 rem P2Pool: XMRig talks to this machine's own node, so there is nobody to
 rem reach over Tor and no address to give: the node pays an address of its own
 rem wallet. P2POOL_PORT if the node was started with another -p2poolport.
+rem P2POOL_HOST when the node runs on another machine of your local network
+rem and was started with -p2poolbind=THAT_ADDRESS.
 :p2pool
 set EXTRA=
 shift
@@ -134,11 +136,12 @@ shift
 goto p2pool_args
 :p2pool_run
 if "%P2POOL_PORT%"=="" set P2POOL_PORT=3333
+if "%P2POOL_HOST%"=="" set P2POOL_HOST=127.0.0.1
 echo.
-echo   P2Pool: mining through your own node at 127.0.0.1:%P2POOL_PORT%
+echo   P2Pool: mining through your own node at %P2POOL_HOST%:%P2POOL_PORT%
 echo   (start it first: Bitflash.exe -p2pool)
 echo.
-xmrig\xmrig.exe -a rx/0 -o 127.0.0.1:%P2POOL_PORT% -u p2pool -p x --retries=100000 --retry-pause=5 %EXTRA%
+xmrig\xmrig.exe -a rx/0 -o %P2POOL_HOST%:%P2POOL_PORT% -u p2pool -p x --retries=100000 --retry-pause=5 %EXTRA%
 echo.
 echo   XMRig stopped.
 pause

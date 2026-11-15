@@ -139,7 +139,7 @@ wallet.
 | Mode | How |
 |---|---|
 | Solo | `bitflash -nogui -gen`, or *Options > Mining Mode* in the window |
-| P2Pool | `bitflash -nogui -p2pool`, then point XMRig at `127.0.0.1:3333` |
+| P2Pool | `bitflash -nogui -p2pool`, then point XMRig at `127.0.0.1:3333` (add `-p2poolbind=192.168.1.10` for miners on your local network) |
 | Bitflash Miner | `mine.cmd YOUR_ADDRESS` on Windows, `./mine.sh YOUR_ADDRESS` on Linux and macOS |
 | Your own XMRig | through Tor to the pool onion, see below |
 

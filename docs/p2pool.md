@@ -178,11 +178,60 @@ share's validity depend on what else a node holds.
 
 ## Mining
 
-- The node serves stratum on **127.0.0.1** only. XMRig, and the Bitflash
-  Miner, point at the miner's own node: `127.0.0.1:3333`.
-- `-p2pool` turns it on; `-p2poolpayto=ADDRESS` chooses where payouts go (by
-  default a fresh address of the node's own wallet, changed every 24 hours).
-- No pool onion, no pool directory, no operator fee.
+- The node serves stratum on **127.0.0.1**. XMRig, and the Bitflash Miner,
+  point at the miner's own node: `127.0.0.1:3333`.
+- No pool onion, no pool directory, no operator fee. The stratum is not part
+  of the P2P network: miners reach it directly, never over Tor.
+
+Options:
+
+| option | what it does |
+|---|---|
+| `-p2pool` | turns P2Pool on |
+| `-p2poolport=N` | the stratum port, 1025 to 65535 (default 3333) |
+| `-p2poolpayto=ADDRESS` | where payouts go (default: a fresh address of the node's own wallet, changed every 24 hours) |
+| `-p2poolbind=IP` | also serve the stratum on this private address, for miners on your local network (default: none, 127.0.0.1 only) |
+
+### Mining from other machines on your local network
+
+One node can take the hashrate of every machine in the house. On the node,
+add `-p2poolbind` with the node machine's own address on the local network:
+
+    bitflash-node -p2pool -p2poolbind=192.168.1.10
+
+On each other machine, point the Bitflash Miner or XMRig at that address:
+
+    Linux, macOS:   P2POOL_HOST=192.168.1.10 ./mine.sh p2pool
+    Windows:        set P2POOL_HOST=192.168.1.10
+                    mine.cmd p2pool
+    XMRig by hand:  xmrig -a rx/0 -o 192.168.1.10:3333 -u p2pool -p x
+
+The node keeps listening on 127.0.0.1 as well, so a miner on the node's own
+machine needs no change.
+
+What to know before turning it on:
+
+- **The stratum has no login.** Anyone who can reach that address and port
+  can mine to this node. What they mine pays this node's payout address
+  (`-p2poolpayto`, or the node's own wallet): the name a miner logs in with
+  is only a label in the log, and nothing a miner sends can change where the
+  node is paid. A stranger on the network can only add hashrate that pays
+  you, or take up the stratum's connection slots (60 at most) and make the
+  node check bogus shares.
+- **Only private addresses are taken:** 10.0.0.0/8, 172.16.0.0/12,
+  192.168.0.0/16, link-local 169.254.0.0/16, IPv6 unique local fc00::/7,
+  link-local fe80::/10 (with its interface, as in `fe80::1%eth0`), and
+  loopback. A public address, `0.0.0.0` and `::` make the node refuse to
+  start: they would put an open stratum on the internet.
+- **Every connection is checked too.** One that does not come from a private
+  address is dropped, so a router forwarding a public port to the node does
+  not open the stratum to the internet. A router that rewrites the source to
+  its own private address defeats this check, so do not forward the stratum
+  port.
+- The connection is plain TCP on your network, not Tor. The miner sends work,
+  never keys or coins, but anyone on the network can see that this machine
+  mines.
+- The stratum serves mining only: no wallet, no RPC, no P2P.
 
 ## Privacy
 
@@ -196,8 +245,9 @@ share's validity depend on what else a node holds.
 ## What changes for whom
 
 - **Miners:** run a node (the wallet is one), add `-p2pool`, point XMRig at
-  `127.0.0.1:3333` (`-p2poolport` for another port). Payouts arrive in their
-  own wallet, spendable 120 blocks later.
+  `127.0.0.1:3333` (`-p2poolport` for another port, `-p2poolbind` for other
+  machines on the local network). Payouts arrive in their own wallet,
+  spendable 120 blocks later.
 - **The central pool:** keeps running until P2Pool is proven on mainnet with
   real blocks paid to several miners. Then it is switched off.
 - **Everyone else:** nothing. Main-chain rules do not change.

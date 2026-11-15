@@ -202,10 +202,18 @@ extern int nMinerThreads;
 // Resolves the automatic case into a real count.
 int MinerThreadCount();
 // P2Pool (docs/p2pool.md): the pool server runs for this node's own miners
-// only, on 127.0.0.1, and every block pays the share window directly.
+// only, on 127.0.0.1 (and on one private address with -p2poolbind), and every
+// block pays the share window directly.
 extern bool fP2PoolMode;
 extern unsigned short nP2PoolPort;           // default 3333
 extern std::string strP2PoolPayTo;           // -p2poolpayto; empty: a fresh wallet address a day
+extern std::string strP2PoolBind;            // -p2poolbind; empty: 127.0.0.1 only
+// -p2poolbind: true when strAddr is a numeric loopback, RFC 1918, link-local
+// or IPv6 ULA address this node may serve stratum on; strWhyNot says why not.
+bool P2PoolBindAllowed(const std::string& strAddr, std::string& strWhyNot);
+// Whether a stratum connection from this peer is let in: the same private
+// ranges (an IPv4-mapped IPv6 peer is judged by its IPv4 address).
+bool P2PoolPeerAllowed(const struct sockaddr* pAddr, size_t nAddrLen);
 extern bool gPoolServerRunning;   // GUI/startup state
 extern volatile bool gPoolRunning; // runtime pool server loop flag (rpc.cpp)
 

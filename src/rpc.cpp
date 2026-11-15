@@ -32,6 +32,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #endif
 
@@ -1309,6 +1310,22 @@ static bool SendLine(btf_socket_t fd, const json& j)
 // anything near a thousand miners.
 static const size_t MAX_STRATUM_LINE = 64 * 1024;
 static const size_t MAX_POOL_MINERS  = 1000;
+// P2Pool serves one person's own rigs, now possibly from the local network
+// (-p2poolbind). The event loop watches them with one select() set, which
+// holds 64 sockets on Windows; past that, miners would sit unheard.
+static const size_t MAX_P2POOL_MINERS = 60;
+
+// What a P2Pool miner calls itself (login, worker, agent) is only a label for
+// the log and the stats. From the local network it comes from whoever
+// connected, so it is kept short and printable: no line breaks to forge log
+// lines with.
+static std::string StratumLabel(const std::string& s)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size() && out.size() < 64; i++)
+        out += (s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : '?';
+    return out;
+}
 
 // Non-blocking recv: pull whatever bytes are available now into buf, then
 // return one complete line if one is ready. Three outcomes:
@@ -1607,6 +1624,11 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         m->address = p["login"].get<std::string>();
         m->worker  = (p.contains("pass") && p["pass"].is_string()) ? p["pass"].get<std::string>() : "worker";
         m->agent   = (p.contains("agent") && p["agent"].is_string()) ? p["agent"].get<std::string>() : "";
+        if (fP2PoolMode) {
+            m->address = StratumLabel(m->address);
+            m->worker  = StratumLabel(m->worker);
+            m->agent   = StratumLabel(m->agent);
+        }
         uint160 h160; bool validAddr = AddressToHash160(m->address, h160);
         // P2Pool pays the node's own address, whatever this miner logs in
         // as: the name is only a label in the log.
@@ -1691,6 +1713,11 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         bool fArr = p.is_array();
         m->address = (fArr && p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : "";
         m->worker  = (fArr && p.size() > 1 && p[1].is_string()) ? p[1].get<std::string>() : "worker";
+        if (fP2PoolMode) {
+            // Only a label here as well: P2PoolPayoutScript pays this node.
+            m->address = StratumLabel(m->address);
+            m->worker  = StratumLabel(m->worker);
+        }
 
         // Validate address before authorising
         uint160 h160; bool validAddr = AddressToHash160(m->address, h160);
@@ -2346,7 +2373,7 @@ static void PoolEventLoop()
                 // Connecting costs nothing and every accepted socket carries a
                 // read buffer, so an unbounded miner list is an unbounded
                 // allocation for whoever runs the pool.
-                if (gMiners.size() >= MAX_POOL_MINERS) {
+                if (gMiners.size() >= (fP2PoolMode ? MAX_P2POOL_MINERS : MAX_POOL_MINERS)) {
                     LogPrint("worker", "[pool] refusing miner fd=%d --"
                              " already at %zu connections\n",
                              (int)fd, gMiners.size());
@@ -2573,6 +2600,193 @@ static void PoolEventLoop()
 }
 
 // ---------------------------------------------------------------------------
+// -p2poolbind: the P2Pool stratum on the local network
+// ---------------------------------------------------------------------------
+// The stratum has no login: whoever reaches it mines, and every share pays
+// this node's address (P2PoolPayoutScript), whatever name the miner gives.
+// So it may face a network the owner's own machines share, never the
+// internet: the address it binds must be private, and so must every peer.
+
+// 127/8 loopback, 10/8, 172.16/12 and 192.168/16 (RFC 1918), 169.254/16
+// link-local.
+static bool PrivateV4(const unsigned char* a)
+{
+    return a[0] == 127
+        || a[0] == 10
+        || (a[0] == 172 && (a[1] & 0xf0) == 16)
+        || (a[0] == 192 && a[1] == 168)
+        || (a[0] == 169 && a[1] == 254);
+}
+
+static bool MappedV4(const unsigned char* a)
+{
+    static const unsigned char prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    return memcmp(a, prefix, 12) == 0;
+}
+
+// ::1 loopback, fc00::/7 unique local, fe80::/10 link-local.
+static bool PrivateV6(const unsigned char* a)
+{
+    static const unsigned char loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    return memcmp(a, loopback, 16) == 0
+        || (a[0] & 0xfe) == 0xfc
+        || (a[0] == 0xfe && (a[1] & 0xc0) == 0x80);
+}
+
+bool P2PoolPeerAllowed(const struct sockaddr* pAddr, size_t nAddrLen)
+{
+    if (!pAddr)
+        return false;
+    if (pAddr->sa_family == AF_INET && nAddrLen >= sizeof(struct sockaddr_in))
+        return PrivateV4((const unsigned char*)&((const struct sockaddr_in*)pAddr)->sin_addr);
+    if (pAddr->sa_family == AF_INET6 && nAddrLen >= sizeof(struct sockaddr_in6))
+    {
+        const unsigned char* a = (const unsigned char*)&((const struct sockaddr_in6*)pAddr)->sin6_addr;
+        return MappedV4(a) ? PrivateV4(a + 12) : PrivateV6(a);
+    }
+    return false;
+}
+
+// Parses -p2poolbind into a socket address. Numeric only: a name would be
+// looked up, and could resolve to anything.
+static bool P2PoolParseBind(const std::string& strAddr, struct sockaddr_storage& ss,
+                            socklen_t& nLen, std::string& strWhyNot)
+{
+    memset(&ss, 0, sizeof(ss));
+    nLen = 0;
+    if (strAddr.empty() || strAddr.size() > 64)
+    {
+        strWhyNot = "it is not an IP address";
+        return false;
+    }
+#ifdef _WIN32
+    // Command-line parsing runs before the node starts Winsock; the reference
+    // count makes this pair harmless later too.
+    WSADATA wsadata;
+    bool fWsa = WSAStartup(MAKEWORD(2, 2), &wsadata) == 0;
+#endif
+    bool fParsed = false;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, strAddr.c_str(), &a4) == 1)
+    {
+        // inet_pton, not getaddrinfo, for IPv4: it takes only the plain
+        // dotted quad, not "10.1" or "0x0a000001".
+        struct sockaddr_in* sin = (struct sockaddr_in*)&ss;
+        sin->sin_family = AF_INET;
+        sin->sin_addr = a4;
+        nLen = sizeof(struct sockaddr_in);
+        fParsed = true;
+    }
+    else if (strAddr.find(':') != std::string::npos)
+    {
+        // getaddrinfo for IPv6, which also reads a link-local zone
+        // ("fe80::1%eth0", or "%12" on Windows).
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET6;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
+        if (getaddrinfo(strAddr.c_str(), NULL, &hints, &res) == 0 && res)
+        {
+            if (res->ai_family == AF_INET6 && res->ai_addrlen <= sizeof(ss))
+            {
+                memcpy(&ss, res->ai_addr, res->ai_addrlen);
+                nLen = (socklen_t)res->ai_addrlen;
+                fParsed = true;
+            }
+            freeaddrinfo(res);
+        }
+    }
+#ifdef _WIN32
+    if (fWsa)
+        WSACleanup();
+#endif
+    if (!fParsed)
+    {
+        strWhyNot = "it is not a numeric IPv4 or IPv6 address (no names, no port)";
+        return false;
+    }
+    if (ss.ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)&ss;
+        const unsigned char* a = (const unsigned char*)&sin6->sin6_addr;
+        static const unsigned char any[16] = {0};
+        if (memcmp(a, any, 16) == 0)
+        {
+            strWhyNot = ":: listens on every interface, including any that face the internet";
+            return false;
+        }
+        if (MappedV4(a))
+        {
+            strWhyNot = "give the IPv4 address itself, not its IPv6-mapped form";
+            return false;
+        }
+        if (!PrivateV6(a))
+        {
+            strWhyNot = "it is not a private address (loopback, link-local fe80::/10 or unique local fc00::/7)";
+            return false;
+        }
+        if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80 && sin6->sin6_scope_id == 0)
+        {
+            strWhyNot = "a link-local IPv6 address needs its interface, e.g. fe80::1%eth0";
+            return false;
+        }
+        return true;
+    }
+    const unsigned char* a = (const unsigned char*)&((const struct sockaddr_in*)&ss)->sin_addr;
+    if (a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0)
+    {
+        strWhyNot = "0.0.0.0 listens on every interface, including any that face the internet";
+        return false;
+    }
+    if (!PrivateV4(a))
+    {
+        strWhyNot = "it is not a private address (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, "
+                    "192.168.0.0/16 or link-local 169.254.0.0/16)";
+        return false;
+    }
+    return true;
+}
+
+bool P2PoolBindAllowed(const std::string& strAddr, std::string& strWhyNot)
+{
+    struct sockaddr_storage ss;
+    socklen_t nLen;
+    return P2PoolParseBind(strAddr, ss, nLen, strWhyNot);
+}
+
+static std::string SockAddrString(const struct sockaddr* pAddr, socklen_t nLen)
+{
+    char host[NI_MAXHOST];
+    if (getnameinfo(pAddr, nLen, host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0)
+        return "?";
+    return host;
+}
+
+// A listening socket on addr:port, or INVALID_SOCKET.
+static btf_socket_t StratumListen(const struct sockaddr_storage& ss, socklen_t nLen, unsigned short nPort)
+{
+    struct sockaddr_storage addr = ss;
+    if (addr.ss_family == AF_INET)
+        ((struct sockaddr_in*)&addr)->sin_port = htons(nPort);
+    else
+        ((struct sockaddr_in6*)&addr)->sin6_port = htons(nPort);
+    btf_socket_t s = (btf_socket_t)socket(addr.ss_family, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET)
+        return s;
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+    if (addr.ss_family == AF_INET6)
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&one, sizeof(one));
+    if (::bind(s, (struct sockaddr*)&addr, nLen) != 0 || listen(s, SOMAXCONN) != 0)
+    {
+        sock_close(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 // Accept miners over the Tor hidden service
 // ---------------------------------------------------------------------------
 // The pool no longer registers at a rendezvous relay. Tor forwards
@@ -2584,8 +2798,9 @@ static void AcceptLoopFn(void*)
 {
     unsigned short poolPort;
     if (fP2PoolMode) {
-        // P2Pool: this node's own miners only, on 127.0.0.1 -- no onion,
-        // nothing announced. Everyone else runs their own node.
+        // P2Pool: this node's own miners only, on 127.0.0.1 and, with
+        // -p2poolbind, one private address -- no onion, nothing announced.
+        // Everyone else runs their own node.
         poolPort = nP2PoolPort;
     } else {
         // The pool shares the node's .btf identity; wait for it (so the log can name
@@ -2613,28 +2828,37 @@ static void AcceptLoopFn(void*)
         poolPort = (unsigned short)(p2p + 1);
     }
 
-    btf_socket_t lsock = (btf_socket_t)socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage loop;
+    memset(&loop, 0, sizeof(loop));
+    ((struct sockaddr_in*)&loop)->sin_family = AF_INET;
+    ((struct sockaddr_in*)&loop)->sin_addr.s_addr = htonl(INADDR_LOOPBACK); // reached via Tor, or this machine's miners
+    btf_socket_t lsock = StratumListen(loop, sizeof(struct sockaddr_in), poolPort);
     if (lsock == INVALID_SOCKET) {
-        LogPrint("pool", "[pool] could not create pool listener socket\n");
+        LogPrint("pool", "[pool] could not listen on 127.0.0.1:%u\n", (unsigned)poolPort);
         return;
     }
-    int one = 1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // loopback only -- reached via Tor
-    addr.sin_port = htons(poolPort);
-    if (::bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        LogPrint("pool", "[pool] could not bind pool listener 127.0.0.1:%u\n", (unsigned)poolPort);
-        sock_close(lsock);
-        return;
+
+    // -p2poolbind, checked at startup. The loopback listener stays: this
+    // machine's own XMRig keeps pointing at 127.0.0.1. An address that is not
+    // up yet (DHCP late at boot) is tried again every 10 s.
+    struct sockaddr_storage lan;
+    socklen_t nLanLen = 0;
+    bool fLan = false;
+    std::string strLan;
+    if (fP2PoolMode && !strP2PoolBind.empty()) {
+        std::string strWhyNot;
+        if (!P2PoolParseBind(strP2PoolBind, lan, nLanLen, strWhyNot))
+            LogPrint("pool", "[p2pool] -p2poolbind=%s refused: %s\n", strP2PoolBind.c_str(), strWhyNot.c_str());
+        else if (!(lan.ss_family == AF_INET &&
+                   ((struct sockaddr_in*)&lan)->sin_addr.s_addr == htonl(INADDR_LOOPBACK))) {
+            fLan = true;
+            strLan = lan.ss_family == AF_INET6 ? "[" + strP2PoolBind + "]" : strP2PoolBind;
+        }
     }
-    if (listen(lsock, SOMAXCONN) != 0) {
-        LogPrint("pool", "[pool] could not listen on pool port %u\n", (unsigned)poolPort);
-        sock_close(lsock);
-        return;
-    }
+    btf_socket_t lanSock = INVALID_SOCKET;
+    int64 nLanTried = 0;
+    bool fLanWarned = false;
+
     if (fP2PoolMode)
         LogPrint("pool", "[p2pool] point XMRig at 127.0.0.1:%u -- shares go to the share chain, "
                  "blocks pay the window\n", (unsigned)poolPort);
@@ -2642,19 +2866,73 @@ static void AcceptLoopFn(void*)
         LogPrint("pool", "[pool] miners connect at %s (pool port %u) over onion\n",
                  BtfLocalAddress().c_str(), (unsigned)poolPort);
 
+    int64 nRefusedLogged = 0;
     while (!fShutdown && gPoolRunning) {
+        if (fLan && lanSock == INVALID_SOCKET && GetTime() - nLanTried >= 10) {
+            nLanTried = GetTime();
+            lanSock = StratumListen(lan, nLanLen, poolPort);
+            if (lanSock != INVALID_SOCKET)
+                LogPrint("pool", "[p2pool] also serving the local network at %s:%u -- anyone who can "
+                         "reach it mines to this node's address\n", strLan.c_str(), (unsigned)poolPort);
+            else if (!fLanWarned) {
+                LogPrint("pool", "[p2pool] could not listen on %s:%u (is that address on this machine?)"
+                         " -- trying again every 10 s\n", strLan.c_str(), (unsigned)poolPort);
+                fLanWarned = true;
+            }
+        }
+
         fd_set rs;
         FD_ZERO(&rs);
         FD_SET(lsock, &rs);
+        int maxfd = (int)lsock;
+        if (lanSock != INVALID_SOCKET) {
+            FD_SET(lanSock, &rs);
+            if ((int)lanSock > maxfd) maxfd = (int)lanSock;
+        }
         struct timeval tv;
         tv.tv_sec = 1; tv.tv_usec = 0;
-        int r = select((int)lsock + 1, &rs, NULL, NULL, &tv);
+        int r = select(maxfd + 1, &rs, NULL, NULL, &tv);
         if (r <= 0) continue;           // timeout or interrupt -> re-check shutdown
-        btf_socket_t c = (btf_socket_t)accept(lsock, NULL, NULL);
-        if (c == INVALID_SOCKET) continue;
-        LogPrint("worker", "[pool] miner connected over onion -- pushing to event loop\n");
-        PushReady(c);
+        btf_socket_t ls[2] = {lsock, lanSock};
+        for (int i = 0; i < 2; i++) {
+            if (ls[i] == INVALID_SOCKET || !FD_ISSET(ls[i], &rs))
+                continue;
+            struct sockaddr_storage peer;
+            socklen_t nPeerLen = sizeof(peer);
+            memset(&peer, 0, sizeof(peer));
+            btf_socket_t c = (btf_socket_t)accept(ls[i], (struct sockaddr*)&peer, &nPeerLen);
+            if (c == INVALID_SOCKET) continue;
+#ifndef _WIN32
+            // The event loop puts every miner in an fd_set; a descriptor past
+            // FD_SETSIZE would be written outside it.
+            if ((int)c >= FD_SETSIZE) {
+                LogPrint("pool", "[pool] dropping a miner connection: descriptor %d is past FD_SETSIZE\n", (int)c);
+                sock_close(c);
+                continue;
+            }
+#endif
+            // Defence in depth behind the bind check: a router forwarding a
+            // public port to this address would otherwise open the stratum to
+            // the internet.
+            if (!P2PoolPeerAllowed((struct sockaddr*)&peer, (size_t)nPeerLen)) {
+                if (GetTime() - nRefusedLogged >= 60) {
+                    LogPrint("pool", "[p2pool] dropped a stratum connection from %s: not a private address\n",
+                             SockAddrString((struct sockaddr*)&peer, nPeerLen).c_str());
+                    nRefusedLogged = GetTime();
+                }
+                sock_close(c);
+                continue;
+            }
+            if (fP2PoolMode)
+                LogPrint("worker", "[p2pool] miner connected from %s\n",
+                         SockAddrString((struct sockaddr*)&peer, nPeerLen).c_str());
+            else
+                LogPrint("worker", "[pool] miner connected over onion -- pushing to event loop\n");
+            PushReady(c);
+        }
     }
+    if (lanSock != INVALID_SOCKET)
+        sock_close(lanSock);
     sock_close(lsock);
     LogPrint("pool", "[pool] pool listener stopped\n");
 }

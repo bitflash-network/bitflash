@@ -53,8 +53,21 @@ pays you at an address of its own wallet (or the one given with
 -p2poolpayto). No address goes on the command line here. Start the node with
 -p2poolport=N and set P2POOL_PORT=N for this script to use another port.
 
-XMRig only talks to 127.0.0.1 in this mode, so it does not use this package's
-Tor. Its 1% donation mining (the dev fee XMRig builds in) then connects to the
+Mining from another machine on your local network: start the node with
+-p2pool -p2poolbind=192.168.1.10 (the node machine's own private address),
+then on the other machine run
+
+  Windows:  set P2POOL_HOST=192.168.1.10
+            mine.cmd p2pool
+  Linux:    P2POOL_HOST=192.168.1.10 ./mine.sh p2pool
+
+The stratum has no login: anyone on that network can mine to your node, and
+all they can do with it is add hashrate that pays your node's address. The
+node takes only private addresses (192.168.x, 10.x, 172.16-31.x and the like)
+for -p2poolbind, and drops connections that do not come from one.
+
+XMRig only talks to your own node in this mode, so it does not use this
+package's Tor. Its 1% donation mining (the dev fee XMRig builds in) then connects to the
 XMRig donation server directly, not over Tor; the official build does not let
 it go below 1%. If that connection matters to you, use the Tor pool mode
 above, or build XMRig from source with the donation set to 0.

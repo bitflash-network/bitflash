@@ -148,7 +148,7 @@ static void PrintUsage()
     printf("            db-env-reopen, db-locks, wallet-sqlite, wallet-sqlite-migration,\n");
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
-    printf("            consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum,\n");
+    printf("            consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, p2pool-lan,\n");
     printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, bignum-int, script-opcodes, rules-v2, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, network-params, socks5-proxy,\n");
     printf("            reply-parsers,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
@@ -163,7 +163,12 @@ static void PrintUsage()
     printf("Mining mode:\n");
     printf("  /p2pool                    (pooled mining with no pool: XMRig points at this node,\n");
     printf("                              blocks pay every miner of the share window; docs/p2pool.md)\n");
-    printf("  /p2poolport=N              (default 3333, on 127.0.0.1 only)\n");
+    printf("  /p2poolport=N              (default 3333, on 127.0.0.1)\n");
+    printf("  /p2poolbind=IP             (also serve stratum on this private address, for miners on\n");
+    printf("                              your local network: 10.x, 172.16-31.x, 192.168.x, 169.254.x,\n");
+    printf("                              fc00::/7 or fe80::/10. No login: anyone who reaches it mines\n");
+    printf("                              to this node's payout address. Public addresses, 0.0.0.0\n");
+    printf("                              and :: are refused)\n");
     printf("  /p2poolpayto=ADDRESS       (default: a fresh address of this wallet, changed daily)\n");
     printf("  /operator\n");
     printf("  /participant=POOL_BTF_ADDRESS\n");
@@ -393,7 +398,22 @@ static void ParseStartupArguments(int argc, char* argv[])
         if (!strP2PoolPayTo.empty() && !AddressToHash160(strP2PoolPayTo, h))
             StartupRefuse(strprintf("-p2poolpayto=%s is not a Bitflash address", strP2PoolPayTo.c_str()),
                           "Leave it out to be paid at a fresh address of this wallet, changed every day.");
+        // The stratum has no login, so it may face the owner's local network
+        // and nothing wider: one private address, checked here and again on
+        // every connection (rpc.cpp).
+        if (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind"))
+        {
+            strP2PoolBind = argval2(argc, argv, "/p2poolbind", "-p2poolbind");
+            string strWhyNot;
+            if (!P2PoolBindAllowed(strP2PoolBind, strWhyNot))
+                StartupRefuse(strprintf("-p2poolbind=%s: %s", strP2PoolBind.c_str(), strWhyNot.c_str()),
+                              "The stratum has no login: it may listen only on a private address of this "
+                              "machine on your local network, such as -p2poolbind=192.168.1.10.");
+        }
     }
+    else if (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind"))
+        StartupRefuse("-p2poolbind needs -p2pool",
+                      "It chooses where the P2Pool stratum listens; add -p2pool to mine with P2Pool.");
 
     if (arg(argc,argv,"/participant") || arg(argc,argv,"-participant"))
     {
