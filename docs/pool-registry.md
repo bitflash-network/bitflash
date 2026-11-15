@@ -555,8 +555,8 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
 - `-p2pool=<poolid>` (64 hex digits): that pool. Pool zero's own id means pool
   zero. A value of 40 to 80 hex digits that is not exactly 64 makes the node
   refuse to start, so a mistyped id does not quietly mine pool zero.
-- A node downgraded to 1.2.34 with `-p2pool=<poolid>` in its config mines pool
-  zero (its parser sees only "-p2pool"). The release notes say so.
+- A node downgraded to 1.2.34 with `-p2pool=<poolid>` on its command line
+  mines pool zero (its parser sees only "-p2pool"). The release notes say so.
 - One node mines one pool at a time; the stratum, the miner and
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
@@ -628,9 +628,8 @@ it.
 
 A **candidate** for epoch `e` is a node with a `.btf` identity (every node on
 this network has one: the secp256k1 x-only key its address encodes, signed
-with BIP340 Schnorr, `src/btfaddr.h`; `docs/rendezvous.md` still says ed25519
-and is corrected alongside this design) that publishes a **guardian ticket**
-for `e`:
+with BIP340 Schnorr, `src/btfaddr.h`) that publishes a **guardian ticket** for
+`e`:
 
 A ticket is 118 bytes. Its body is the first 54:
 
@@ -694,16 +693,23 @@ Phase C pins vectors for the body, the header, the work hash and the score.
      boundary, judges such a ticket on a view the sender may not share); a
      message whose stated seed hash is not that block's hash (the sender is on
      another branch, however deep the reorg); the deadline (unasked relays
-     only); a body it has already checked this epoch, whether it passed,
-     failed, or passed and was not kept (outranked for its key or past the
-     cap): a bounded set of up to 16384 `SHA256d` body hashes per epoch, so a
-     second signature over the same body, or a replay of a ticket that lost,
-     never costs this node a second hash;
+     only); a body already in this epoch's checked set (below);
   3. the signature, then the work against the seed the message names, which
      step 2 made sure is also this node's, under a RandomX budget of its own,
      separate from both share budgets, and spent on older connections first
      (the `OlderHeld` order), so tickets from fresh connections cannot starve
      the answers this node asked for.
+
+  **The checked set.** A body (`SHA256d` of its 54 bytes) enters this
+  epoch's checked set **only once its signature has verified**, and stays
+  whether its work then passes or fails, and whether a passing ticket is kept
+  or loses (outranked for its key, or past the cap). Up to 16384 body hashes
+  per epoch. So a replay of a body whose signature verified never costs a
+  second hash, and a copy of an honest body with a bad signature costs this
+  node one signature check, scores its sender, and leaves nothing behind: it
+  cannot keep the real ticket out. (Once the signature holds, whether the work
+  passes depends on the body and the named seed alone, so remembering a work
+  failure is safe.)
 
   A ticket that passes is kept and relayed. Only a failure in step 1 or 3
   scores the sender. A bad signature is never honest, and neither is work that
@@ -713,10 +719,13 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   leave it, the queue is emptied when a seed changes, and a disconnected
   peer's queued tickets are dropped.
 - **The ticket format and target are frozen**, like a share rules version.
-  Work below target is scored, so a release that changed the target would
-  make old and new honest nodes score each other; a change is a new ticket
-  version with its own magic and body layout. A node drops a ticket of a
-  version it does not know, or no longer takes, without scoring the sender.
+  Work that fails the target is scored, so a release that changed the target
+  would make old and new honest nodes score each other; a change is a new
+  ticket version, carried in a new command (`pooltkt2` and so on), never in
+  `pooltkt`, so it is never parsed as a malformed version 1 ticket. A node
+  ignores the command of a version it does not know, as it ignores any unknown
+  command, and stops sending, without scoring anyone, a version it no longer
+  takes.
 - **When a seed block leaves the active chain** (a reorg at least 30 blocks
   deep through height `720(e - 1)`), the node drops its held set for `e`,
   makes its own ticket for `e` again on the new seed, and fills the set again
@@ -739,9 +748,10 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   for want of budget; Phase C sizes the budget so a fresh node sees the draw
   within an hour.
 - **Persistence.** A node keeps its own tickets and its held sets for the
-  previous, current and next epochs in `pool-tickets.dat`, read back (and
-  checked again) at start, so a restart does not leave it blind for the rest of
-  an epoch.
+  previous, current and next epochs in `pool-tickets.dat`, read back at start
+  and checked again through the ticket budget queue like an answer (up to
+  3 x 4096 hashes, never blocking the start), so a restart does not leave it
+  blind for the rest of an epoch.
 - **At most 4096 tickets per epoch are held; past that, the 4096 with the
   lowest work hashes.** Arrival order would let whoever floods first fill the
   set; lowest hash makes every node converge on the same set whatever the
@@ -884,6 +894,12 @@ mean safely: the record alone restarts the pool, and the anchors tell a
 reviving node which offered line is the real one.
 
 ### Opting out
+
+Guarding is **on by default** on every node of a release with the registry,
+mining or not, because pools travel only if ordinary nodes carry them. What
+that costs a node that never touches an option: one ticket a day (a few
+minutes of one core at idle priority), at most 128 MB of guarded share chains,
+at most 64 KB/s serving them, and under 1 MB of tickets a day (section 11).
 
 `-poolguard=0`: no tickets, never drawn, carries only pool zero, the pool it
 mines and `-poolcarry` pools. Mining is unaffected.
