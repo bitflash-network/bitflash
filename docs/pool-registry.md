@@ -428,7 +428,7 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 | `p2xshare` | pool id, `ShareX` | a share, as `p2pshare` |
 | `p2xgetsh` | pool id, up to 500 share ids | ask for shares by id, as `p2pgetsh` |
 | `p2xsync` | pool id, resume point (a share id, or 0) | ask for a line, as `p2psync`; with a resume point the server holds, only the shares of its history at or above that share's height (section 17) |
-| `p2xshares` | pool id, tip height, up to 100 shares and 256 KB | a part of a line, as `p2pshares` but smaller and paced, only in answer to `p2xsync` for that pool (section 17) |
+| `p2xshares` | pool id, the snapshot's tip height, an end flag, up to 100 shares and 256 x 1024 bytes | a part of a line, as `p2pshares` but smaller and paced, only in answer to `p2xsync` for that pool (section 17) |
 | `p2xnone` | pool id | "I hold nothing of this pool": the answer to `p2xsync` or `p2xgetsh` for a pool this node does not carry, or carries with no shares |
 | `pooltkt` | an epoch, the ticket seed hash the sender checked them against, up to 512 guardian tickets | tickets, relayed or in answer to `poolgettkt` (section 10, Phase C) |
 | `poolgettkt` | an epoch | ask a peer for the tickets it holds for that epoch; answered with `pooltkt` parts, at most 4096 tickets in all (section 10, Phase C) |
@@ -970,8 +970,8 @@ reviving node which offered line is the real one.
 Guarding is **on by default** on every node of a release with the registry,
 mining or not, because pools travel only if ordinary nodes carry them. It is
 on through bridges too: a node on Snowflake or meek makes its ticket and
-holds pools like any other, and only serves and pulls more slowly (section
-17). What
+holds, serves and pulls pools like any other, at whatever speed its circuit
+carries (section 17). What
 that costs a node that never touches an option: one ticket a day (a few
 minutes of one core at idle priority), at most 128 MB of guarded share chains,
 at most 64 KB/s serving them, and the ticket traffic of section 11 (about
@@ -989,7 +989,7 @@ mines and `-poolcarry` pools. Mining is unaffected.
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
 | guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
-| on Snowflake or meek | the same bytes and pools as every node; only the serving rate defaults to 16 KB/s, and handoff pulls one pool at a time (section 17) |
+| on Snowflake or meek | exactly as every node: the same budgets, slots, rates and pulls; the circuit alone sets the speed (section 17) |
 | a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s for serving histories of guarded pools; past it a `p2xsync` waits (`DeferSync`), never refused for good |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
@@ -1164,16 +1164,21 @@ Two things would need consensus and are deliberately left out:
   snapshot even when the line moves or reorgs during it, with every uncle a
   part names sent in or before that part; a serve whose part has not drained
   in 5 minutes ended; unproven inbound serves held to half the slots; the
-  receiving window restarted by each part, ended by a part flagged last, and
-  closed at 60 minutes while parts keep coming; a 256 KB part of two shares
-  refused, a single share over it taken; a partial fetch written to
-  `pools/<poolid>.part`, read back after a restart through `AddHistory`, and
-  resumed; no template, `poolinv` or serve before the chain is complete; the
-  file deleted when it is.
+  receiving window restarted by each part, ended by an end flag, and closed
+  at 60 minutes while parts keep coming; a serve cut short (a share of its
+  snapshot pruned) flagged "ended early", leaving the chain not complete and
+  resumed; "end of history" followed by the catch-up ask, the chain complete
+  only after it (or 5 minutes without an answer); `AddHistory` reporting a
+  part it stopped early on, so that part is not "taken in full"; a part of
+  two shares over 256 x 1024 bytes refused, a single share over it taken; a
+  slow serve older than 15 minutes under 1 KB/s ended when an ask waits; a
+  partial fetch written to `pools/<poolid>.part`, read back after a restart
+  through `AddHistory`, and resumed; no template, `poolinv` or serve before
+  the chain is complete; the file deleted when it is.
 - Transport (section 17): `gettorinfo` `transports` for bundled rungs and for
-  user lines of each kind, `meek_lite` reported as meek; on Snowflake or meek
-  the same budgets, slots and ticket as on a direct node and only the serving
-  rate lower, following a change of rung while the node runs.
+  user lines of each kind, `meek_lite` reported as meek, redone on a change
+  of rung; and no pool behaviour reading it (budgets, slots, rate, pulls and
+  ticket the same with any value).
 - Phase C: ticket vectors (body, header, work hash, score), the lowest-hash
   rule for duplicates and for the 4096 cap, the deadline for relays and not
   for answers, the same-body check before the hash, a bad-signature copy
@@ -1218,13 +1223,12 @@ on the same network the whole time:
 7. **Through bridges.** Two testnet nodes run behind the bridge ladder for the
    whole proof, on hosts whose clocks are synced by NTP (offset logged under
    0.5 s), in this order:
-   1. Neither node has a `bridges.txt`, and both first run `settorbridges
-      "forget"` so no remembered rung changes where they start. Both start
-      with `-torbridges` (the bundled Snowflake rung); one stays there, the
-      other is moved once with `settorbridges "now"` to the next rung, obfs4.
-      `gettorinfo` confirms each: `transport` "snowflake" and "obfs4", and
-      `transports` to match; the Snowflake node's log names its 16 KB/s
-      serving rate. (A user obfs4 line would show `transport` "user" and
+   1. Neither node has a `bridges.txt`. Each is first started, runs
+      `settorbridges "forget"` so no remembered rung changes where it starts,
+      and is stopped; then both start with `-torbridges` (the bundled
+      Snowflake rung); one stays there, the other is moved once with
+      `settorbridges "now"` to the next rung, obfs4. `gettorinfo` confirms
+      each: `transport` "snowflake" and "obfs4", and `transports` to match. (A user obfs4 line would show `transport` "user" and
       `transports` ["obfs4"]; that case is a Phase B self-test.)
    2. Pool A (spacing 20 s, depth 3) is mined by direct-Tor nodes holding at
       least 60% of its hashrate, and by each bridge node with at most 20%,
@@ -1242,7 +1246,7 @@ on the same network the whole time:
    3. Both make tickets with default settings, and on testnet's few tickets
       both are drawn for A within an epoch or two (the step waits for that).
       Each holds and announces A like a direct guardian; the Snowflake node
-      serves A's line to a fresh node at its 16 KB/s, paced, and the obfs4
+      serves A's line to a fresh node, paced by its circuit, and the obfs4
       node serves it too.
    4. With A dormant, a fresh Snowflake node with an empty data directory
       fetches A's window from guardians; it announces nothing and builds no
@@ -1356,29 +1360,32 @@ The time rules need no change: a share may run 120 s ahead of a node's clock,
 and a line counts as live for 180 share intervals.
 
 **Histories over slow links.** A line of 3 to 9 MB takes minutes over meek,
-and a guardian on a slow bridge serves at 16 KB/s. Pool zero keeps its rules
+and a guardian behind Snowflake serves at whatever its circuit carries. Pool zero keeps its rules
 as they are (section 8: `p2pshares` parts of 400 shares and up to 2 MB, the
 whole history queued at once, taken within 5 minutes of asking,
 `SYNC_ANSWER_WINDOW`). Registered pools have their own messages and are
 served differently:
 
-- **Small parts, the last one flagged.** A `p2xshares` part holds at most
-  100 shares, and at most 256 KB of shares unless it is a single share (a
-  share may itself be up to `MAX_SHARE_BYTES`, 256 KB). It carries a flag
-  set on the last part of the serve. A part that breaks these bounds is
-  refused and its sender scored.
+- **Small parts, the end flagged.** A `p2xshares` part holds at most 100
+  shares, and at most 256 x 1024 bytes of shares (`MAX_SHARE_BYTES`, the
+  same constant for sender and receiver) unless it is a single share, which
+  may itself be that large. Every part carries the snapshot's tip height
+  (below), not the live tip, and an end flag with three values: *more*,
+  *end of history* (the snapshot is sent in full) and *ended early* (the
+  serve stopped before that). A part that breaks these bounds is refused and
+  its sender scored.
 - **A snapshot, served paced.** When a serve starts, the server takes the
   list of share ids it would send (its `History()` from the resume point,
   oldest first, each uncle before the first share that names it) and serves
   that list, whatever its line does meanwhile; a share of the list pruned
-  before it is sent ends the serve early, flagged last, and the receiver
+  before it is sent ends the serve, flagged *ended early*, and the receiver
   resumes. It queues the next part only when the previous one has left the
   send queue and the guard rate allows it. The guard rate
   (`-poolguardkbps`, section 11) paces every registered history serve, of
   guarded, mined and carried pools alike.
 - **Fixed slots, no stall.** Every node runs at most **8** registered serves
   at once, whatever its rate or transport, each getting an equal part of the
-  rate (at least 2 KB/s at 16 KB/s, 8 KB/s at 64 KB/s); a further ask waits
+  rate (at least 8 KB/s at the default 64 KB/s, whatever the circuit allows below that); a further ask waits
   for a free slot (`DeferSync`). Unproven inbound connections hold at most 4
   of the 8, so they never block peers this node dialled or proven ones. A
   serve whose last queued part has not left the send queue within 5 minutes
@@ -1388,11 +1395,15 @@ served differently:
   when the same connection asks again for the same pool (the new ask replaces
   it and counts as an ask). A paced serve holds at most one part of the send
   queue, so the slow-reader rule (`DropSlowestHistoryReader`) has no queued
-  history to drop it for; the stall limit does that job.
+  history to drop it for; its job is done by the stall limit and by one more
+  rule: when an ask waits for a slot, the slowest serve older than 15 minutes
+  that averages under 1 KB/s ends, flagged *ended early* (its reader resumes
+  later from where it stopped). So slow readers cannot keep the slots
+  forever.
 - **A receiving window with a ceiling.** The first part is taken up to 60
   minutes after asking, since it may wait for a free slot. After it, each part
-  restarts a 5-minute wait for the next, and the part flagged last ends the
-  window. Whatever arrives, the window closes 60 minutes after the ask; a
+  restarts a 5-minute wait for the next, and a part flagged *end of
+  history* or *ended early* ends the window. Whatever arrives, the window closes 60 minutes after the ask; a
   fetch still moving then goes on with a new ask, from where it stopped
   (below). The shares taken for one ask stay under one history's worth
   (`3 x HISTORY_SHARES + 2 x 100`, with the pool's `HISTORY_SHARES`).
@@ -1417,43 +1428,41 @@ gave Tor, by their first word (`BtfBridgeTransport` over `g_torBridges`, read
 under `cs_managedTor`, which `BtfSetTorBridges` then takes to write it too): `snowflake`, `obfs4`, `webtunnel`, `meek_lite`
 reported as `meek`, and any other kind passed through as written.
 `gettorinfo` gains a field **`transports`**: the sorted list of the kinds in
-the lines Tor has now, empty when Tor runs without bridges. The node counts as
-**on a slow bridge** when that list holds Snowflake or meek (Tor may use any
-line it was given, so the slowest kind decides). With an external Tor the node
-cannot tell, and counts as direct unless told otherwise with `-poollowbw`.
-The transport can change while the node runs (the ladder climbs, the operator
-calls `settorbridges`): the classification is redone each time Tor is
-restarted on new lines, and the rates below follow it.
+the lines Tor has now, empty when Tor runs without bridges; with an external
+Tor the node cannot tell, and says so. The field is for the operator and for
+Phase D, and is redone each time Tor is restarted on new lines (the ladder
+climbs, the operator calls `settorbridges`). **Nothing in the pool protocol
+depends on it**: every choice below is the same on every transport.
 
 **Guarding through bridges is on, and looks the same.** Tickets are public,
-the draw is deterministic and `poolinv` is seen by peers, so anything a node
-on a censored network did differently in them would point it out: stopping
-its ticket, or holding fewer pools than its ticket and the draw say it should.
-A node on a slow bridge therefore makes its ticket, is drawn, and holds and
-announces pools exactly like any other, with the same byte and pool budgets
-(section 11) and the same 8 serve slots. Only what no peer can tell from a slow circuit changes, when
-the operator has not set it:
+the draw is deterministic, `poolinv` is seen by peers, and a peer can compare
+how fast a node serves pool zero's history (queued whole, at the circuit's
+speed) with how fast it serves a registered one. So anything a node on a
+censored network did differently would point it out: stopping its ticket,
+holding fewer pools than its ticket and the draw say it should, capping its
+serving rate below what its circuit carries, or pulling fewer pools at once.
+A node behind any bridge therefore does all of it exactly like any other: the
+same ticket, the same byte and pool budgets (section 11), the same 8 serve
+slots, the same default serving rate (64 KB/s, `-poolguardkbps`), and the
+same handoff pulls (at most 2 pools at a time). A slow bridge needs no rule
+of its own: paced serving queues the next part only when the previous one has
+left the send queue, so the circuit itself sets the pace, which is what any
+slow circuit looks like. A lower `-poolguardkbps` or `-poolguardmb`, or
+`-poolguard=0`, stays an explicit operator choice, as on any node (an
+operator on a metered link makes it; the budget shows in the ticket, or the
+ticket is absent, as for anyone who chose so).
 
-| | serving rate by default | handoff pulls |
-|---|---|---|
-| direct, obfs4, webtunnel | 64 KB/s (section 11) | several pools at once |
-| Snowflake, meek, or `-poollowbw` | 16 KB/s | one pool at a time |
-
-The slot count, the budgets and the ticket are the same on every node
-(above), so a peer that asks for more histories than the slots learns
-nothing about the transport. A pull goes to the announcing peer that serves
-fastest, and moves to another (with its resume point) when a serve runs
-below 2 KB/s; a guarded line of up to 64 MB then takes from about 20 minutes
-to a few hours, and the old guardians, the reserve and the miners hold it
-meanwhile (section 10, linger). An operator on a metered link who cannot afford the guard budget
-sets `-poolguard=0` or a smaller `-poolguardmb`, an explicit choice that, like
-on any node, shows in its ticket or in its absence.
+A pull goes to the announcing peer that serves fastest, and moves to another
+(with its resume point) when a serve averages under 1 KB/s over 5 minutes; a
+guarded line of up to 64 MB takes from about 20 minutes to a few hours, and
+the old guardians, the reserve and the miners hold it meanwhile (section 10,
+linger).
 
 **No "low-bandwidth" flag on the wire.** A flag in tickets or in `poolinv`
 would tell every node which nodes sit on censored networks. So a node never
 says so: the ticket's capacity field carries only an explicit `-poolguardmb`,
-or the same default for everybody, and what a slow bridge changes is only
-how fast bytes move, which is what any slow circuit looks like.
+or the same default for everybody, and a slow bridge changes only how fast
+bytes move, which is what any slow circuit looks like.
 
 **Bounded handoff.** A guarded line is at most 64 MB (section 11). Ticket
 traffic is about 0.5 MB a day for each peer the node relays tickets to, plus
@@ -1466,8 +1475,16 @@ is taken as it arrives (`AddHistory` per part).
 - **Complete or not.** `AddHistory` checks in full every share above the
   stated tip height minus the retarget window, so a chain in progress has a
   tip long before the history ends. A registered pool's chain therefore has
-  an explicit state: it is **complete** once a part flagged last has been
-  taken in full, or its tip has reached the tip height the server stated. Until then the node builds no template on it,
+  an explicit state. A part is *taken in full* when `AddHistory` took every
+  share of it (today it returns true when it stops early on an innocent
+  refusal, `p2pool_chain.cpp`; it is extended to report that). After a part
+  flagged *end of history* is taken in full, the node asks the same peer once
+  more, at once, with its new tip as the resume point (one of the 3 asks), to
+  catch up with the shares found while the snapshot was sent, which on a live
+  pool can be an hour of them. The chain is **complete** when that catch-up's
+  *end of history* part is taken in full, or 5 minutes after the catch-up
+  ask with no answer. *Ended early* never completes a chain. Until it is
+  complete the node builds no template on it,
   does not announce it in `poolinv`, does not serve or relay it, and writes
   it only to the partial file below, never to `pools/<poolid>.dat`.
 - **Kept across a restart.** The partial file, `pools/<poolid>.part`, holds
@@ -1513,10 +1530,9 @@ as today. `-poolguard=0` and no `-poolcarry` keep it there.
 - An observer on the user's network sees the bridge transport and nothing
   else; Everpool adds no connection of its own. Inside Tor every message is
   carried in fixed 514-byte cells, so what shows is volume and timing.
-- The messages and the behaviour are the same on every transport. The only
-  transport-dependent choices are local (how fast to serve and to pull) and
-  look like a slow circuit; every node makes its ticket, holds pools and
-  announces them the same way.
+- The messages and the behaviour are the same on every transport: every node
+  makes its ticket, holds, announces, serves and pulls pools the same way,
+  with the same defaults. A slow bridge shows only as a slow circuit.
 - **Timing.** A node relays every share of every pool it carries, so a burst
   every share interval is the pattern of every carrier, not of a miner. That
   does not hide a miner's own shares from the peers it sends them to: a share
