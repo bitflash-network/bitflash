@@ -617,7 +617,11 @@ fuzz-light-pow: obj-fuzz/fuzz_light_pow.o $(LIGHT_POW_SAN_OBJS)
 test_p2pool: test_p2pool.cpp p2pool.cpp p2pool.h
 	$(CXX) $(CXXFLAGS) -o $@ test_p2pool.cpp p2pool.cpp
 
-tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 test_p2pool bitflash-node
+# The pool registry record (docs/pool-registry.md): encoding, rules, ids.
+test_poolrecord: test_poolrecord.cpp poolrecord.cpp poolrecord.h
+	$(CXX) $(CXXFLAGS) -o $@ test_poolrecord.cpp poolrecord.cpp $(PLATFORM_LIB) -lsodium
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 test_p2pool test_poolrecord bitflash-node
 	./test_bip32
 	./test_btfchan
 	./test_btfaddr
@@ -631,6 +635,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./test_chatswap
 	./test_bip21
 	./test_p2pool
+	./test_poolrecord
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
