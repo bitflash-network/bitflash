@@ -61,10 +61,14 @@ then on the other machine run
             mine.cmd p2pool
   Linux:    P2POOL_HOST=192.168.1.10 ./mine.sh p2pool
 
-The stratum has no login: anyone on that network can mine to your node, and
-all they can do with it is add hashrate that pays your node's address. The
-node takes only private addresses (192.168.x, 10.x, 172.16-31.x and the like)
-for -p2poolbind, and drops connections that do not come from one.
+The stratum has no login: anyone on that network can mine to your node.
+What they mine pays your node's address, and nothing they send changes that;
+the worst they can do is get in the way of your mining (the node keeps room
+for the miner on its own machine). The node takes only private addresses
+(192.168.x, 10.x, 172.16-31.x and the like) for -p2poolbind, and drops
+connections that do not come from one. Turn it on only if you trust every
+private network the node machine is on: home network, VPN, ZeroTier.
+For an IPv6 address, write it in brackets: P2POOL_HOST=[fd00::10].
 
 XMRig only talks to your own node in this mode, so it does not use this
 package's Tor. Its 1% donation mining (the dev fee XMRig builds in) then connects to the

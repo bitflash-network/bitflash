@@ -207,7 +207,8 @@ On each other machine, point the Bitflash Miner or XMRig at that address:
     XMRig by hand:  xmrig -a rx/0 -o 192.168.1.10:3333 -u p2pool -p x
 
 The node keeps listening on 127.0.0.1 as well, so a miner on the node's own
-machine needs no change.
+machine needs no change. For an IPv6 address, put it in brackets for the
+miner: `P2POOL_HOST=[fd00::10]`, `-o [fd00::10]:3333`.
 
 What to know before turning it on:
 
@@ -215,9 +216,18 @@ What to know before turning it on:
   can mine to this node. What they mine pays this node's payout address
   (`-p2poolpayto`, or the node's own wallet): the name a miner logs in with
   is only a label in the log, and nothing a miner sends can change where the
-  node is paid. A stranger on the network can only add hashrate that pays
-  you, or take up the stratum's connection slots (60 at most) and make the
-  node check bogus shares.
+  node is paid. A stranger on the network can add hashrate that pays you, or
+  get in the way of your mining: take up the connection slots the local
+  network gets (48 in all, 8 per address; 12 more are kept for 127.0.0.1, so
+  the node's own machine always gets in) and make the node check bogus
+  shares. A connection that does not log in within 30 s, or does not read
+  what the node sends, is dropped.
+- **Trust every private network this machine is on.** "Local network" means
+  any network that reaches this machine from a private address: a VPN, a
+  ZeroTier or Tailscale network, a Docker bridge, a guest Wi-Fi on the same
+  router. On Linux a machine on any of them can reach the bound address
+  through its own interface. Turn the option on only where you trust all of
+  them.
 - **Only private addresses are taken:** 10.0.0.0/8, 172.16.0.0/12,
   192.168.0.0/16, link-local 169.254.0.0/16, IPv6 unique local fc00::/7,
   link-local fe80::/10 (with its interface, as in `fe80::1%eth0`), and
