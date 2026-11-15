@@ -408,7 +408,7 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 
 | message | carries | what it does |
 |---|---|---|
-| `poolinv` | up to 32 pool ids | the registered pools this node can serve now (below). Sent after `version`, and again when the set changes (at most once a minute) |
+| `poolinv` | up to 32 pool ids | the registered pools this node can serve now (below). Sent after `version`, and again when the set changes (at most once a minute; a peer that sends them faster is not scored, since that is judged on the receiver's clock, and the receiver simply acts on the latest one at most once a minute) |
 | `p2xshare` | pool id, `ShareX` | a share, as `p2pshare` |
 | `p2xgetsh` | pool id, up to 500 share ids | ask for shares by id, as `p2pgetsh` |
 | `p2xsync` | pool id | ask for a line, as `p2psync` |
@@ -435,7 +435,8 @@ crowd real pools out of the message.
   receiver did not announce.
 - *Requests* (`p2xsync`, `p2xgetsh`, `poolwho`) may go to any `NODE_POOLREG`
   peer: that is how a node finds a pool nobody announced to it. A request for
-  a pool not carried, or carried with no shares, or naming pool zero's id,
+  a pool not announced (not carried, or a guarded or `-poolcarry` pool this
+  node holds no shares of yet), or naming pool zero's id,
   gets `p2xnone`, at the cost of one map lookup, and scores nobody. Requests are rationed by the budgets
   below, as `p2psync` is today.
 - *Answers* (`p2xshares`, and `p2xshare` sent in answer to `p2xgetsh`) are taken
@@ -443,7 +444,7 @@ crowd real pools out of the message.
   `p2pshares` has today, kept per pool). An answer for a pool this node
   stopped carrying between the ask and the answer is dropped silently.
 
-Every message starts with its pool id, so the receiver decides before reading
+Every `p2x*` message starts with its pool id, so the receiver decides before reading
 the rest. For a pushed `p2xshare`:
 
 - pool id carried: the share goes through the same pipeline as pool zero's
@@ -566,7 +567,7 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   draw gives it (section 10), plus any given with `-poolcarry=<poolid>`
   (at most 8).
 
-RPC:
+RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
@@ -626,8 +627,10 @@ it.
 ### Who can be drawn: candidates and tickets
 
 A **candidate** for epoch `e` is a node with a `.btf` identity (every node on
-this network has one: the ed25519 key its address encodes,
-`docs/rendezvous.md`) that publishes a **guardian ticket** for `e`:
+this network has one: the secp256k1 x-only key its address encodes, signed
+with BIP340 Schnorr, `src/btfaddr.h`; `docs/rendezvous.md` still says ed25519
+and is corrected alongside this design) that publishes a **guardian ticket**
+for `e`:
 
 A ticket is 118 bytes. Its body is the first 54:
 
@@ -636,10 +639,13 @@ A ticket is 118 bytes. Its body is the first 54:
 | 0 | 4 | network magic (`pchMessageStart`) |
 | 4 | 4 | `"BTFG"` |
 | 8 | 4 | epoch `e`, little-endian |
-| 12 | 32 | the node's `.btf` ed25519 public key |
+| 12 | 32 | the node's `.btf` public key, x-only, as its address encodes it |
 | 44 | 2 | guard capacity in MB, little-endian (what it offers; informative) |
 | 46 | 8 | nonce, little-endian |
-| 54 | 64 | ed25519 signature by that key over the 54 bytes of the body |
+| 54 | 64 | BIP340 Schnorr signature by that key over `SHA256("Bitflash/guard-ticket/1" \|\| the 54 bytes of the body)`, made and checked as descriptors are (`SignDescriptor`, `VerifyDescriptor`: `secp256k1_schnorrsig_sign32`, `secp256k1_xonly_pubkey_parse` and `secp256k1_schnorrsig_verify`) |
+
+BIP340 verification is specified to the bit, so every node agrees on whether a
+signature is valid; that matters because a bad signature is scored.
 
 Its **work** is the main chain's PoW v2 RandomX hash (`GetPoWHash`, with no
 new hash code) of this 80-byte header:
@@ -678,8 +684,9 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   node keeps that one, so views converge.
 - Tickets travel in `pooltkt` between `NODE_POOLREG` peers. A node checks one
   in this order:
-  1. framing and magic; a malformed message or another network's magic is
-     the sender's fault and scored;
+  1. framing and magic; a malformed message, another network's magic, or a
+     ticket whose body epoch is not the message's epoch is the sender's fault
+     and scored;
   2. **innocent drops, before any hash, nobody scored:** an epoch outside
      previous, current and next by this node's tip; a ticket seed block this
      node does not have on its active chain with at least 30 confirmations
@@ -687,9 +694,11 @@ Phase C pins vectors for the body, the header, the work hash and the score.
      boundary, judges such a ticket on a view the sender may not share); a
      message whose stated seed hash is not that block's hash (the sender is on
      another branch, however deep the reorg); the deadline (unasked relays
-     only); a body it already holds (`SHA256d` of the 54 bytes: a second
-     signature over the same body gains a key owner nothing, and cannot make
-     this node hash one ticket many times);
+     only); a body it has already checked this epoch, whether it passed,
+     failed, or passed and was not kept (outranked for its key or past the
+     cap): a bounded set of up to 16384 `SHA256d` body hashes per epoch, so a
+     second signature over the same body, or a replay of a ticket that lost,
+     never costs this node a second hash;
   3. the signature, then the work against the seed the message names, which
      step 2 made sure is also this node's, under a RandomX budget of its own,
      separate from both share budgets, and spent on older connections first
@@ -699,7 +708,15 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   A ticket that passes is kept and relayed. Only a failure in step 1 or 3
   scores the sender. A bad signature is never honest, and neither is work that
   fails against the seed the sender itself named: whatever the two nodes'
-  views of the chain, that check gives the same answer on both.
+  views of the chain, that check gives the same answer on both. Answered
+  tickets that wait in the queue for budget go through step 2 again when they
+  leave it, the queue is emptied when a seed changes, and a disconnected
+  peer's queued tickets are dropped.
+- **The ticket format and target are frozen**, like a share rules version.
+  Work below target is scored, so a release that changed the target would
+  make old and new honest nodes score each other; a change is a new ticket
+  version with its own magic and body layout. A node drops a ticket of a
+  version it does not know, or no longer takes, without scoring the sender.
 - **When a seed block leaves the active chain** (a reorg at least 30 blocks
   deep through height `720(e - 1)`), the node drops its held set for `e`,
   makes its own ticket for `e` again on the new seed, and fills the set again

@@ -24,8 +24,9 @@ answered first.
 
 ## The address
 
-A `.btf` address is 52 base32 characters and encodes an ed25519 public key, the
-same shape and for the same reason as a Tor v3 `.onion`:
+A `.btf` address is 52 base32 characters and encodes a secp256k1 x-only public
+key (signatures by it are BIP340 Schnorr, `src/btfaddr.h`), the same shape and
+for the same reason as a Tor v3 `.onion`:
 
 ```
 fd5gieenz3oep42siocc7z7ldealvt6iztu3nkekzphc6prwwcs45xi.btf
@@ -45,7 +46,7 @@ A node publishes a small signed JSON object describing where it is:
   "created": 1788975691,
   "onion": "btjui62nrnc4ysmqkfxkkastvn65mecgf4j6qn2fxll3ayc7lb2vkuid.onion:8443",
   "enc": "<x25519 public key, hex>",
-  "pubkey": "<ed25519 public key, hex>",
+  "pubkey": "<secp256k1 x-only public key, hex>",
   "sig": "<signature over the canonical form>",
   "sig3": "<signature over the v3 canonical form>"
 }
