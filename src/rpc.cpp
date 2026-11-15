@@ -2828,11 +2828,11 @@ static void AcceptLoopFn(void*)
         poolPort = (unsigned short)(p2p + 1);
     }
 
-    struct sockaddr_storage loop;
-    memset(&loop, 0, sizeof(loop));
-    ((struct sockaddr_in*)&loop)->sin_family = AF_INET;
-    ((struct sockaddr_in*)&loop)->sin_addr.s_addr = htonl(INADDR_LOOPBACK); // reached via Tor, or this machine's miners
-    btf_socket_t lsock = StratumListen(loop, sizeof(struct sockaddr_in), poolPort);
+    struct sockaddr_storage loopAddr;
+    memset(&loopAddr, 0, sizeof(loopAddr));
+    ((struct sockaddr_in*)&loopAddr)->sin_family = AF_INET;
+    ((struct sockaddr_in*)&loopAddr)->sin_addr.s_addr = htonl(INADDR_LOOPBACK); // reached via Tor, or this machine's miners
+    btf_socket_t lsock = StratumListen(loopAddr, sizeof(struct sockaddr_in), poolPort);
     if (lsock == INVALID_SOCKET) {
         LogPrint("pool", "[pool] could not listen on 127.0.0.1:%u\n", (unsigned)poolPort);
         return;
