@@ -714,12 +714,16 @@ Phase C pins vectors for the body, the header, the work hash and the score.
     about it needs room;
   - the set fills only with bodies that each cost a ticket of work. It holds
     up to 16384 per epoch; when full, the body with the highest work hash
-    leaves to make room, and a new body is never refused for want of room;
+    among those not in the held set leaves to make room for the newcomer, and
+    a new body is never refused for want of room;
   - the set belongs to one seed: it is emptied with the held set when the
     epoch's seed block leaves the active chain.
 
   A ticket that passes is kept and relayed. Only a failure in step 1 or 3
-  scores the sender. A bad signature is never honest, and neither is work that
+  scores the sender, once per message: a `pooltkt` is read up to its first
+  invalid ticket, and the rest of it is dropped. An unasked relay that finds
+  the ticket budget empty is dropped, unscored (the ticket will come again,
+  or in an answer). A bad signature is never honest, and neither is work that
   fails against the seed the sender itself named: whatever the two nodes'
   views of the chain, that check gives the same answer on both. Answered
   tickets that wait in the queue for budget go through step 2 again when they
@@ -754,13 +758,16 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   applies. Checking a full answer costs up to 4096 hashes per epoch, more than
   the ticket budget gives at once, so answered tickets wait in a queue and are
   checked as the budget refills. Each asked peer's answer has its own queue
-  (at most 4096 tickets, and at most 4 peers asked per epoch at a time),
-  deduplicated by body as tickets enter (a body already in the checked set or
-  in another queue never enters), and the queues are drained in turn, one
-  ticket from each, so one peer's answer of junk cannot crowd out another's
-  real tickets; a peer whose answer turns out to hold invalid tickets is
-  scored for each and its queue dropped. Tickets that arrive beyond a full
-  queue are dropped, unscored. Phase C
+  (at most 4096 tickets, and at most 4 peers asked per epoch at a time,
+  about 1.9 MB at most), deduplicated **only within that queue and against
+  the checked set**, never against another peer's queue: a body two peers
+  sent waits in both queues, and whichever copy is reached second is dropped
+  for free by step 2 (the first one's body is in the checked set by then).
+  So no answering peer can take ownership of tickets others sent too, and a
+  peer that disconnects, or whose queue is dropped, takes only its own copies
+  with it. The queues are drained in turn, one ticket from each; at the first
+  invalid ticket in a peer's answer, that peer is scored once and its queue
+  dropped. Tickets that arrive beyond a full queue are dropped, unscored. Phase C
   sizes the budget so a fresh node sees the draw within an hour.
 - **Persistence.** A node keeps its own tickets and its held sets for the
   previous, current and next epochs, each with the seed hash it was checked
@@ -1001,6 +1008,14 @@ costs about 16 times H tickets for near-certain capture of that one pool: the
 same order. Raising H is the honest answer: every guarding node makes one
 ticket a day.
 
+These counts are in tickets, and a ticket is a fixed number of hashes. Honest
+nodes make theirs at idle priority on one core; a miner's rig in RandomX fast
+mode makes many times more. In hashes: if a ticket costs W hashes, 22 H
+tickets is 22 H W hashes, which for any miner is affordable, and filling all
+4096 places is too. That is why this section does not rest on the cost: the
+ticket work bounds traffic and makes capture cost something, and capture
+still buys only withholding.
+
 ## 13. What stays out of consensus, and why
 
 Nothing in this design needs rules v5 or any main-chain change:
@@ -1081,7 +1096,10 @@ Two things would need consensus and are deliberately left out:
   for answers, the same-body check before the hash, a bad-signature copy
   arriving before the real ticket (the real one is still held), a checked set
   filled to its limit (no body refused), a failing body sent twice (checked
-  and scored twice), answer queues drained in turn, a message naming another
+  and scored twice), answer queues drained in turn, an asked peer that
+  disconnects before its queue is checked and one whose queue is dropped
+  after a bad signature (in both, an honest peer's copies of the same tickets
+  still end up held), a message naming another
   seed dropped unscored, a held set dropped and rebuilt when its seed is
   reorged out, a restart that reads
   `pool-tickets.dat` back and a fresh node that fills its set by
