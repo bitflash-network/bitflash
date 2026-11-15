@@ -427,7 +427,7 @@ commands, `ProcessMessage`, but they are not sent to it anyway):
 | `poolinv` | up to 32 pool ids | the registered pools this node can serve now (below). Sent after `version`, and again when the set changes (at most once a minute; a peer that sends them faster is not scored, since that is judged on the receiver's clock, and the receiver simply acts on the latest one at most once a minute) |
 | `p2xshare` | pool id, `ShareX` | a share, as `p2pshare` |
 | `p2xgetsh` | pool id, up to 500 share ids | ask for shares by id, as `p2pgetsh` |
-| `p2xsync` | pool id, resume point (a share id, or 0) | ask for a line, as `p2psync`; with a resume point the server holds, only the shares of its history at or above that share's height (section 17) |
+| `p2xsync` | pool id, resume point (a share id, or 0) | ask for a line, as `p2psync`; with a resume point the server holds, its snapshot from where that share's branch meets its line, less the uncle depth (section 17) |
 | `p2xshares` | pool id, the snapshot's tip height, an end flag, up to 100 shares and 256 x 1024 bytes | a part of a line, as `p2pshares` but smaller and paced, only in answer to `p2xsync` for that pool (section 17) |
 | `p2xnone` | pool id | "I hold nothing of this pool": the answer to `p2xsync` or `p2xgetsh` for a pool this node does not carry, or carries with no shares |
 | `pooltkt` | an epoch, the ticket seed hash the sender checked them against, up to 512 guardian tickets | tickets, relayed or in answer to `poolgettkt` (section 10, Phase C) |
@@ -991,7 +991,7 @@ mines and `-poolcarry` pools. Mining is unaffected.
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
 | on Snowflake or meek | exactly as every node: the same budgets, slots, rates and pulls; the circuit alone sets the speed (section 17) |
 | a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
-| guard bandwidth | `-poolguardkbps`, default 64 KB/s for serving histories of guarded pools; past it a `p2xsync` waits (`DeferSync`), never refused for good |
+| guard bandwidth | `-poolguardkbps`, default 64 KB/s, pacing every registered history serve (guarded, mined and carried pools alike, section 17); past it a `p2xsync` waits (`DeferSync`), never refused for good |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
 | tickets | at most 4096 per epoch, 118 bytes each: about 0.5 MB a day for each peer they are relayed to; an asked set adds up to 4 answers of 480 KB, about 1.9 MB per epoch, 5.8 MB at start (section 10) |
 | RandomX | three budgets: pool zero's (unchanged), one for all registered pools together, one for tickets; never one per pool |
@@ -1409,11 +1409,13 @@ served differently:
   (`3 x HISTORY_SHARES + 2 x 100`, with the pool's `HISTORY_SHARES`).
 
 So the slowest link a fetch survives moves a part every 5 minutes, about
-1 KB/s, and a server gives every serve at least 2 KB/s of its own rate. A
+1 KB/s, and a server at the default rate gives every serve at least 8 KB/s
+of it, when its circuit carries that. A
 stalled fetch ends 5 minutes after its last part, and no peer can keep a
 window or a slot open longer than an hour, or push more than one history
-into a window. A 9 MB line at the 2 KB/s floor takes about 75 minutes, so
-it spans two asks; the resume point makes the second one cost only the rest.
+into a window. A 9 MB line takes about 19 minutes at 8 KB/s; over a circuit
+that carries only 2 KB/s it takes about 75 minutes and spans two asks, and
+the resume point makes the second one cost only the rest.
 A sliding window for pool zero would be local to the receiver and change
 nothing a server sees; whether pool zero needs it is measured over meek in
 Phase D before any change.
@@ -1488,7 +1490,7 @@ is taken as it arrives (`AddHistory` per part).
   does not announce it in `poolinv`, does not serve or relay it, and writes
   it only to the partial file below, never to `pools/<poolid>.dat`.
 - **Kept across a restart.** The partial file, `pools/<poolid>.part`, holds
-  the tip height the server stated and the shares taken so far, oldest first;
+  the snapshot's tip height and the shares taken so far, oldest first;
   each part taken is appended and flushed before the next is asked for, so
   a restart loses at most the part in transit. At start the file is read back
   through `AddHistory` with that height (clamped as a received part is), its
@@ -1557,5 +1559,5 @@ Section 15: the Phase B self-tests for the spacing rules, the job rebuild,
 resumable fetches, paced serving, the receiving window, the complete state
 and `transports`; and Phase D step 7,
 where a Snowflake node and an obfs4 node on testnet mine a registered pool
-against the pass mark above, guard it, and fetch a dormant window across a
-restart, with the measured delays written back here.
+against the pass mark above, guard it, and fetch a dormant window and a live
+line across a restart, with the measured delays written back here.
