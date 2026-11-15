@@ -130,8 +130,11 @@ bool PoolRecord::Check(std::string& errOut) const
         return Fail(errOut, "unknown record format");
     if (nRules != SHARE_RULES_V1)
         return Fail(errOut, "unknown share rules version");
-    if (nSpacing < MIN_SPACING || nSpacing > MAX_SPACING)
-        return Fail(errOut, "share spacing out of range (10 to 120 s)");
+    // Pool zero's exact record is the only one allowed its 10 s; a copy of it
+    // with any other byte changed is an ordinary record and needs 20 s.
+    bool fPoolZero = nSpacing == POOL_ZERO_SPACING && Encode() == PoolZero().Encode();
+    if (!fPoolZero && (nSpacing < MIN_SPACING || nSpacing > MAX_SPACING))
+        return Fail(errOut, "share spacing out of range (20 to 120 s)");
     if (nWindow < MIN_WINDOW || nWindow > MAX_WINDOW)
         return Fail(errOut, "PPLNS window out of range (360 to 2160 shares)");
     if (nRetarget < MIN_RETARGET || nRetarget > MAX_RETARGET || nRetarget > nWindow)
@@ -140,10 +143,12 @@ bool PoolRecord::Check(std::string& errOut) const
         return Fail(errOut, "share floor is not a canonical positive compact target");
     if (!NoEasierThanNetwork(nFloor))
         return Fail(errOut, "share floor easier than the network floor");
-    if (nUncleDepth > MAX_UNCLE_DEPTH)
-        return Fail(errOut, "uncle depth out of range (0 to 3)");
-    if (nUncleDepth == 0 ? nUnclePct != 0 : (nUnclePct < MIN_UNCLE_PCT || nUnclePct > MAX_UNCLE_PCT))
-        return Fail(errOut, "uncle share out of range (50 to 100 with uncles, 0 without)");
+    if (nUncleDepth < MIN_UNCLE_DEPTH || nUncleDepth > MAX_UNCLE_DEPTH)
+        return Fail(errOut, "uncle depth out of range (1 to 3)");
+    if (!fPoolZero && nSpacing * nUncleDepth < MIN_UNCLE_SECONDS)
+        return Fail(errOut, "spacing x uncle depth under 60 s (depth 3 below 30 s, 2 below 60 s)");
+    if (nUnclePct < MIN_UNCLE_PCT || nUnclePct > MAX_UNCLE_PCT)
+        return Fail(errOut, "uncle share out of range (80 to 100)");
     if (nFeeBps > MAX_FEE_BPS)
         return Fail(errOut, "creator fee above 3%");
     if (nFeeType > FEE_P2SH)

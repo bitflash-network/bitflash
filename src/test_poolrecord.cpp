@@ -39,6 +39,15 @@ static std::vector<unsigned char> Script(const std::vector<unsigned char>& data)
     return s;
 }
 
+// Pool zero's rules at 30 s: valid, and not pool zero's own record, so every
+// rule applies to it in full.
+static poolreg::PoolRecord Base()
+{
+    poolreg::PoolRecord r = poolreg::PoolZero();
+    r.nSpacing = 30;
+    return r;
+}
+
 static bool Refused(const poolreg::PoolRecord& r)
 {
     std::string err;
@@ -106,8 +115,8 @@ int main()
     printf("a_record_round_trips\n");
     {
         poolreg::PoolRecord r = poolreg::PoolZero();
-        r.nSpacing = 20; r.nWindow = 1440; r.nRetarget = 360; r.nFloor = 0x1e7fffff;
-        r.nUncleDepth = 2; r.nUnclePct = 75; r.nFeeBps = 100; r.nFeeType = poolreg::FEE_P2SH;
+        r.nSpacing = 30; r.nWindow = 1440; r.nRetarget = 360; r.nFloor = 0x1e7fffff;
+        r.nUncleDepth = 2; r.nUnclePct = 90; r.nFeeBps = 100; r.nFeeType = poolreg::FEE_P2SH;
         memset(r.feeHash, 0xab, 20); r.name = "A_pool-2";
         poolreg::PoolRecord back;
         CHECK(r.Check(err), "a fee pool is a valid record");
@@ -139,40 +148,53 @@ int main()
     printf("every_rule_refuses\n");
     {
         poolreg::PoolRecord r;
-        r = poolreg::PoolZero(); r.nFormat = 2;            CHECK(Refused(r), "a later record format");
-        r = poolreg::PoolZero(); r.nRules = 2;             CHECK(Refused(r), "a later rules version");
-        r = poolreg::PoolZero(); r.nSpacing = 9;           CHECK(Refused(r), "spacing under 10 s");
-        r = poolreg::PoolZero(); r.nSpacing = 121;         CHECK(Refused(r), "spacing over 120 s");
-        r = poolreg::PoolZero(); r.nWindow = 359;          CHECK(Refused(r), "window under 360");
-        r = poolreg::PoolZero(); r.nWindow = 2161;         CHECK(Refused(r), "window over 2160");
-        r = poolreg::PoolZero(); r.nRetarget = 119;        CHECK(Refused(r), "retarget under 120");
-        r = poolreg::PoolZero(); r.nRetarget = 721;        CHECK(Refused(r), "retarget over 720");
-        r = poolreg::PoolZero(); r.nWindow = 400; r.nRetarget = 401; CHECK(Refused(r), "retarget over the window");
-        r = poolreg::PoolZero(); r.nFloor = 0x1f100000;    CHECK(Refused(r), "a floor easier than the network's");
-        r = poolreg::PoolZero(); r.nFloor = 0x2000ffff;    CHECK(Refused(r), "a floor much easier than the network's");
-        r = poolreg::PoolZero(); r.nFloor = 0x1e007fff;    CHECK(Refused(r), "a floor spelled with a needless leading zero");
-        r = poolreg::PoolZero(); r.nFloor = 0x1e00ffff;    CHECK(r.Check(err), "the leading zero MPI needs is canonical");
-        r = poolreg::PoolZero(); r.nFloor = 0x1e800000;    CHECK(Refused(r), "a negative floor");
-        r = poolreg::PoolZero(); r.nFloor = 0x01003456;    CHECK(Refused(r), "a floor with bytes SetCompact never reads");
-        r = poolreg::PoolZero(); r.nFloor = 0;             CHECK(Refused(r), "a zero floor");
-        r = poolreg::PoolZero(); r.nUncleDepth = 4;        CHECK(Refused(r), "uncle depth over 3");
-        r = poolreg::PoolZero(); r.nUnclePct = 49;         CHECK(Refused(r), "uncle share under 50");
-        r = poolreg::PoolZero(); r.nUnclePct = 101;        CHECK(Refused(r), "uncle share over 100");
-        r = poolreg::PoolZero(); r.nUncleDepth = 0;        CHECK(Refused(r), "an uncle share with no uncles");
-        r = poolreg::PoolZero(); r.nUncleDepth = 0; r.nUnclePct = 0;
-        CHECK(r.Check(err), "no uncles and no uncle share is fine");
-        r = poolreg::PoolZero(); r.nFeeBps = 301; r.nFeeType = poolreg::FEE_P2PKH; r.feeHash[0] = 1;
+        r = Base(); r.nFormat = 2;            CHECK(Refused(r), "a later record format");
+        r = Base(); r.nRules = 2;             CHECK(Refused(r), "a later rules version");
+        r = Base(); r.nSpacing = 19;          CHECK(Refused(r), "spacing under 20 s");
+        r = Base(); r.nSpacing = 121;         CHECK(Refused(r), "spacing over 120 s");
+        r = Base(); r.nWindow = 359;          CHECK(Refused(r), "window under 360");
+        r = Base(); r.nWindow = 2161;         CHECK(Refused(r), "window over 2160");
+        r = Base(); r.nRetarget = 119;        CHECK(Refused(r), "retarget under 120");
+        r = Base(); r.nRetarget = 721;        CHECK(Refused(r), "retarget over 720");
+        r = Base(); r.nWindow = 400; r.nRetarget = 401; CHECK(Refused(r), "retarget over the window");
+        r = Base(); r.nFloor = 0x1f100000;    CHECK(Refused(r), "a floor easier than the network's");
+        r = Base(); r.nFloor = 0x2000ffff;    CHECK(Refused(r), "a floor much easier than the network's");
+        r = Base(); r.nFloor = 0x1e007fff;    CHECK(Refused(r), "a floor spelled with a needless leading zero");
+        r = Base(); r.nFloor = 0x1e00ffff;    CHECK(r.Check(err), "the leading zero MPI needs is canonical");
+        r = Base(); r.nFloor = 0x1e800000;    CHECK(Refused(r), "a negative floor");
+        r = Base(); r.nFloor = 0x01003456;    CHECK(Refused(r), "a floor with bytes SetCompact never reads");
+        r = Base(); r.nFloor = 0;             CHECK(Refused(r), "a zero floor");
+        r = Base(); r.nUncleDepth = 4;        CHECK(Refused(r), "uncle depth over 3");
+        r = Base(); r.nUnclePct = 79;         CHECK(Refused(r), "uncle share under 80");
+        r = Base(); r.nUnclePct = 101;        CHECK(Refused(r), "uncle share over 100");
+        r = Base(); r.nUnclePct = 100;        CHECK(r.Check(err), "uncle share of 100");
+        r = Base(); r.nUncleDepth = 0;        CHECK(Refused(r), "no uncles");
+        r = Base(); r.nUncleDepth = 0; r.nUnclePct = 0; CHECK(Refused(r), "no uncles and no uncle share");
+        r = Base(); r.nSpacing = 120; r.nUncleDepth = 0; r.nUnclePct = 0; CHECK(Refused(r), "no uncles even at 120 s");
+        r = Base(); r.nSpacing = 20; r.nUncleDepth = 3; CHECK(r.Check(err), "20 s with depth 3");
+        r = Base(); r.nSpacing = 20; r.nUncleDepth = 2; CHECK(Refused(r), "20 s with depth 2");
+        r = Base(); r.nSpacing = 29; r.nUncleDepth = 2; CHECK(Refused(r), "29 s with depth 2");
+        r = Base(); r.nSpacing = 30; r.nUncleDepth = 2; CHECK(r.Check(err), "30 s with depth 2");
+        r = Base(); r.nSpacing = 39; r.nUncleDepth = 1; CHECK(Refused(r), "39 s with depth 1");
+        r = Base(); r.nSpacing = 59; r.nUncleDepth = 1; CHECK(Refused(r), "59 s with depth 1");
+        r = Base(); r.nSpacing = 60; r.nUncleDepth = 1; CHECK(r.Check(err), "60 s with depth 1");
+        r = Base(); r.nSpacing = 120; r.nUncleDepth = 1; CHECK(r.Check(err), "120 s with depth 1");
+        r = poolreg::PoolZero();              CHECK(r.Check(err), "pool zero's own record, at 10 s");
+        r = poolreg::PoolZero(); r.name = "bitflash2"; CHECK(Refused(r), "a copy of pool zero at 10 s with another name");
+        r = poolreg::PoolZero(); r.nWindow = 2159; CHECK(Refused(r), "a copy of pool zero at 10 s with another window");
+        r = poolreg::PoolZero(); r.nSpacing = 20; r.name = "copy"; CHECK(r.Check(err), "pool zero's rules at 20 s are a valid record");
+        r = Base(); r.nFeeBps = 301; r.nFeeType = poolreg::FEE_P2PKH; r.feeHash[0] = 1;
         CHECK(Refused(r), "a fee over 3%");
-        r = poolreg::PoolZero(); r.nFeeBps = 300; r.nFeeType = poolreg::FEE_P2PKH; r.feeHash[0] = 1;
+        r = Base(); r.nFeeBps = 300; r.nFeeType = poolreg::FEE_P2PKH; r.feeHash[0] = 1;
         CHECK(r.Check(err), "a fee of exactly 3%");
-        r = poolreg::PoolZero(); r.nFeeBps = 50;           CHECK(Refused(r), "a fee with no destination");
-        r = poolreg::PoolZero(); r.nFeeType = poolreg::FEE_P2PKH; CHECK(Refused(r), "a destination type with no fee");
-        r = poolreg::PoolZero(); r.feeHash[7] = 1;         CHECK(Refused(r), "a destination hash with no fee");
-        r = poolreg::PoolZero(); r.nFeeBps = 50; r.nFeeType = 3; r.feeHash[0] = 1; CHECK(Refused(r), "an unknown fee type");
-        r = poolreg::PoolZero(); r.name = "";              CHECK(Refused(r), "no name");
-        r = poolreg::PoolZero(); r.name = "has space";     CHECK(Refused(r), "a space in the name");
-        r = poolreg::PoolZero(); r.name = "caf\xc3\xa9";   CHECK(Refused(r), "a non-ASCII name");
-        r = poolreg::PoolZero(); r.name = "dot.name";      CHECK(Refused(r), "a dot in the name");
+        r = Base(); r.nFeeBps = 50;           CHECK(Refused(r), "a fee with no destination");
+        r = Base(); r.nFeeType = poolreg::FEE_P2PKH; CHECK(Refused(r), "a destination type with no fee");
+        r = Base(); r.feeHash[7] = 1;         CHECK(Refused(r), "a destination hash with no fee");
+        r = Base(); r.nFeeBps = 50; r.nFeeType = 3; r.feeHash[0] = 1; CHECK(Refused(r), "an unknown fee type");
+        r = Base(); r.name = "";              CHECK(Refused(r), "no name");
+        r = Base(); r.name = "has space";     CHECK(Refused(r), "a space in the name");
+        r = Base(); r.name = "caf\xc3\xa9";   CHECK(Refused(r), "a non-ASCII name");
+        r = Base(); r.name = "dot.name";      CHECK(Refused(r), "a dot in the name");
     }
 
     printf("the_script_shape\n");

@@ -33,11 +33,17 @@ static const size_t MAX_RECORD_BYTES = FIXED_BYTES + MAX_NAME_LEN;
 // What a record must burn to count: 1 BTF.
 static const int64_t MIN_BURN = 100000000;
 
-static const unsigned int MIN_SPACING = 10, MAX_SPACING = 120;
+// Spacing 20 s or more, and spacing x uncle depth at least 60 s, so a share
+// that arrives late over a Tor bridge is paid as an uncle rather than lost
+// (docs/pool-registry.md, sections 1 and 17). Pool zero's own record, with
+// its 10 s, is the one exception.
+static const unsigned int MIN_SPACING = 20, MAX_SPACING = 120;
+static const unsigned int POOL_ZERO_SPACING = 10;
+static const unsigned int MIN_UNCLE_SECONDS = 60;
 static const unsigned int MIN_WINDOW = 360, MAX_WINDOW = 2160;
 static const unsigned int MIN_RETARGET = 120, MAX_RETARGET = 720;
-static const unsigned int MAX_UNCLE_DEPTH = 3;
-static const unsigned int MIN_UNCLE_PCT = 50, MAX_UNCLE_PCT = 100;
+static const unsigned int MIN_UNCLE_DEPTH = 1, MAX_UNCLE_DEPTH = 3;
+static const unsigned int MIN_UNCLE_PCT = 80, MAX_UNCLE_PCT = 100;
 static const unsigned int MAX_FEE_BPS = 300;
 // The network floor, bnProofOfWorkLimit (~uint256(0) >> 12), in compact form.
 // No compact value lies strictly between SetCompact(NETWORK_FLOOR) and
