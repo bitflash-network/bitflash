@@ -596,8 +596,12 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
 - `-p2pool=<poolid>` (64 hex digits): that pool. Pool zero's own id means pool
   zero. A value of 40 to 80 hex digits that is not exactly 64 makes the node
   refuse to start, so a mistyped id does not quietly mine pool zero.
-- A node downgraded to 1.2.34 with `-p2pool=<poolid>` on its command line
-  mines pool zero (its parser sees only "-p2pool"). The release notes say so.
+- `-p2pool=local:<name>`: the local pool of that name on this node (section
+  18). A `local:` value naming no local pool here (a typo, a pool left with
+  `poolleave`) makes the node refuse to start, for the same reason.
+- A node downgraded to 1.2.34 with `-p2pool=<poolid>` or `-p2pool=local:<name>`
+  on its command line mines pool zero (its parser sees only "-p2pool"). The
+  release notes say so.
 - One node mines one pool at a time; the stratum, the miner and
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
@@ -1654,8 +1658,8 @@ has the code and the password can: membership is the only thing it protects.
 **What a password buys.** Without one, the pool is private only as long as
 its code is: anyone who has the code, or guesses it (a default record with a
 common name is easy to guess), computes the same id and key. With one, the
-code can be shared openly and the pool is still closed. Nothing a non-member
-sees lets it test a password offline: the anchor is keyed with `C` (below),
+code can be shared openly and the pool is still closed. Nothing seen by
+anyone a member did not list lets it test a password offline: the anchor is keyed with `C` (below),
 and a hello is bound to the onion it was sent to, so only that listed peer
 can check it, at one Argon2id run per guess. The operator's own copies of the
 id and password are kept out of argv and logs (above, and *Using it*).
@@ -1718,9 +1722,13 @@ nodes that accept connections.
 - **The hello.** On a connection to or from a peer (inbound onion
   connections are anonymous, so the listing alone proves nothing), a member
   proves membership with three messages, after the version handshake. Every
-  tag is bound to `O`, the onion the initiator dialled: Tor guarantees that
+  tag is bound to `O`, the onion the initiator dialled, written one way only:
+  the 56 lowercase characters of the v3 name, without `.onion` or the
+  `ADDR@` part. Tor guarantees that
   only the holder of that onion's key receives the connection, so a tag
-  made for one node is worth nothing at another.
+  made for one node is worth nothing at another. A node that does not know
+  its own onion (an external Tor whose onion service it was not told about)
+  can send hellos but not answer them.
   1. `p2lhello`: a random 32-byte nonce `nA` and `tA = HMAC(A, "hello" || O
      || nA)`, first 16 bytes. Sent only to listed peers.
   2. The receiver tries `tA` with `O` set to its own onion (each of them, if
@@ -1787,8 +1795,8 @@ left anywhere else to clean up.
 |---|---|
 | `poolcreate everpool {params} [dryrun]` | an Everpool pool: the record of section 1, burned on the chain (section 9) |
 | `poolcreate local {params} [password]` | a local pool: checks the record as section 1 does, with the defaults of section 9, derives the id, saves `pools/local/<id>.conf`, and returns the name, the pool code and the note below. A name already used by a local pool on this node is refused. Nothing is sent anywhere |
-| `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the name and the note |
-| `poolpeers local:<name> ["ADDR@HOST.onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows them and which have proven membership |
+| `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the name and the note. A name already used by a local pool on this node is refused (after joining with a mistyped password, `poolleave` and join again) |
+| `poolpeers local:<name> ["ADDR@HOST.onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows each and its state: connected with a session, at the session cap, or no proof (not a member, or a wrong password) |
 | `poolleave local:<name>` | forgets a local pool: deletes its files after the node stops mining it |
 | `poollist`, `poolinfo` | show this node's local pools too, marked `"local": true`, with their sessions; never any other node's |
 
@@ -1809,7 +1817,8 @@ notes carry the same informative note, without alarm:
 
 - Self-tests (Phase B): the local record round-trip and every section 1 rule
   under `"BTFL"`; a `"BTFL"` record in an `OP_RETURN` not indexed; the code's
-  checksum; fixed vectors for `K`, the id and `A` with and without a password;
+  checksum; fixed vectors for `K`, the id, `A` and `C` with and without a
+  password; `-p2pool=local:<name>` with an unknown name refusing to start;
   the anchor rules (`"p2l"` with the wrong hash, an unkeyed hash, two of
   them, alongside a `"p2p"` or a `"p2x"`; a format 1 share refusing
   `"p2l"`); the hello (a match, no match answered by silence, a hello
