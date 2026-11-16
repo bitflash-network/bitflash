@@ -14,6 +14,7 @@
 #include "treasury.h"
 #include "chatrelay.h"  // the chat's records: held, relayed and served here
 #include "p2pool_net.h"  // the P2Pool share chain: held, checked and relayed here
+#include "poolindex.h"   // the pool registry, read off the active chain
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -4684,6 +4685,11 @@ bool LoadBlockIndex(bool fAllowNew)
         if (!block.AddToBlockIndex(nFile, nBlockPos))
             return error("LoadBlockIndex() : genesis block not accepted");
     }
+
+    // The pool registry is a reading of this chain (poolindex.h): its own
+    // thread follows the active chain from here on, and never decides
+    // whether a block is valid.
+    PoolIndexStart();
 
     return true;
 }
