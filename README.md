@@ -147,6 +147,13 @@ wallet.
 coinbase pays the miners of the last 2160 shares in proportion to their work. There is no
 operator, no custody and no fee. See [docs/p2pool.md](docs/p2pool.md).
 
+**Everpool**, in development, goes one step further: anyone can create a pool as a
+permanent record on the chain, which nobody (its creator and the developers included) can
+delete or edit, and its share chain travels between nodes so the pool outlives every
+machine. It is an open protocol any chain can adopt:
+[github.com/bitflash-network/everpool](https://github.com/bitflash-network/everpool); the
+design is in [docs/pool-registry.md](docs/pool-registry.md).
+
 **Bitflash Miner** is the official XMRig release packaged with a Tor client and a launcher. It
 mines to the network pool over Tor, with a 1% fee, or to a local P2Pool node with
 `mine.cmd p2pool`. Antivirus products commonly flag XMRig; the binary is unmodified, and
