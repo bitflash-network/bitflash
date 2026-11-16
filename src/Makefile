@@ -666,6 +666,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=chain-work
 	./bitflash-node -selftest=consensus-safety
 	./bitflash-node -selftest=reorg-safety
+	./bitflash-node -selftest=pool-index
 	./bitflash-node -selftest=pool-stratum
 	./bitflash-node -selftest=parse-money
 	./bitflash-node -selftest=serialize-canonical
