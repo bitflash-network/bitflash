@@ -30,6 +30,7 @@
 #include "invoice.h"
 #include "btfaddr.h"
 #include "p2pool_net.h"
+#include "nostr.h"
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -4749,6 +4750,16 @@ static const char* LocalPeerState(int n)
     }
 }
 
+// This node as the other members list it: ADDRESS@HOST.onion:PORT, what
+// they give poolpeers. Null while Tor has not published the onion yet.
+static json SelfAsPeer()
+{
+    string strAddr = BtfLocalAddress(), strOnion = BtfLocalOnionEndpoint();
+    if (strAddr.empty() || strOnion.empty())
+        return json(nullptr);
+    return strAddr + "@" + strOnion;
+}
+
 static json LocalPeersJson(const P2PoolLocalStatusInfo& st)
 {
     json a = json::array();
@@ -4798,6 +4809,7 @@ static json rpc_poolpeers(const json& p)
     j["peers"] = LocalPeersJson(st);
     j["sessions"] = (int)st.nSessions;
     j["inboundsessions"] = (int)st.nInboundSessions;
+    j["self"] = SelfAsPeer();
     return j;
 }
 
@@ -4837,6 +4849,7 @@ static json LocalPoolJson(const string& strName, const P2PoolLocalStatusInfo& st
     j["inboundsessions"] = (int)st.nInboundSessions;
     j["pending"] = (int)st.nPending;
     j["peers"] = LocalPeersJson(st);
+    j["self"] = SelfAsPeer();
     return j;
 }
 
