@@ -658,6 +658,29 @@ pool at once costs that pool, at worst, a restart (see *Reviving*), and costs
 nobody coins already paid: PPLNS pays a share in every block found while it is
 in the window, and a block that was found has paid.
 
+**Guardians do not vote and do not lead.** There is no leader among a pool's
+guardians, no election and no threshold signature. Each one checks shares
+against the pool's frozen rules version and follows the line with the most
+work, exactly as every pool zero node does today. Two honest guardians cannot
+disagree about a share's validity, and the old and new sets during a handoff
+cannot either; a guardian that refuses a valid share is only withholding it,
+and the miner sends it to every node that announces the pool.
+
+**Guardians are not hidden.** Being a guardian is public by design: the
+tickets are broadcast and a seeker computes a pool's sixteen so that it can
+dial them. What stays private is what stays private for every node, its IP
+address, which Tor hides. Cover traffic or padding to disguise guardian
+traffic was considered and left out: it would cost every node bandwidth to
+hide a role that does not need hiding, and a pool's share traffic is small (a
+share every spacing, a few kilobytes) and paced (section 17).
+
+**There is no minimum number of guardians.** A pool works with none while
+somebody mines it, because its miners hold its line; guardians only keep it
+when nobody does and give a new miner somewhere to find it. On a network with
+fewer tickets than places, every node is drawn for every pool and the guard
+budget (section 11) keeps the pools with the most work. As nodes join, the
+next epoch's draw spreads the pools over them with no step of its own.
+
 ### Epochs and seeds
 
 - An **epoch** is 720 blocks (about a day): epoch `e` is heights `720e` to
@@ -685,6 +708,19 @@ pool, and pay for only those 16 tickets. The deadline matters for nodes that
 were online before it; a node that starts later asks its peers for the
 tickets they hold (`poolgettkt`), and the work in the score is what protects
 it.
+
+**Why not a VRF.** Algorand-style sortition, where each node evaluates a VRF
+on the seed and keeps quiet unless it is selected, was considered and is not
+used, for two reasons. A BIP340 signature is not a VRF: the signer picks the
+nonce, so one key can produce many valid signatures over the same message and
+keep the one that scores best. A real VRF (ECVRF, RFC 9381) would be new
+cryptography and a new dependency for a property the ticket already has: its
+work hash is fixed an epoch before the draw seed exists, one ticket per key
+counts, and anyone can recompute the score. The second reason is that silent
+self-selection does not fit what guardians are for. A guardian exists to be
+found by a miner who needs a pool's line, so the seeker has to be able to
+compute who guards the pool, which needs the tickets to be public. Tickets are
+broadcast for that reason, not as a cost of the scheme.
 
 ### Who can be drawn: candidates and tickets
 
@@ -837,6 +873,19 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   and checked again through the ticket budget queue like an answer (up to
   3 x 4096 hashes, never blocking the start), so a restart does not leave it
   blind for the rest of an epoch.
+- **A ticket is not a coin.** It is never on the main chain, spends no output
+  and is not held by the wallet. It cannot usefully be sold: it is signed by a
+  node's `.btf` key and names that node's onion, so handing it over means
+  handing over the node's identity, and it is worth one epoch, about a day.
+  Buying tickets is buying RandomX work under someone else's name, which an
+  attacker can do more simply by computing them, and what either buys is
+  bounded the same way (section 12).
+- **A drawn node that does not serve keeps its ticket.** There is no penalty
+  and no "inactive" mark: such a mark would be a reputation under another
+  name, and an attacker would pass it by answering the first dial and going
+  quiet after. A drawn node that does not announce the pool simply receives
+  none of its shares, and the reserve, the lingering set, the miners and every
+  announcing peer are asked in its place.
 - **At most 4096 tickets per epoch are held; past that, the 4096 with the
   lowest work hashes.** Arrival order would let whoever floods first fill the
   set; lowest hash makes every node converge on the same set whatever the
@@ -1036,6 +1085,7 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | a frozen bug in a rules version | a pool cannot be fixed | the fix is a new version and new pools; releases may refuse to build templates for a broken version, never stop validating it |
 | a fake anchor (a solo block labelled `"p2x" + id`) | a pool looks more successful than it is | anchors are shown as claims; a node that carries the pool shows the blocks its share chain confirms, and orders by share work, not anchors |
 | a malicious guardian withholds | a new miner cannot fetch the line from it | reserve, lingering set, miners, every announcing peer, `poolwho`; at worst a restart, no coins lost |
+| all 16 guardians of a pool flooded at once while a miner M is active | a new miner N cannot reach the guardians | M announces the pool to its own peers (`poolinv`) whatever the guardians do, and N asks its peers (`poolwho`): one peer in common is enough for N to fetch M's line. Hints are not passed on (a lie costs one dial), so with no peer in common N waits and starts its own line; when the two meet, M's line has more work and wins, N's lone shares are orphaned, and M's window and the blocks it found are untouched. The attack costs flooding 16 onion services for the whole time and cutting every common peer, and buys an hour's delay for one newcomer |
 | a malicious guardian serves an old or private line | a reviving node mines on the wrong line | chain choice by work, `TIP_MAX_AGE`, and the anchor check (section 10); a forged heavier line needs real PoW |
 | a forged deep history | displaces an honest line | unchanged from pool zero: the deep end of a history is trusted on work alone, so a forgery needs as much work as the honest line, and is taken only from a peer this node asked: for pool zero within 5 minutes of asking, as today; for a registered pool the first part within 60 minutes of asking, each next one within 5 minutes of the one before, never more than 60 minutes after asking, and never more shares than one history (section 17) |
 | Sybil: many tickets to capture a pool's guardians | the attacker holds all 8 and the reserve of one pool for one epoch | each ticket costs RandomX work, every epoch; the score depends on the work hash, so aiming at one pool after seeing the seed costs a ticket per try; the held set is the 4096 lowest work hashes, so an attacker's share of it, and of every pool's places, follows its share of all ticket work; and capture only buys withholding, which the rows above bound |
@@ -1106,6 +1156,16 @@ Two things would need consensus and are deliberately left out:
   so a share chain bug would stop the main chain.
 - **A guarantee that registrations get mined.** Censoring transactions is a
   main-chain question for every transaction, not this one.
+
+**A chain split.** Because nothing here is consensus, a split of the main
+chain (a soft fork that some nodes do not follow, or an attack) needs no rule
+of its own. Each node reads the registry from its own active chain, the one
+with the most work. A record mined before the split exists on both sides with
+the same id; one mined after exists only on the side that mined it. A share
+commits to a template built on the node's own tip, so its payout lands on that
+side only. When the split heals, the losing side's registrations and anchors
+are undone like any reorg (section 3) and come back if mined again, and the
+pool's share chain is kept on disk throughout. Nothing is re-anchored by hand.
 
 ## 14. Migration
 
