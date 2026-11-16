@@ -126,6 +126,9 @@ public:
     // The line behind the tip, HISTORY_SHARES deep, with the uncles it names,
     // oldest first: what a starting peer is sent.
     void History(vector<Share>& out) const;
+    // The same line's share ids and heights, in the same order: what a paced
+    // serve keeps, fetching each share as its part goes out.
+    void HistoryIds(vector<uint256>& idsOut, vector<int>& heightsOut) const;
 
     bool Has(const uint256& id) const { return mapShares.count(id) != 0; }
     uint256 Tip() const { return hashTip; }
@@ -199,6 +202,8 @@ private:
     size_t ByteCap(const set<uint256>& keep) const;
 
     const Entry* Get(const uint256& id) const;
+    // The entries History returns, in its order.
+    void HistoryEntries(vector<const Entry*>& v) const;
     bool OnLine(const uint256& id, const uint256& from, int nDepth) const;
     bool UncleTaken(const uint256& uncle, const uint256& from, int nDepth) const;
     // Why 'u' may not be an uncle of a child of 'parent' at nHeight; NULL if it may.

@@ -8348,6 +8348,67 @@ static int RunP2PoolLocalSelfTest()
         delete pA;
         delete pB;
     }
+    {
+        // The stretches that count the other pools' bytes: one already sent
+        // is dropped as the next is noted, and past 512 waiting two are
+        // joined where the least lies between them, so a pool zero history
+        // queued among them never counts as theirs.
+        CNode* pC = NewP2PoolTestNode(true);
+        P2PoolQueueRegBytesForTest(pC, 10);
+        CRITICAL_BLOCK(pC->cs_vSend)
+        {
+            pC->nSendDrained += pC->vSend.size();
+            pC->vSend.clear();
+        }
+        std::vector<char> history(1000 * 1000, 0x11), small(10, 0x22);
+        pC->vSend.write(&history[0], history.size());
+        for (int i = 0; i < 513; i++)
+        {
+            P2PoolQueueRegBytesForTest(pC, 10);
+            pC->vSend.write(&small[0], small.size());
+        }
+        size_t nSpans = 0;
+        size_t nReg = P2PoolRegQueuedForTest(pC, &nSpans);
+        size_t nAll = pC->vSend.size();
+        nFail += Check(nSpans == 512 && nReg >= 513 * 10 && nReg <= 513 * 10 + 10 && nAll - nReg >= history.size(),
+                       "a sent stretch is dropped as the next is noted, and 513 waiting are joined across 10 bytes, "
+                       "never across the pool zero history before them") ? 0 : 1;
+        P2PoolForgetDeferred(pC);
+        delete pC;
+    }
+    {
+        // A paced serve keeps share ids, not shares: a line of 121, served
+        // a part at a time, holds 121 ids while it waits on the rate; a
+        // share gone from the chain meanwhile ends it early.
+        uint256 tip = g.GetId();
+        bool fLine = true;
+        size_t nLineBytes = 0;
+        for (int i = 1; i <= 120 && fLine; i++)
+        {
+            p2pool::Share s = RulesShare(mirror, main, tip, payTo((unsigned char)(10 + i % 5)), t + 10 * i);
+            fLine = mirror.Add(s, main, err);
+            tip = s.GetId();
+            nLineBytes += ::GetSerializeSize(p2pool::ShareL(s), SER_NETWORK);
+            SendLocalItem(pM2, "p2lshare", h2, p2pool::ShareL(s));
+        }
+        P2PoolLocalStatusInfo st;
+        fLine = fLine && P2PoolLocalStatus("home", st) && st.nShares == 121 && pM2->nMisbehavior == 0;
+        size_t nServes = P2PoolRegisteredServesForTest();
+        size_t nParts = CountSent(pM2, "p2lshares");
+        SendLocalItem(pM2, "p2lsync", h2, uint256(0));
+        size_t nHeld = P2PoolRegServeHeldBytesForTest();
+        bool fWaiting = P2PoolRegisteredServesForTest() == nServes + 1 && CountSent(pM2, "p2lshares") == nParts + 1;
+        nFail += Check(fLine && fWaiting && nHeld >= 121 * 32 && nHeld < 2 * (121 + 1) * 32 + 1000 && nHeld * 10 < nLineBytes,
+                       "a paced serve of a 121-share line sends its first part and holds ids, not shares, while it waits") ? 0 : 1;
+        if (!fLine) printf("       line: %s (%u shares)\n", err.c_str(), (unsigned)st.nShares);
+        P2PoolRegServeLoseNextForTest();
+        Sleep(1100);
+        P2PoolServeDeferred();
+        vector<unsigned char> last;
+        bool fEnded = CountSent(pM2, "p2lshares") == nParts + 2 && LastSent(pM2, "p2lshares", last) && last.size() >= 13 &&
+                      last[12] == 2 && P2PoolRegisteredServesForTest() == nServes;
+        nFail += Check(fEnded, "a share pruned from the chain before its part goes ends the serve early, flagged so") ? 0 : 1;
+    }
 
     // ---- leaving
     {
@@ -8376,7 +8437,80 @@ static int RunP2PoolLocalSelfTest()
         fChainInv = P2PoolChain().CheckInvariants(errInv) && P2PoolChain().Size() == 5;
     nFail += Check(fChainInv, "pool zero's share chain holds its five shares and its invariants after all that") ? 0 : 1;
 
-    CNode* vAll[] = { pStranger, pWrongOnion, pM1, pM2, pZeroPeer, pOut, pOutOther };
+    // ---- section 8: a proven member's shares are hashed through budgets
+    // too. RandomX is checked from here on; the shares sent have no work, so
+    // a share that reaches its hash is refused and its sender scored, and a
+    // share the budgets hold back is neither hashed nor scored.
+    CNode* pOutM = NewP2PoolTestNode(false);
+    {
+        P2PoolResetForTest(bnFloor, true);
+        vector<string> vOwn(1, O);
+        P2PoolSetOwnOnionsForTest(vOwn);
+        bool fJoined = P2PoolLocalAdd(rec, keys, "", true, err);
+        pOutM->strBtfAddr = "BF1provenmember";
+        pOutM->strBtfMeeting = "onion " + O2 + ".onion:8333";
+        vector<string> vPeers(1, "BF1provenmember@" + O2 + ".onion:8333");
+        bool fListed = P2PoolLocalSetPeers("home", vPeers, err);
+        P2PoolOnVersion(pOutM);
+        vector<unsigned char> hello;
+        uint64 hM = 0;
+        bool fSession = fJoined && fListed && LastSent(pOutM, "p2lhello", hello) && hello.size() == 48;
+        if (fSession)
+        {
+            unsigned char nB[32], tB[poollocal::TAG_BYTES], hb[poollocal::HANDLE_BYTES];
+            memset(nB, 0xa1, sizeof(nB));
+            poollocal::ReplyTag(keys.A, O2, &hello[0], nB, tB);
+            CDataStream ss(SER_NETWORK, VERSION);
+            ss.write((const char*)nB, 32);
+            ss.write((const char*)tB, sizeof(tB));
+            SendP2PoolTest(pOutM, "p2lhello", ss);
+            poollocal::SessionHandle(keys.A, O2, &hello[0], nB, hb);
+            hM = poollocal::HandleValue(hb);
+            P2PoolLocalStatusInfo st;
+            fSession = CountSent(pOutM, "p2lack") == 1 && P2PoolLocalStatus("home", st) && st.nSessions == 1;
+        }
+        // Shares with every cheap check passed and no parent here, so each
+        // would be hashed on arrival.
+        p2pool::ShareChain mirrorPow(rules, false);
+        p2pool::Share base = RulesShare(mirrorPow, main, 0, payTo(6), t);
+        auto orphan = [&](int i) {
+            p2pool::Share o = base;
+            o.data.hashPrevShare = uint256(5000 + i);
+            o.data.nShareHeight = 3;
+            o.data.nShareBits = 0x1b00ffff;     // harder than the floor: no chance it has the work
+            o.nNonce = 0;
+            o.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << (int64)(t + i) << p2pool::AnchorPush(rules, o.data);
+            o.hashMerkleRoot = o.coinbase.GetHash();
+            return o;
+        };
+        // The session's budget spent, the class's full: held, not hashed.
+        P2PoolDrainProvenWorkForTest(false, true);
+        for (int i = 0; i < 3; i++)
+            SendLocalItem(pOutM, "p2lshare", hM, p2pool::ShareL(orphan(i)));
+        bool fHeldSession = pOutM->nMisbehavior == 0 && P2PoolRegisteredDeferredCount() == 1 && P2PoolRegisteredOrphanCount() == 0;
+        P2PoolServeDeferred();
+        fHeldSession = fHeldSession && pOutM->nMisbehavior == 0 && P2PoolRegisteredDeferredCount() == 1;
+        nFail += Check(fSession && fHeldSession,
+                       "a proven member (a peer this node dialled, in session) whose session budget is spent: its shares are "
+                       "held, not hashed, and it is not scored") ? 0 : 1;
+        // The class's budget spent, the session's full: held all the same.
+        P2PoolRefillProvenWorkForTest();
+        P2PoolDrainProvenWorkForTest(true, false);
+        P2PoolServeDeferred();
+        SendLocalItem(pOutM, "p2lshare", hM, p2pool::ShareL(orphan(3)));
+        bool fHeldClass = pOutM->nMisbehavior == 0 && P2PoolRegisteredDeferredCount() == 1 && P2PoolRegisteredOrphanCount() == 0;
+        nFail += Check(fHeldClass, "with the class's budget for proven peers spent, every session's share waits too") ? 0 : 1;
+        nFail += Check(P2PoolShareWorkTokens() == 32 && P2PoolDeferredCount() == 0 && P2PoolOrphanCount() == 0,
+                       "pool zero's budget and held entries are untouched by it") ? 0 : 1;
+        // Budgets back: the held share is hashed (and, having no work, its
+        // sender is scored, as for any share without work).
+        P2PoolRefillProvenWorkForTest();
+        P2PoolServeDeferred();
+        nFail += Check(P2PoolRegisteredDeferredCount() == 0 && pOutM->nMisbehavior > 0,
+                       "once the budgets refill, the held share is hashed") ? 0 : 1;
+    }
+
+    CNode* vAll[] = { pStranger, pWrongOnion, pM1, pM2, pZeroPeer, pOut, pOutOther, pOutM };
     for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
     {
         P2PoolForgetDeferred(vAll[i]);
