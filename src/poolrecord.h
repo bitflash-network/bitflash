@@ -59,6 +59,10 @@ enum FeeType
 
 struct PoolRecord
 {
+    // The magic: "BTFP" for a registry record, read from the chain, or
+    // "BTFL" for a local pool's record, which members hand each other and
+    // which is never read from the chain (section 18).
+    bool fLocal;
     unsigned char nFormat;        // RECORD_FORMAT
     unsigned char nRules;         // SHARE_RULES_V1
     unsigned int nSpacing;        // seconds per share
@@ -83,13 +87,15 @@ struct PoolRecord
     std::vector<unsigned char> FeeScript() const;
 };
 
-// Read a record from its bytes (the OP_RETURN's data). False, with a reason,
-// unless the bytes are a record in exactly its canonical form.
+// Read a record from its bytes (the OP_RETURN's data, or the bytes inside a
+// local pool's code). False, with a reason, unless the bytes are a record in
+// exactly its canonical form. out.fLocal says which magic it carried.
 bool Parse(const std::vector<unsigned char>& data, PoolRecord& out, std::string& errOut);
 
 // Read a record from an output's script: OP_RETURN and one direct push of the
 // record (opcode equal to its length), nothing after it. The burn is the
-// caller's to check (MIN_BURN).
+// caller's to check (MIN_BURN). A local record ("BTFL") is refused: nothing
+// on the chain is a local pool.
 bool ParseScript(const std::vector<unsigned char>& scriptPubKey, PoolRecord& out, std::string& errOut);
 
 // SHA256d("Bitflash/pool/1" || network magic || record), the 32 bytes in

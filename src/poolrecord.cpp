@@ -13,6 +13,7 @@ namespace poolreg
 {
 
 static const unsigned char MAGIC[4] = { 'B', 'T', 'F', 'P' };
+static const unsigned char MAGIC_LOCAL[4] = { 'B', 'T', 'F', 'L' };
 static const char ID_TAG[] = "Bitflash/pool/1";
 
 static bool Fail(std::string& errOut, const char* why)
@@ -22,7 +23,7 @@ static bool Fail(std::string& errOut, const char* why)
 }
 
 PoolRecord::PoolRecord()
-    : nFormat(RECORD_FORMAT), nRules(SHARE_RULES_V1), nSpacing(0), nWindow(0), nRetarget(0),
+    : fLocal(false), nFormat(RECORD_FORMAT), nRules(SHARE_RULES_V1), nSpacing(0), nWindow(0), nRetarget(0),
       nFloor(0), nUncleDepth(0), nUnclePct(0), nFeeBps(0), nFeeType(FEE_NONE)
 {
     memset(feeHash, 0, sizeof(feeHash));
@@ -52,7 +53,8 @@ static unsigned int Get32(const unsigned char* p)
 
 std::vector<unsigned char> PoolRecord::Encode() const
 {
-    std::vector<unsigned char> v(MAGIC, MAGIC + 4);
+    const unsigned char* pMagic = fLocal ? MAGIC_LOCAL : MAGIC;
+    std::vector<unsigned char> v(pMagic, pMagic + 4);
     v.push_back(nFormat);
     v.push_back(nRules);
     Put16(v, nSpacing);
@@ -169,9 +171,11 @@ bool Parse(const std::vector<unsigned char>& data, PoolRecord& out, std::string&
     if (data.size() < MIN_RECORD_BYTES || data.size() > MAX_RECORD_BYTES)
         return Fail(errOut, "not 42 to 73 bytes");
     const unsigned char* d = &data[0];
-    if (memcmp(d, MAGIC, 4) != 0)
+    bool fLocal = memcmp(d, MAGIC_LOCAL, 4) == 0;
+    if (!fLocal && memcmp(d, MAGIC, 4) != 0)
         return Fail(errOut, "not a pool record");
     PoolRecord r;
+    r.fLocal = fLocal;
     r.nFormat = d[4];
     r.nRules = d[5];
     r.nSpacing = Get16(d + 6);
@@ -202,7 +206,14 @@ bool ParseScript(const std::vector<unsigned char>& s, PoolRecord& out, std::stri
     size_t n = s[1];
     if (n < MIN_RECORD_BYTES || n > MAX_RECORD_BYTES || s.size() != 2 + n)
         return Fail(errOut, "not one direct push of a record");
-    return Parse(std::vector<unsigned char>(s.begin() + 2, s.end()), out, errOut);
+    if (!Parse(std::vector<unsigned char>(s.begin() + 2, s.end()), out, errOut))
+        return false;
+    if (out.fLocal)
+    {
+        out = PoolRecord();
+        return Fail(errOut, "a local pool record, never read from the chain");
+    }
+    return true;
 }
 
 std::vector<unsigned char> PoolRecord::FeeScript() const

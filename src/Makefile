@@ -621,7 +621,11 @@ test_p2pool: test_p2pool.cpp p2pool.cpp p2pool.h
 test_poolrecord: test_poolrecord.cpp poolrecord.cpp poolrecord.h
 	$(CXX) $(CXXFLAGS) -o $@ test_poolrecord.cpp poolrecord.cpp $(PLATFORM_LIB) -lsodium
 
-tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 test_p2pool test_poolrecord bitflash-node
+# P2Pool local (docs/pool-registry.md, section 18): code, keys, anchor, hello.
+test_poollocal: test_poollocal.cpp poollocal.cpp poollocal.h poolrecord.cpp poolrecord.h
+	$(CXX) $(CXXFLAGS) -o $@ test_poollocal.cpp poollocal.cpp poolrecord.cpp $(PLATFORM_LIB) -lsodium
+
+tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg test_btfchatbox test_btfchatlog test_btfchatlink test_chatstore test_community test_chatswap test_bip21 test_p2pool test_poolrecord test_poollocal bitflash-node
 	./test_bip32
 	./test_btfchan
 	./test_btfaddr
@@ -636,6 +640,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./test_bip21
 	./test_p2pool
 	./test_poolrecord
+	./test_poollocal
 	./bitflash-node -selftest=wallet-keypool
 	./bitflash-node -selftest=wallet-hd
 	./bitflash-node -selftest=wallet-format
