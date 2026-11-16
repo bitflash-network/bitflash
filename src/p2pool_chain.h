@@ -10,6 +10,7 @@
 
 // Include headers.h (or headers_core.h) first: they have no include guard.
 #include "p2pool_share.h"
+#include "poollocal.h"
 
 namespace p2pool
 {
@@ -69,6 +70,10 @@ public:
     virtual int64 Now() const = 0;
 };
 
+// Share rules v1 for a local pool (docs/pool-registry.md, section 18): its
+// record's parameters, its id, and its key C for the "p2l" anchor.
+bool RulesForLocal(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, PoolRules& out, string& errOut);
+
 // Expected hashes to meet a target, capped at 2^64-1: a share's weight.
 uint64_t WorkOf(unsigned int nBits);
 
@@ -83,7 +88,13 @@ public:
     // hashTip spelled out: uint256 does not zero itself, and a chain with no
     // shares must answer 0 for its tip, not whatever the memory held.
     explicit ShareChain(const CBigNum& bnFloorIn, bool fCheckPoWIn = true)
-        : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+        : rules(PoolRules::Zero(bnFloorIn)), hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+    // Any pool's share chain: share rules v1 with that pool's parameters
+    // (docs/pool-registry.md, section 5). The one above is pool zero's.
+    explicit ShareChain(const PoolRules& rulesIn, bool fCheckPoWIn = true)
+        : rules(rulesIn), hashTip(0), bnFloor(rulesIn.bnFloor), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+
+    const PoolRules& Rules() const { return rules; }
 
     // Verify a share in context and keep it. A share whose parent or uncles
     // are not here is refused with their ids in *pvMissing, so the caller
@@ -167,6 +178,7 @@ private:
         bool fTrusted;         // taken on its work alone (AddTrusted)
         size_t nSize;          // serialized bytes of the share
     };
+    PoolRules rules;
     map<uint256, Entry> mapShares;
     uint256 hashTip;
     CBigNum bnFloor;

@@ -6469,6 +6469,346 @@ static int RunP2PoolChainSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-rules: share rules v1 with a pool's parameters ---------------
+
+// ChainShare for any pool: the pool id in the share data when the pool is
+// not pool zero, the pool's own anchor, and its fee among the payouts.
+static p2pool::Share RulesShare(const p2pool::ShareChain& chain, const TestMainView& main, const uint256& parent,
+                                const vector<unsigned char>& payout, unsigned int nTime,
+                                const vector<uint256>& uncles = vector<uint256>())
+{
+    const p2pool::PoolRules& rules = chain.Rules();
+    p2pool::Share s;
+    s.data.fX = !rules.IsZero();
+    s.data.poolId = rules.poolId;
+    s.data.hashPrevShare = parent;
+    s.data.nShareHeight = parent == 0 ? 0 : chain.Height(parent) + 1;
+    s.data.vUncles = uncles;
+    s.data.payoutScript = payout;
+    s.data.nShareBits = chain.NextShareBits(parent);
+
+    vector<p2pool::WindowShare> window;
+    vector<p2pool::Payout> pay;
+    string err;
+    chain.WindowFor(s.data, p2pool::WorkOf(s.data.nShareBits), window, err);
+    p2pool::ComputePoolPayouts(rules, window, CBlock().GetBlockValue(main.nTip + 1, 0), pay, err);
+
+    s.coinbase.vin.resize(1);
+    s.coinbase.vin[0].prevout.SetNull();
+    s.coinbase.vin[0].scriptSig << (main.nTip + 1) << (int64)nTime << p2pool::AnchorPush(rules, s.data);
+    for (size_t i = 0; i < pay.size(); i++)
+        s.coinbase.vout.push_back(CTxOut(pay[i].value, CScript(pay[i].script.begin(), pay[i].script.end())));
+    s.nVersion = 1;
+    s.hashPrevBlock = main.BlockAt(main.nTip);
+    s.hashMerkleRoot = s.coinbase.GetHash();
+    s.nTime = nTime;
+    s.nBits = main.nBits;
+    s.nNonce = 0;
+    return s;
+}
+
+// The same share with another scriptSig after the height and the time.
+static p2pool::Share WithScriptSig(const p2pool::Share& s, const TestMainView& main, const CScript& rest)
+{
+    p2pool::Share t = s;
+    t.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << (int64)s.nTime;
+    t.coinbase.vin[0].scriptSig += rest;
+    t.hashMerkleRoot = t.coinbase.GetHash();
+    return t;
+}
+
+static int RunP2PoolRulesSelfTest()
+{
+    printf("p2pool-rules self-test\n");
+    int nFail = 0;
+    string err;
+    std::string serr;
+
+    // ---- pool zero is 1.2.34 exactly
+    {
+        CBigNum bnFloor;
+        bnFloor.SetCompact(0x207fffff);
+        p2pool::PoolRules z = p2pool::PoolRules::Zero(bnFloor);
+        nFail += Check(z.nSpacing == p2pool::SHARE_SPACING && z.nWindow == p2pool::WINDOW_SHARES &&
+                       z.nRetarget == p2pool::RETARGET_SHARES && z.nUncleDepth == p2pool::MAX_UNCLE_DEPTH &&
+                       z.nUnclePct == 80 && z.nFeeBps == 0 && z.IsZero() &&
+                       z.HistoryShares() == p2pool::HISTORY_SHARES && z.MaxChainShares() == p2pool::MAX_CHAIN_SHARES &&
+                       z.NearTipShares() == p2pool::NEAR_TIP_SHARES && z.TipMaxAge() == p2pool::TIP_MAX_AGE &&
+                       z.MaxOutputs() == 3 * p2pool::WINDOW_SHARES,
+                       "pool zero's rules are today's constants, each one") ? 0 : 1;
+        poolreg::PoolRecord rec = poolreg::PoolZero();
+        nFail += Check(rec.nSpacing == z.nSpacing && rec.nWindow == z.nWindow && rec.nRetarget == z.nRetarget &&
+                       (int)rec.nUncleDepth == z.nUncleDepth && rec.nUnclePct == z.nUnclePct && rec.nFeeBps == 0,
+                       "and what pool zero's record says") ? 0 : 1;
+
+        bool fSame = true;
+        uint64_t w = 1;
+        for (int i = 0; i < 200000 && fSame; i++)
+        {
+            w = w * 6364136223846793005ULL + 1442695040888963407ULL;
+            uint64_t x = i < 1000 ? (uint64_t)i : (i % 3 == 0 ? w >> (i % 60) : w);
+            if (p2pool::UnclePaid(x, 80) != x / 5 * 4 + (x % 5) * 4 / 5)
+                fSame = false;
+        }
+        fSame = fSame && p2pool::UnclePaid(0xFFFFFFFFFFFFFFFFULL, 80) == 0xFFFFFFFFFFFFFFFFULL / 5 * 4 + (0xFFFFFFFFFFFFFFFFULL % 5) * 4 / 5;
+        nFail += Check(fSame, "an uncle's 80% is the amount 1.2.34 computes, for every work tried") ? 0 : 1;
+        nFail += Check(p2pool::UnclePaid(1000, 100) == 1000 && p2pool::UnclePaid(999, 90) == 899 &&
+                       p2pool::UnclePaid(0xFFFFFFFFFFFFFFFFULL, 100) == 0xFFFFFFFFFFFFFFFFULL,
+                       "other uncle shares are floor(work x p / 100), without overflow") ? 0 : 1;
+
+        // A pool zero share is the bytes it always was: written here field by
+        // field, in 1.2.34's order, and compared with what the share writes.
+        p2pool::Share s;
+        s.nVersion = 1; s.hashPrevBlock = 11; s.hashMerkleRoot = 12; s.nTime = 13; s.nBits = 14; s.nNonce = 15;
+        s.coinbase.vin.resize(1);
+        s.coinbase.vin[0].prevout.SetNull();
+        s.coinbase.vin[0].scriptSig << 61000;
+        s.vMerkleBranch.push_back(uint256(16));
+        s.data.hashPrevShare = 17; s.data.vUncles.push_back(uint256(18)); s.data.nShareHeight = 19;
+        s.data.nShareBits = 20; s.data.payoutScript = vector<unsigned char>(25, 0x21);
+        s.data.poolId = 99;     // never written while fX is off
+        CDataStream a(SER_NETWORK), b(SER_NETWORK), d0(SER_NETWORK), d1(SER_NETWORK);
+        a << s;
+        b << s.nVersion << s.hashPrevBlock << s.hashMerkleRoot << s.nTime << s.nBits << s.nNonce << s.coinbase
+          << s.vMerkleBranch << s.data.hashPrevShare << s.data.vUncles << s.data.nShareHeight << s.data.nShareBits
+          << s.data.payoutScript;
+        nFail += Check(a.size() == b.size() && memcmp(&a[0], &b[0], a.size()) == 0,
+                       "a pool zero share is byte for byte the 1.2.34 share") ? 0 : 1;
+        d0 << s.data;
+        p2pool::ShareX x(s);
+        d1 << x.data;
+        nFail += Check(d1.size() == d0.size() + 32 && memcmp(&d1[0], s.data.poolId.begin(), 32) == 0 &&
+                       memcmp(&d1[32], &d0[0], d0.size()) == 0 && x.data.GetHash() != s.data.GetHash(),
+                       "a format 1 share's data is the pool id and then the same fields") ? 0 : 1;
+        CDataStream wire(SER_NETWORK);
+        vector<p2pool::ShareX> vx(2, x), vback;
+        wire << vx;
+        wire >> vback;
+        nFail += Check(vback.size() == 2 && vback[1].data.fX && vback[1].data.poolId == uint256(99) &&
+                       vback[1].data.GetHash() == x.data.GetHash() && vback[1].GetId() == x.GetId(),
+                       "format 1 shares survive the wire with their pool id") ? 0 : 1;
+    }
+
+    // ---- a local pool's share chain
+    const unsigned char magic[4] = { 0xce, 0xe2, 0xc0, 0xff };
+    poolreg::PoolRecord rec = poolreg::PoolZero();
+    rec.fLocal = true; rec.nSpacing = 30; rec.nWindow = 360; rec.nRetarget = 120; rec.nUncleDepth = 2;
+    rec.nUnclePct = 90; rec.nFloor = 0x1f0fffff; rec.name = "home";
+    poollocal::Keys keys, keysOther;
+    bool fKeys = poollocal::Derive(rec.Encode(), magic, "a password", keys, serr) &&
+                 poollocal::Derive(rec.Encode(), magic, "another", keysOther, serr);
+    p2pool::PoolRules rules, rulesOther;
+    bool fRules = fKeys && p2pool::RulesForLocal(rec, keys, rules, err) && p2pool::RulesForLocal(rec, keysOther, rulesOther, err);
+    nFail += Check(fRules && rules.nAnchor == p2pool::ANCHOR_P2L && rules.nSpacing == 30 && rules.nWindow == 360 &&
+                   rules.nRetarget == 120 && rules.nUncleDepth == 2 && rules.nUnclePct == 90 &&
+                   rules.HistoryShares() == 494 && rules.MaxChainShares() == 1976 && rules.NearTipShares() == 14 &&
+                   rules.TipMaxAge() == 5400 && rules.MaxOutputs() == 1080 && rules.poolId != rulesOther.poolId,
+                   "a local record and its keys give the pool's rules") ? 0 : 1;
+    {
+        poolreg::PoolRecord reg = rec; reg.fLocal = false;
+        p2pool::PoolRules r;
+        nFail += Check(!p2pool::RulesForLocal(reg, keys, r, err), "a registry record gives no local rules") ? 0 : 1;
+    }
+    if (!fRules)
+    {
+        printf("p2pool-rules: FAILED (no rules: %s %s)\n", err.c_str(), serr.c_str());
+        return 1;
+    }
+
+    TestMainView main;
+    main.nBits = 0x1d00ffff; main.nTip = 61000; main.nNow = 1800000000;
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    auto payTo = [](unsigned char c) {
+        CScript s;
+        s << OP_DUP << OP_HASH160 << uint160(c) << OP_EQUALVERIFY << OP_CHECKSIG;
+        return vector<unsigned char>(s.begin(), s.end());
+    };
+    vector<unsigned char> pa = payTo(1), pb = payTo(2);
+
+    p2pool::ShareChain chain(rules, false), zero(rules.bnFloor, false), other(rulesOther, false);
+    unsigned int t = (unsigned int)main.nNow - 3000;
+    p2pool::Share g = RulesShare(chain, main, 0, pa, t);
+    nFail += Check(g.data.fX && g.data.poolId == rules.poolId, "a local share names its pool in its data") ? 0 : 1;
+    {
+        uint256 hashAnchor;
+        nFail += Check(!p2pool::FindCommitment(g.coinbase, hashAnchor), "and carries no p2p commitment") ? 0 : 1;
+    }
+    nFail += Check(!zero.Add(g, main, err), "pool zero refuses a local pool's share") ? 0 : 1;
+    nFail += Check(!other.Add(g, main, err), "so does the pool of the same code with another password") ? 0 : 1;
+    {
+        p2pool::Share z = ChainShare(zero, main, 0, pa, t);
+        nFail += Check(!chain.Add(z, main, err), "a local pool refuses a pool zero share") ? 0 : 1;
+        p2pool::Share z2 = z;
+        z2.data.fX = true; z2.data.poolId = rules.poolId;
+        nFail += Check(!chain.Add(z2, main, err), "even relabelled with the pool's id: its p2p commitment says otherwise") ? 0 : 1;
+        nFail += Check(zero.Add(z, main, err), "which pool zero takes") ? 0 : 1;
+    }
+
+    // The anchor rules, each on the first share of the line.
+    {
+        uint256 h = g.data.GetHash();
+        vector<unsigned char> good = p2pool::AnchorPush(rules, g.data);
+        vector<unsigned char> wrongHash = poollocal::AnchorData(rules.anchorKey, uint256(5).begin());
+        vector<unsigned char> otherKey = poollocal::AnchorData(rulesOther.anchorKey, h.begin());
+        vector<unsigned char> unkeyed(good.begin(), good.begin() + 3);
+        unkeyed.insert(unkeyed.end(), h.begin(), h.end());
+        vector<unsigned char> p2p = p2pool::CommitmentPush(h);
+        vector<unsigned char> p2x(67, 0x33);
+        p2x[0] = 'p'; p2x[1] = '2'; p2x[2] = 'x';
+        bool fBlock;
+        auto ok = [&](const CScript& rest) {
+            p2pool::Share s = WithScriptSig(g, main, rest);
+            return p2pool::CheckShareWork(s, rules, fBlock, err, false);
+        };
+        nFail += Check(good.size() == 35 && ok(CScript() << good), "exactly one p2l push keyed with C is the anchor") ? 0 : 1;
+        nFail += Check(!ok(CScript() << wrongHash), "a p2l push over another hash is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << otherKey), "a p2l push keyed with another pool's key is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << unkeyed), "an unkeyed hash after p2l is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << good << good), "two p2l pushes are refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << good << wrongHash), "the anchor beside another p2l push is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << good << p2p) && !ok(CScript() << p2p << good), "the anchor beside a p2p push is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript() << good << p2x) && !ok(CScript() << p2x << good), "the anchor beside a p2x push is refused") ? 0 : 1;
+        nFail += Check(!ok(CScript()), "no anchor at all is refused") ? 0 : 1;
+        {
+            CScript cut = CScript() << good;
+            cut.push_back(0x20);      // a push of 32 bytes that are not there
+            nFail += Check(!ok(cut), "a scriptSig that does not parse to its end is refused") ? 0 : 1;
+        }
+        {
+            // The same data under OP_PUSHDATA1 is the same push.
+            CScript pd;
+            pd.push_back(OP_PUSHDATA1); pd.push_back(35);
+            pd.insert(pd.end(), good.begin(), good.end());
+            nFail += Check(ok(pd) && !ok(CScript(pd) << good), "a push is known by its data, whatever opcode carried it") ? 0 : 1;
+        }
+
+        // Format 1 (a registered pool) refuses p2l, and has its own anchor.
+        p2pool::PoolRules reg = rules;
+        reg.nAnchor = p2pool::ANCHOR_P2X;
+        vector<unsigned char> x = p2pool::AnchorPush(reg, g.data);
+        auto okReg = [&](const CScript& rest) {
+            p2pool::Share s = WithScriptSig(g, main, rest);
+            return p2pool::CheckShareWork(s, reg, fBlock, err, false);
+        };
+        nFail += Check(x.size() == 67 && okReg(CScript() << x), "a registered pool's anchor is p2x, its id and the hash") ? 0 : 1;
+        nFail += Check(!okReg(CScript() << x << good) && !okReg(CScript() << good), "a format 1 share refuses any p2l push") ? 0 : 1;
+        nFail += Check(!okReg(CScript() << x << p2p) && !okReg(CScript() << x << p2x) && !okReg(CScript() << x << x),
+                       "and a p2p push, and a second p2x push of any pool") ? 0 : 1;
+
+        // Pool zero's frozen rule counts only p2p pushes.
+        p2pool::Share z = ChainShare(zero, main, 0, pb, t);
+        CBigNum bnFloor = rules.bnFloor;
+        p2pool::Share zl = WithScriptSig(z, main, CScript() << p2pool::CommitmentPush(z.data.GetHash()) << good);
+        nFail += Check(p2pool::CheckShareWork(zl, bnFloor, fBlock, err, false),
+                       "pool zero's rule is unchanged: a p2l push beside its p2p commitment is none of its business") ? 0 : 1;
+    }
+
+    // A line of shares on the pool's own parameters.
+    nFail += Check(chain.Add(g, main, err), "the local pool takes its first share") ? 0 : 1;
+    if (!err.empty()) printf("       %s\n", err.c_str());
+    {
+        uint256 tip = g.GetId();
+        bool fAll = true;
+        for (int i = 1; i <= 5 && fAll; i++)
+        {
+            p2pool::Share s = RulesShare(chain, main, tip, i % 2 ? pb : pa, t + 30 * i);
+            fAll = chain.Add(s, main, err);
+            tip = s.GetId();
+        }
+        nFail += Check(fAll && chain.Tip() == tip && chain.Height(tip) == 5, "and a line of them") ? 0 : 1;
+        if (!fAll) printf("       %s\n", err.c_str());
+
+        // Uncle depth 2: a side share two back may be named, three back not.
+        uint256 h3 = 0, h2 = 0;
+        {
+            p2pool::Share cur;
+            uint256 id = tip;
+            for (int back = 0; back < 3 && chain.GetShare(id, cur); back++)
+            {
+                if (back == 1) h3 = cur.data.hashPrevShare;      // parent of height 4: height 3
+                if (back == 2) h2 = cur.data.hashPrevShare;      // parent of height 3: height 2
+                id = cur.data.hashPrevShare;
+            }
+        }
+        p2pool::Share side4 = RulesShare(chain, main, h3, pa, t + 30 * 4 + 1);   // height 4, off the line
+        p2pool::Share side3 = RulesShare(chain, main, h2, pa, t + 30 * 3 + 1);   // height 3, off the line
+        bool fSides = chain.Add(side4, main, err) && chain.Add(side3, main, err);
+        vector<uint256> u4(1, side4.GetId()), u3(1, side3.GetId());
+        p2pool::Share withOld = RulesShare(chain, main, tip, pb, t + 30 * 6, u3);
+        nFail += Check(fSides && !chain.Add(withOld, main, err), "an uncle three shares older is refused at uncle depth 2") ? 0 : 1;
+        p2pool::Share withUncle = RulesShare(chain, main, tip, pb, t + 30 * 6, u4);
+        vector<p2pool::WindowShare> window;
+        bool fWin = chain.WindowFor(withUncle.data, p2pool::WorkOf(withUncle.data.nShareBits), window, err);
+        uint64_t nUncleWork = p2pool::WorkOf(side4.data.nShareBits), nPaid = 0, nIncluder = 0;
+        if (fWin && window.size() >= 2)
+        {
+            nPaid = window[0].work;
+            nIncluder = window[1].work;
+        }
+        nFail += Check(chain.Add(withUncle, main, err), "one two shares older is taken") ? 0 : 1;
+        nFail += Check(fWin && nPaid == p2pool::UnclePaid(nUncleWork, 90) &&
+                       nIncluder == p2pool::WorkOf(withUncle.data.nShareBits) + nUncleWork - nPaid,
+                       "the uncle is paid 90% of its work and its includer the rest") ? 0 : 1;
+        string inv;
+        nFail += Check(chain.CheckInvariants(inv), "the chain's invariants hold") ? 0 : 1;
+        if (!inv.empty()) printf("       %s\n", inv.c_str());
+    }
+
+    // ---- the creator fee
+    {
+        p2pool::PoolRules fee = rules;
+        fee.nFeeBps = 250;
+        fee.feeScript = payTo(9);
+        vector<p2pool::WindowShare> window;
+        p2pool::WindowShare w;
+        w.payoutScript = payTo(3); w.work = 100; window.push_back(w);
+        w.payoutScript = payTo(12); w.work = 300; window.push_back(w);
+        vector<p2pool::Payout> pay, plain;
+        int64 T = 5000000123LL;
+        bool fOk = p2pool::ComputePoolPayouts(fee, window, T, pay, err) && p2pool::ComputePayouts(window, T - T * 250 / 10000, plain, err);
+        int64 nSum = 0;
+        for (size_t i = 0; i < pay.size(); i++) nSum += pay[i].value;
+        nFail += Check(fOk && pay.size() == 3 && pay[1].script == fee.feeScript && pay[1].value == T * 250 / 10000 &&
+                       pay[0].value == plain[0].value && pay[2].value == plain[1].value && nSum == T,
+                       "the fee is floor(T x bps / 10000), in its place by script bytes, and the rest pays the window") ? 0 : 1;
+        fee.feeScript = payTo(12);
+        fOk = p2pool::ComputePoolPayouts(fee, window, T, pay, err);
+        nFail += Check(fOk && pay.size() == 2 && pay[1].value == plain[1].value + T * 250 / 10000,
+                       "a creator who also mines gets one output with both amounts") ? 0 : 1;
+        fee.feeScript = payTo(9);
+        fee.nFeeBps = 1;
+        fOk = p2pool::ComputePoolPayouts(fee, window, 9999, pay, err);
+        nFail += Check(fOk && pay.size() == 2, "a fee that rounds to 0 is no output") ? 0 : 1;
+        p2pool::PoolRules none = rules;
+        fOk = p2pool::ComputePoolPayouts(none, window, T, pay, err) && p2pool::ComputePayouts(window, T, plain, err);
+        bool fSame = fOk && pay.size() == plain.size();
+        for (size_t i = 0; fSame && i < pay.size(); i++)
+            fSame = pay[i].value == plain[i].value && pay[i].script == plain[i].script;
+        nFail += Check(fSame, "with no fee the payouts are ComputePayouts'") ? 0 : 1;
+
+        // A fee pool's chain takes a share that pays the fee and refuses one that keeps it.
+        fee.nFeeBps = 250;
+        p2pool::ShareChain fc(fee, false);
+        p2pool::Share s = RulesShare(fc, main, 0, pa, t);
+        p2pool::Share skim = s;
+        nFail += Check(skim.coinbase.vout.size() == 2, "a fee pool's first share pays the miner and the creator") ? 0 : 1;
+        if (skim.coinbase.vout.size() == 2)
+        {
+            skim.coinbase.vout[0].nValue += skim.coinbase.vout[1].nValue;
+            skim.coinbase.vout.pop_back();
+            skim.hashMerkleRoot = skim.coinbase.GetHash();
+        }
+        nFail += Check(!fc.Add(skim, main, err), "a share that keeps the creator's fee is refused") ? 0 : 1;
+        nFail += Check(fc.Add(s, main, err), "the one that pays it is taken") ? 0 : 1;
+        nFail += Check(!chain.Add(s, main, err), "and is no share of the pool without the fee") ? 0 : 1;
+    }
+
+    printf("%s\n", nFail ? "p2pool-rules: FAILED" : "p2pool-rules: all passed");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // ---- p2pool-sync: a starting node takes a peer's history -----------------
 static int RunP2PoolSyncSelfTest()
 {
@@ -17746,6 +18086,8 @@ int RunSelfTest(const std::string& name)
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")
         return RunP2PoolShareSelfTest();
+    if (name == "p2pool-rules")
+        return RunP2PoolRulesSelfTest();
     if (name == "rules-v3")
         return RunRulesV3SelfTest();
     if (name == "rules-v4")

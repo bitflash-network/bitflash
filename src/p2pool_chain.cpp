@@ -26,6 +26,44 @@ bool InnocentRefusal(const string& err)
            err.compare(0, 5, "here:") == 0;
 }
 
+PoolRules PoolRules::Zero(const CBigNum& bnFloorIn)
+{
+    PoolRules r;
+    r.nSpacing = SHARE_SPACING;
+    r.nWindow = WINDOW_SHARES;
+    r.nRetarget = RETARGET_SHARES;
+    r.bnFloor = bnFloorIn;
+    r.nUncleDepth = MAX_UNCLE_DEPTH;
+    r.nUnclePct = 80;
+    r.nFeeBps = 0;
+    r.nAnchor = ANCHOR_P2P;
+    return r;
+}
+
+bool RulesForLocal(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, PoolRules& out, string& errOut)
+{
+    std::string err;
+    if (!rec.fLocal || !rec.Check(err))
+    {
+        errOut = rec.fLocal ? err : "not a local pool's record";
+        return false;
+    }
+    PoolRules r;
+    r.nSpacing = rec.nSpacing;
+    r.nWindow = rec.nWindow;
+    r.nRetarget = rec.nRetarget;
+    r.bnFloor.SetCompact(rec.nFloor);
+    r.nUncleDepth = (int)rec.nUncleDepth;
+    r.nUnclePct = rec.nUnclePct;
+    r.nFeeBps = rec.nFeeBps;
+    r.feeScript = rec.FeeScript();
+    r.nAnchor = ANCHOR_P2L;
+    memcpy(r.poolId.begin(), keys.id, 32);
+    memcpy(r.anchorKey, keys.C, 32);
+    out = r;
+    return true;
+}
+
 uint64_t WorkOf(unsigned int nBits)
 {
     CBigNum bnTarget;
@@ -119,15 +157,15 @@ const char* ShareChain::UncleProblem(const uint256& u, const uint256& parent, in
     // histories never put such a share near the tip, where uncles are.
     if (e->fTrusted)
         return "here: an uncle this node holds only on its work";
-    if (e->nHeight >= nHeight || e->nHeight < nHeight - MAX_UNCLE_DEPTH)
+    if (e->nHeight >= nHeight || e->nHeight < nHeight - rules.nUncleDepth)
         return "an uncle too old or not older";
     // A sibling of the line, not a share on it: its parent is on the line,
     // it is not.
-    if (OnLine(u, parent, MAX_UNCLE_DEPTH))
+    if (OnLine(u, parent, rules.nUncleDepth))
         return "an uncle that is an ancestor";
-    if (!OnLine(e->share.data.hashPrevShare, parent, MAX_UNCLE_DEPTH))
+    if (!OnLine(e->share.data.hashPrevShare, parent, rules.nUncleDepth))
         return "an uncle off this line";
-    if (UncleTaken(u, parent, MAX_UNCLE_DEPTH))
+    if (UncleTaken(u, parent, rules.nUncleDepth))
         return "an uncle already paid as one";
     return NULL;
 }
@@ -167,7 +205,7 @@ unsigned int ShareChain::NextShareBits(const uint256& parent) const
     // nBits the share itself states -- which let a share name an easy nBits
     // and be mined for next to nothing.
     const Entry* p = Get(parent);
-    if (!p || p->nHeight + 1 < (int)RETARGET_SHARES)
+    if (!p || p->nHeight + 1 < (int)rules.nRetarget)
         return bnFloor.GetCompact();
 
     // The mean target of the last RETARGET_SHARES shares, scaled by how much
@@ -175,7 +213,7 @@ unsigned int ShareChain::NextShareBits(const uint256& parent) const
     CBigNum bnSum = 0;
     const Entry* e = p;
     const Entry* first = p;
-    for (unsigned int i = 0; i < RETARGET_SHARES && e; i++)
+    for (unsigned int i = 0; i < rules.nRetarget && e; i++)
     {
         CBigNum bn;
         bn.SetCompact(e->share.data.nShareBits);
@@ -183,12 +221,12 @@ unsigned int ShareChain::NextShareBits(const uint256& parent) const
         first = e;
         e = Get(e->share.data.hashPrevShare);
     }
-    int64 nExpected = (int64)(RETARGET_SHARES - 1) * SHARE_SPACING;
+    int64 nExpected = (int64)(rules.nRetarget - 1) * rules.nSpacing;
     int64 nActual = (int64)p->share.nTime - (int64)first->share.nTime;
     if (nActual < nExpected / 4) nActual = nExpected / 4;
     if (nActual > nExpected * 4) nActual = nExpected * 4;
 
-    CBigNum bnNew = bnSum / (int64)RETARGET_SHARES;
+    CBigNum bnNew = bnSum / (int64)rules.nRetarget;
     bnNew *= nActual;
     bnNew /= nExpected;
 
@@ -219,7 +257,7 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
                 const Entry* u = c.Get(uncles[i]);
                 if (!u)
                     return false;
-                uint64_t paid = u->work / 5 * 4 + (u->work % 5) * 4 / 5;
+                uint64_t paid = UnclePaid(u->work, c.rules.nUnclePct);
                 WindowShare w;
                 w.payoutScript = u->share.data.payoutScript;
                 w.work = paid;
@@ -237,7 +275,7 @@ bool ShareChain::WindowFor(const ShareData& d, uint64_t nOwnWork, vector<WindowS
     if (!Credit::Share(out, d.payoutScript, nOwnWork, d.vUncles, *this))
         return Fail(errOut, "the payout window reaches shares this node does not have");
     uint256 cur = d.hashPrevShare;
-    for (unsigned int n = 1; n < WINDOW_SHARES && cur != 0; n++)
+    for (unsigned int n = 1; n < rules.nWindow && cur != 0; n++)
     {
         // A hole in the window means this node has not synced enough share
         // history to know what the share must pay; guessing would make it
@@ -264,16 +302,16 @@ vector<uint256> ShareChain::UncleCandidates(const uint256& parent) const
     for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end() && v.size() < MAX_UNCLES; ++it)
     {
         const Entry& e = it->second;
-        if (e.nHeight >= nHeight || e.nHeight < nHeight - MAX_UNCLE_DEPTH)
+        if (e.nHeight >= nHeight || e.nHeight < nHeight - rules.nUncleDepth)
             continue;
         // Never one taken on its work alone: peers check an uncle in full,
         // and one planted near the tip by a history refused this node's
         // shares everywhere and got it banned.
         if (e.fTrusted)
             continue;
-        if (OnLine(it->first, parent, MAX_UNCLE_DEPTH) ||
-            !OnLine(e.share.data.hashPrevShare, parent, MAX_UNCLE_DEPTH) ||
-            UncleTaken(it->first, parent, MAX_UNCLE_DEPTH))
+        if (OnLine(it->first, parent, rules.nUncleDepth) ||
+            !OnLine(e.share.data.hashPrevShare, parent, rules.nUncleDepth) ||
+            UncleTaken(it->first, parent, rules.nUncleDepth))
             continue;
         v.push_back(it->first);
     }
@@ -380,7 +418,7 @@ bool ShareChain::AddInContext(const Share& s, const MainView& main, string& errO
         return false;
 
     bool fBlock = false;
-    if (!CheckShare(s, window, nBlockHeight, bnFloor, fBlock, errOut, fCheckPoW, pGate))
+    if (!CheckShare(s, window, nBlockHeight, rules, fBlock, errOut, fCheckPoW, pGate))
         return false;
 
     Entry e;
@@ -426,10 +464,10 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     // peers to answer fill the room with lines of no work and keep the
     // honest history out.
     size_t nShareBytes = ::GetSerializeSize(s, SER_NETWORK);
-    if (mapShares.size() >= MAX_CHAIN_SHARES || nBytes + nShareBytes > nMaxBytes)
+    if (mapShares.size() >= rules.MaxChainShares() || nBytes + nShareBytes > nMaxBytes)
     {
         Evict(1, nShareBytes);
-        if (mapShares.size() >= MAX_CHAIN_SHARES)
+        if (mapShares.size() >= rules.MaxChainShares())
             return Fail(errOut, "here: no room for more history");
         if (nBytes + nShareBytes > nMaxBytes)
         {
@@ -444,7 +482,7 @@ bool ShareChain::AddTrusted(const Share& s, string& errOut)
     if (nTrustedBytes + nShareBytes > MAX_TRUSTED_BYTES)
         return Fail(errOut, "here: no room for more history");
     bool fBlock;
-    if (!CheckShareWork(s, bnFloor, fBlock, errOut, fCheckPoW))
+    if (!CheckShareWork(s, rules, fBlock, errOut, fCheckPoW))
         return false;
     // Linked to what is here when its parent is; the deepest one of a
     // history has no parent here, and starts the line.
@@ -551,11 +589,11 @@ bool ShareChain::CheckInvariants(string& errOut) const
         return Fail(errOut, "shares checked in full but no tip");
     // Over a cap only with nothing left that Evict may drop: every share
     // held is kept (Kept) or has children.
-    if (mapShares.size() > MAX_CHAIN_SHARES || nBytes > nMaxBytes)
+    if (mapShares.size() > rules.MaxChainShares() || nBytes > nMaxBytes)
     {
         set<uint256> keep, parents;
         Kept(keep);
-        if (mapShares.size() <= MAX_CHAIN_SHARES && nBytes <= ByteCap(keep))
+        if (mapShares.size() <= rules.MaxChainShares() && nBytes <= ByteCap(keep))
             return true;
         for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
             parents.insert(it->second.share.data.hashPrevShare);
@@ -586,7 +624,7 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
         // in full too. Hung on this node's tip, a share taken on trust once
         // carried a child onto the tip that every peer then refused.
         const Entry* parent = Get(s.data.hashPrevShare);
-        bool fTrust = (int64)s.data.nShareHeight < (int64)nTipHeight - (int64)RETARGET_SHARES &&
+        bool fTrust = (int64)s.data.nShareHeight < (int64)nTipHeight - (int64)rules.nRetarget &&
                       (!parent || parent->fTrusted);
         bool fOk = fTrust ? AddTrusted(s, err) : Add(s, main, err);
         if (fOk || err == "already have this share")
@@ -633,7 +671,7 @@ bool ShareChain::LinesMeet(const uint256& a, const uint256& b, CBigNum& bnAOut, 
 CBigNum ShareChain::LineWork(const Entry* e) const
 {
     CBigNum bn = 0;
-    for (unsigned int n = 0; n < WINDOW_SHARES && e; n++)
+    for (unsigned int n = 0; n < rules.nWindow && e; n++)
     {
         bn += e->bnOwnWork;
         e = Get(e->share.data.hashPrevShare);
@@ -663,8 +701,8 @@ bool ShareChain::Heavier(const uint256& id, int64 nNow) const
         return true;
     if (c->share.data.hashPrevShare == hashTip)
         return true;   // it builds on the tip
-    bool fCandLive = (int64)c->share.nTime >= nNow - TIP_MAX_AGE;
-    bool fTipLive = (int64)t->share.nTime >= nNow - TIP_MAX_AGE;
+    bool fCandLive = (int64)c->share.nTime >= nNow - rules.TipMaxAge();
+    bool fTipLive = (int64)t->share.nTime >= nNow - rules.TipMaxAge();
     if (fCandLive != fTipLive)
         return fCandLive;
     CBigNum bnC, bnT;
@@ -679,7 +717,7 @@ void ShareChain::History(vector<Share>& out) const
     set<uint256> seen;
     vector<const Entry*> v;
     uint256 cur = hashTip;
-    for (unsigned int n = 0; n < HISTORY_SHARES && cur != 0; n++)
+    for (unsigned int n = 0; n < rules.HistoryShares() && cur != 0; n++)
     {
         const Entry* e = Get(cur);
         if (!e)
@@ -736,7 +774,7 @@ void ShareChain::Prune()
         return;
     // HISTORY_SHARES covers the window and the retarget, and is what a
     // starting peer is sent.
-    int nKeep = (int)HISTORY_SHARES + 10;
+    int nKeep = (int)rules.HistoryShares() + 10;
     int nCut = tip->nHeight - nKeep;
     // Every ten heights, not every share: a pass looks at every share held,
     // and keeping a few more than needed for a while costs nothing.
@@ -787,12 +825,12 @@ void ShareChain::Kept(set<uint256>& keep) const
 {
     uint256 cur = hashTip;
     const Entry* pNear = NULL;
-    for (unsigned int n = 0; n < HISTORY_SHARES + 10 && cur != 0; n++)
+    for (unsigned int n = 0; n < rules.HistoryShares() + 10 && cur != 0; n++)
     {
         const Entry* e = Get(cur);
         if (!e)
             break;
-        if (n == (unsigned int)NEAR_TIP_SHARES)
+        if (n == (unsigned int)rules.NearTipShares())
             pNear = e;
         keep.insert(cur);
         keep.insert(e->share.data.vUncles.begin(), e->share.data.vUncles.end());
@@ -845,7 +883,7 @@ size_t ShareChain::ByteCap(const set<uint256>& keep) const
 // than NEAR_TIP_SHARES still has room to come in before it is near the tip.
 void ShareChain::Evict(size_t nRoom, size_t nRoomBytes)
 {
-    bool fCount = mapShares.size() + nRoom > MAX_CHAIN_SHARES;
+    bool fCount = mapShares.size() + nRoom > rules.MaxChainShares();
     bool fBytes = nBytes + nRoomBytes > nMaxBytes;
     if (!fCount && !fBytes)
         return;
@@ -863,7 +901,7 @@ void ShareChain::Evict(size_t nRoom, size_t nRoomBytes)
     for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
         if (!keep.count(it->first) && !children.count(it->first))
             leaves.insert(make_pair(it->second.bnChainWork, it->first));
-    size_t nTarget = MAX_CHAIN_SHARES * 3 / 4;
+    size_t nTarget = rules.MaxChainShares() * 3 / 4;
     size_t nTargetBytes = nCap - nMaxBytes / 4;
     while (((fCount && mapShares.size() > nTarget) || (fBytes && nBytes > nTargetBytes)) && !leaves.empty())
     {
