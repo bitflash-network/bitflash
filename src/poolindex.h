@@ -8,13 +8,21 @@
 // output that is a valid record (poolrecord.h) burning at least 1 BTF is an
 // appearance of its pool. A pool is pending until its first appearance has 30
 // confirmations, then active. Coinbase anchors ("p2p" for pool zero, "p2x"
-// naming a registered pool) are counted as claims.
+// naming a pool) are counted as claims.
+//
+// Anchors naming an id nobody burned cost their miner nothing, so they are
+// not kept for ever: at every height that is a multiple of 144, each id that
+// is neither pool zero nor registered at that height loses its anchors more
+// than 2160 blocks old. That is part of the fold, so it is the same on every
+// node and after every rebuild; a pool whose record appears later has only
+// the anchors of its last 2160 blocks before it. The index then grows only by
+// burns, plus a bounded number of recent claims.
 //
 // The index is a cache of that fold, kept in pool-registry.dat. It remembers
-// the last block it read; on each pass it walks back from it to the active
-// chain, forgets everything above the fork point, and reads forward again.
-// Deleting the file makes the node read the chain again and reach the same
-// registry.
+// the last block it read (and a few before it); on each pass it walks back
+// from it to the active chain, forgets everything above the fork point, and
+// reads forward again. Deleting the file makes the node read the chain again
+// and reach the same registry.
 //
 // Nothing here decides whether a block is valid, and nothing here decides
 // whether a share is valid: a pool's state decides only what a node carries.
@@ -22,6 +30,7 @@
 #ifndef BITFLASH_POOLINDEX_H
 #define BITFLASH_POOLINDEX_H
 
+#include <atomic>
 #include "poolrecord.h"
 
 // A pool counts once its first appearance has this many confirmations: the
@@ -31,10 +40,18 @@ static const int POOL_ACTIVE_CONFIRMATIONS = 30;
 static const int POOL_ANCHOR_WINDOW = 720;
 // The newest anchors kept for each pool, for showing.
 static const unsigned int POOL_RECENT_ANCHORS = 64;
-// Anchors are kept this far beyond what is shown, so a reorg up to this
-// depth is undone exactly in place. A deeper one that would leave a count
-// short makes the index read the chain again from genesis.
+// What the index keeps beyond what it answers, so a reorg up to this depth is
+// undone exactly in place. A deeper one that would leave an answer short
+// makes the index read the chain again from genesis.
 static const int POOL_INDEX_REORG_MARGIN = 1440;
+// The anchors of an id that is not registered: the last 2160 blocks, swept
+// every 144 blocks (at heights that are multiples of 144).
+static const int POOL_UNREGISTERED_ANCHOR_BLOCKS = POOL_ANCHOR_WINDOW + POOL_INDEX_REORG_MARGIN;
+static const int POOL_ANCHOR_SWEEP_INTERVAL = 144;
+// Block hashes the file keeps besides its tip: the last 64, and one every 144
+// blocks for the margin, so a node whose block index lost its last blocks in
+// an unclean stop finds where to resume instead of starting from genesis.
+static const int POOL_LOCATOR_RECENT = 64;
 
 enum PoolStatus
 {
@@ -88,19 +105,24 @@ public:
     int nHeight;
     uint256 hashBlock;
     uint256 hashShareData;
+    // -1 while it counts; otherwise the sweep height that dropped it (an id
+    // not registered then). Kept a while after, so a reorg can bring it back.
+    int nDroppedAt;
 
-    CPoolAnchor() : nHeight(-1), hashBlock(0), hashShareData(0) {}
+    CPoolAnchor() : nHeight(-1), hashBlock(0), hashShareData(0), nDroppedAt(-1) {}
 
     IMPLEMENT_SERIALIZE
     (
         READWRITE(nHeight);
         READWRITE(hashBlock);
         READWRITE(hashShareData);
+        READWRITE(nDroppedAt);
     )
 
     bool operator==(const CPoolAnchor& b) const
     {
-        return nHeight == b.nHeight && hashBlock == b.hashBlock && hashShareData == b.hashShareData;
+        return nHeight == b.nHeight && hashBlock == b.hashBlock && hashShareData == b.hashShareData &&
+               nDroppedAt == b.nDroppedAt;
     }
 };
 
@@ -118,9 +140,10 @@ public:
     )
 };
 
-// The anchors naming one pool id, oldest first, and the height of the newest
-// one dropped from the front (-1 when none was): what lets a reorg tell
-// whether what is left still answers exactly.
+// The anchors naming one pool id, oldest first: the dropped ones (if any)
+// first, then the ones that count. nTrimmedTop is the height of the newest
+// anchor removed from the front while it still counted (-1 when none was):
+// what lets a reorg tell whether what is left still answers exactly.
 class CPoolAnchorSet
 {
 public:
@@ -133,6 +156,23 @@ public:
     (
         READWRITE(v);
         READWRITE(nTrimmedTop);
+    )
+};
+
+// A block the index read: where to resume after an unclean stop.
+class CPoolLocatorEntry
+{
+public:
+    int nHeight;
+    uint256 hash;
+
+    CPoolLocatorEntry() : nHeight(-1), hash(0) {}
+    CPoolLocatorEntry(int nHeightIn, const uint256& hashIn) : nHeight(nHeightIn), hash(hashIn) {}
+
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(nHeight);
+        READWRITE(hash);
     )
 };
 
@@ -174,24 +214,32 @@ public:
 
     int Height() const { return nHeight; }
     uint256 TipHash() const { return hashTip; }
+    // Blocks read before the tip, oldest first (the tip itself included).
+    const std::vector<CPoolLocatorEntry>& Locator() const { return vLocator; }
 
     // Read the next block of the active chain: nHeight must be Height() + 1.
     bool ConnectBlock(const CBlock& block, int nHeightIn, const uint256& hashBlock);
     // Forget every appearance and anchor above nHeightIn, which becomes the
-    // tip. False when an anchor count would no longer be exact (a reorg
-    // deeper than the margin): the caller then reads the chain again.
+    // tip. False when an answer would no longer be exact (a reorg deeper than
+    // the margin): the caller then reads the chain again.
     bool DisconnectAbove(int nHeightIn, const uint256& hashAt);
 
     uint256 ZeroId() const;
+    bool IsRegistered(const uint256& id) const;
     int Status(const uint256& id) const;
     bool Lookup(const uint256& id, CPoolInfo& out) const;
     // Pool zero first, then every pool on the chain by first appearance.
     void List(std::vector<CPoolInfo>& out) const;
     bool Appearances(const uint256& id, std::vector<CPoolAppearance>& out) const;
-    // The newest anchors naming id (newest first, at most 64) and how many
-    // fall in the last 720 blocks. Any id, registered or not.
+    // The newest anchors naming id that count (newest first, at most 64) and
+    // how many fall in the last 720 blocks. Any id, registered or not.
     void Anchors(const uint256& id, std::vector<CPoolAnchor>& vRecent, int& nInWindow) const;
     size_t PoolCount() const { return mapPools.size(); }
+    // What is kept, for the bounds: anchors stored (counting or dropped but
+    // still kept for a reorg), those that count, and the ids that have any.
+    size_t AnchorsStored() const;
+    size_t AnchorsCounted() const;
+    size_t AnchorIds() const { return mapAnchors.size(); }
 
     // A hash of what the registry answers (sections 3 and 7), and nothing
     // of how it is kept: two registries of the same chain give the same one.
@@ -207,6 +255,8 @@ public:
         READWRITE(hashTip);
         READWRITE(mapPools);
         READWRITE(mapAnchors);
+        READWRITE(nPurgedTop);
+        READWRITE(vLocator);
         if (fRead)
             const_cast<CPoolRegistry*>(this)->fInit = true;
     )
@@ -218,12 +268,19 @@ private:
     uint256 hashTip;
     std::map<uint256, CPoolEntry> mapPools;
     std::map<uint256, CPoolAnchorSet> mapAnchors;
+    // The newest sweep height whose dropped anchors were then removed for
+    // good (-1 when none): a reorg below it cannot be undone exactly.
+    int nPurgedTop;
+    std::vector<CPoolLocatorEntry> vLocator;
 
     void Fill(const uint256& id, const CPoolEntry* pEntry, CPoolInfo& out) const;
+    void Sweep(int nSweepHeight);
+    void TrimAnchors(const uint256& id, CPoolAnchorSet& set, int nTip);
 };
 
 // How the index reads a block of the chain: from disk in the node, from
-// memory in the self-test.
+// memory in the self-test. It may return false or throw; either is a block
+// that could not be read, tried again later.
 typedef bool (*PoolIndexReadFn)(const CBlockIndex* pindex, CBlock& block);
 
 // The registry kept in step with the active chain (mapBlockIndex,
@@ -241,34 +298,47 @@ public:
 
     // One pass: find the fork point, forget above it, read up to nMaxBlocks
     // blocks forward. Takes cs_main briefly and never holds it while reading
-    // a block. Returns how much changed (0: nothing to do, -1: a block could
-    // not be read); fSyncedOut says whether the index reached the tip.
+    // a block; ends early when the chain moves under it, or on a stop.
+    // Returns how much changed (0: nothing to do, -1: a block could not be
+    // read); fSyncedOut says whether the index is at the tip.
     int Step(unsigned int nMaxBlocks, bool& fSyncedOut);
+
+    // Ends Step's reading at the next block (the thread's stop).
+    void RequestStop() { fStop = true; }
+    void ClearStop() { fStop = false; }
+    bool Stopping() const;
 
     // A copy of the registry, and queries under the lock.
     CPoolRegistry Snapshot() const;
     int Height() const;
     uint256 TipHash() const;
+    void Tip(int& nHeightOut, uint256& hashOut) const;
     bool Lookup(const uint256& id, CPoolInfo& out) const;
     void List(std::vector<CPoolInfo>& out) const;
     int Status(const uint256& id) const;
     bool Appearances(const uint256& id, std::vector<CPoolAppearance>& out) const;
     void Anchors(const uint256& id, std::vector<CPoolAnchor>& vRecent, int& nInWindow) const;
     uint256 Digest() const;
-    // How many times the index started again from genesis (for the
-    // self-test, and the log).
+    // How many times the index started reading the chain again from genesis,
+    // and whether it is doing so now. While it is, the registry it answers
+    // with is the one it had, not an empty one.
     int Rebuilds() const;
+    bool Rebuilding() const;
 
 private:
-    mutable CCriticalSection cs;      // reg, nRebuilds
+    mutable CCriticalSection cs;      // reg, shadow, fShadow, nRebuilds, strPath
     CCriticalSection csStep;          // one pass at a time
-    CPoolRegistry reg;
+    CPoolRegistry reg;                // what is answered
+    CPoolRegistry shadow;             // the chain read again, while fShadow
+    bool fShadow;
     std::string strPath;
     PoolIndexReadFn fnRead;
     int nRebuilds;
     bool fReadFailLogged;
+    std::atomic<bool> fStop;
 
     void EnsureInitLocked() const;
+    void StartOverLocked(const unsigned char magic[4]);
 };
 
 // The node's index: started at the end of LoadBlockIndex, read by a thread
