@@ -1702,7 +1702,8 @@ void ThreadReconnectCachedBtfPeers(void* parg)
         set<string> setListed;
         foreach(const string& strPeer, vListed)
             setListed.insert(strPeer.substr(0, strPeer.find('@')));
-        if (!vListed.empty())
+        // Not in isolated mode, which dials nobody but /connectbtf peers.
+        if (!vListed.empty() && !fBtfIsolated)
             DialLocalPoolPeers(vListed, LOCAL_POOL_DIALS_PER_ROUND);
         int nListed = setListed.empty() ? 0 : CountListedConnected(setListed);
 

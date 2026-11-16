@@ -8,9 +8,11 @@
 
 #include <sodium.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -208,6 +210,31 @@ int main()
         std::vector<unsigned char> shorter(a.begin(), a.end() - 1);
         CHECK(!poollocal::AnchorMatches(shorter, k1.C, hash), "34 bytes are no anchor");
         CHECK(Hex(a).find(Hex(k1.id, 32)) == std::string::npos, "the pool id is not in it");
+    }
+
+    printf("sessions_wipe\n");
+    {
+        // A Sessions keeps A alone of the keys, and wipes it when it goes.
+        std::vector<unsigned char> rec = Home().Encode();
+        poollocal::Keys k;
+        poollocal::Derive(rec, mainMagic, "correct horse battery staple", k, err);
+        alignas(poollocal::Sessions) unsigned char buf[sizeof(poollocal::Sessions)];
+        poollocal::Sessions* p = new (buf) poollocal::Sessions(k);
+        bool fHeldA = std::search(buf, buf + sizeof(buf), k.A, k.A + 32) != buf + sizeof(buf);
+        bool fNoK = std::search(buf, buf + sizeof(buf), k.K, k.K + 32) == buf + sizeof(buf) &&
+                    std::search(buf, buf + sizeof(buf), k.C, k.C + 32) == buf + sizeof(buf) &&
+                    std::search(buf, buf + sizeof(buf), k.id, k.id + 32) == buf + sizeof(buf);
+        p->~Sessions();
+        bool fGone = std::search(buf, buf + sizeof(buf), k.A, k.A + 32) == buf + sizeof(buf);
+        CHECK(fHeldA && fNoK, "a pool's sessions hold A, and not K, C or the id");
+        CHECK(fGone, "and A is wiped when they go");
+        sodium_memzero(&k, sizeof(k));
+    }
+
+    printf("handle_value\n");
+    {
+        unsigned char h[8] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x88 };
+        CHECK(poollocal::HandleValue(h) == 0x8807060504030201ULL, "the handle is its 8 bytes read little-endian");
     }
 
     printf("onion_name\n");

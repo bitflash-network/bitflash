@@ -374,7 +374,7 @@ static void Handshake(Conn& c, const uint8_t* data, size_t size)
     unsigned char h[poollocal::HANDLE_BYTES];
     poollocal::SessionHandle(g_keys.A, O, nA, nB, h);
     c.fSession = true;
-    memcpy(&c.h, h, sizeof(c.h));
+    c.h = poollocal::HandleValue(h);
     // What the session opened with: an ask for the line, under the handle.
     Drain(p);
 }

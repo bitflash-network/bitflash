@@ -4555,7 +4555,10 @@ static string PoolPassword(const json& p, size_t i)
         throw runtime_error("the password is a string");
     string s = p[i].get<string>();
     if (s.size() > poollocal::MAX_PASSWORD_LEN)
+    {
+        OPENSSL_cleanse(&s[0], s.size());
         throw runtime_error(strprintf("the password is at most %u bytes", (unsigned)poollocal::MAX_PASSWORD_LEN));
+    }
     return s;
 }
 
@@ -5026,17 +5029,40 @@ static const RpcEntry kMethods[] = {
 bool (*g_pfnFuzzRpcAllow)(const char* pszMethod) = NULL;
 #endif
 
+// Every string value in a request, wiped once it has been answered: a pool
+// call's password is one of them. The request's own bytes are wiped by the
+// callers that hold them.
+static void WipeJsonStrings(json& j)
+{
+    if (j.is_string())
+    {
+        string& s = j.get_ref<string&>();
+        if (!s.empty())
+            OPENSSL_cleanse(&s[0], s.size());
+    }
+    else if (j.is_array() || j.is_object())
+        for (json::iterator it = j.begin(); it != j.end(); ++it)
+            WipeJsonStrings(*it);
+}
+
+string JsonRpcWipeStringsForTest(const string& strJson)
+{
+    json j = json::parse(strJson);
+    WipeJsonStrings(j);
+    return j.dump();
+}
+
 static json Dispatch(const json& req)
 {
     json id = req.contains("id") ? req["id"] : json(nullptr);
     json reply;
     reply["id"] = id;
+    json params = json::array();
     try
     {
         if (!req.contains("method") || !req["method"].is_string())
             throw runtime_error("missing method");
         string method = req["method"].get<string>();
-        json params = json::array();
         if (req.contains("params"))
         {
             // Positional only. Silently treating an object as "no params"
@@ -5081,6 +5107,7 @@ static json Dispatch(const json& req)
         reply["result"] = nullptr;
         reply["error"]  = json{{"code", -1}, {"message", e.what()}};
     }
+    WipeJsonStrings(params);
     return reply;
 }
 
@@ -5252,11 +5279,12 @@ int JsonRpcHandleRequest(const string& req, string& strReplyOut)
         return 404;
 
     json reply;
+    json parsed;
     try
     {
         if (!JsonNestingWithin(body, MAX_JSON_NESTING))
             throw runtime_error(strprintf("request nests deeper than %u levels", (unsigned)MAX_JSON_NESTING));
-        json parsed = json::parse(body);
+        parsed = json::parse(body);
         if (parsed.is_array())
         {
             // Batch: one reply per request, in order. Capped, because every
@@ -5280,6 +5308,9 @@ int JsonRpcHandleRequest(const string& req, string& strReplyOut)
     {
         reply = json{{"result", nullptr}, {"error", json{{"code", -32600}, {"message", e.what()}}}, {"id", nullptr}};
     }
+    WipeJsonStrings(parsed);
+    if (!body.empty())
+        OPENSSL_cleanse(&body[0], body.size());
     strReplyOut = reply.dump();
     return 200;
 }
@@ -5294,6 +5325,9 @@ static void HandleConnection(btf_socket_t s)
     }
     string strReply;
     int nCode = JsonRpcHandleRequest(req, strReply);
+    // A pool call's password was in it.
+    if (!req.empty())
+        OPENSSL_cleanse(&req[0], req.size());
     if (nCode == 401)
     {
         // Same answer whether the user is unknown or the password is wrong,

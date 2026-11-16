@@ -146,7 +146,8 @@ bool P2PoolLocalAdd(const poolreg::PoolRecord& rec, const poollocal::Keys& keys,
 // password), it comes back from there on every start (P2PoolInit), and a
 // share chain left in pools/local/<id>.dat is read. The keys come from
 // poollocal::Derive, whose Argon2id run the caller makes before, outside
-// every lock. Takes cs_main, then cs_p2pool. Errors name no file.
+// every lock. Takes cs_p2pool only (never cs_main), and reads a share
+// chain left in the file outside every lock. Errors name no file.
 bool P2PoolLocalJoin(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, string& errOut);
 // Read its saved share chain, once the block index is loaded.
 bool P2PoolLocalLoad(const string& strName);
@@ -201,5 +202,23 @@ size_t P2PoolRegisteredOrphanCount();
 int P2PoolRegisteredShareWorkTokens();
 size_t P2PoolRegisteredServesForTest();
 void P2PoolDrainRegisteredBudgetsForTest();
+// Self-tests: n bytes queued on a connection as a message of a pool other
+// than zero; the bytes of such messages still queued (and the stretches
+// kept to count them).
+void P2PoolQueueRegBytesForTest(CNode* pnode, size_t n);
+size_t P2PoolRegQueuedForTest(CNode* pnode, size_t* pnSpans = NULL);
+// Self-tests: the bytes the paced serves in flight hold for their snapshots,
+// and the next share of each made to be one the chain no longer holds.
+size_t P2PoolRegServeHeldBytesForTest();
+void P2PoolRegServeLoseNextForTest();
+// Self-tests: the registered class's budgets for proven peers' shares (the
+// class's and each session's) emptied or refilled, and the connections the
+// registered class holds a share or an ask for.
+void P2PoolDrainProvenWorkForTest(bool fClass, bool fSessions);
+void P2PoolRefillProvenWorkForTest();
+size_t P2PoolRegisteredDeferredCount();
+// Self-tests: the message thread's check of one connection for a listed
+// peer reached at another onion than the one listed (true: dropped).
+bool P2PoolLocalDropWrongOnionForTest(CNode* pnode);
 
 #endif

@@ -366,7 +366,7 @@ static void LoadShares(PoolState& ps)
             printf("p2pool: a local pool's saved share chain is unreadable (%s); starting from peers\n", e.what());
         return;
     }
-    NodeMainView main;   // the caller holds cs_main
+    NodeMainView main;   // the clock only: no lock needed for it
     string err;
     if (!chain.AddHistory(v, nTipHeight, main, err))
         printf("p2pool: saved share chain refused (%s); starting from peers\n", err.c_str());
@@ -1650,7 +1650,11 @@ struct LocalConn
     poollocal::HelloLimiter limiter;    // hellos read from it
     int64 nLastHelloSent;
     int nHellosSent;
-    LocalConn() : nConn(0), nLastHelloSent(0), nHellosSent(0) {}
+    // Answers to those read: at most two for each hello sent (the answer,
+    // and one stray before it), so a peer this node dialled cannot make it
+    // check answers it never asked for.
+    int nRepliesRead;
+    LocalConn() : nConn(0), nLastHelloSent(0), nHellosSent(0), nRepliesRead(0) {}
 };
 static map<CNode*, LocalConn> mapLocalConn;
 static uint64 nNextLocalConn = 1;
@@ -1714,9 +1718,9 @@ static bool DialledOnion(CNode* pnode, string& oOut)
 }
 
 // Whether a pool lists this peer: the same .btf address at the same onion.
-static bool Listed(const LocalPool& lp, const string& strBtfAddr, const string& O)
+static bool ListedIn(const vector<string>& vPeers, const string& strBtfAddr, const string& O)
 {
-    foreach(const string& strPeer, lp.vPeers)
+    foreach(const string& strPeer, vPeers)
     {
         size_t at = strPeer.find('@');
         if (at == string::npos || strPeer.compare(0, at, strBtfAddr) != 0 || at != strBtfAddr.size())
@@ -1729,6 +1733,11 @@ static bool Listed(const LocalPool& lp, const string& strBtfAddr, const string& 
             return true;
     }
     return false;
+}
+
+static bool Listed(const LocalPool& lp, const string& strBtfAddr, const string& O)
+{
+    return ListedIn(lp.vPeers, strBtfAddr, O);
 }
 
 // Under cs_p2pool.
@@ -1994,8 +2003,7 @@ static void StartRegServe(PoolState& ps, CNode* pfrom)
 // Under cs_p2pool: the session is open on both sides.
 static void OpenSession(LocalPool* lp, CNode* pnode, const unsigned char h[poollocal::HANDLE_BYTES])
 {
-    uint64 n;
-    memcpy(&n, h, sizeof(n));
+    uint64 n = poollocal::HandleValue(h);
     lp->mapHandle[pnode] = n;
     lp->state.mapPeer[pnode] = PeerPool();
     LogPrint("p2pool", "p2pool: local pool '%s': a member is in session (%u now)\n",
@@ -2076,6 +2084,88 @@ static void LocalForgetNode(CNode* pnode)
     }
 }
 
+// Under cs_p2pool: one pool's session with one connection ends (the peer was
+// taken off the pool's list); the connection and its other pools stay. What
+// the peer sends under the old handle is dropped unread from then on.
+static void LocalCloseSession(LocalPool* lp, CNode* pnode)
+{
+    map<CNode*, LocalConn>::iterator it = mapLocalConn.find(pnode);
+    if (it != mapLocalConn.end())
+        lp->sessions.Close(it->second.nConn);
+    lp->mapHandle.erase(pnode);
+    lp->mapHelloAt.erase(pnode);
+    lp->state.mapPeer.erase(pnode);
+    for (std::list<RegServe>::iterator itS = lRegServes.begin(); itS != lRegServes.end();)
+        if (itS->pnode == pnode && itS->pool == &lp->state)
+            itS = lRegServes.erase(itS);
+        else
+            ++itS;
+    map<CNode*, P2PoolDeferred>::iterator itD = classReg.mapDeferred.find(pnode);
+    if (itD != classReg.mapDeferred.end())
+    {
+        P2PoolDeferred& d = itD->second;
+        if (d.fShare && d.poolShare == &lp->state)
+        {
+            d.fShare = false;
+            d.share = Share();
+            d.poolShare = NULL;
+        }
+        d.vSync.erase(std::remove(d.vSync.begin(), d.vSync.end(), &lp->state), d.vSync.end());
+        d.fSync = !d.vSync.empty();
+    }
+}
+
+// A listed peer this node is connected to at an onion other than the one
+// listed gets no hello there (a hello goes to the listed onion only: whoever
+// else received one could test passwords against it), and that connection
+// keeps the listed onion from being dialled (one connection per peer). After
+// a grace with no session on it, it is dropped, at most once in this long per
+// peer, and the dialler reaches the listed onion.
+static const int64 WRONG_ONION_GRACE = 2 * 60;
+static const int64 WRONG_ONION_DROP_INTERVAL = 30 * 60;
+static map<string, int64> mapWrongOnionDropAt;
+
+// Under cs_p2pool. True if the connection was dropped.
+static bool LocalDropWrongOnion(CNode* pnode, int64 nNow)
+{
+    if (pnode->fInbound || pnode->fDisconnect || pnode->strBtfAddr.empty() ||
+        nNow - pnode->nTimeConnected < WRONG_ONION_GRACE)
+        return false;
+    string O;
+    if (!DialledOnion(pnode, O))
+        return false;
+    bool fListedElsewhere = false;
+    foreach(LocalPool* lp, vLocalPools)
+    {
+        if (lp->fLeaving)
+            continue;
+        if (lp->mapHandle.count(pnode) || Listed(*lp, pnode->strBtfAddr, O))
+            return false;
+        foreach(const string& strPeer, lp->vPeers)
+            if (strPeer.size() > pnode->strBtfAddr.size() && strPeer[pnode->strBtfAddr.size()] == '@' &&
+                strPeer.compare(0, pnode->strBtfAddr.size(), pnode->strBtfAddr) == 0)
+                fListedElsewhere = true;
+    }
+    if (!fListedElsewhere)
+        return false;
+    map<string, int64>::iterator it = mapWrongOnionDropAt.find(pnode->strBtfAddr);
+    if (it != mapWrongOnionDropAt.end() && nNow - it->second < WRONG_ONION_DROP_INTERVAL)
+        return false;
+    mapWrongOnionDropAt[pnode->strBtfAddr] = nNow;
+    LogPrint("p2pool", "p2pool: a listed peer is connected at another onion than the one listed; "
+                       "dropping that connection so the listed onion is dialled\n");
+    pnode->fDisconnect = true;
+    return true;
+}
+
+bool P2PoolLocalDropWrongOnionForTest(CNode* pnode)
+{
+    bool f;
+    CRITICAL_BLOCK(cs_p2pool)
+        f = LocalDropWrongOnion(pnode, GetTime());
+    return f;
+}
+
 // Under cs_p2pool: a pool this node left.
 static void LocalRemove(LocalPool* lp)
 {
@@ -2120,7 +2210,10 @@ static void LocalTick()
     CRITICAL_BLOCK(cs_vNodes)
         CRITICAL_BLOCK(cs_p2pool)
             foreach(CNode* pnode, vNodes)
+            {
                 LocalSendHello(pnode);
+                LocalDropWrongOnion(pnode, nNow);
+            }
     CRITICAL_BLOCK(cs_p2pool)
     {
         vector<CNode*> vGone;
@@ -2150,6 +2243,7 @@ static void LocalResetForTest(bool fCheckPoW)
     nMinedChainSeq = 0;
     lRegServes.clear();
     mapLocalConn.clear();
+    mapWrongOnionDropAt.clear();
     foreach(LocalPool* lp, vLocalPools)
     {
         delete lp->state.chain;
@@ -2168,14 +2262,22 @@ static LocalPool* LocalByName(const string& strName)
     return NULL;
 }
 
-// Under cs_p2pool.
-static size_t LiveLocalPools()
+// Under cs_p2pool: whether a pool of this name may join now.
+static bool LocalRoomFor(const string& strName, string& errOut)
 {
-    size_t n = 0;
-    foreach(LocalPool* lp, vLocalPools)
-        if (!lp->fLeaving)
-            n++;
-    return n;
+    if (LocalByName(strName))
+    {
+        errOut = "a local pool with that name is already on this node";
+        return false;
+    }
+    // Pools being left count until they are gone: their chains are still
+    // in memory, and their files go only then.
+    if (vLocalPools.size() >= poollocal::MAX_LOCAL_POOLS)
+    {
+        errOut = "this node is in as many local pools as it may be";
+        return false;
+    }
+    return true;
 }
 
 // Under cs_p2pool. A new local pool, not yet in vLocalPools; NULL, with the
@@ -2191,16 +2293,8 @@ static LocalPool* LocalNew(const poolreg::PoolRecord& rec, const poollocal::Keys
     }
     if (!RulesForLocal(rec, keys, rules, errOut))
         return NULL;
-    if (LocalByName(rec.name))
-    {
-        errOut = "a local pool with that name is already on this node";
+    if (!LocalRoomFor(rec.name, errOut))
         return NULL;
-    }
-    if (LiveLocalPools() >= poollocal::MAX_LOCAL_POOLS)
-    {
-        errOut = "this node is in as many local pools as it may be";
-        return NULL;
-    }
     LocalPool* lp = new LocalPool(rec.name, rec, keys, new ShareChain(rules, fCheckPoW), strFile);
     lp->strConf = strConf;
     return lp;
@@ -2263,7 +2357,16 @@ static bool WriteLocalConf(const LocalPool& lp, const vector<string>& vPeers, st
     string s = "# A local pool of this node (docs/pool-registry.md, section 18).\n"
                "# Whoever reads this file can join the pool.\n";
     s += "record=" + HexStr(r.begin(), r.end(), false) + "\n";
-    s += "k=" + HexStr(lp.keys.K, lp.keys.K + sizeof(lp.keys.K), false) + "\n";
+    string strK = HexStr(lp.keys.K, lp.keys.K + sizeof(lp.keys.K), false);
+    // Room for K and every peer line, so no reallocation leaves a copy of K.
+    size_t nPeerBytes = 0;
+    foreach(const string& strPeer, vPeers)
+        nPeerBytes += 6 + strPeer.size();
+    s.reserve(s.size() + 3 + strK.size() + nPeerBytes + 1);
+    s += "k=";
+    s += strK;
+    s += "\n";
+    OPENSSL_cleanse(&strK[0], strK.size());
     foreach(const string& strPeer, vPeers)
         s += "peer=" + strPeer + "\n";
     string err;
@@ -2357,6 +2460,8 @@ static bool ReadLocalConf(const string& strPath, vector<unsigned char>& vRecord,
                 memcpy(K, &v[0], 32);
                 OPENSSL_cleanse(&v[0], v.size());
             }
+            if (!h.empty())
+                OPENSSL_cleanse(&h[0], h.size());
             OPENSSL_cleanse(&line[0], line.size());
             fK = true;
         }
@@ -2422,32 +2527,48 @@ bool P2PoolLocalJoin(const poolreg::PoolRecord& rec, const poollocal::Keys& keys
         return false;
     }
     string strBase = LocalDir() + "/" + poolreg::IdHex(keys.id);
-    // cs_main before cs_p2pool, as P2PoolInit: a share chain left in the
-    // pool's file is read the way it is on start.
-    CRITICAL_BLOCK(cs_main)
-        CRITICAL_BLOCK(cs_p2pool)
-        {
-            // Its files go when a pool that is being left is taken down: the
-            // same name, and so the same files, is not reused until then.
-            foreach(LocalPool* lp, vLocalPools)
-                if (lp->fLeaving && lp->strName == rec.name)
-                {
-                    errOut = "a local pool with that name is being left; try again in a few seconds";
-                    return false;
-                }
-            LocalPool* lp = LocalNew(rec, keys, strBase + ".dat", strBase + ".conf", fLocalCheckPoW, errOut);
-            if (!lp)
-                return false;
-            if (!WriteLocalConf(*lp, lp->vPeers, errOut))
+    // Its files go when a pool that is being left is taken down: the same
+    // name, and so the same files, is not reused until then.
+    LocalPool* lp = NULL;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        foreach(LocalPool* lpOld, vLocalPools)
+            if (lpOld->fLeaving && lpOld->strName == rec.name)
             {
-                delete lp->state.chain;
-                delete lp;
+                errOut = "a local pool with that name is being left; try again in a few seconds";
                 return false;
             }
+        lp = LocalNew(rec, keys, strBase + ".dat", strBase + ".conf", fLocalCheckPoW, errOut);
+    }
+    if (!lp)
+        return false;
+    // A share chain left in the pool's file is read here, outside every
+    // lock: its newest shares are checked in full, RandomX and all, and the
+    // pool is nobody else's until it is added below. (The block index is
+    // not needed: a share's validity rests on nothing of the main chain.)
+    LoadShares(lp->state);
+    bool fOk = true;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        foreach(LocalPool* lpOld, vLocalPools)
+            if (lpOld->fLeaving && lpOld->strName == rec.name)
+            {
+                errOut = "a local pool with that name is being left; try again in a few seconds";
+                fOk = false;
+            }
+        fOk = fOk && LocalRoomFor(rec.name, errOut) && WriteLocalConf(*lp, lp->vPeers, errOut);
+        if (fOk)
+        {
             vLocalPools.push_back(lp);
-            LoadShares(lp->state);
             LogPrint("p2pool", "p2pool: local pool '%s' joined\n", lp->strName.c_str());
         }
+    }
+    if (!fOk)
+    {
+        delete lp->state.chain;
+        delete lp;
+        return false;
+    }
     return true;
 }
 
@@ -2481,19 +2602,43 @@ bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, st
             errOut = "a listed peer is ADDRESS@HOST.onion[:PORT]";
             return false;
         }
-    CRITICAL_BLOCK(cs_p2pool)
-    {
-        LocalPool* lp = LocalByName(strName);
-        if (!lp)
+    // cs_vNodes before cs_p2pool, as LocalTick.
+    CRITICAL_BLOCK(cs_vNodes)
+        CRITICAL_BLOCK(cs_p2pool)
         {
-            errOut = "no local pool with that name on this node";
-            return false;
+            LocalPool* lp = LocalByName(strName);
+            if (!lp)
+            {
+                errOut = "no local pool with that name on this node";
+                return false;
+            }
+            if (!WriteLocalConf(*lp, vPeers, errOut))
+                return false;
+            // A peer taken off the list: the session this node opened by
+            // dialling it closes, and the connection is no longer kept for
+            // the pool (one another pool still lists stays kept).
+            vector<string> vOld = lp->vPeers;
+            lp->vPeers = vPeers;
+            lp->mapHelloAt.clear();
+            foreach(CNode* pnode, vNodes)
+            {
+                string O;
+                if (pnode->fDisconnect || !DialledOnion(pnode, O) || Listed(*lp, pnode->strBtfAddr, O))
+                    continue;
+                if (!ListedIn(vOld, pnode->strBtfAddr, O))
+                    continue;
+                LocalCloseSession(lp, pnode);
+                bool fListedElsewhere = false;
+                foreach(LocalPool* lpOther, vLocalPools)
+                    if (lpOther != lp && !lpOther->fLeaving && Listed(*lpOther, pnode->strBtfAddr, O))
+                        fListedElsewhere = true;
+                if (!fListedElsewhere && pnode->fNetworkNode)
+                {
+                    pnode->fNetworkNode = false;
+                    pnode->Release();
+                }
+            }
         }
-        if (!WriteLocalConf(*lp, vPeers, errOut))
-            return false;
-        lp->vPeers = vPeers;
-        lp->mapHelloAt.clear();
-    }
     return true;
 }
 
@@ -2781,8 +2926,9 @@ static bool LocalProcessMessage(CNode* pfrom, const string& strCommand, CDataStr
             {
                 // The answer to a hello of ours.
                 map<CNode*, LocalConn>::iterator it = mapLocalConn.find(pfrom);
-                if (it == mapLocalConn.end())
+                if (it == mapLocalConn.end() || it->second.nRepliesRead >= 2 * it->second.nHellosSent)
                     return true;
+                it->second.nRepliesRead++;
                 foreach(LocalPool* lp, vLocalPools)
                 {
                     WireAck ack;

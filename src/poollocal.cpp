@@ -265,6 +265,14 @@ void SessionHandle(const unsigned char A[32], const std::string& O, const unsign
     memcpy(out, full, HANDLE_BYTES);
 }
 
+uint64_t HandleValue(const unsigned char h[HANDLE_BYTES])
+{
+    uint64_t n = 0;
+    for (size_t i = 0; i < HANDLE_BYTES; i++)
+        n |= (uint64_t)h[i] << (8 * i);
+    return n;
+}
+
 bool HelloLimiter::Allow(int64_t nNow)
 {
     if (nTotal >= HELLO_LIFETIME)
@@ -274,6 +282,16 @@ bool HelloLimiter::Allow(int64_t nNow)
     nLast = nNow;
     nTotal++;
     return true;
+}
+
+Sessions::Sessions(const Keys& keysIn)
+{
+    memcpy(A, keysIn.A, sizeof(A));
+}
+
+Sessions::~Sessions()
+{
+    sodium_memzero(A, sizeof(A));
 }
 
 bool Sessions::Seen(const unsigned char nA[32]) const
@@ -300,7 +318,7 @@ bool Sessions::StartHello(uint64_t conn, const std::string& O, const unsigned ch
     half.nTime = 0;
     mapOut[conn] = half;
     memcpy(out.nonce, nA, NONCE_BYTES);
-    HelloTag(keys.A, o, nA, out.tag);
+    HelloTag(A, o, nA, out.tag);
     return true;
 }
 
@@ -312,7 +330,7 @@ bool Sessions::OnReply(uint64_t conn, const Hello& reply, unsigned char ackOut[A
         return false;
     const Half& half = it->second;
     unsigned char want[TAG_BYTES];
-    ReplyTag(keys.A, half.O, half.nA, reply.nonce, want);
+    ReplyTag(A, half.O, half.nA, reply.nonce, want);
     if (sodium_memcmp(want, reply.tag, TAG_BYTES) != 0)
         return false;
     if (mapSession.size() >= MAX_SESSIONS)
@@ -320,9 +338,9 @@ bool Sessions::OnReply(uint64_t conn, const Hello& reply, unsigned char ackOut[A
         mapOut.erase(it);
         return false;
     }
-    AckTag(keys.A, half.O, half.nA, reply.nonce, ackOut);
+    AckTag(A, half.O, half.nA, reply.nonce, ackOut);
     Handle handle;
-    SessionHandle(keys.A, half.O, half.nA, reply.nonce, handle.h);
+    SessionHandle(A, half.O, half.nA, reply.nonce, handle.h);
     memcpy(hOut, handle.h, HANDLE_BYTES);
     mapSession[conn] = handle;
     mapOut.erase(it);
@@ -339,7 +357,7 @@ bool Sessions::OnHello(uint64_t conn, const std::vector<std::string>& vOwnOnions
         if (!OnionName(vOwnOnions[i], o))
             continue;
         unsigned char want[TAG_BYTES];
-        HelloTag(keys.A, o, hello.nonce, want);
+        HelloTag(A, o, hello.nonce, want);
         if (sodium_memcmp(want, hello.tag, TAG_BYTES) != 0)
             continue;
         // A member's hello for this node. Everything below answers with the
@@ -360,7 +378,7 @@ bool Sessions::OnHello(uint64_t conn, const std::vector<std::string>& vOwnOnions
         half.nTime = nNow;
         mapPending[conn] = half;
         memcpy(replyOut.nonce, nB, NONCE_BYTES);
-        ReplyTag(keys.A, o, hello.nonce, nB, replyOut.tag);
+        ReplyTag(A, o, hello.nonce, nB, replyOut.tag);
         return true;
     }
     return false;
@@ -375,7 +393,7 @@ bool Sessions::OnAck(uint64_t conn, const unsigned char ack[ACK_BYTES], int64_t 
         return false;
     const Half& half = it->second;
     unsigned char want[ACK_BYTES];
-    AckTag(keys.A, half.O, half.nA, half.nB, want);
+    AckTag(A, half.O, half.nA, half.nB, want);
     if (sodium_memcmp(want, ack, ACK_BYTES) != 0)
         return false;
     if (mapSession.count(conn) || mapSession.size() >= MAX_SESSIONS)
@@ -384,7 +402,7 @@ bool Sessions::OnAck(uint64_t conn, const unsigned char ack[ACK_BYTES], int64_t 
         return false;
     }
     Handle handle;
-    SessionHandle(keys.A, half.O, half.nA, half.nB, handle.h);
+    SessionHandle(A, half.O, half.nA, half.nB, handle.h);
     memcpy(hOut, handle.h, HANDLE_BYTES);
     mapSession[conn] = handle;
     mapPending.erase(it);

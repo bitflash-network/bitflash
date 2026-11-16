@@ -57,6 +57,11 @@ PoolRules::PoolRules()
     memset(anchorKey, 0, sizeof(anchorKey));
 }
 
+PoolRules::~PoolRules()
+{
+    OPENSSL_cleanse(anchorKey, sizeof(anchorKey));
+}
+
 uint64_t UnclePaid(uint64_t work, unsigned int nPct)
 {
     return work / 100 * nPct + (work % 100) * nPct / 100;

@@ -139,14 +139,19 @@ their last parameter. It travels in the request body to 127.0.0.1 and nowhere
 else, and it must never be on a command line, where the process list and the
 shell history keep it: read it from a prompt and send the body on stdin.
 
+The RPC credential stays off the command line too: keep it in a netrc file
+only you can read, `~/.bitflash-rpc.netrc` (mode 600), holding the one line
+`machine 127.0.0.1 login exchange password SECRET`, and point curl at it.
+
 ```bash
 read -rs -p 'Pool password: ' PW; echo
 printf '{"id":1,"method":"pooljoin","params":["btfl1:...","%s"]}' "$PW" |
-  curl -s -u exchange:SECRET -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:8432/
+  curl -s --netrc-file ~/.bitflash-rpc.netrc -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:8432/
 unset PW
 ```
 
-(`printf` is a shell builtin, so the password is in no process's arguments.
+(`printf` is a shell builtin, so the password is in no process's arguments,
+and curl reads the RPC credential from the file, so it is in none either.
 A password with a `"` or a backslash in it has to be escaped for JSON.)
 The node stretches it with Argon2id (64 MiB) into the pool's key, keeps that
 key in `pools/local/<id>.conf` (owner-only) and never the password. No answer,

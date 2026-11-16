@@ -1905,7 +1905,7 @@ left anywhere else to clean up.
 | `poolcreate local {params} [password]` | a local pool: checks the record as section 1 does, with the defaults of section 9, derives the id, saves `pools/local/<id>.conf`, and returns the name, the pool code and the note below. A name already used by a local pool on this node is refused. Nothing is sent anywhere |
 | `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the name and the note. A name already used by a local pool on this node is refused (after joining with a mistyped password, `poolleave` and join again) |
 | `poolpeers local:<name> ["ADDR@HOST.onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows each and its state: connected with a session, this node at its session cap, or no proof (not a member, a wrong password, or the peer at its own cap, which answers with silence) |
-| `poolleave local:<name>` | forgets a local pool: deletes its files after the node stops mining it |
+| `poolleave local:<name>` | forgets a local pool: closes its sessions and deletes its files. Refused while this node mines it: restart the node without `-p2pool=local:<name>` first |
 | `poollist`, `poolinfo` | show this node's local pools too, marked `"local": true`, with their sessions; never any other node's |
 
 `poolcreate` with no mode is refused with a message that names the two, so

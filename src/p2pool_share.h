@@ -153,6 +153,10 @@ struct PoolRules
     unsigned char anchorKey[32];      // ANCHOR_P2L: the pool's key C
 
     PoolRules();
+    // C is wiped wherever a copy of the rules goes.
+    ~PoolRules();
+    PoolRules(const PoolRules&) = default;
+    PoolRules& operator=(const PoolRules&) = default;
     static PoolRules Zero(const CBigNum& bnFloorIn);
 
     bool IsZero() const { return nAnchor == ANCHOR_P2P; }

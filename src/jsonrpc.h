@@ -31,6 +31,10 @@ int JsonRpcRequestLength(const std::string& buf, size_t& nTotalOut);
 // right ones, before anything else is looked at), then POST (404), then the
 // JSON-RPC call or batch. Returns the HTTP status; strReplyOut is the body.
 int JsonRpcHandleRequest(const std::string& req, std::string& strReplyOut);
+// Self-tests: a request's JSON, parsed, every string value wiped as a call's
+// params are once it is answered (a pool call's password among them), and
+// written back out.
+std::string JsonRpcWipeStringsForTest(const std::string& strJson);
 
 // Renews the inheritances this wallet owns before they open to the heir
 // (docs/inheritance.md). Runs whether or not the RPC server does.

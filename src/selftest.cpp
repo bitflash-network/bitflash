@@ -6635,6 +6635,15 @@ static int RunP2PoolRulesSelfTest()
         p2pool::PoolRules r;
         nFail += Check(!p2pool::RulesForLocal(reg, keys, r, err), "a registry record gives no local rules") ? 0 : 1;
     }
+    {
+        // Every copy of a local pool's rules wipes its C when it goes.
+        alignas(p2pool::PoolRules) unsigned char buf[sizeof(p2pool::PoolRules)];
+        p2pool::PoolRules* pr = new (buf) p2pool::PoolRules(rules);
+        bool fHeld = std::search(buf, buf + sizeof(buf), keys.C, keys.C + 32) != buf + sizeof(buf);
+        pr->~PoolRules();
+        bool fGone = std::search(buf, buf + sizeof(buf), keys.C, keys.C + 32) == buf + sizeof(buf);
+        nFail += Check(fRules && fHeld && fGone, "a copy of a local pool's rules holds C, and wipes it when it goes") ? 0 : 1;
+    }
     if (!fRules)
     {
         printf("p2pool-rules: FAILED (no rules: %s %s)\n", err.c_str(), serr.c_str());
@@ -7890,7 +7899,7 @@ static bool OpenLocalSession(CNode* pnode, const unsigned char A[32], const stri
     CDataStream ss(SER_NETWORK, VERSION);
     ss.write((const char*)ack, sizeof(ack));
     SendP2PoolTest(pnode, "p2lack", ss);
-    memcpy(&hOut, h, sizeof(hOut));
+    hOut = poollocal::HandleValue(h);
     return true;
 }
 
@@ -7966,6 +7975,8 @@ static int RunP2PoolLocalSelfTest()
         nFail += Check(fFour && !P2PoolLocalAdd(r, keysOther, "", false, err), "four local pools a node, and no fifth") ? 0 : 1;
         for (int i = 0; i < 3; i++)
             P2PoolLocalLeave(strprintf("more%d", i), err);
+        nFail += Check(!P2PoolLocalAdd(r, keysOther, "", false, err),
+                       "pools being left count toward the four until they are gone") ? 0 : 1;
         P2PoolServeDeferred();
         P2PoolLocalStatusInfo st;
         nFail += Check(!P2PoolLocalStatus("more0", st) && P2PoolLocalStatus("home", st) && P2PoolLocalAdd(r, keysOther, "", false, err) &&
@@ -8021,7 +8032,7 @@ static int RunP2PoolLocalSelfTest()
         uint64 hSent = 0;
         bool fSync = LastSent(pM1, "p2lsync", sync) && sync.size() == 8 + 32;
         if (fSync)
-            memcpy(&hSent, &sync[0], 8);
+            hSent = poollocal::HandleValue(&sync[0]);
         nFail += Check(fSync && hSent == h1, "the first thing sent in it asks for the pool's line, under the session's handle") ? 0 : 1;
         nFail += Check(!SentContains(pM1, rules.poolId.begin(), 32) && !SentContains(pM1, keys.id, 32),
                        "and the pool id is nowhere in what was sent") ? 0 : 1;
@@ -8122,7 +8133,7 @@ static int RunP2PoolLocalSelfTest()
         bool fPart = LastSent(pM2, "p2lshares", part) && part.size() > 13;
         uint64 hPart = 0;
         if (fPart)
-            memcpy(&hPart, &part[0], 8);
+            hPart = poollocal::HandleValue(&part[0]);
         nFail += Check(fPart && hPart == h2 && part[12] == 1 && P2PoolRegisteredServesForTest() == 0,
                        "a member asking for the line is sent it in parts, the last one flagged as the end") ? 0 : 1;
         SendLocalItem(pStranger, "p2lsync", h2, uint256(0));
@@ -8180,6 +8191,84 @@ static int RunP2PoolLocalSelfTest()
         }
         nFail += Check(fAcked && P2PoolLocalStatus("home", st) && st.nSessions == 3,
                        "a reply with the wrong key is ignored; the right one is acked, and the session is open") ? 0 : 1;
+    }
+    {
+        // Answers on a connection this node dialled are read two for each
+        // hello it sent: the third, even the right one, is not read.
+        CNode* pLim = NewP2PoolTestNode(false);
+        pLim->strBtfAddr = "BF1listedpeer";
+        pLim->strBtfMeeting = "onion " + O2 + ".onion:8333";
+        P2PoolOnVersion(pLim);
+        vector<unsigned char> hello;
+        bool fHello = CountSent(pLim, "p2lhello") == 1 && LastSent(pLim, "p2lhello", hello) && hello.size() == 48;
+        unsigned char nB[32], tB[poollocal::TAG_BYTES];
+        memset(nB, 0x83, sizeof(nB));
+        for (int i = 0; i < 3 && fHello; i++)
+        {
+            poollocal::ReplyTag(i < 2 ? keysOther.A : keys.A, O2, &hello[0], nB, tB);
+            CDataStream ss(SER_NETWORK, VERSION);
+            ss.write((const char*)nB, 32);
+            ss.write((const char*)tB, sizeof(tB));
+            SendP2PoolTest(pLim, "p2lhello", ss);
+        }
+        P2PoolLocalStatusInfo st;
+        nFail += Check(fHello && CountSent(pLim, "p2lack") == 0 && P2PoolLocalStatus("home", st) && st.nSessions == 3,
+                       "answers to a hello are read two at most: a third, even the right one, opens nothing") ? 0 : 1;
+        P2PoolForgetDeferred(pLim);
+        delete pLim;
+    }
+    {
+        // A listed peer reached at another onion than the one listed: no
+        // hello there, and after a grace with no session the connection is
+        // dropped, once in half an hour, so the listed onion can be dialled.
+        CNode* pW = NewP2PoolTestNode(false);
+        pW->strBtfAddr = "BF1listedpeer";
+        pW->strBtfMeeting = "onion " + O + ".onion:8333";
+        P2PoolOnVersion(pW);
+        bool fNoHello = CountSent(pW, "p2lhello") == 0;
+        pW->nTimeConnected = GetTime();
+        bool fYoung = !P2PoolLocalDropWrongOnionForTest(pW) && !pW->fDisconnect;
+        pW->nTimeConnected = GetTime() - 300;
+        bool fDropped = P2PoolLocalDropWrongOnionForTest(pW) && pW->fDisconnect;
+        CNode* pW2 = NewP2PoolTestNode(false);
+        pW2->strBtfAddr = "BF1listedpeer";
+        pW2->strBtfMeeting = "onion " + O + ".onion:8333";
+        pW2->nTimeConnected = GetTime() - 300;
+        bool fOnce = !P2PoolLocalDropWrongOnionForTest(pW2) && !pW2->fDisconnect;
+        CNode* pRight = NewP2PoolTestNode(false);
+        pRight->strBtfAddr = "BF1listedpeer";
+        pRight->strBtfMeeting = "onion " + O2 + ".onion:8333";
+        pRight->nTimeConnected = GetTime() - 300;
+        pOutOther->nTimeConnected = GetTime() - 300;
+        bool fKept = !P2PoolLocalDropWrongOnionForTest(pRight) && !P2PoolLocalDropWrongOnionForTest(pOutOther) &&
+                     !pRight->fDisconnect && !pOutOther->fDisconnect;
+        nFail += Check(fNoHello && fYoung && fDropped && fOnce && fKept,
+                       "a listed peer reached at another onion gets no hello, and after two minutes without a session that "
+                       "connection is dropped (once in half an hour) so the listed onion is dialled; others are kept") ? 0 : 1;
+        CNode* vW[] = { pW, pW2, pRight };
+        for (size_t i = 0; i < 3; i++)
+        {
+            P2PoolForgetDeferred(vW[i]);
+            delete vW[i];
+        }
+    }
+    {
+        // A peer taken off the list: the session this node dialled for
+        // closes, and the connection is no longer pinned for the pool.
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.push_back(pOut);
+        pOut->AddRef();
+        pOut->fNetworkNode = true;
+        int nRefs = pOut->GetRefCount();
+        vector<string> vNone, vPeers(1, "BF1listedpeer@" + O2 + ".onion:8333");
+        bool fSet = P2PoolLocalSetPeers("home", vNone, err);
+        P2PoolLocalStatusInfo st;
+        bool fClosed = fSet && P2PoolLocalStatus("home", st) && st.nSessions == 2 && !pOut->fNetworkNode &&
+                       pOut->GetRefCount() == nRefs - 1;
+        CRITICAL_BLOCK(cs_vNodes)
+            vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), pOut), vNodes.end());
+        nFail += Check(fClosed && P2PoolLocalSetPeers("home", vPeers, err),
+                       "a listed peer taken off the list loses the session this node dialled it for, and its pin") ? 0 : 1;
     }
 
     // ---- section 8: pool zero beside all that
@@ -8432,6 +8521,53 @@ static int RunP2PoolLocalNodeSelfTest()
                      rDeep.nSpacing == 60;
         nFail += Check(fDeep, "and with uncle depth 1, a spacing of 60") ? 0 : 1;
         LocalNodeRpc(user, pass, "poolleave", json::array({ "local:deep1" }), &strAll);
+        Sleep(1100);
+        P2PoolServeDeferred();
+    }
+    {
+        // The params of a call are wiped once it is answered: the password
+        // does not stay behind in them.
+        std::string strWiped = JsonRpcWipeStringsForTest("[\"local\", {\"name\": \"home\"}, \"pw-home-1\"]");
+        nFail += Check(strWiped.find("pw-home-1") == std::string::npos && strWiped.find("local") == std::string::npos &&
+                       strWiped.find("name") != std::string::npos,
+                       "a call's params are wiped once it is answered, the password among them") ? 0 : 1;
+    }
+    {
+        // Joining waits on no chain lock: a share chain left in the pool's
+        // file is read (RandomX and all) outside every lock, and cs_main is
+        // never taken. Here another thread holds cs_main throughout.
+        poolreg::PoolRecord recLf = recHome;
+        recLf.name = "lockfree";
+        poollocal::Keys keysLf;
+        bool fDerived = poollocal::Derive(recLf.Encode(), magic, "pw-lf", keysLf, err);
+        std::atomic<bool> fHeld(false), fRelease(false);
+        std::thread holder([&]() {
+            CRITICAL_BLOCK(cs_main)
+            {
+                fHeld = true;
+                while (!fRelease)
+                    Sleep(10);
+            }
+        });
+        while (!fHeld)
+            Sleep(1);
+        int64 nStart = GetTime();
+        std::atomic<bool> fJoined(false), fDone(false);
+        std::thread joiner([&]() {
+            std::string errJ;
+            fJoined = fDerived && P2PoolLocalJoin(recLf, keysLf, errJ);
+            fDone = true;
+        });
+        while (!fDone && GetTime() - nStart < 5)
+            Sleep(10);
+        bool fQuick = fDone;
+        fRelease = true;
+        holder.join();
+        joiner.join();
+        OPENSSL_cleanse(&keysLf, sizeof(keysLf));
+        nFail += Check(fQuick && fJoined, "pooljoin takes no chain lock: it completes while another thread holds cs_main") ? 0 : 1;
+        std::string errL;
+        P2PoolLocalLeave("lockfree", errL);
         Sleep(1100);
         P2PoolServeDeferred();
     }
