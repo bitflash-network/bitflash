@@ -702,6 +702,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=explorer
 	./bitflash-node -selftest=db-locks
 	./bitflash-node -selftest=db-open-failure
+	./bitflash-node -selftest=p2pool-local-node
 	./bitflash-node -selftest=private-file
 	./bitflash-node -selftest=swap-wait-payment
 	./bitflash-node -selftest=swap-timelock
