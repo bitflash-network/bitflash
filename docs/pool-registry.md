@@ -217,6 +217,27 @@ anchors that name it (section 7): the last 64 (height, block hash, share data
 hash) and the count over the last 720 blocks. All of it is undone by a reorg
 the same way.
 
+**Anchors that name no registered pool are kept only for a while.** A
+`"p2x"` push costs nothing to write, so a miner could name a new made-up id in
+every coinbase; kept forever, those claims would grow the index without any
+burn, against section 11. So at every height that is a multiple of 144, an id
+that is neither pool zero nor registered at that height loses its anchors
+older than 2160 blocks. A dropped anchor stays in the file for 1440 more
+blocks, so a reorg above the sweep restores it exactly; a reorg below an
+anchor dropped for good is detected and the chain is read again. The sweep is
+part of reading the chain, so a rebuild gives the same result. A pool whose
+record appears later starts with the anchors of its last 2160 blocks before
+the burn.
+
+**The file and restarts.** The index lives in `pool-registry.dat`, written
+atomically, with a checksum, and rebuildable from the block files: deleting
+it and starting again gives the same registry. It keeps the hashes of the
+last 64 blocks it read and one every 144 blocks, so a node whose block index
+lost its last blocks in an unclean stop resumes from the newest one it still
+has instead of reading from genesis. A rebuild from genesis (a damaged file,
+a reorg deeper than the kept anchors allow) is read into a second registry
+while the old one keeps answering, and takes over at the tip.
+
 **Cost.** One parse per `OP_RETURN` output of at least 1 BTF, a few hundred
 bytes per pool on disk and in memory. There is no cap on the number of
 entries: a cap would let whoever fills it stop everybody else from creating a
@@ -413,7 +434,7 @@ how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
 a `"p2x"` push names its pool in full. The count reads a coinbase the way a
 share is read: the scriptSig must parse fully, and it counts for pool zero
 with exactly one `"p2p"` push and no `"p2x"` push, for a registered pool with
-exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). The index keeps these counts (section
+exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). A `"p2x"` push naming pool zero's own id also counts for no pool: pool zero's shares never carry its id (section 6), so such a push cannot come from its template. The index keeps these counts (section
 3). They are *claims*: anybody can put a `"p2x"` push in a solo block's
 coinbase. Only a node that carries the pool can tell a real one (the coinbase
 pays that pool's window, the share data is in its share chain) from a label,
