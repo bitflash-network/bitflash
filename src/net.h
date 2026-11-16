@@ -825,6 +825,12 @@ public:
     // has named its P2Pool peers to us yet (once per connection).
     int64 nP2PoolLastGood;
     bool fP2PoolPeersRecv;
+    // Bytes this connection has sent in its life, and the stretches of the
+    // send stream that hold messages of pools other than pool zero, as stream
+    // positions (docs/pool-registry.md, section 8): pool zero's queue caps
+    // count vSend less those. Both under cs_vSend.
+    uint64 nSendDrained;
+    std::deque<std::pair<uint64, uint64> > vRegSpans;
 protected:
     int nRefCount;
 public:
@@ -973,6 +979,7 @@ public:
         nP2PoolHistoryRecv = 0;
         nP2PoolLastGood = 0;
         fP2PoolPeersRecv = false;
+        nSendDrained = 0;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

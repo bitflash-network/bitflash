@@ -7746,6 +7746,517 @@ static int RunP2PoolDosSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-local: a local pool on the wire, and pool zero beside it ------
+// docs/pool-registry.md, section 18 (the hello, the session's handle, silence
+// to whoever is not a member) and section 8 (nothing done with another pool
+// changes how pool zero's traffic is treated).
+
+namespace {
+struct SentMessage
+{
+    string strCommand;
+    vector<unsigned char> payload;
+};
+}
+
+// What a test peer was sent, message by message.
+static vector<SentMessage> SentTo(CNode* pnode)
+{
+    vector<SentMessage> out;
+    CDataStream v(pnode->vSend);
+    try
+    {
+        while (!v.empty())
+        {
+            CMessageHeader hdr;
+            v >> hdr;
+            if (hdr.nMessageSize > v.size())
+                break;
+            SentMessage m;
+            m.strCommand = hdr.GetCommand();
+            m.payload.assign(v.begin(), v.begin() + hdr.nMessageSize);
+            v.ignore(hdr.nMessageSize);
+            out.push_back(m);
+        }
+    }
+    catch (std::exception&) {}
+    return out;
+}
+
+static size_t CountSent(CNode* pnode, const char* pszCommand)
+{
+    size_t n = 0;
+    foreach(const SentMessage& m, SentTo(pnode))
+        if (m.strCommand == pszCommand)
+            n++;
+    return n;
+}
+
+static bool LastSent(CNode* pnode, const char* pszCommand, vector<unsigned char>& payloadOut)
+{
+    bool f = false;
+    foreach(const SentMessage& m, SentTo(pnode))
+        if (m.strCommand == pszCommand)
+        {
+            payloadOut = m.payload;
+            f = true;
+        }
+    return f;
+}
+
+static bool SentContains(CNode* pnode, const unsigned char* p, size_t n)
+{
+    if (pnode->vSend.size() < n)
+        return false;
+    const char* b = &pnode->vSend[0];
+    for (size_t i = 0; i + n <= pnode->vSend.size(); i++)
+        if (memcmp(b + i, p, n) == 0)
+            return true;
+    return false;
+}
+
+// The peer's side of a hello, as a member with key A dialling onion O.
+static void SendLocalHello(CNode* pnode, const unsigned char A[32], const string& O, const unsigned char nA[32])
+{
+    unsigned char tag[poollocal::TAG_BYTES];
+    poollocal::HelloTag(A, O, nA, tag);
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss.write((const char*)nA, 32);
+    ss.write((const char*)tag, sizeof(tag));
+    SendP2PoolTest(pnode, "p2lhello", ss);
+}
+
+// The whole handshake from the peer's side, on an inbound connection. The
+// handle of the session, if this node opened one.
+static bool OpenLocalSession(CNode* pnode, const unsigned char A[32], const string& O, unsigned char seed, uint64& hOut)
+{
+    unsigned char nA[32];
+    memset(nA, seed, sizeof(nA));
+    size_t nBefore = CountSent(pnode, "p2lhello");
+    SendLocalHello(pnode, A, O, nA);
+    vector<unsigned char> reply;
+    if (CountSent(pnode, "p2lhello") != nBefore + 1 || !LastSent(pnode, "p2lhello", reply) || reply.size() != 48)
+        return false;
+    unsigned char tB[poollocal::TAG_BYTES], ack[poollocal::ACK_BYTES], h[poollocal::HANDLE_BYTES];
+    poollocal::ReplyTag(A, O, nA, &reply[0], tB);
+    if (memcmp(tB, &reply[32], sizeof(tB)) != 0)
+        return false;
+    poollocal::AckTag(A, O, nA, &reply[0], ack);
+    poollocal::SessionHandle(A, O, nA, &reply[0], h);
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss.write((const char*)ack, sizeof(ack));
+    SendP2PoolTest(pnode, "p2lack", ss);
+    memcpy(&hOut, h, sizeof(hOut));
+    return true;
+}
+
+template <typename T>
+static void SendLocalItem(CNode* pnode, const char* pszCommand, uint64 h, const T& item)
+{
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << h << item;
+    SendP2PoolTest(pnode, pszCommand, ss);
+}
+
+static int RunP2PoolLocalSelfTest()
+{
+    printf("p2pool-local self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    string err;
+
+    TestMainView main;
+    main.nBits = 0x1d00ffff;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    auto payTo = [](unsigned char c) {
+        CScript s;
+        s << OP_DUP << OP_HASH160 << uint160(c) << OP_EQUALVERIFY << OP_CHECKSIG;
+        return vector<unsigned char>(s.begin(), s.end());
+    };
+    CBigNum bnFloor;
+    bnFloor.SetCompact(0x207fffff);
+    P2PoolResetForTest(bnFloor, false);
+
+    const unsigned char magic[4] = { 0xce, 0xe2, 0xc0, 0xff };
+    poolreg::PoolRecord rec = poolreg::PoolZero();
+    rec.fLocal = true; rec.nSpacing = 30; rec.nWindow = 360; rec.nRetarget = 120; rec.nUncleDepth = 2;
+    rec.nUnclePct = 90; rec.nFloor = 0x1f0fffff; rec.name = "home";
+    poollocal::Keys keys, keysOther;
+    p2pool::PoolRules rules, rulesOther;
+    if (!poollocal::Derive(rec.Encode(), magic, "a password", keys, err) ||
+        !poollocal::Derive(rec.Encode(), magic, "another", keysOther, err) ||
+        !p2pool::RulesForLocal(rec, keys, rules, err) || !p2pool::RulesForLocal(rec, keysOther, rulesOther, err))
+    {
+        printf("p2pool-local: FAILED (no keys: %s)\n", err.c_str());
+        return 1;
+    }
+    const string O = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx";
+    const string O2 = "bcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxy";
+
+    {
+        poolreg::PoolRecord reg = rec;
+        reg.fLocal = false;
+        nFail += Check(!P2PoolLocalAdd(reg, keys, "", false, err), "a registry record is no local pool") ? 0 : 1;
+    }
+    nFail += Check(P2PoolLocalAdd(rec, keys, "", false, err), "a local pool joins this node") ? 0 : 1;
+    nFail += Check(!P2PoolLocalAdd(rec, keysOther, "", false, err), "its name is taken on this node from then on") ? 0 : 1;
+    {
+        bool fFour = true;
+        for (int i = 0; i < 3; i++)
+        {
+            poolreg::PoolRecord r = rec;
+            r.name = strprintf("more%d", i);
+            fFour = fFour && P2PoolLocalAdd(r, keysOther, "", false, err);
+        }
+        poolreg::PoolRecord r = rec;
+        r.name = "fifth";
+        nFail += Check(fFour && !P2PoolLocalAdd(r, keysOther, "", false, err), "four local pools a node, and no fifth") ? 0 : 1;
+        for (int i = 0; i < 3; i++)
+            P2PoolLocalLeave(strprintf("more%d", i), err);
+        P2PoolServeDeferred();
+        P2PoolLocalStatusInfo st;
+        nFail += Check(!P2PoolLocalStatus("more0", st) && P2PoolLocalStatus("home", st) && P2PoolLocalAdd(r, keysOther, "", false, err) &&
+                       P2PoolLocalLeave("fifth", err),
+                       "a pool this node left makes room for another") ? 0 : 1;
+        Sleep(1100);
+        P2PoolServeDeferred();
+    }
+    {
+        vector<string> v(1, O);
+        P2PoolSetOwnOnionsForTest(v);
+    }
+
+    // ---- the hello: silence to whoever is not a member
+    CNode* pStranger = NewP2PoolTestNode(true);
+    {
+        unsigned char nA[32];
+        memset(nA, 0x51, sizeof(nA));
+        SendLocalHello(pStranger, keysOther.A, O, nA);
+        P2PoolLocalStatusInfo st;
+        nFail += Check(pStranger->vSend.empty() && pStranger->nMisbehavior == 0 && P2PoolLocalStatus("home", st) &&
+                       st.nSessions == 0 && st.nPending == 0,
+                       "a hello with the wrong password gets silence, and nobody is scored") ? 0 : 1;
+    }
+    CNode* pWrongOnion = NewP2PoolTestNode(true);
+    {
+        unsigned char nA[32];
+        memset(nA, 0x52, sizeof(nA));
+        SendLocalHello(pWrongOnion, keys.A, O2, nA);
+        nFail += Check(pWrongOnion->vSend.empty() && pWrongOnion->nMisbehavior == 0,
+                       "a member's hello made for another onion, replayed here, gets silence") ? 0 : 1;
+    }
+    {
+        // Not 48 bytes, and an ack out of nowhere.
+        CDataStream ss(SER_NETWORK, VERSION);
+        ss << uint256(7);
+        SendP2PoolTest(pStranger, "p2lhello", ss);
+        SendP2PoolTest(pStranger, "p2lack", ss);
+        nFail += Check(pStranger->vSend.empty() && pStranger->nMisbehavior == 0,
+                       "a malformed hello and an ack out of nowhere are dropped unread") ? 0 : 1;
+    }
+
+    // ---- a member: three messages, then the session's handle
+    CNode* pM1 = NewP2PoolTestNode(true);
+    CNode* pM2 = NewP2PoolTestNode(true);
+    uint64 h1 = 0, h2 = 0;
+    bool fS1 = OpenLocalSession(pM1, keys.A, O, 0x61, h1);
+    {
+        P2PoolLocalStatusInfo st;
+        nFail += Check(fS1 && P2PoolLocalStatus("home", st) && st.nSessions == 1 && st.nPending == 0,
+                       "a member's hello is answered, and its ack opens a session") ? 0 : 1;
+        vector<unsigned char> sync;
+        uint64 hSent = 0;
+        bool fSync = LastSent(pM1, "p2lsync", sync) && sync.size() == 8 + 32;
+        if (fSync)
+            memcpy(&hSent, &sync[0], 8);
+        nFail += Check(fSync && hSent == h1, "the first thing sent in it asks for the pool's line, under the session's handle") ? 0 : 1;
+        nFail += Check(!SentContains(pM1, rules.poolId.begin(), 32) && !SentContains(pM1, keys.id, 32),
+                       "and the pool id is nowhere in what was sent") ? 0 : 1;
+    }
+    {
+        // The same nonce again, on another connection: a replay.
+        CNode* pReplay = NewP2PoolTestNode(true);
+        unsigned char nA[32];
+        memset(nA, 0x61, sizeof(nA));
+        SendLocalHello(pReplay, keys.A, O, nA);
+        nFail += Check(pReplay->vSend.empty(), "a hello whose nonce was seen before gets silence") ? 0 : 1;
+        P2PoolForgetDeferred(pReplay);
+        delete pReplay;
+    }
+    {
+        // Two hellos within a minute on one connection: the second is not read.
+        CNode* pFast = NewP2PoolTestNode(true);
+        unsigned char nA[32];
+        memset(nA, 0x71, sizeof(nA));
+        SendLocalHello(pFast, keysOther.A, O, nA);
+        memset(nA, 0x72, sizeof(nA));
+        SendLocalHello(pFast, keys.A, O, nA);
+        nFail += Check(pFast->vSend.empty(), "a second hello within a minute on one connection is dropped unread") ? 0 : 1;
+        P2PoolForgetDeferred(pFast);
+        delete pFast;
+    }
+    bool fS2 = OpenLocalSession(pM2, keys.A, O, 0x62, h2);
+    nFail += Check(fS2 && h2 != h1, "a second member has a session and a handle of its own") ? 0 : 1;
+
+    // ---- shares travel between members, and nowhere else
+    p2pool::ShareChain mirror(rules, false), mirrorOther(rulesOther, false);
+    unsigned int t = (unsigned int)main.nNow - 3000;
+    p2pool::Share g = RulesShare(mirror, main, 0, payTo(1), t);
+    mirror.Add(g, main, err);
+    CNode* pZeroPeer = NewP2PoolTestNode(true);
+    {
+        // An unknown handle: dropped unread.
+        SendLocalItem(pStranger, "p2lshare", h1, p2pool::ShareX(g));
+        SendLocalItem(pM1, "p2lshare", h1 ^ 1, p2pool::ShareX(g));
+        P2PoolLocalStatusInfo st;
+        nFail += Check(P2PoolLocalStatus("home", st) && st.nShares == 0 && pStranger->vSend.empty() &&
+                       pStranger->nMisbehavior == 0 && pM1->nMisbehavior == 0,
+                       "a share under a handle the connection does not hold is dropped, nobody scored") ? 0 : 1;
+        size_t nM2 = CountSent(pM2, "p2lshare");
+        SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareX(g));
+        vector<unsigned char> relayed;
+        uint64 hRelayed = 0;
+        bool fRelayed = CountSent(pM2, "p2lshare") == nM2 + 1 && LastSent(pM2, "p2lshare", relayed) && relayed.size() > 8;
+        if (fRelayed)
+            memcpy(&hRelayed, &relayed[0], 8);
+        nFail += Check(P2PoolLocalStatus("home", st) && st.nShares == 1 && st.nTipHeight == 0 && pM1->nMisbehavior == 0,
+                       "a member's share is taken on the pool's share chain") ? 0 : 1;
+        nFail += Check(fRelayed && hRelayed == h2 && CountSent(pM1, "p2lshare") == 0,
+                       "and passed on to the other member under that member's own handle, not back to its sender") ? 0 : 1;
+        nFail += Check(pZeroPeer->vSend.empty() && pStranger->vSend.empty(),
+                       "a peer with no session is sent nothing of it") ? 0 : 1;
+        bool fZeroEmpty;
+        CRITICAL_BLOCK(cs_p2pool)
+            fZeroEmpty = P2PoolChain().Size() == 0;
+        nFail += Check(fZeroEmpty && P2PoolOrphanCount() == 0, "pool zero's share chain holds nothing of it") ? 0 : 1;
+    }
+    {
+        // The same share on pool zero's own message: not pool zero's.
+        CNode* pLiar = NewP2PoolTestNode(true);
+        p2pool::Share z = g;
+        z.data.fX = false;
+        SendP2PoolTestItem(pLiar, "p2pshare", z);
+        bool fZeroEmpty;
+        CRITICAL_BLOCK(cs_p2pool)
+            fZeroEmpty = P2PoolChain().Size() == 0;
+        nFail += Check(fZeroEmpty && pLiar->nMisbehavior > 0, "sent as a pool zero share it is refused, and its sender scored") ? 0 : 1;
+        P2PoolForgetDeferred(pLiar);
+        delete pLiar;
+    }
+    {
+        // Another pool's share inside this pool's session.
+        CNode* pM3 = NewP2PoolTestNode(true);
+        uint64 h3 = 0;
+        bool fS3 = OpenLocalSession(pM3, keys.A, O, 0x63, h3);
+        p2pool::Share o = RulesShare(mirrorOther, main, 0, payTo(2), t);
+        SendLocalItem(pM3, "p2lshare", h3, p2pool::ShareX(o));
+        P2PoolLocalStatusInfo st;
+        nFail += Check(fS3 && pM3->nMisbehavior > 0 && P2PoolLocalStatus("home", st) && st.nShares == 1,
+                       "a share of another pool sent in the session is invalid, and its sender scored") ? 0 : 1;
+        P2PoolForgetDeferred(pM3);
+        delete pM3;
+        nFail += Check(P2PoolLocalStatus("home", st) && st.nSessions == 2, "a connection that goes takes its session with it") ? 0 : 1;
+    }
+    {
+        // Asked for by id, and for the line.
+        vector<uint256> vIds(1, g.GetId());
+        size_t nBefore = CountSent(pM2, "p2lshare");
+        SendLocalItem(pM2, "p2lgetsh", h2, vIds);
+        nFail += Check(CountSent(pM2, "p2lshare") == nBefore + 1, "a member asking for a share by id is sent it") ? 0 : 1;
+        SendLocalItem(pM2, "p2lsync", h2, uint256(0));
+        vector<unsigned char> part;
+        bool fPart = LastSent(pM2, "p2lshares", part) && part.size() > 13;
+        uint64 hPart = 0;
+        if (fPart)
+            memcpy(&hPart, &part[0], 8);
+        nFail += Check(fPart && hPart == h2 && part[12] == 1 && P2PoolRegisteredServesForTest() == 0,
+                       "a member asking for the line is sent it in parts, the last one flagged as the end") ? 0 : 1;
+        SendLocalItem(pStranger, "p2lsync", h2, uint256(0));
+        SendLocalItem(pStranger, "p2lgetsh", h2, vIds);
+        nFail += Check(pStranger->vSend.empty() && pStranger->nMisbehavior == 0,
+                       "a peer with no session asking the same gets silence") ? 0 : 1;
+    }
+
+    // ---- the initiator's side: a listed peer is dialled, and told
+    CNode* pOut = NewP2PoolTestNode(false);
+    CNode* pOutOther = NewP2PoolTestNode(false);
+    {
+        pOut->strBtfAddr = "BF1listedpeer";
+        pOut->strBtfMeeting = "onion " + O2 + ".onion:8333";
+        pOutOther->strBtfAddr = "BF1somebodyelse";
+        pOutOther->strBtfMeeting = "onion " + O + ".onion:8333";
+        vector<string> vPeers(1, "BF1listedpeer@" + O2 + ".onion:8333");
+        vector<string> vBad(1, "BF1listedpeer");
+        vector<string> vMany(17, vPeers[0]);
+        nFail += Check(!P2PoolLocalSetPeers("home", vBad, err) && !P2PoolLocalSetPeers("home", vMany, err) &&
+                       !P2PoolLocalSetPeers("nosuch", vPeers, err) && P2PoolLocalSetPeers("home", vPeers, err),
+                       "listed peers are ADDRESS@HOST.onion, sixteen at most") ? 0 : 1;
+        P2PoolOnVersion(pOutOther);
+        P2PoolOnVersion(pOut);
+        vector<unsigned char> hello;
+        bool fHello = CountSent(pOut, "p2lhello") == 1 && LastSent(pOut, "p2lhello", hello) && hello.size() == 48;
+        unsigned char tA[poollocal::TAG_BYTES];
+        if (fHello)
+            poollocal::HelloTag(keys.A, O2, &hello[0], tA);
+        nFail += Check(fHello && memcmp(tA, &hello[32], sizeof(tA)) == 0,
+                       "an outbound connection to a listed peer is sent a hello bound to the onion dialled") ? 0 : 1;
+        nFail += Check(CountSent(pOutOther, "p2lhello") == 0, "a peer nobody listed is sent none") ? 0 : 1;
+        // The peer's reply, and this node's ack.
+        unsigned char nB[32], tB[poollocal::TAG_BYTES], ack[poollocal::ACK_BYTES];
+        memset(nB, 0x81, sizeof(nB));
+        P2PoolLocalStatusInfo st;
+        bool fAcked = false;
+        if (fHello)
+        {
+            // A reply made with another key first: not this pool's.
+            poollocal::ReplyTag(keysOther.A, O2, &hello[0], nB, tB);
+            CDataStream bad(SER_NETWORK, VERSION);
+            bad.write((const char*)nB, 32);
+            bad.write((const char*)tB, sizeof(tB));
+            SendP2PoolTest(pOut, "p2lhello", bad);
+            bool fNoAck = CountSent(pOut, "p2lack") == 0;
+            poollocal::ReplyTag(keys.A, O2, &hello[0], nB, tB);
+            CDataStream ss(SER_NETWORK, VERSION);
+            ss.write((const char*)nB, 32);
+            ss.write((const char*)tB, sizeof(tB));
+            SendP2PoolTest(pOut, "p2lhello", ss);
+            poollocal::AckTag(keys.A, O2, &hello[0], nB, ack);
+            vector<unsigned char> sent;
+            fAcked = fNoAck && LastSent(pOut, "p2lack", sent) && sent.size() == 32 && memcmp(&sent[0], ack, 32) == 0;
+        }
+        nFail += Check(fAcked && P2PoolLocalStatus("home", st) && st.nSessions == 3,
+                       "a reply with the wrong key is ignored; the right one is acked, and the session is open") ? 0 : 1;
+    }
+
+    // ---- section 8: pool zero beside all that
+    p2pool::ShareChain zeroMirror(bnFloor, false);
+    uint256 zeroTip = 0;
+    {
+        bool fBuilt = true;
+        for (int i = 0; i < 5 && fBuilt; i++)
+        {
+            p2pool::Share z = ChainShare(zeroMirror, main, zeroTip, payTo(3), t + 10 * i);
+            fBuilt = zeroMirror.Add(z, main, err) && P2PoolSubmitShare(z, err);
+            zeroTip = z.GetId();
+        }
+        P2PoolLocalStatusInfo st;
+        nFail += Check(fBuilt && P2PoolLocalStatus("home", st) && st.nShares == 1 &&
+                       CountSent(pM1, "p2pshare") == 0 && CountSent(pM1, "p2lshare") == 0,
+                       "this node's own shares go to the pool it mines, pool zero, and not into a local pool's sessions") ? 0 : 1;
+    }
+    {
+        // Every budget of the other class spent, its orphan queue full, a
+        // paced serve held up by a reader that takes nothing.
+        P2PoolDrainRegisteredBudgetsForTest();
+        for (int i = 0; i < 300; i++)
+        {
+            p2pool::Share o = g;
+            o.data.hashPrevShare = uint256(1000 + i);
+            o.data.nShareHeight = 3;
+            o.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << (int64)(t + i) << p2pool::AnchorPush(rules, o.data);
+            o.hashMerkleRoot = o.coinbase.GetHash();
+            SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareX(o));
+        }
+        std::vector<char> big(600 * 1000);
+        size_t nParts = CountSent(pM1, "p2lshares");
+        size_t nZeroParts = CountSent(pM1, "p2pshares");
+        CRITICAL_BLOCK(pM1->cs_vSend)
+        {
+            pM1->vRegSpans.push_back(std::make_pair(pM1->nSendDrained + (uint64)pM1->vSend.size(),
+                                                    pM1->nSendDrained + (uint64)pM1->vSend.size() + (uint64)big.size()));
+            pM1->vSend.write(&big[0], big.size());
+        }
+        size_t nQueued = pM1->vSend.size();
+        SendLocalItem(pM1, "p2lsync", h1, uint256(0));
+        nFail += Check(pM1->nMisbehavior == 0 && P2PoolRegisteredOrphanCount() == 256 && P2PoolRegisteredShareWorkTokens() == 0 &&
+                       P2PoolRegisteredServesForTest() == 1 && pM1->vSend.size() == nQueued && nParts == 0 && nZeroParts == 0,
+                       "the other class at its limits: budgets spent, 256 orphans waiting, a serve waiting on its reader") ? 0 : 1;
+        nFail += Check(P2PoolOrphanCount() == 0 && P2PoolShareWorkTokens() == 32 && P2PoolHistoryServeTokens() == 4 &&
+                       P2PoolHistoryAskTokens() == 2 && P2PoolDeferredCount() == 0,
+                       "pool zero's budgets, orphan queue and held entries are untouched by it") ? 0 : 1;
+        // A pool zero history request, from a new unproven peer and from the
+        // very connection whose queue the other class filled: served at once.
+        SendP2PoolTest(pZeroPeer, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        SendP2PoolTest(pM1, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        nFail += Check(CountSent(pZeroPeer, "p2pshares") == 1 && pM1->vSend.size() > nQueued &&
+                       P2PoolHistoryServeTokens() == 2 && P2PoolDeferredCount() == 0,
+                       "and a pool zero history request is served at once, from pool zero's own budget") ? 0 : 1;
+    }
+    {
+        // The send queue caps: 5 MB of another pool's messages waiting on a
+        // connection do not count against pool zero's 4 MB; 5 MB of anything
+        // else do, as they always did.
+        CNode* pA = NewP2PoolTestNode(true);
+        CNode* pB = NewP2PoolTestNode(true);
+        std::vector<char> big(5 * 1000 * 1000);
+        pA->vSend.write(&big[0], big.size());
+        CRITICAL_BLOCK(pB->cs_vSend)
+        {
+            pB->vRegSpans.push_back(std::make_pair(pB->nSendDrained, pB->nSendDrained + (uint64)big.size()));
+            pB->vSend.write(&big[0], big.size());
+        }
+        vector<uint256> vIds(1, zeroTip);
+        SendP2PoolTestItem(pA, "p2pgetsh", vIds);
+        SendP2PoolTestItem(pB, "p2pgetsh", vIds);
+        nFail += Check(pA->vSend.size() == big.size() && pB->vSend.size() > big.size(),
+                       "pool zero's queue cap counts the send buffer less the other pools' bytes") ? 0 : 1;
+        P2PoolForgetDeferred(pA);
+        P2PoolForgetDeferred(pB);
+        delete pA;
+        delete pB;
+    }
+
+    // ---- leaving
+    {
+        string errLeave;
+        P2PoolLocalStatusInfo st;
+        bool fLeft = P2PoolLocalLeave("home", errLeave);
+        Sleep(1100);
+        P2PoolServeDeferred();
+        size_t nBefore = pM1->vSend.size();
+        vector<uint256> vIds(1, g.GetId());
+        SendLocalItem(pM1, "p2lgetsh", h1, vIds);
+        nFail += Check(fLeft && !P2PoolLocalStatus("home", st) && pM1->vSend.size() == nBefore && pM1->nMisbehavior == 0 &&
+                       P2PoolRegisteredOrphanCount() == 0 && P2PoolRegisteredServesForTest() == 0,
+                       "a pool this node left is gone: its sessions, its orphans, its serves, and a handle of it means nothing") ? 0 : 1;
+        unsigned char nA[32];
+        memset(nA, 0x91, sizeof(nA));
+        CNode* pLate = NewP2PoolTestNode(true);
+        SendLocalHello(pLate, keys.A, O, nA);
+        nFail += Check(pLate->vSend.empty(), "and a member's hello gets the silence a stranger's does") ? 0 : 1;
+        P2PoolForgetDeferred(pLate);
+        delete pLate;
+    }
+    string errInv;
+    bool fChainInv;
+    CRITICAL_BLOCK(cs_p2pool)
+        fChainInv = P2PoolChain().CheckInvariants(errInv) && P2PoolChain().Size() == 5;
+    nFail += Check(fChainInv, "pool zero's share chain holds its five shares and its invariants after all that") ? 0 : 1;
+
+    CNode* vAll[] = { pStranger, pWrongOnion, pM1, pM2, pZeroPeer, pOut, pOutOther };
+    for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
+    {
+        P2PoolForgetDeferred(vAll[i]);
+        delete vAll[i];
+    }
+    P2PoolResetForTest(bnProofOfWorkLimit, true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -18082,6 +18593,8 @@ int RunSelfTest(const std::string& name)
         return RunP2PoolLanSelfTest();
     if (name == "p2pool-dos")
         return RunP2PoolDosSelfTest();
+    if (name == "p2pool-local")
+        return RunP2PoolLocalSelfTest();
     if (name == "p2pool-chain")
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")
@@ -18172,6 +18685,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local\n");
     return 1;
 }

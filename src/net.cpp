@@ -2598,6 +2598,7 @@ void ThreadSocketHandler2(void* parg)
                         if (nBytes > 0)
                         {
                             vSend.erase(vSend.begin(), vSend.begin() + nBytes);
+                            pnode->nSendDrained += nBytes;
                             pnode->nLastSend = GetTime();
                         }
                         else if (nBytes == 0)

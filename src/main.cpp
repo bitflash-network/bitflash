@@ -5132,7 +5132,8 @@ bool ProcessMessages(CNode* pfrom)
             // them held up blocks, RPC and mining for minutes. They take
             // cs_p2pool alone. Before the version, ProcessMessage refuses them.
             bool fDone = false;
-            if (strCommand.compare(0, 3, "p2p") == 0 && pfrom->nVersion != 0)
+            // A local pool's messages ("p2l") take the same path.
+            if ((strCommand.compare(0, 3, "p2p") == 0 || strCommand.compare(0, 3, "p2l") == 0) && pfrom->nVersion != 0)
             {
                 CDataStream vCopy(vMsg);
                 fDone = fRet = P2PoolProcessMessage(pfrom, strCommand, vCopy);

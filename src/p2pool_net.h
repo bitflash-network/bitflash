@@ -108,4 +108,64 @@ void P2PoolRefillBudgetsForTest();
 // Self-tests: every shared budget empty, the next token a full period away.
 void P2PoolDrainBudgetsForTest();
 
+// ---- Pools other than pool zero (docs/pool-registry.md, sections 8 and 18)
+//
+// Pool zero keeps the budgets, the orphan queue and the held entries above
+// to itself. Every other pool this node is in spends from one second set of
+// the same shape, the registered class, so nothing done with those pools
+// changes how pool zero's traffic is treated.
+//
+// A local pool's messages, between members only, after a hello that proves
+// membership to the onion that was dialled:
+//   p2lhello   32-byte nonce, 16-byte tag: the hello, and the answer to it
+//   p2lack     32 bytes: the initiator's proof; the session is open
+//   p2lshare   handle, ShareX
+//   p2lgetsh   handle, vector<uint256>
+//   p2lsync    handle, uint256 (a share to resume from, or 0)
+//   p2lshares  handle, int tip height, end flag, vector<ShareX>
+// The handle is the session's 8 bytes; the pool id is never on the wire. A
+// hello that matches no pool of this node, and a handle it does not hold on
+// that connection, get silence, and nobody is scored for them.
+
+// The share chain this node's miners work on: pool zero's, or the local
+// pool's that P2PoolLocalMine named. Under cs_p2pool.
+p2pool::ShareChain& P2PoolMinedChain();
+
+// A local pool joins this node (at most poollocal::MAX_LOCAL_POOLS, one per
+// name). strFile is where its share chain is kept between runs; empty keeps
+// it in memory only. fCheckPoW false is for self-tests.
+bool P2PoolLocalAdd(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, const string& strFile,
+                    bool fCheckPoW, string& errOut);
+// Read its saved share chain, once the block index is loaded.
+bool P2PoolLocalLoad(const string& strName);
+// The members' nodes this one dials and says hello to, each
+// ADDRESS@HOST.onion[:PORT]; at most poollocal::MAX_LISTED_PEERS.
+bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, string& errOut);
+// Forget a local pool: its sessions close and its file goes on the next
+// pass of the message thread. Refused while this node mines it.
+bool P2PoolLocalLeave(const string& strName, string& errOut);
+// Mine this local pool instead of pool zero (-p2pool=local:<name>); at
+// startup, before any template is built.
+bool P2PoolLocalMine(const string& strName, string& errOut);
+struct P2PoolLocalStatusInfo
+{
+    size_t nSessions;       // members in session with this node
+    size_t nPending;        // hellos answered and not acked yet
+    size_t nShares;
+    int nTipHeight;
+    vector<string> vPeers;
+    bool fMined;
+};
+bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out);
+// Every peer some local pool of this node lists, once each.
+void P2PoolLocalDialList(vector<string>& out);
+
+// Self-tests: the onions this node answers hellos for, the registered
+// class's counters, and its budgets emptied.
+void P2PoolSetOwnOnionsForTest(const vector<string>& v);
+size_t P2PoolRegisteredOrphanCount();
+int P2PoolRegisteredShareWorkTokens();
+size_t P2PoolRegisteredServesForTest();
+void P2PoolDrainRegisteredBudgetsForTest();
+
 #endif
