@@ -1724,18 +1724,19 @@ has the code and the password can: membership is the only thing it protects.
 its code is: anyone who has the code, or guesses it (a default record with a
 common name is easy to guess), computes the same id and key. With one, the
 code can be shared openly and the pool is still closed. Precisely: someone
-who holds the code but not the password, and sees everything on the chain
-and everything a node sends to a peer that is not in session with it, has
-nothing to test a password guess against offline. The id is never sent to
-such a peer; the coinbase anchor (below) hashes a 256-bit random salt that
-never goes on the chain, so checking a guess against it means guessing the
-salt as well; and a hello is bound to the onion it was sent to, so only the
-listed peer that receives it can check it, at one Argon2id run per guess. The
-salt does this, not the key `C`: whoever holds the code derives `C` from each
-guess as easily as the id. Members can test guesses (they hold shares, which
-carry the id and the salt), but they already hold `K`. The operator's own
-copies of the id and password are kept out of argv and logs (above, and
-*Using it*).
+who holds the code but not the password can test a password guess offline
+only against a hello sent to it, which a member sends only to a peer it
+listed. Everything on the chain, and everything sent to anyone else, gives
+it nothing to test against: the id and the shares go only to members in
+session; the coinbase anchor (below) hashes a 256-bit random salt that never
+goes on the chain, so checking a guess against it means guessing the salt as
+well; and a hello is bound to the onion it was sent to, so only the listed
+peer that receives it can check it, at one Argon2id run per guess. The salt
+does this for the anchor, not the key `C`: whoever holds the code derives
+`C` from each guess as easily as the id. Members can test guesses (they hold
+shares, which carry the id and the salt), but they already hold `K`. The
+operator's own copies of the id and password are kept out of argv and logs
+(above, and *Using it*).
 
 ### The coinbase anchor
 
@@ -1880,7 +1881,11 @@ nodes that accept connections.
 ### Limits
 
 A local pool spends from the registered class of section 8, never from pool
-zero's: its shares are checked through the registered RandomX budget, its
+zero's: its shares are checked through the registered RandomX budget (a
+member in session is proven, and its shares still draw on a budget of their
+own: one per session, twice the pool's share rate with a small burst, and
+one for all sessions together; a share over it is held, not hashed and not
+scored), its
 orphans wait in the registered queue, its serves take the 8 registered slots
 and the per-(connection, pool) limits of sections 8 and 17, with the session
 in place of the pool. On top of that: at most 4 local pools per node, at most
