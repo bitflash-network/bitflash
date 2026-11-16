@@ -378,8 +378,16 @@ static void LoadShares(PoolState& ps)
 static void WriteShares(const string& strFile, int nTipHeight, const vector<Share>& v, bool fPrivate)
 {
     string tmp = strFile + ".new";
+    if (fPrivate)
     {
-        CAutoFile file(fPrivate ? OpenPrivateFile(tmp.c_str(), false) : fopen(tmp.c_str(), "wb"));
+        CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
+        if (!file)
+            return;
+        file << nTipHeight << v;
+    }
+    else
+    {
+        CAutoFile file(fopen(tmp.c_str(), "wb"));
         if (!file)
             return;
         file << nTipHeight << v;

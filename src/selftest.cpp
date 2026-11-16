@@ -8458,7 +8458,7 @@ static int RunP2PoolLocalNodeSelfTest()
     // ---- the node starts again: its pools come back from their files
     {
         // A file that is not a local pool's: skipped, and nothing else is.
-        FILE* f = fopen((tmp + "/pools/local/" + std::string(64, 'a') + ".conf").c_str(), "wb");
+        FILE* f = OpenPrivateFile((tmp + "/pools/local/" + std::string(64, 'a') + ".conf").c_str(), false);
         if (f)
         {
             fputs("record=00\nk=00\n", f);
