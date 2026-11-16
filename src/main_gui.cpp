@@ -163,6 +163,8 @@ static void PrintUsage()
     printf("Mining mode:\n");
     printf("  /p2pool                    (pooled mining with no pool: XMRig points at this node,\n");
     printf("                              blocks pay every miner of the share window; docs/p2pool.md)\n");
+    printf("  /p2pool=local:NAME         (mine this node's local pool NAME instead: a private pool of\n");
+    printf("                              your own machines; poolcreate local / pooljoin make one)\n");
     printf("  /p2poolport=N              (default 3333, on 127.0.0.1)\n");
     printf("  /p2poolbind=IP             (also serve stratum on this private address, for miners on\n");
     printf("                              your local network: 10.x, 172.16-31.x, 192.168.x, 169.254.x,\n");
@@ -314,6 +316,9 @@ static void StartupRefuse(const string& strWhat, const string& strFix)
 }
 
 static bool fJsonRpc = false;
+// -p2pool=local:<name>: the local pool this node mines (its name; the pool
+// id is never on the command line).
+static string strP2PoolLocalName;
 
 static void ParseStartupArguments(int argc, char* argv[])
 {
@@ -384,6 +389,14 @@ static void ParseStartupArguments(int argc, char* argv[])
             StartupRefuse("-p2pool and -operator do not go together",
                           "P2Pool needs no operator: every miner runs their own node.");
         fP2PoolMode = true;
+        // Which pool (docs/pool-registry.md, section 9): pool zero, or
+        // local:<name>. A pool id this release cannot mine, or a mistyped
+        // one, refuses rather than quietly mine pool zero. Whether the named
+        // local pool is on this node is known once P2PoolInit has read them.
+        string strChoiceWhyNot;
+        if (!P2PoolParseChoice(argval2(argc, argv, "/p2pool", "-p2pool"), strP2PoolLocalName, strChoiceWhyNot))
+            StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, or -p2pool=local:<name> for a "
+                                     "local pool of this node (poollist shows them).");
         string strPort = argval2(argc, argv, "/p2poolport", "-p2poolport");
         if (!strPort.empty())
         {
@@ -1178,8 +1191,16 @@ int main(int argc, char* argv[])
         return 1;
     }
     // The share chain this node kept (p2pool.dat); every node relays shares,
-    // so every node keeps it, mining or not.
+    // so every node keeps it, mining or not. Its local pools come back too.
     P2PoolInit();
+    if (fP2PoolMode && !strP2PoolLocalName.empty())
+    {
+        string strWhyNot;
+        if (!P2PoolLocalMine(strP2PoolLocalName, strWhyNot))
+            StartupRefuse(strprintf("-p2pool=local:%s: %s", strP2PoolLocalName.c_str(), strWhyNot.c_str()),
+                          "Create the pool with poolcreate local or join it with pooljoin first; "
+                          "a pool left with poolleave is gone from this node.");
+    }
 #endif
 
     printf("Loading wallet...\n");
