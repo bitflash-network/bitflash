@@ -13621,14 +13621,57 @@ static int RunChainWorkSelfTest()
 namespace {
 
 std::map<const CBlockIndex*, CBlock> g_poolIndexBlocks;
+// Ways to make a read go wrong: fail (or throw) at one height, and something
+// to do while a block is read (move the chain, ask for a stop).
+int g_poolIndexFailAt = -1;
+bool g_fPoolIndexThrow = false;
+std::function<void(const CBlockIndex*)> g_poolIndexReadHook;
 
 bool PoolIndexTestRead(const CBlockIndex* pindex, CBlock& block)
 {
+    if (pindex->nHeight == g_poolIndexFailAt)
+    {
+        if (g_fPoolIndexThrow)
+            throw std::runtime_error("CAutoFile::read : end of file");
+        return false;
+    }
     std::map<const CBlockIndex*, CBlock>::const_iterator it = g_poolIndexBlocks.find(pindex);
     if (it == g_poolIndexBlocks.end())
         return false;
     block = it->second;
+    if (g_poolIndexReadHook)
+        g_poolIndexReadHook(pindex);
     return true;
+}
+
+// A pool-registry.dat as the index writes one: version, registry, any extra
+// bytes, and the hash of all of it. With nPatchAt >= 0 one 4-byte field of
+// the registry (counted from the start of the file) is overwritten first.
+bool PoolIndexTestWriteFile(const std::string& path, int nVersion, const CPoolRegistry& r,
+                            const std::string& extra, int nPatchAt = -1, int nPatch = 0)
+{
+    CDataStream ss(SER_DISK);
+    ss << nVersion << r;
+    std::string data(ss.begin(), ss.end());
+    data += extra;
+    if (nPatchAt >= 0 && nPatchAt + 4 <= (int)data.size())
+        memcpy(&data[nPatchAt], &nPatch, 4);
+    uint256 h = Hash(data.begin(), data.end());
+    data.append((const char*)h.begin(), 32);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool fOk = fwrite(data.data(), 1, data.size(), f) == data.size();
+    return fclose(f) == 0 && fOk;
+}
+
+bool PoolIndexTestWriteRaw(const std::string& path, const std::string& data)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool fOk = fwrite(data.data(), 1, data.size(), f) == data.size();
+    return fclose(f) == 0 && fOk;
 }
 
 std::vector<unsigned char> PoolIndexTestRecord(const std::string& name)
@@ -14213,7 +14256,9 @@ static int RunPoolIndexSelfTest()
                            "a damaged file is not used; the chain gives the same registry") ? 0 : 1;
         }
 
-        // A file whose tip this node does not know.
+        // A file ending in blocks this node lost (an unclean stop that took
+        // the last blocks of its block index): it resumes from the newest
+        // block of its locator that the node still knows.
         {
             CBlockIndex* pTipS = chain.Extend(pM[50], 5, fillMain);
             chain.SetMain(pTipS);
@@ -14227,28 +14272,253 @@ static int RunPoolIndexSelfTest()
                 chain.Forget(pTipS);
                 pTipS = prev;
             }
+            CPoolIndex resumed(PoolIndexTestRead);
+            resumed.SetPath(path);
+            bool fLoaded = resumed.Load();
+            bool fSyncedS = PoolIndexTestSync(resumed, 1000);
+            nFail += Check(fOk && fLoaded && fSyncedS && resumed.Rebuilds() == 0 && resumed.Digest() == idx.Digest(),
+                           "a file ending in blocks this node lost resumes from its locator, not from genesis") ? 0 : 1;
+        }
+
+        // A file of a chain this node never had: read again from genesis,
+        // the old registry answering until the new one reaches the tip.
+        {
+            CPoolRegistry stray;
+            stray.Reset((const unsigned char*)pchMessageStart);
+            CTransaction txC = PoolIndexTestBurn(PoolIndexTestRecordScript(recC), poolreg::MIN_BURN, 14);
+            for (int n = 0; n <= 40; n++)
+                stray.ConnectBlock(n == 5 ? PoolIndexTestBlock(n, none, std::vector<CTransaction>(1, txC)) : PoolIndexTestPlain(n),
+                                   n, uint256((uint64)0xdead0000 + n));
+            bool fWritten = PoolIndexTestWriteFile(path, 2, stray, "");
             CPoolIndex stranger(PoolIndexTestRead);
             stranger.SetPath(path);
             bool fLoaded = stranger.Load();
-            bool fSyncedS = PoolIndexTestSync(stranger, 1000);
-            nFail += Check(fOk && fLoaded && fSyncedS && stranger.Rebuilds() == 1 && stranger.Digest() == idx.Digest(),
-                           "a file ending in a block this node does not know: the chain is read again") ? 0 : 1;
+            bool fSynced0 = false;
+            stranger.Step(1000, fSynced0);
+            stranger.Step(10, fSynced0);
+            bool fMidway = stranger.Rebuilding() && stranger.Status(idC) == POOL_ACTIVE && stranger.Height() == 40;
+            bool fOk = PoolIndexTestSync(stranger, 1000);
+            nFail += Check(fWritten && fLoaded && fMidway && fOk && !stranger.Rebuilding() && stranger.Rebuilds() == 1 &&
+                           stranger.Status(idC) == POOL_UNKNOWN && stranger.Digest() == idx.Digest(),
+                           "a file of a chain this node never had: read again beside it, its pools answered until then") ? 0 : 1;
+
+            // Files that are not used.
+            std::string body;
+            {
+                CDataStream ss(SER_DISK);
+                ss << stray;
+                body.assign(ss.begin(), ss.end());
+            }
+            CPoolRegistry other;
+            const unsigned char magicOther[4] = { 0xce, 0xe2, 0xc0, 0xff };
+            other.Reset(magicOther);
+            other.ConnectBlock(PoolIndexTestPlain(0), 0, uint256(1));
+            bool fRefused = true;
+            const char* vWhy[] = { "another version", "another network", "fewer than 36 bytes", "trailing bytes",
+                                   "contents that do not hold together" };
+            for (int k = 0; k < 5; k++)
+            {
+                bool fW = false;
+                if (k == 0)
+                    fW = PoolIndexTestWriteFile(path, 1, stray, "");
+                else if (k == 1)
+                    fW = PoolIndexTestWriteFile(path, 2, other, "");
+                else if (k == 2)
+                    fW = PoolIndexTestWriteRaw(path, std::string(35, 'x'));
+                else if (k == 3)
+                    fW = PoolIndexTestWriteFile(path, 2, stray, "xyz");
+                else
+                    fW = PoolIndexTestWriteFile(path, 2, stray, "", 8, 2);   // the tip at 2, an appearance at 5
+                CPoolIndex refused(PoolIndexTestRead);
+                refused.SetPath(path);
+                bool fL = refused.Load();
+                if (!fW || fL)
+                {
+                    printf("       (a file with %s was %s)\n", vWhy[k], fW ? "used" : "not written");
+                    fRefused = false;
+                }
+            }
+            nFail += Check(fRefused, "files of another version or network, too short, with trailing bytes, "
+                                     "or whose contents do not hold together are not used") ? 0 : 1;
+            bool fGood = PoolIndexTestWriteFile(path, 2, stray, "");
+            CPoolIndex good(PoolIndexTestRead);
+            good.SetPath(path);
+            nFail += Check(fGood && good.Load(), "and the same file, as written, is") ? 0 : 1;
+        }
+
+        // The network changes under the index.
+        {
+            CPoolIndex net(PoolIndexTestRead);
+            bool fOk = PoolIndexTestSync(net, 1000);
+            SelectChainParams(true);
+            bool fSyncedN = false;
+            int n = net.Step(1000, fSyncedN);
+            const unsigned char magicTest[4] = { 0xce, 0xe2, 0xc0, 0xff };
+            bool fReset = n == 1 && net.Rebuilds() == 1 && net.Height() == -1 && net.Snapshot().HasMagic(magicTest);
+            SelectChainParams(false);
+            fOk = fOk && PoolIndexTestSync(net, 1000);
+            nFail += Check(fReset && fOk && net.Rebuilds() == 2 && net.Digest() == idx.Digest(),
+                           "another network's registry is dropped at the next pass, and the chain read again") ? 0 : 1;
+        }
+
+        // The chain moves while a pass reads it.
+        {
+            CPoolIndex moving(PoolIndexTestRead);
+            g_poolIndexReadHook = [&](const CBlockIndex* p) {
+                if (p == pM[30])
+                    chain.SetMain(pTipZ);
+            };
+            bool fSyncedM = false;
+            moving.Step(1000, fSyncedM);
+            g_poolIndexReadHook = nullptr;
+            int nAfter = moving.Height();
+            bool fOk = PoolIndexTestSync(moving, 1000);
+            nFail += Check(nAfter == 29 && fOk && moving.Rebuilds() == 0 && moving.Digest() == PoolIndexTestReference(pTipZ),
+                           "a block no longer on the chain ends the pass; the next ones follow the new branch") ? 0 : 1;
+            chain.SetMain(pTipM);
+        }
+
+        // A block that cannot be read, and one whose read throws.
+        {
+            CPoolIndex flaky(PoolIndexTestRead);
+            bool fSyncedF = false;
+            g_poolIndexFailAt = 20;
+            int n1 = flaky.Step(1000, fSyncedF);
+            int n2 = flaky.Step(1000, fSyncedF);
+            nFail += Check(n1 == 20 && n2 == -1 && flaky.Height() == 19,
+                           "a block that cannot be read ends the pass, and the next pass says so") ? 0 : 1;
+            g_fPoolIndexThrow = true;
+            bool fEscaped = false;
+            int n3 = 0;
+            try
+            {
+                n3 = flaky.Step(1000, fSyncedF);
+            }
+            catch (...)
+            {
+                fEscaped = true;
+            }
+            g_poolIndexFailAt = -1;
+            g_fPoolIndexThrow = false;
+            int nAt = flaky.Height();
+            bool fOk = PoolIndexTestSync(flaky, 1000);
+            if (!Check(!fEscaped && n3 == -1 && nAt == 19 && fOk && flaky.Digest() == idx.Digest(),
+                       "a read that throws is the same: the pass ends, nothing escapes, the next pass goes on"))
+            {
+                printf("       (escaped %d, returned %d, at %d, synced %d, same %d)\n", (int)fEscaped, n3, nAt, (int)fOk,
+                       (int)(flaky.Digest() == idx.Digest()));
+                nFail++;
+            }
+        }
+
+        // A stop asked for in the middle of a pass.
+        {
+            CPoolIndex stopper(PoolIndexTestRead);
+            g_poolIndexReadHook = [&](const CBlockIndex* p) {
+                if (p->nHeight == 25)
+                    stopper.RequestStop();
+            };
+            bool fSyncedS = false;
+            int n = stopper.Step(1000, fSyncedS);
+            g_poolIndexReadHook = nullptr;
+            bool fStopped = n == 26 && stopper.Height() == 25 && stopper.Step(1000, fSyncedS) == 0 && stopper.Height() == 25;
+            stopper.ClearStop();
+            bool fOk = PoolIndexTestSync(stopper, 1000);
+            nFail += Check(fStopped && fOk && stopper.Digest() == idx.Digest(),
+                           "a stop ends the pass after the block being read, and reading resumes after it") ? 0 : 1;
+        }
+
+        // Anchors naming ids nobody burned: kept only for the last 2160
+        // blocks, so they cost the index a bounded amount, however many.
+        {
+            CPoolRegistry s;
+            s.Reset((const unsigned char*)pchMessageStart);
+            std::vector<std::vector<unsigned char> > vRec;
+            for (int n = 0; n < 4000; n++)
+                vRec.push_back(PoolIndexTestRecord(strprintf("s%d", n)));
+            size_t nMaxStored = 0, nMaxCounted = 0;
+            for (int n = 0; n < 4000; n++)
+            {
+                uint256 id = PoolIndexTestId(vRec[n]);
+                s.ConnectBlock(PoolIndexTestBlock(n, std::vector<std::vector<unsigned char> >(1, PoolIndexTestPush("p2x", &id, uint256(n)))),
+                               n, uint256((uint64)5 * 0x100000 + n));
+                nMaxStored = std::max(nMaxStored, s.AnchorsStored());
+                nMaxCounted = std::max(nMaxCounted, s.AnchorsCounted());
+            }
+            const size_t nBoundStored = POOL_UNREGISTERED_ANCHOR_BLOCKS + POOL_INDEX_REORG_MARGIN + 2 * POOL_ANCHOR_SWEEP_INTERVAL;
+            const size_t nBoundCounted = POOL_UNREGISTERED_ANCHOR_BLOCKS + POOL_ANCHOR_SWEEP_INTERVAL;
+            printf("       4000 blocks, each naming a new id: at most %u anchors kept, %u counting\n",
+                   (unsigned int)nMaxStored, (unsigned int)nMaxCounted);
+            nFail += Check(nMaxStored <= nBoundStored && nMaxCounted <= nBoundCounted && s.AnchorIds() == s.AnchorsStored(),
+                           "4000 blocks each naming a new id keep a bounded number of anchors") ? 0 : 1;
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            s.Anchors(PoolIndexTestId(vRec[100]), v, nWin);
+            bool fOldGone = v.empty();
+            s.Anchors(PoolIndexTestId(vRec[3990]), v, nWin);
+            nFail += Check(fOldGone && v.size() == 1 && nWin == 1,
+                           "an old claim of an id nobody burned is gone; a recent one counts") ? 0 : 1;
+            std::vector<CTransaction> vTx;
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(vRec[100]), poolreg::MIN_BURN, 15));
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(vRec[3990]), poolreg::MIN_BURN, 16));
+            s.ConnectBlock(PoolIndexTestBlock(4000, none, vTx), 4000, uint256((uint64)5 * 0x100000 + 4000));
+            CPoolInfo i100, i3990;
+            s.Lookup(PoolIndexTestId(vRec[100]), i100);
+            s.Lookup(PoolIndexTestId(vRec[3990]), i3990);
+            nFail += Check(i100.nStatus == POOL_PENDING && i100.vRecentAnchors.empty() &&
+                           i3990.nStatus == POOL_PENDING && i3990.vRecentAnchors.size() == 1,
+                           "burned later, a pool has the anchors of its last 2160 blocks before the burn, no older") ? 0 : 1;
+
+            // The same on a chain, with reorgs across the sweeps.
+            std::function<CBlock(int)> fillSpam = [&](int n) {
+                uint256 id = PoolIndexTestId(vRec[n % 4000]);
+                std::vector<std::vector<unsigned char> > p(1, PoolIndexTestPush("p2x", &id, uint256(n)));
+                return PoolIndexTestBlock(n, p);
+            };
+            // 4000 blocks: the first sweep that drops a claim is at 2304, the
+            // first that removes dropped ones for good at 3744.
+            CBlockIndex* pTipP = chain.Extend(pGen, 4000, fillSpam);
+            CBlockIndex* pP3800 = pTipP;
+            while (pP3800->nHeight > 3800)
+                pP3800 = pP3800->pprev;
+            CBlockIndex* pP2400 = pP3800;
+            while (pP2400->nHeight > 2400)
+                pP2400 = pP2400->pprev;
+            chain.SetMain(pTipP);
+            CPoolIndex spam(PoolIndexTestRead);
+            bool fOk = PoolIndexTestSync(spam, 1000);
+            nFail += Check(fOk && spam.Digest() == PoolIndexTestReference(pTipP) &&
+                           spam.Snapshot().AnchorsStored() <= nBoundStored,
+                           "read on a chain, the same bound, and the same registry as a straight read") ? 0 : 1;
+            CBlockIndex* pTipP1 = chain.Extend(pP3800, 250, fillPlain);
+            chain.SetMain(pTipP1);
+            fOk = PoolIndexTestSync(spam, 1000);
+            nFail += Check(fOk && spam.Rebuilds() == 0 && spam.Digest() == PoolIndexTestReference(pTipP1),
+                           "a reorg of 200 blocks across sweeps brings the swept claims back in place, exactly") ? 0 : 1;
+            CBlockIndex* pTipP2 = chain.Extend(pP2400, 1700, fillPlain);
+            chain.SetMain(pTipP2);
+            fOk = PoolIndexTestSync(spam, 1000);
+            if (!Check(fOk && spam.Rebuilds() == 1 && spam.Digest() == PoolIndexTestReference(pTipP2),
+                       "one below claims already removed for good reads the chain again, and is exact"))
+            {
+                printf("       (synced %d, rebuilds %d, same %d, height %d)\n", (int)fOk, spam.Rebuilds(),
+                       (int)(spam.Digest() == PoolIndexTestReference(pTipP2)), spam.Height());
+                nFail++;
+            }
         }
 
         // Reorgs and the margin: pool zero anchored in every block, so its
-        // oldest anchors are dropped as the chain grows.
+        // oldest anchors are removed as the chain grows.
         {
             std::function<CBlock(int)> fillZero = [&](int n) {
                 std::vector<std::vector<unsigned char> > p(1, PoolIndexTestPush("p2p", NULL, uint256(n)));
                 return PoolIndexTestBlock(n, p, n == 100 ? std::vector<CTransaction>(1, txA) : std::vector<CTransaction>());
             };
             CBlockIndex* pTipL = chain.Extend(pGen, 2400, fillZero);
-            CBlockIndex* pL1000 = pTipL;
-            while (pL1000->nHeight > 1000)
-                pL1000 = pL1000->pprev;
-            CBlockIndex* pL900 = pL1000;
-            while (pL900->nHeight > 900)
-                pL900 = pL900->pprev;
+            CBlockIndex* pL960 = pTipL;
+            while (pL960->nHeight > 960)
+                pL960 = pL960->pprev;
+            CBlockIndex* pL959 = pL960->pprev;
             chain.SetMain(pTipL);
             CPoolIndex deep(PoolIndexTestRead);
             deep.SetPath(path);
@@ -14256,13 +14526,13 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fOk && deep.Digest() == PoolIndexTestReference(pTipL) && deep.Status(idA) == POOL_ACTIVE,
                            "2400 blocks, each with an anchor: read to the tip") ? 0 : 1;
 
-            CBlockIndex* pTipL1 = chain.Extend(pL1000, 1401, fillZero);
+            CBlockIndex* pTipL1 = chain.Extend(pL960, 1440, fillZero);
             chain.SetMain(pTipL1);
             fOk = PoolIndexTestSync(deep, 1000);
             nFail += Check(fOk && deep.Rebuilds() == 0 && deep.Digest() == PoolIndexTestReference(pTipL1),
-                           "a reorg 1400 blocks deep, within the margin, is undone in place and exact") ? 0 : 1;
+                           "a reorg of exactly 1440 blocks, the margin, is undone in place and exact") ? 0 : 1;
 
-            CBlockIndex* pTipL2 = chain.Extend(pL900, 1502, fillZero);
+            CBlockIndex* pTipL2 = chain.Extend(pL959, 1443, fillZero);
             chain.SetMain(pTipL2);
             fOk = PoolIndexTestSync(deep, 1000);
             std::vector<CPoolAnchor> v;
@@ -14270,7 +14540,7 @@ static int RunPoolIndexSelfTest()
             deep.Anchors(idZero, v, nWin);
             nFail += Check(fOk && deep.Rebuilds() == 1 && deep.Digest() == PoolIndexTestReference(pTipL2) &&
                            nWin == POOL_ANCHOR_WINDOW && v.size() == POOL_RECENT_ANCHORS && v[0].nHeight == 2402,
-                           "one deeper than what was kept reads the chain again, and is exact") ? 0 : 1;
+                           "one of 1441 reads the chain again, and is exact") ? 0 : 1;
         }
     }
     catch (std::exception& e)
@@ -14336,23 +14606,27 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fApart && apart.Digest() == PoolIndex().Digest(),
                            "a second reading of the same block files gives the same registry") ? 0 : 1;
 
-            // The thread writes its file soon after it reaches the tip.
-            for (int i = 0; i < 300; i++)
+            // Stopped at once, before its first save (10 s after the tip),
+            // the thread saves on its way out.
+            bool fBeforeSave = !pszDataDir && GetTime() - nStart < 8;
+            bool fFileBefore = false;
             {
                 FILE* f = fopen(fileNode.c_str(), "rb");
                 if (f)
                 {
+                    fFileBefore = true;
                     fclose(f);
-                    break;
                 }
-                Sleep(100);
             }
             PoolIndexStop();
             CPoolIndex fromFile;
             fromFile.SetPath(fileNode);
             bool fLoaded = fromFile.Load();
             nFail += Check(fLoaded && fromFile.Digest() == PoolIndex().Digest(),
-                           "it writes pool-registry.dat, which reads back to the same registry") ? 0 : 1;
+                           "stopped, it writes pool-registry.dat, which reads back to the same registry") ? 0 : 1;
+            if (!pszDataDir)
+                nFail += Check(fBeforeSave && !fFileBefore && fLoaded,
+                               "and that file came from the save on the way out, not an earlier one") ? 0 : 1;
 
             if (pszDataDir)
             {
