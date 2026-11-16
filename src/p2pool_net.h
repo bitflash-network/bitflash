@@ -130,33 +130,67 @@ void P2PoolDrainBudgetsForTest();
 // The share chain this node's miners work on: pool zero's, or the local
 // pool's that P2PoolLocalMine named. Under cs_p2pool.
 p2pool::ShareChain& P2PoolMinedChain();
+// A number that changes whenever a share joins that chain: the stratum
+// checks then whether the uncles its job names are still the ones the next
+// share could name (docs/pool-registry.md, section 9).
+uint64 P2PoolMinedChainSeq();
 
 // A local pool joins this node (at most poollocal::MAX_LOCAL_POOLS, one per
 // name). strFile is where its share chain is kept between runs; empty keeps
-// it in memory only. fCheckPoW false is for self-tests.
+// it in memory only. fCheckPoW false is for self-tests. Nothing is written:
+// P2PoolLocalJoin is what poolcreate and pooljoin use.
 bool P2PoolLocalAdd(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, const string& strFile,
                     bool fCheckPoW, string& errOut);
+// A local pool joins this node for good: its file pools/local/<id>.conf is
+// written owner-only (the record, K and the listed peers, never the
+// password), it comes back from there on every start (P2PoolInit), and a
+// share chain left in pools/local/<id>.dat is read. The keys come from
+// poollocal::Derive, whose Argon2id run the caller makes before, outside
+// every lock. Takes cs_main, then cs_p2pool. Errors name no file.
+bool P2PoolLocalJoin(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, string& errOut);
 // Read its saved share chain, once the block index is loaded.
 bool P2PoolLocalLoad(const string& strName);
 // The members' nodes this one dials and says hello to, each
-// ADDRESS@HOST.onion[:PORT]; at most poollocal::MAX_LISTED_PEERS.
+// ADDRESS@HOST.onion[:PORT]; at most poollocal::MAX_LISTED_PEERS. Saved in
+// the pool's file.
 bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, string& errOut);
-// Forget a local pool: its sessions close and its file goes on the next
+// Forget a local pool: its sessions close and its files go on the next
 // pass of the message thread. Refused while this node mines it.
 bool P2PoolLocalLeave(const string& strName, string& errOut);
 // Mine this local pool instead of pool zero (-p2pool=local:<name>); at
 // startup, before any template is built.
 bool P2PoolLocalMine(const string& strName, string& errOut);
+// What -p2pool=<value> asks to mine (docs/pool-registry.md, section 9):
+// pool zero (true, strLocalOut empty: no value, any value that is not a
+// pool id, or pool zero's own id), a local pool (true, its name, from
+// "local:<name>"), or nothing a node may start with (false, and why: an
+// Everpool pool's id, which this release cannot mine yet, or 40 to 80 hex
+// digits that are not 64, a mistyped id). The value is never echoed back.
+bool P2PoolParseChoice(const string& strValue, string& strLocalOut, string& errOut);
 struct P2PoolLocalStatusInfo
 {
+    enum
+    {
+        PEER_NOT_CONNECTED = 0, // no connection this node dialled to it
+        PEER_CONNECTED,         // dialled, no hello sent on it yet
+        PEER_NO_PROOF,          // a hello went, and no session came of it
+        PEER_OUR_CAP,           // this node is at its session cap for the pool
+        PEER_SESSION,           // in session
+    };
+    poolreg::PoolRecord rec;
     size_t nSessions;       // members in session with this node
+    size_t nInboundSessions;
     size_t nPending;        // hellos answered and not acked yet
     size_t nShares;
     int nTipHeight;
     vector<string> vPeers;
+    vector<int> vPeerState; // one of the above per listed peer
     bool fMined;
+    bool fAtCap;
 };
 bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out);
+// The names of this node's local pools.
+void P2PoolLocalNames(vector<string>& out);
 // Every peer some local pool of this node lists, once each.
 void P2PoolLocalDialList(vector<string>& out);
 

@@ -5,6 +5,9 @@
 #include "p2pool_net.h"
 #include "nostr.h"
 #include <list>
+#ifndef WIN32
+#include <dirent.h>
+#endif
 
 using namespace p2pool;
 
@@ -225,6 +228,24 @@ ShareChain& P2PoolMinedChain()
     return *PoolMined().chain;
 }
 
+// Bumped under cs_p2pool whenever a share joins the mined pool's chain.
+static uint64 nMinedChainSeq = 0;
+
+uint64 P2PoolMinedChainSeq()
+{
+    uint64 n;
+    CRITICAL_BLOCK(cs_p2pool)
+        n = nMinedChainSeq;
+    return n;
+}
+
+// Under cs_p2pool.
+static void NoteChainGrew(PoolState& ps)
+{
+    if (&ps == &PoolMined())
+        nMinedChainSeq++;
+}
+
 // The per-connection state of a pool: CNode's own fields for pool zero, the
 // session's for any other. A connection with no session in that pool gets a
 // scratch one, which nothing keeps.
@@ -352,11 +373,13 @@ static void LoadShares(PoolState& ps)
     printf("p2pool: %u shares loaded, tip at height %d\n", (unsigned)chain.Size(), chain.Height(chain.Tip()));
 }
 
-static void WriteShares(const string& strFile, int nTipHeight, const vector<Share>& v)
+// fPrivate: owner-only, for a local pool's file, whose shares carry the pool
+// id (with the code, a password oracle; section 18).
+static void WriteShares(const string& strFile, int nTipHeight, const vector<Share>& v, bool fPrivate)
 {
     string tmp = strFile + ".new";
     {
-        CAutoFile file(fopen(tmp.c_str(), "wb"));
+        CAutoFile file(fPrivate ? OpenPrivateFile(tmp.c_str(), false) : fopen(tmp.c_str(), "wb"));
         if (!file)
             return;
         file << nTipHeight << v;
@@ -467,6 +490,7 @@ static void MaybeSaveShares(PoolState& ps, bool fNow = false)
     vector<Share> v;
     int nTipHeight;
     string strFile;
+    bool fPrivate;
     CRITICAL_BLOCK(cs_p2pool)
     {
         if (!fNow && GetTime() - ps.nLastSave < 120)
@@ -475,9 +499,10 @@ static void MaybeSaveShares(PoolState& ps, bool fNow = false)
         ps.chain->History(v);
         nTipHeight = ps.chain->Height(ps.chain->Tip());
         strFile = ps.strFile;
+        fPrivate = !ps.fZero;
     }
     if (!strFile.empty())
-        WriteShares(strFile, nTipHeight, v);
+        WriteShares(strFile, nTipHeight, v, fPrivate);
 }
 
 // A share that is also a block: what its coinbase pays, so every node -- not
@@ -759,6 +784,8 @@ static bool AcceptShare(PoolState& ps, const Share& s, CNode* pfrom, bool fHisto
             fOk = (*ps.chain).Add(cur, main, err, &vMissing, &fBlock, pGate);
             nTipHeight = (*ps.chain).Height((*ps.chain).Tip());
             bnTipNext.SetCompact((*ps.chain).NextShareBits((*ps.chain).Tip()));
+            if (fOk)
+                NoteChainGrew(ps);
         }
         if (fOk)
         {
@@ -933,7 +960,11 @@ bool P2PoolSubmitShare(const Share& share, string& errOut, bool* pfBlock)
     NodeMainView main;
     bool fOk, fBlock = false;
     CRITICAL_BLOCK(cs_p2pool)
+    {
         fOk = ps.chain->Add(share, main, errOut, NULL, &fBlock);
+        if (fOk)
+            NoteChainGrew(ps);
+    }
     if (fOk)
         MaybeSaveShares(ps);
     if (pfBlock)
@@ -1493,7 +1524,7 @@ void P2PoolDrainRegisteredBudgetsForTest()
     }
 }
 
-static void LocalResetForTest();
+static void LocalResetForTest(bool fCheckPoW);
 
 void P2PoolResetForTest(const CBigNum& bnFloor, bool fCheckPoW)
 {
@@ -1502,7 +1533,7 @@ void P2PoolResetForTest(const CBigNum& bnFloor, bool fCheckPoW)
         PoolState& ps = PoolZero();
         classZero.Reset();
         classReg.Reset();
-        LocalResetForTest();
+        LocalResetForTest(fCheckPoW);
         delete ps.chain;
         ps.chain = new ShareChain(bnFloor, fCheckPoW);
         ps.nFirstHistoryAsk = 0;
@@ -1586,15 +1617,22 @@ struct LocalPool
     map<CNode*, uint64> mapHandle;      // the open sessions and their handles
     map<CNode*, int64> mapHelloAt;      // when this node last sent each connection a hello
     bool fLeaving;
+    // pools/local/<id>.conf: the record, K and the listed peers, never the
+    // password. Empty for a pool kept in memory only (self-tests).
+    string strConf;
 
     LocalPool(const string& strNameIn, const poolreg::PoolRecord& recIn, const poollocal::Keys& keysIn,
               ShareChain* chainIn, const string& strFileIn)
         : strName(strNameIn), rec(recIn), keys(keysIn), sessions(keysIn),
           state(&classReg, chainIn, strFileIn), fLeaving(false) {}
+    ~LocalPool() { OPENSSL_cleanse(&keys, sizeof(keys)); }
 };
 
 // Under cs_p2pool.
 static vector<LocalPool*> vLocalPools;
+// Self-tests: whether the pools made from files and RPCs check RandomX work
+// (P2PoolResetForTest sets it; always true in a node).
+static bool fLocalCheckPoW = true;
 
 // What this node keeps for a connection that took part in a hello. Each
 // holds a reference on its node until the connection is seen closed.
@@ -2045,6 +2083,12 @@ static void LocalRemove(LocalPool* lp)
         remove(lp->state.strFile.c_str());
         remove((lp->state.strFile + ".new").c_str());
     }
+    if (!lp->strConf.empty())
+    {
+        remove(lp->strConf.c_str());
+        remove((lp->strConf + ".new").c_str());
+    }
+    LogPrint("p2pool", "p2pool: local pool '%s' left; its files are gone\n", lp->strName.c_str());
     delete lp->state.chain;
     delete lp;
 }
@@ -2090,16 +2134,12 @@ static void LocalTick()
     PumpRegServes();
 }
 
-// Under cs_p2pool (P2PoolInit). The pools this node saved come back here
-// once they have a file format of their own (pools/local/<id>.conf).
-static void LocalPoolsInit()
-{
-}
-
 // Under cs_p2pool. Self-tests: no local pool, no session; the nodes are the
 // tests' own and are not touched.
-static void LocalResetForTest()
+static void LocalResetForTest(bool fCheckPoW)
 {
+    fLocalCheckPoW = fCheckPoW;
+    nMinedChainSeq = 0;
     lRegServes.clear();
     mapLocalConn.clear();
     foreach(LocalPool* lp, vLocalPools)
@@ -2120,36 +2160,286 @@ static LocalPool* LocalByName(const string& strName)
     return NULL;
 }
 
-bool P2PoolLocalAdd(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, const string& strFile,
-                    bool fCheckPoW, string& errOut)
+// Under cs_p2pool.
+static size_t LiveLocalPools()
+{
+    size_t n = 0;
+    foreach(LocalPool* lp, vLocalPools)
+        if (!lp->fLeaving)
+            n++;
+    return n;
+}
+
+// Under cs_p2pool. A new local pool, not yet in vLocalPools; NULL, with the
+// reason, if its record or its name cannot be one here.
+static LocalPool* LocalNew(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, const string& strFile,
+                           const string& strConf, bool fCheckPoW, string& errOut)
 {
     PoolRules rules;
     if (!rec.fLocal)
     {
         errOut = "not a local pool's record";
-        return false;
+        return NULL;
     }
     if (!RulesForLocal(rec, keys, rules, errOut))
-        return false;
+        return NULL;
+    if (LocalByName(rec.name))
+    {
+        errOut = "a local pool with that name is already on this node";
+        return NULL;
+    }
+    if (LiveLocalPools() >= poollocal::MAX_LOCAL_POOLS)
+    {
+        errOut = "this node is in as many local pools as it may be";
+        return NULL;
+    }
+    LocalPool* lp = new LocalPool(rec.name, rec, keys, new ShareChain(rules, fCheckPoW), strFile);
+    lp->strConf = strConf;
+    return lp;
+}
+
+bool P2PoolLocalAdd(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, const string& strFile,
+                    bool fCheckPoW, string& errOut)
+{
     CRITICAL_BLOCK(cs_p2pool)
     {
-        if (LocalByName(rec.name))
-        {
-            errOut = "a local pool with that name is already on this node";
+        LocalPool* lp = LocalNew(rec, keys, strFile, "", fCheckPoW, errOut);
+        if (!lp)
             return false;
-        }
-        size_t nLive = 0;
-        foreach(LocalPool* lp, vLocalPools)
-            if (!lp->fLeaving)
-                nLive++;
-        if (nLive >= poollocal::MAX_LOCAL_POOLS)
-        {
-            errOut = "this node is in as many local pools as it may be";
-            return false;
-        }
-        LocalPool* lp = new LocalPool(rec.name, rec, keys, new ShareChain(rules, fCheckPoW), strFile);
         vLocalPools.push_back(lp);
     }
+    return true;
+}
+
+// ---- The pool file: pools/local/<id>.conf
+//
+// One per local pool: "record=" and the record in hex, "k=" and K in hex,
+// and a "peer=" line for each listed peer; never the password. Whoever reads
+// it can join the pool, so it is written owner-only; and the id in its name
+// (with the code, a password oracle) goes to no log line, no error and no
+// RPC answer: those say "pools/local" and the pool's name.
+
+static string LocalDir()
+{
+    return GetAppDir() + "/pools/local";
+}
+
+static bool MakeLocalDir()
+{
+    _mkdir((GetAppDir() + "/pools").c_str());
+    _mkdir(LocalDir().c_str());
+    struct stat st;
+    return stat(LocalDir().c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+// ADDRESS@HOST.onion[:PORT], the form /connectbtf takes.
+static bool ListedPeerOk(const string& strPeer)
+{
+    size_t at = strPeer.find('@');
+    if (at == string::npos || at == 0)
+        return false;
+    string s = strPeer.substr(at + 1), o;
+    size_t colon = s.rfind(':');
+    if (colon != string::npos)
+        s.resize(colon);
+    return poollocal::OnionName(s, o);
+}
+
+// Under cs_p2pool. The file with these listed peers; true at once for a pool
+// kept in memory only.
+static bool WriteLocalConf(const LocalPool& lp, const vector<string>& vPeers, string& errOut)
+{
+    if (lp.strConf.empty())
+        return true;
+    vector<unsigned char> r = lp.rec.Encode();
+    string s = "# A local pool of this node (docs/pool-registry.md, section 18).\n"
+               "# Whoever reads this file can join the pool.\n";
+    s += "record=" + HexStr(r.begin(), r.end(), false) + "\n";
+    s += "k=" + HexStr(lp.keys.K, lp.keys.K + sizeof(lp.keys.K), false) + "\n";
+    foreach(const string& strPeer, vPeers)
+        s += "peer=" + strPeer + "\n";
+    string err;
+    bool fOk = WriteFileAtomicPrivate(lp.strConf, s, err);
+    OPENSSL_cleanse(&s[0], s.size());
+    if (!fOk)
+        errOut = "could not write the local pool's file under the data directory (pools/local)";
+    return fOk;
+}
+
+// The ids that have a file in pools/local, each the 64 lowercase hex digits
+// of a file's name before ".conf".
+static void ListLocalConfs(vector<string>& out)
+{
+    vector<string> vNames;
+#ifdef WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((LocalDir() + "/*.conf").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                vNames.push_back(fd.cFileName);
+        while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR* d = opendir(LocalDir().c_str());
+    if (d)
+    {
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL)
+            vNames.push_back(e->d_name);
+        closedir(d);
+    }
+#endif
+    foreach(const string& n, vNames)
+    {
+        if (n.size() != 64 + 5 || n.compare(64, 5, ".conf") != 0)
+            continue;
+        bool fHex = true;
+        for (size_t i = 0; i < 64 && fHex; i++)
+            fHex = (n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f');
+        if (fHex)
+            out.push_back(n.substr(0, 64));
+    }
+    std::sort(out.begin(), out.end());
+}
+
+// One file, read back: the record, K and the listed peers. False on anything
+// that is not exactly a file this code writes.
+static bool ReadLocalConf(const string& strPath, vector<unsigned char>& vRecord, unsigned char K[32],
+                          vector<string>& vPeers)
+{
+    FILE* f = fopen(strPath.c_str(), "rb");
+    if (!f)
+        return false;
+    // A record, a key and sixteen peers fit well inside this.
+    char buf[16 * 1024];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    bool fWhole = feof(f) != 0;
+    fclose(f);
+    string s(buf, n);
+    OPENSSL_cleanse(buf, sizeof(buf));
+    bool fRecord = false, fK = false, fOk = fWhole;
+    size_t pos = 0;
+    while (fOk && pos < s.size())
+    {
+        size_t end = s.find('\n', pos);
+        string line = s.substr(pos, end == string::npos ? string::npos : end - pos);
+        pos = end == string::npos ? s.size() : end + 1;
+        if (!line.empty() && line[line.size() - 1] == '\r')
+            line.resize(line.size() - 1);
+        if (line.empty() || line[0] == '#')
+            continue;
+        if (line.compare(0, 7, "record=") == 0 && !fRecord)
+        {
+            string h = line.substr(7);
+            fOk = !h.empty() && h.size() % 2 == 0 && IsHex(h) && h.size() <= 2 * poolreg::MAX_RECORD_BYTES;
+            if (fOk)
+                vRecord = ParseHex(h);
+            fRecord = true;
+        }
+        else if (line.compare(0, 2, "k=") == 0 && !fK)
+        {
+            string h = line.substr(2);
+            fOk = h.size() == 64 && IsHex(h);
+            if (fOk)
+            {
+                vector<unsigned char> v = ParseHex(h);
+                memcpy(K, &v[0], 32);
+                OPENSSL_cleanse(&v[0], v.size());
+            }
+            OPENSSL_cleanse(&line[0], line.size());
+            fK = true;
+        }
+        else if (line.compare(0, 5, "peer=") == 0)
+        {
+            // A peer this build would not list is left out, not the pool.
+            string p = line.substr(5);
+            if (ListedPeerOk(p) && vPeers.size() < poollocal::MAX_LISTED_PEERS &&
+                std::find(vPeers.begin(), vPeers.end(), p) == vPeers.end())
+                vPeers.push_back(p);
+        }
+        else
+            fOk = false;
+    }
+    OPENSSL_cleanse(&s[0], s.size());
+    return fOk && fRecord && fK;
+}
+
+// Under cs_main and cs_p2pool (P2PoolInit): the local pools this node saved.
+static void LocalPoolsInit()
+{
+    vector<string> vIds;
+    ListLocalConfs(vIds);
+    foreach(const string& strId, vIds)
+    {
+        string strBase = LocalDir() + "/" + strId;
+        vector<unsigned char> vRecord;
+        unsigned char K[32];
+        vector<string> vPeers;
+        poolreg::PoolRecord rec;
+        poollocal::Keys keys;
+        string err;
+        bool fOk = ReadLocalConf(strBase + ".conf", vRecord, K, vPeers) &&
+                   poolreg::Parse(vRecord, rec, err) && rec.fLocal &&
+                   poollocal::DeriveFromK(vRecord, (const unsigned char*)pchMessageStart, K, keys, err) &&
+                   poolreg::IdHex(keys.id) == strId;
+        OPENSSL_cleanse(K, sizeof(K));
+        if (!fOk)
+        {
+            OPENSSL_cleanse(&keys, sizeof(keys));
+            printf("p2pool: a file in pools/local is not a local pool of this network; skipped\n");
+            continue;
+        }
+        LocalPool* lp = LocalNew(rec, keys, strBase + ".dat", strBase + ".conf", fLocalCheckPoW, err);
+        OPENSSL_cleanse(&keys, sizeof(keys));
+        if (!lp)
+        {
+            printf("p2pool: local pool '%s' not loaded: %s\n", rec.name.c_str(), err.c_str());
+            continue;
+        }
+        lp->vPeers = vPeers;
+        vLocalPools.push_back(lp);
+        LoadShares(lp->state);
+        printf("p2pool: local pool '%s' is back, %u listed peer(s)\n", lp->strName.c_str(), (unsigned)vPeers.size());
+    }
+}
+
+bool P2PoolLocalJoin(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, string& errOut)
+{
+    if (!MakeLocalDir())
+    {
+        errOut = "could not make the directory pools/local under the data directory";
+        return false;
+    }
+    string strBase = LocalDir() + "/" + poolreg::IdHex(keys.id);
+    // cs_main before cs_p2pool, as P2PoolInit: a share chain left in the
+    // pool's file is read the way it is on start.
+    CRITICAL_BLOCK(cs_main)
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            // Its files go when a pool that is being left is taken down: the
+            // same name, and so the same files, is not reused until then.
+            foreach(LocalPool* lp, vLocalPools)
+                if (lp->fLeaving && lp->strName == rec.name)
+                {
+                    errOut = "a local pool with that name is being left; try again in a few seconds";
+                    return false;
+                }
+            LocalPool* lp = LocalNew(rec, keys, strBase + ".dat", strBase + ".conf", fLocalCheckPoW, errOut);
+            if (!lp)
+                return false;
+            if (!WriteLocalConf(*lp, lp->vPeers, errOut))
+            {
+                delete lp->state.chain;
+                delete lp;
+                return false;
+            }
+            vLocalPools.push_back(lp);
+            LoadShares(lp->state);
+            LogPrint("p2pool", "p2pool: local pool '%s' joined\n", lp->strName.c_str());
+        }
     return true;
 }
 
@@ -2178,18 +2468,11 @@ bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, st
         return false;
     }
     foreach(const string& strPeer, vPeers)
-    {
-        size_t at = strPeer.find('@');
-        string s = at == string::npos ? "" : strPeer.substr(at + 1), o;
-        size_t colon = s.rfind(':');
-        if (colon != string::npos)
-            s.resize(colon);
-        if (at == string::npos || at == 0 || !poollocal::OnionName(s, o))
+        if (!ListedPeerOk(strPeer))
         {
             errOut = "a listed peer is ADDRESS@HOST.onion[:PORT]";
             return false;
         }
-    }
     CRITICAL_BLOCK(cs_p2pool)
     {
         LocalPool* lp = LocalByName(strName);
@@ -2198,6 +2481,8 @@ bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, st
             errOut = "no local pool with that name on this node";
             return false;
         }
+        if (!WriteLocalConf(*lp, vPeers, errOut))
+            return false;
         lp->vPeers = vPeers;
         lp->mapHelloAt.clear();
     }
@@ -2235,28 +2520,105 @@ bool P2PoolLocalMine(const string& strName, string& errOut)
             return false;
         }
         pPoolMined = &lp->state;
+        printf("p2pool: this node mines local pool '%s'\n", lp->strName.c_str());
     }
     return true;
+}
+
+bool P2PoolParseChoice(const string& strValue, string& strLocalOut, string& errOut)
+{
+    strLocalOut.clear();
+    if (strValue.compare(0, 6, "local:") == 0)
+    {
+        string strName = strValue.substr(6);
+        if (!poolreg::NameOk(strName))
+        {
+            errOut = "-p2pool=local: needs the name of a local pool on this node (1 to 32 of A-Z, a-z, 0-9, - and _)";
+            return false;
+        }
+        strLocalOut = strName;
+        return true;
+    }
+    size_t nHex = 0;
+    while (nHex < strValue.size() && isxdigit((unsigned char)strValue[nHex]))
+        nHex++;
+    if (nHex != strValue.size() || nHex < 40 || nHex > 80)
+        return true;    // "-p2pool", "-p2pool=1", "-p2pool=0": pool zero, as before
+    if (nHex != 64)
+    {
+        errOut = "the value of -p2pool looks like a mistyped pool id: a pool id is 64 hex digits";
+        return false;
+    }
+    unsigned char id[32];
+    vector<unsigned char> vZero = poolreg::PoolZero().Encode();
+    poolreg::PoolId(vZero, (const unsigned char*)pchMessageStart, id);
+    string strLower = strValue;
+    for (size_t i = 0; i < strLower.size(); i++)
+        strLower[i] = (char)tolower((unsigned char)strLower[i]);
+    if (strLower == poolreg::IdHex(id))
+        return true;    // pool zero's own id
+    errOut = "-p2pool=<pool id> names an Everpool pool, which this release cannot mine yet";
+    return false;
 }
 
 bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out)
 {
     bool f = false;
-    CRITICAL_BLOCK(cs_p2pool)
-    {
-        LocalPool* lp = LocalByName(strName);
-        if (lp)
+    // cs_vNodes before cs_p2pool, as LocalTick.
+    CRITICAL_BLOCK(cs_vNodes)
+        CRITICAL_BLOCK(cs_p2pool)
         {
-            out.nSessions = lp->mapHandle.size();
-            out.nPending = lp->sessions.Pending();
-            out.nShares = lp->state.chain->Size();
-            out.nTipHeight = lp->state.chain->Height(lp->state.chain->Tip());
-            out.vPeers = lp->vPeers;
-            out.fMined = &lp->state == pPoolMined;
-            f = true;
+            LocalPool* lp = LocalByName(strName);
+            if (lp)
+            {
+                out.rec = lp->rec;
+                out.nSessions = lp->mapHandle.size();
+                out.nPending = lp->sessions.Pending();
+                out.nShares = lp->state.chain->Size();
+                out.nTipHeight = lp->state.chain->Height(lp->state.chain->Tip());
+                out.vPeers = lp->vPeers;
+                out.fMined = &lp->state == pPoolMined;
+                out.fAtCap = lp->mapHandle.size() >= poollocal::MAX_SESSIONS;
+                out.nInboundSessions = 0;
+                for (map<CNode*, uint64>::iterator it = lp->mapHandle.begin(); it != lp->mapHandle.end(); ++it)
+                    if (it->first->fInbound)
+                        out.nInboundSessions++;
+                // Each listed peer: whether this node holds a connection it
+                // dialled to that address at that onion, and what came of it.
+                out.vPeerState.clear();
+                foreach(const string& strPeer, lp->vPeers)
+                {
+                    int nState = P2PoolLocalStatusInfo::PEER_NOT_CONNECTED;
+                    foreach(CNode* pnode, vNodes)
+                    {
+                        string O;
+                        if (pnode->fDisconnect || !DialledOnion(pnode, O) || !Listed(*lp, pnode->strBtfAddr, O) ||
+                            strPeer.compare(0, pnode->strBtfAddr.size() + 1, pnode->strBtfAddr + "@") != 0)
+                            continue;
+                        if (lp->mapHandle.count(pnode))
+                            nState = P2PoolLocalStatusInfo::PEER_SESSION;
+                        else if (out.fAtCap)
+                            nState = P2PoolLocalStatusInfo::PEER_OUR_CAP;
+                        else if (lp->mapHelloAt.count(pnode))
+                            nState = P2PoolLocalStatusInfo::PEER_NO_PROOF;
+                        else
+                            nState = P2PoolLocalStatusInfo::PEER_CONNECTED;
+                        break;
+                    }
+                    out.vPeerState.push_back(nState);
+                }
+                f = true;
+            }
         }
-    }
     return f;
+}
+
+void P2PoolLocalNames(vector<string>& out)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+        foreach(LocalPool* lp, vLocalPools)
+            if (!lp->fLeaving)
+                out.push_back(lp->strName);
 }
 
 void P2PoolLocalDialList(vector<string>& out)
@@ -2375,7 +2737,10 @@ static void OnShares(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<S
     string err;
     bool fOk = true;
     CRITICAL_BLOCK(cs_p2pool)
+    {
         fOk = ps.chain->AddHistory(part, nTipHeight, main, err);
+        NoteChainGrew(ps);
+    }
     if (!fOk)
     {
         LogPrint("p2pool", "p2pool: history refused: %s\n", err.c_str());
