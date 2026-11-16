@@ -1,7 +1,7 @@
 # Everpool: the P2Pool that no one can delete, edit or shut down
 
-Status: design (Phase A). Nothing here is implemented yet. The phases are at
-the end. Main-chain consensus does not change: everything below is node
+Status: design done (Phase A); implementation in progress (Phase B, section
+16). The phases are at the end. Main-chain consensus does not change: everything below is node
 software and P2Pool protocol, and ships in an ordinary release.
 
 **Everpool** is the name of the feature: pools that live on the chain and
