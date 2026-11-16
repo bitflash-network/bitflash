@@ -6481,6 +6481,10 @@ static p2pool::Share RulesShare(const p2pool::ShareChain& chain, const TestMainV
     p2pool::Share s;
     s.data.fX = !rules.IsZero();
     s.data.poolId = rules.poolId;
+    // A local pool's salt: random in a template, fixed here so tests repeat.
+    s.data.fSalt = rules.nAnchor == p2pool::ANCHOR_P2L;
+    if (s.data.fSalt)
+        s.data.salt = Hash(BEGIN(nTime), END(nTime)) ^ parent;
     s.data.hashPrevShare = parent;
     s.data.nShareHeight = parent == 0 ? 0 : chain.Height(parent) + 1;
     s.data.vUncles = uncles;
@@ -6587,6 +6591,28 @@ static int RunP2PoolRulesSelfTest()
         nFail += Check(vback.size() == 2 && vback[1].data.fX && vback[1].data.poolId == uint256(99) &&
                        vback[1].data.GetHash() == x.data.GetHash() && vback[1].GetId() == x.GetId(),
                        "format 1 shares survive the wire with their pool id") ? 0 : 1;
+
+        // A local pool's share: the pool id, the salt, then the same fields.
+        s.data.salt = 98;       // never written while fSalt is off
+        CDataStream d0b(SER_NETWORK), dl(SER_NETWORK);
+        d0b << s.data;
+        p2pool::ShareL l(s);
+        dl << l.data;
+        uint256 salt = 98;
+        nFail += Check(d0b.size() == d0.size() && memcmp(&d0b[0], &d0[0], d0.size()) == 0 &&
+                       dl.size() == d0.size() + 64 && memcmp(&dl[0], s.data.poolId.begin(), 32) == 0 &&
+                       memcmp(&dl[32], salt.begin(), 32) == 0 && memcmp(&dl[64], &d0[0], d0.size()) == 0 &&
+                       l.data.GetHash() != x.data.GetHash(),
+                       "a local share's data is the pool id, the salt and then the same fields; pool zero's has neither") ? 0 : 1;
+        p2pool::ShareL l2 = l;
+        l2.data.salt = 97;
+        CDataStream wl(SER_NETWORK);
+        vector<p2pool::ShareL> vl(1, l), vlback;
+        wl << vl;
+        wl >> vlback;
+        nFail += Check(vlback.size() == 1 && vlback[0].data.fSalt && vlback[0].data.salt == uint256(98) &&
+                       vlback[0].data.GetHash() == l.data.GetHash() && l2.data.GetHash() != l.data.GetHash(),
+                       "local shares survive the wire with their salt, and the salt changes the hash the anchor keys") ? 0 : 1;
     }
 
     // ---- a local pool's share chain
@@ -6683,14 +6709,32 @@ static int RunP2PoolRulesSelfTest()
             nFail += Check(ok(pd) && !ok(CScript(pd) << good), "a push is known by its data, whatever opcode carried it") ? 0 : 1;
         }
 
+        // The salt is part of what the anchor keys: the same share with its
+        // salt changed, or dropped, is not this anchor's.
+        {
+            p2pool::Share other = g;
+            other.data.salt = other.data.salt ^ uint256(1);
+            p2pool::Share noSalt = g;
+            noSalt.data.fSalt = false;
+            p2pool::Share noSaltOwn = WithScriptSig(noSalt, main, CScript() << p2pool::AnchorPush(rules, noSalt.data));
+            nFail += Check(!p2pool::CheckShareWork(WithScriptSig(other, main, CScript() << good), rules, fBlock, err, false) &&
+                           !p2pool::CheckShareWork(WithScriptSig(noSalt, main, CScript() << good), rules, fBlock, err, false) &&
+                           !p2pool::CheckShareWork(noSaltOwn, rules, fBlock, err, false),
+                           "a local share with another salt, or none (even anchored to that), is refused") ? 0 : 1;
+        }
+
         // Format 1 (a registered pool) refuses p2l, and has its own anchor.
         p2pool::PoolRules reg = rules;
         reg.nAnchor = p2pool::ANCHOR_P2X;
-        vector<unsigned char> x = p2pool::AnchorPush(reg, g.data);
+        p2pool::Share gReg = g;
+        gReg.data.fSalt = false;
+        vector<unsigned char> x = p2pool::AnchorPush(reg, gReg.data);
         auto okReg = [&](const CScript& rest) {
-            p2pool::Share s = WithScriptSig(g, main, rest);
+            p2pool::Share s = WithScriptSig(gReg, main, rest);
             return p2pool::CheckShareWork(s, reg, fBlock, err, false);
         };
+        nFail += Check(!p2pool::CheckShareWork(WithScriptSig(g, main, CScript() << p2pool::AnchorPush(reg, g.data)), reg, fBlock, err, false),
+                       "a registered pool's share carries no salt") ? 0 : 1;
         nFail += Check(x.size() == 67 && okReg(CScript() << x), "a registered pool's anchor is p2x, its id and the hash") ? 0 : 1;
         nFail += Check(!okReg(CScript() << x << good) && !okReg(CScript() << good), "a format 1 share refuses any p2l push") ? 0 : 1;
         nFail += Check(!okReg(CScript() << x << p2p) && !okReg(CScript() << x << p2x) && !okReg(CScript() << x << x),
@@ -8015,19 +8059,19 @@ static int RunP2PoolLocalSelfTest()
     CNode* pZeroPeer = NewP2PoolTestNode(true);
     {
         // An unknown handle: dropped unread.
-        SendLocalItem(pStranger, "p2lshare", h1, p2pool::ShareX(g));
-        SendLocalItem(pM1, "p2lshare", h1 ^ 1, p2pool::ShareX(g));
+        SendLocalItem(pStranger, "p2lshare", h1, p2pool::ShareL(g));
+        SendLocalItem(pM1, "p2lshare", h1 ^ 1, p2pool::ShareL(g));
         P2PoolLocalStatusInfo st;
         nFail += Check(P2PoolLocalStatus("home", st) && st.nShares == 0 && pStranger->vSend.empty() &&
                        pStranger->nMisbehavior == 0 && pM1->nMisbehavior == 0,
                        "a share under a handle the connection does not hold is dropped, nobody scored") ? 0 : 1;
         size_t nM2 = CountSent(pM2, "p2lshare");
-        SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareX(g));
+        SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareL(g));
         vector<unsigned char> relayed;
         uint64 hRelayed = 0;
         bool fRelayed = CountSent(pM2, "p2lshare") == nM2 + 1 && LastSent(pM2, "p2lshare", relayed) && relayed.size() > 8;
         if (fRelayed)
-            memcpy(&hRelayed, &relayed[0], 8);
+            hRelayed = poollocal::HandleValue(&relayed[0]);
         nFail += Check(P2PoolLocalStatus("home", st) && st.nShares == 1 && st.nTipHeight == 0 && pM1->nMisbehavior == 0,
                        "a member's share is taken on the pool's share chain") ? 0 : 1;
         nFail += Check(fRelayed && hRelayed == h2 && CountSent(pM1, "p2lshare") == 0,
@@ -8044,6 +8088,7 @@ static int RunP2PoolLocalSelfTest()
         CNode* pLiar = NewP2PoolTestNode(true);
         p2pool::Share z = g;
         z.data.fX = false;
+        z.data.fSalt = false;
         SendP2PoolTestItem(pLiar, "p2pshare", z);
         bool fZeroEmpty;
         CRITICAL_BLOCK(cs_p2pool)
@@ -8058,7 +8103,7 @@ static int RunP2PoolLocalSelfTest()
         uint64 h3 = 0;
         bool fS3 = OpenLocalSession(pM3, keys.A, O, 0x63, h3);
         p2pool::Share o = RulesShare(mirrorOther, main, 0, payTo(2), t);
-        SendLocalItem(pM3, "p2lshare", h3, p2pool::ShareX(o));
+        SendLocalItem(pM3, "p2lshare", h3, p2pool::ShareL(o));
         P2PoolLocalStatusInfo st;
         nFail += Check(fS3 && pM3->nMisbehavior > 0 && P2PoolLocalStatus("home", st) && st.nShares == 1,
                        "a share of another pool sent in the session is invalid, and its sender scored") ? 0 : 1;
@@ -8164,7 +8209,7 @@ static int RunP2PoolLocalSelfTest()
             o.data.nShareHeight = 3;
             o.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << (int64)(t + i) << p2pool::AnchorPush(rules, o.data);
             o.hashMerkleRoot = o.coinbase.GetHash();
-            SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareX(o));
+            SendLocalItem(pM1, "p2lshare", h1, p2pool::ShareL(o));
         }
         std::vector<char> big(600 * 1000);
         size_t nParts = CountSent(pM1, "p2lshares");
@@ -8539,6 +8584,71 @@ static int RunP2PoolLocalNodeSelfTest()
                        "and the room kept for the coinbase is the pool's MaxOutputs") ? 0 : 1;
         nFail += Check(sig.size() <= 100 && std::search(sig.begin(), sig.end(), keysHome.id, keysHome.id + 32) == sig.end(),
                        "the pool id is nowhere in the coinbase") ? 0 : 1;
+
+        // Section 18: a block's anchor tests no password. This is the first
+        // share of a chain, whose data is public but for the salt: the id
+        // (from the code and a guess, here the right password), parent 0,
+        // no uncles, height 0, the record's floor, the coinbase's one output.
+        // Whoever holds the code and sees the block rebuilds all of it, runs
+        // Argon2id once per guess, and must still find 256 random bits.
+        {
+            poollocal::Keys kGuess;
+            std::string errK;
+            bool fDerived = poollocal::Derive(recHome.Encode(), magic, "pw-home-1", kGuess, errK);
+            vector<unsigned char> push;
+            {
+                CScript::const_iterator pc = c.vin[0].scriptSig.begin();
+                opcodetype op;
+                vector<unsigned char> v;
+                while (pc < c.vin[0].scriptSig.end() && c.vin[0].scriptSig.GetOp(pc, op, v))
+                    if (v.size() == 35 && v[0] == 'p' && v[1] == '2' && v[2] == 'l')
+                        push = v;
+            }
+            p2pool::ShareData pub;
+            pub.fX = true;
+            memcpy(pub.poolId.begin(), kGuess.id, 32);
+            pub.hashPrevShare = 0;
+            pub.nShareHeight = 0;
+            pub.nShareBits = recHome.nFloor;
+            pub.payoutScript.assign(c.vout[0].scriptPubKey.begin(), c.vout[0].scriptPubKey.end());
+            // Without the salt: the old format, and the new one with a guess.
+            uint256 hOld = pub.GetHash();
+            pub.fSalt = true;
+            uint256 hZero = pub.GetHash();
+            pub.salt = ~uint256(0);
+            uint256 hOnes = pub.GetHash();
+            bool fFirstShare = d1.hashPrevShare == 0 && d1.vUncles.empty() && d1.nShareHeight == 0 &&
+                               d1.nShareBits == recHome.nFloor;
+            bool fNone = fDerived && push.size() == 35 && !poollocal::AnchorMatches(push, kGuess.C, hOld.begin()) &&
+                         !poollocal::AnchorMatches(push, kGuess.C, hZero.begin()) &&
+                         !poollocal::AnchorMatches(push, kGuess.C, hOnes.begin());
+            // With the salt a member got with the share: it checks.
+            pub.salt = d1.salt;
+            uint256 hMember = pub.GetHash();
+            bool fMember = poollocal::AnchorMatches(push, kGuess.C, hMember.begin());
+            // The salt is in no byte of the block.
+            CDataStream ssBlock(SER_NETWORK);
+            ssBlock << block;
+            vector<unsigned char> vBlock(ssBlock.begin(), ssBlock.end());
+            uint256 salt = d1.salt;
+            bool fOffChain = d1.fSalt && salt != 0 &&
+                             std::search(vBlock.begin(), vBlock.end(), salt.begin(), salt.end()) == vBlock.end();
+            // A second template from the very same state: another salt, and
+            // so another anchor, though everything public is the same.
+            CBlock blockAgain;
+            blockAgain.vtx.push_back(cb);
+            p2pool::ShareData dAgain;
+            unsigned int nS2 = 0, nB2 = 0;
+            bool fAgain = P2PoolCoinbaseForTest(blockAgain, 1000, 0x1f0fffff, 0, dAgain, nS2, nB2) &&
+                          dAgain.hashPrevShare == d1.hashPrevShare && dAgain.salt != d1.salt &&
+                          blockAgain.vtx[0].vin[0].scriptSig != c.vin[0].scriptSig;
+            OPENSSL_cleanse(&kGuess, sizeof(kGuess));
+            nFail += Check(fFirstShare && fNone && fMember,
+                           "a first share's anchor: the code, the right password and the whole block do not check it without "
+                           "the salt; with the salt a member holds, it checks") ? 0 : 1;
+            nFail += Check(fOffChain && fAgain,
+                           "the salt is in no byte of the block, and each template draws a fresh one") ? 0 : 1;
+        }
 
         // The share it makes joins the local pool's chain, and only it.
         p2pool::Share s;

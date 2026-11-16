@@ -120,6 +120,7 @@ static void FixShare(Share& s, unsigned char nFlags)
     const PoolRules& rules = chain.Rules();
     ShareData& d = s.data;
     d.fX = true;
+    d.fSalt = true;
     if (nFlags & (F_FIX_LINK | F_FIX_PAY | F_FIX_ANCHOR))
         d.poolId = rules.poolId;
     if (nFlags & F_FIX_LINK)
@@ -183,7 +184,7 @@ static void FixBody(int nKind, CDataStream& vBody, unsigned char nFlags)
         CDataStream vFixed(SER_NETWORK, VERSION);
         if (nKind == K_SHARE)
         {
-            ShareX s;
+            ShareL s;
             vCopy >> s;
             CRITICAL_BLOCK(cs_p2pool)
                 FixShare(s, nFlags);
@@ -193,7 +194,7 @@ static void FixBody(int nKind, CDataStream& vBody, unsigned char nFlags)
         {
             int nTip;
             unsigned char nFlag;
-            vector<ShareX> v;
+            vector<ShareL> v;
             vCopy >> nTip >> nFlag >> v;
             CRITICAL_BLOCK(cs_p2pool)
                 for (size_t i = 0; i < v.size(); i++)
@@ -497,10 +498,11 @@ static void WriteRaw(const string& strDir, const char* pszName, const string& st
 // A share on 'parent' that pays exactly what the chain says it must, with
 // stand-in work and the pool's anchor, added to the chain so the next can
 // build on it. Under cs_p2pool.
-static ShareX SeedShare(const uint256& parent, unsigned char tag, unsigned int nTime)
+static ShareL SeedShare(const uint256& parent, unsigned char tag, unsigned int nTime)
 {
     ShareChain& chain = P2PoolMinedChain();
-    ShareX s;
+    ShareL s;
+    s.data.salt = Hash(BEGIN(nTime), END(nTime));   // a template's salt, fixed here so seeds repeat
     s.data.hashPrevShare = parent;
     s.data.payoutScript = PayTo(tag);
     s.coinbase.vin.resize(1);
@@ -524,7 +526,7 @@ static ShareX SeedShare(const uint256& parent, unsigned char tag, unsigned int n
 
 static void WriteSeeds(const string& strDir)
 {
-    vector<ShareX> line;
+    vector<ShareL> line;
     CRITICAL_BLOCK(cs_p2pool)
     {
         // The pool's spacing is 30 s: the line is spaced so.
@@ -555,7 +557,7 @@ static void WriteSeeds(const string& strDir)
         // A history answering the ask the session opened with, in two parts.
         string str(1, (char)fOut);
         AppendHandshake(str, 3);
-        vector<ShareX> a(line.begin(), line.begin() + 10), b(line.begin() + 10, line.end());
+        vector<ShareL> a(line.begin(), line.begin() + 10), b(line.begin() + 10, line.end());
         CDataStream s1(SER_NETWORK, VERSION), s2(SER_NETWORK, VERSION);
         s1 << (int)line.size() - 1 << (unsigned char)0 << a;
         s2 << (int)line.size() - 1 << (unsigned char)1 << b;
@@ -606,13 +608,13 @@ static void WriteSeeds(const string& strDir)
         // (bit 1), a share with no parent here, another pool's id.
         string str(1, (char)(fIn | F_FIX_LINK | F_FIX_PAY | F_FIX_ANCHOR));
         AppendHandshake(str, 5);
-        ShareX bad = line[0];
+        ShareL bad = line[0];
         bad.nNonce = 1;
         AppendItem(str, K_SHARE, bad);
-        ShareX block = line[0];
+        ShareL block = line[0];
         block.nNonce = 2;
         AppendItem(str, K_SHARE, block);
-        ShareX lost = line[5];
+        ShareL lost = line[5];
         lost.data.hashPrevShare = uint256(12345);
         AppendItem(str, K_SHARE, lost);
         WriteRaw(strDir, "fixups", str);

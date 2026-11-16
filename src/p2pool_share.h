@@ -17,13 +17,23 @@ namespace p2pool
 // What the coinbase commits to: the share chain side of a share. Pool zero's
 // shares have the first form, frozen; every other pool's (a registered or a
 // local pool, docs/pool-registry.md sections 6 and 18) carry the pool's id in
-// front, "ShareDataX". One struct holds both: fX says which, is set before a
-// share is read and is not itself on the wire, so a pool zero share is the
-// bytes it always was.
+// front, "ShareDataX", and a local pool's also a salt after the id. One
+// struct holds all three: fX and fSalt say which, are set before a share is
+// read and are not themselves on the wire, so a pool zero share is the bytes
+// it always was.
+//
+// The salt: 32 random bytes, fresh for every template, that members receive
+// with the share and that never go on the chain. A local pool's coinbase
+// anchor is keyed with C, which anybody holding the pool code derives from a
+// guessed password; the rest of the share data is often guessable from the
+// chain (a first share is the pool id, 0, no uncles, height 0, the floor and
+// the one output). The salt is what keeps the anchor from testing a guess.
 struct ShareData
 {
     bool fX;                          // format 1: poolId is part of the data
+    bool fSalt;                       // a local pool's share: salt follows poolId
     uint256 poolId;                   // the pool this share belongs to (fX)
+    uint256 salt;                     // (fSalt) random, never on the chain
     uint256 hashPrevShare;            // 0 for the first share of a chain
     vector<uint256> vUncles;          // at most MAX_UNCLES
     unsigned int nShareHeight;
@@ -31,12 +41,14 @@ struct ShareData
     vector<unsigned char> payoutScript;
 
     // uint256 does not zero itself: a default ShareData starts a chain.
-    ShareData() : fX(false), poolId(0), hashPrevShare(0), nShareHeight(0), nShareBits(0) {}
+    ShareData() : fX(false), fSalt(false), poolId(0), salt(0), hashPrevShare(0), nShareHeight(0), nShareBits(0) {}
 
     IMPLEMENT_SERIALIZE
     (
         if (fX)
             READWRITE(poolId);
+        if (fSalt)
+            READWRITE(salt);
         READWRITE(hashPrevShare);
         READWRITE(vUncles);
         READWRITE(nShareHeight);
@@ -103,8 +115,16 @@ struct Share
 // messages while a vector of Share reads pool zero's.
 struct ShareX : public Share
 {
-    ShareX() { data.fX = true; }
-    ShareX(const Share& s) : Share(s) { data.fX = true; }
+    ShareX() { data.fX = true; data.fSalt = false; }
+    ShareX(const Share& s) : Share(s) { data.fX = true; data.fSalt = false; }
+};
+
+// A local pool's share (section 18): format 1 with the salt after the pool
+// id. What the p2l messages and a local pool's file carry.
+struct ShareL : public Share
+{
+    ShareL() { data.fX = true; data.fSalt = true; }
+    ShareL(const Share& s) : Share(s) { data.fX = true; data.fSalt = true; }
 };
 
 // Which commitment a pool's coinbase carries.
@@ -112,7 +132,7 @@ enum Anchor
 {
     ANCHOR_P2P = 0,     // pool zero: "p2p" and the hash of ShareData
     ANCHOR_P2X = 1,     // a registered pool: "p2x", the pool id, the hash
-    ANCHOR_P2L = 2,     // a local pool: "p2l" and the hash keyed with C
+    ANCHOR_P2L = 2,     // a local pool: "p2l" and the hash (salt included) keyed with C
 };
 
 // Share rules v1 (docs/pool-registry.md, section 5): the code of 1.2.34 with

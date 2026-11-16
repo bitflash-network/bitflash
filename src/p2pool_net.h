@@ -119,10 +119,10 @@ void P2PoolDrainBudgetsForTest();
 // membership to the onion that was dialled:
 //   p2lhello   32-byte nonce, 16-byte tag: the hello, and the answer to it
 //   p2lack     32 bytes: the initiator's proof; the session is open
-//   p2lshare   handle, ShareX
+//   p2lshare   handle, ShareL (format 1 with the salt)
 //   p2lgetsh   handle, vector<uint256>
 //   p2lsync    handle, uint256 (a share to resume from, or 0)
-//   p2lshares  handle, int tip height, end flag, vector<ShareX>
+//   p2lshares  handle, int tip height, end flag, vector<ShareL>
 // The handle is the session's 8 bytes; the pool id is never on the wire. A
 // hello that matches no pool of this node, and a handle it does not hold on
 // that connection, get silence, and nobody is scored for them.

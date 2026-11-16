@@ -369,6 +369,10 @@ with `SerializeHash`. A format 1 share (`ShareX`) is a pool zero `Share` with
 `ShareDataX` in place of `ShareData`: the same header fields, coinbase and
 merkle branch.
 
+A local pool's share (section 18) adds one field to this, a random salt
+after `poolId` that never goes on the chain; a registered pool's share has
+none.
+
 On top of the v1 rules, a format 1 share is valid only if:
 
 - its `poolId` is the pool whose rules it is checked against, and is not pool
@@ -1669,9 +1673,9 @@ Pool zero, the default P2Pool, stays as it is for whoever picks neither.
 
 A local pool has the same parameters as an Everpool pool and obeys the same
 share rules v1 (section 5), and its shares have the `ShareX`/`ShareDataX`
-structure of section 6, with the anchor rule below in place of section 6's
-`"p2x"` rule: it is the same code with a different identity and a different
-reach. A share whose `ShareDataX.poolId` is not the session's pool is
+structure of section 6 plus a salt, with the anchor rule below in place of
+section 6's `"p2x"` rule: it is the same code with a different identity and
+a different reach. A share whose `ShareDataX.poolId` is not the session's pool is
 invalid, and its sender scored, as in section 8. Its parameters are a record
 in the format of section 1, with three differences:
 
@@ -1719,21 +1723,63 @@ has the code and the password can: membership is the only thing it protects.
 **What a password buys.** Without one, the pool is private only as long as
 its code is: anyone who has the code, or guesses it (a default record with a
 common name is easy to guess), computes the same id and key. With one, the
-code can be shared openly and the pool is still closed. Nothing seen by
-anyone a member did not list lets it test a password offline: the anchor is keyed with `C` (below),
-and a hello is bound to the onion it was sent to, so only that listed peer
-can check it, at one Argon2id run per guess. The operator's own copies of the
-id and password are kept out of argv and logs (above, and *Using it*).
+code can be shared openly and the pool is still closed. Precisely: someone
+who holds the code but not the password, and sees everything on the chain
+and everything a node sends to a peer that is not in session with it, has
+nothing to test a password guess against offline. The id is never sent to
+such a peer; the coinbase anchor (below) hashes a 256-bit random salt that
+never goes on the chain, so checking a guess against it means guessing the
+salt as well; and a hello is bound to the onion it was sent to, so only the
+listed peer that receives it can check it, at one Argon2id run per guess. The
+salt does this, not the key `C`: whoever holds the code derives `C` from each
+guess as easily as the id. Members can test guesses (they hold shares, which
+carry the id and the salt), but they already hold `K`. The operator's own
+copies of the id and password are kept out of argv and logs (above, and
+*Using it*).
 
 ### The coinbase anchor
 
-A local pool's coinbase carries a **35-byte push**: `"p2l"` and
-`HMAC-SHA256(C, SerializeHash(ShareDataX))` (the share data, `poolId`
-included). The hash is keyed because share data is partly public: a share's
-parent may be a block (its hash is on the chain), its payout script is among
-the coinbase outputs, and its height and bits can be searched; an unkeyed
-hash would let anyone holding the code test passwords against the chain.
-Members check it the same way, with `C`. It carries no pool id, so:
+A local pool's share data is section 6's `ShareDataX` with one more field,
+a **salt**, right after `poolId`:
+
+```
+ShareDataL {
+    uint256 poolId;               // as ShareDataX
+    uint256 salt;                 // 32 random bytes, fresh for every template
+    uint256 hashPrevShare;        // and the rest as ShareDataX
+    vector<uint256> vUncles;
+    unsigned int nShareHeight;
+    unsigned int nShareBits;
+    vector<unsigned char> payoutScript;
+}
+```
+
+serialized in that order, so a local share (`ShareL`) is a `ShareX` with 32
+more bytes after the pool id. The node that builds a template draws the salt
+from its strong random source; the share carries it to the members, in
+`p2lshare` and `p2lshares` and in each member's `pools/local/<id>.dat`, and
+nothing puts it on the chain. Pool zero's share bytes do not change, and a
+registered pool's share has no salt.
+
+The coinbase carries a **35-byte push**: `"p2l"` and `HMAC-SHA256(C,
+SerializeHash(ShareDataL))` (the share data, `poolId` and `salt` included).
+Members check it with `C`.
+
+Why the salt. Everything else in the share data is often public or
+guessable: `poolId` follows from the code and a guessed password,
+`hashPrevShare` is 0 or the hash of a block on the chain, `vUncles` is often
+empty, the height is small, `nShareBits` is the record's floor for the first
+retarget window, and `payoutScript` is one of the coinbase outputs. The first
+share of a chain, mined into a block, is all of that: `(id, 0, [], 0, floor,
+the one output)`. Keying the hash with `C` adds nothing against someone who
+holds the code, since `C` follows from the guess as the id does. Without the
+salt, such a block would let them run a dictionary offline, one Argon2id run
+per guess. With it, a guess can only be checked by also guessing 256 random
+bits, so the block tells them nothing about the password (section *What a
+password buys*). A restart from the same code and password, or a block whose
+parent share was also a block, gets a fresh salt like any other.
+
+It carries no pool id, so:
 
 - each block of the pool shows a different hash, and nothing in the anchors
   ties one block of the pool to another;
@@ -1747,10 +1793,11 @@ Members check it the same way, with `C`. It carries no pool id, so:
 The share rules of section 6 extend to it, so that one PoW counts on at most
 one share chain:
 
-- a local share is valid only if its coinbase parses fully and carries
-  exactly one `"p2l"` push, whose 32 bytes are `HMAC-SHA256(C,
-  SerializeHash(ShareDataX))` with `poolId` equal to this local pool's id,
-  and no `"p2p"` push and no `"p2x"` push;
+- a local share is valid only if it carries a salt, its coinbase parses
+  fully and carries exactly one `"p2l"` push, whose 32 bytes are
+  `HMAC-SHA256(C, SerializeHash(ShareDataL))` with `poolId` equal to this
+  local pool's id, and no `"p2p"` push and no `"p2x"` push (the salt's value
+  is not checked: it protects the members' own password);
 - a registered pool's share (format 1) also refuses any `"p2l"` push (added
   to section 6's list);
 - pool zero's frozen rule counts only `"p2p"` pushes, so a pool zero coinbase
@@ -1882,7 +1929,11 @@ notes carry the same informative note, without alarm:
   password; `-p2pool=local:<name>` with an unknown name refusing to start;
   the anchor rules (`"p2l"` with the wrong hash, an unkeyed hash, two of
   them, alongside a `"p2p"` or a `"p2x"`; a format 1 share refusing
-  `"p2l"`); the hello (a match, no match answered by silence, a hello
+  `"p2l"`; a local share with another salt or none refused); a block's
+  anchor that cannot be checked from the code, the right password and the
+  whole block without the salt, for the first share of a chain, and can be
+  with the salt a member holds; the salt in no byte of the block, and fresh
+  in each template; the hello (a match, no match answered by silence, a hello
   replayed to a third node and a handshake relayed between two members both
   failing, a repeated `nA` dropped, an unacked reply expiring, the session
   cap answered by silence, the rate limit, an unknown `h` dropped); the id
@@ -1893,6 +1944,8 @@ notes carry the same informative note, without alarm:
   node lists one of them with the wrong password and gets nothing; both mine
   until a block is found, its coinbase pays both to the satoshi, the coins
   mature and are spent; the block's anchor is a `"p2l"` push and nothing on
-  the chain or in any other node's `poollist` names the pool; one node goes
+  the chain or in any other node's `poollist` names the pool; the code, the
+  right password and the block do not check the anchor, and the salt from a
+  member's share file does; one node goes
   away and comes back from its file; then both go away, and the pool is
   gone. One of the two runs behind Snowflake for the whole step.

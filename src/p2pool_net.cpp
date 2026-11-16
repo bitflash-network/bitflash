@@ -353,7 +353,7 @@ static void LoadShares(PoolState& ps)
             file >> nTipHeight >> v;
         else
         {
-            vector<ShareX> vx;
+            vector<ShareL> vx;
             file >> nTipHeight >> vx;
             v.assign(vx.begin(), vx.end());
         }
@@ -2859,7 +2859,7 @@ static bool LocalProcessMessage(CNode* pfrom, const string& strCommand, CDataStr
 
     if (strCommand == "p2lshare")
     {
-        ShareX s;
+        ShareL s;
         vRecv >> s;
         OnShare(ps, pfrom, s);
     }
@@ -2907,7 +2907,7 @@ static bool LocalProcessMessage(CNode* pfrom, const string& strCommand, CDataStr
     {
         int nTipHeight;
         unsigned char nFlag;
-        vector<ShareX> vx;
+        vector<ShareL> vx;
         vRecv >> nTipHeight >> nFlag >> vx;
         if (nFlag > PART_ENDED_EARLY)
         {

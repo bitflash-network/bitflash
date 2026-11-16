@@ -178,6 +178,16 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
             d.fX = true;
             d.poolId = rules.poolId;
         }
+        // A local pool's share data carries a fresh random salt, which the
+        // members get with the share and the chain never sees: without it,
+        // whoever holds the pool code could rebuild the share data of a
+        // block (the first share of a chain is all public) and test
+        // passwords against its anchor offline.
+        if (rules.nAnchor == p2pool::ANCHOR_P2L)
+        {
+            d.fSalt = true;
+            GetStrongRandBytes(d.salt.begin(), 32);
+        }
         d.hashPrevShare = c.Tip();
         d.nShareHeight = d.hashPrevShare == 0 ? 0 : c.Height(d.hashPrevShare) + 1;
         d.nShareBits = c.NextShareBits(d.hashPrevShare);
