@@ -1073,14 +1073,21 @@ static void ThreadPoolIndex(void* parg)
         for (int i = 0; i < nTenths && !idx.Stopping(); i++)
             Sleep(100);
     }
+    // On the way out: whatever was read since the last save is written, and
+    // the log says so, so a stop that waited for it can be checked.
     if (nUnsaved > 0)
     {
+        bool fSaved = false;
         try
         {
-            idx.Save();
+            fSaved = idx.Save();
         }
         catch (std::exception& e) { printf("pool index: saving: %s\n", e.what()); }
+        printf("pool index: stopping, %s pool-registry.dat up to block %d\n",
+               fSaved ? "saved" : "could not save", idx.Height());
     }
+    else
+        printf("pool index: stopping, pool-registry.dat already up to block %d\n", idx.Height());
     g_fPoolIndexRunning = false;
 }
 
@@ -1110,6 +1117,8 @@ void PoolIndexStop()
     PoolIndex().RequestStop();
     for (int i = 0; i < 300 && g_fPoolIndexRunning; i++)
         Sleep(100);
+    if (g_fPoolIndexRunning)
+        printf("pool index: the thread did not stop within 30 s\n");
 }
 
 bool PoolIndexLookup(const uint256& id, CPoolInfo& out)
