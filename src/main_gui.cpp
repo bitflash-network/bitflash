@@ -157,7 +157,7 @@ static void PrintUsage()
     // reading the source. Kept in step now; a suite that cannot be discovered is
     // a suite that stops being run.
     printf("            wallet-sqlite-encrypt, wallet-backend-default, wallet-convert,\n");
-    printf("            managed-tor, treasury, explorer, chat-link, chat-identity, chat-relay, chat-dos,\n");
+    printf("            managed-tor, treasury, pool-settings, explorer, chat-link, chat-identity, chat-relay, chat-dos,\n");
     printf("            nostr-relay, swap-prune,\n");
     printf("            or chat-live (needs Tor and the network; not run by `make tests`)\n");
     printf("\n");
@@ -429,10 +429,13 @@ static void ParseStartupArguments(int argc, char* argv[])
         StartupRefuse("-p2poolbind needs -p2pool",
                       "It chooses where the P2Pool stratum listens; add -p2pool to mine with P2Pool.");
 
+    // The pool settings (main.h) are read whole here and written back once
+    // the options below have been parsed.
+    CPoolSettings poolSet = GetPoolSettings();
     if (arg(argc,argv,"/participant") || arg(argc,argv,"-participant"))
     {
         nMineMode = MINE_PARTICIPANT;
-        strParticipantPool = argval2(argc, argv, "/participant", "-participant");
+        poolSet.strParticipantPool = argval2(argc, argv, "/participant", "-participant");
         fMineModeFromCommandLine = true;
     }
 
@@ -441,7 +444,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         fStratumBridge = true;
         string bridgePool = argval2(argc, argv, "/stratumbridge", "-stratumbridge");
         if (!bridgePool.empty())
-            strParticipantPool = bridgePool;
+            poolSet.strParticipantPool = bridgePool;
     }
 
     string bridgePort = argval2(argc, argv, "/stratumbridgeport", "-stratumbridgeport");
@@ -457,17 +460,17 @@ static void ParseStartupArguments(int argc, char* argv[])
 
     string poolName = argval2(argc, argv, "/poolname", "-poolname");
     if (!poolName.empty())
-        strPoolName = poolName;
+        poolSet.strPoolName = poolName;
 
     string poolDash = argval2(argc, argv, "/pooldashboard", "-pooldashboard");
     if (poolDash.empty())
         poolDash = argval2(argc, argv, "/pooldash", "-pooldash");
     if (!poolDash.empty())
-        strPoolDashboardUrl = poolDash;
+        poolSet.strPoolDashboardUrl = poolDash;
 
     string poolFee = argval2(argc, argv, "/poolfee", "-poolfee");
     if (!poolFee.empty())
-        dPoolFeePercent = atof(poolFee.c_str());
+        poolSet.dPoolFeePercent = atof(poolFee.c_str());
 
     string poolFeeTo = argval2(argc, argv, "/poolfeeto", "-poolfeeto");
     if (!poolFeeTo.empty())
@@ -476,7 +479,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         // and the node started anyway with the fee going to the default.
         if (poolFeeTo != "treasury" && poolFeeTo != "operator")
             StartupRefuse(strprintf("-poolfeeto is 'treasury' or 'operator', not '%s'", poolFeeTo.c_str()), "");
-        fPoolFeeToTreasury = poolFeeTo == "treasury";
+        poolSet.fPoolFeeToTreasury = poolFeeTo == "treasury";
     }
 
     string treasuryShare = argval2(argc, argv, "/treasuryshare", "-treasuryshare");
@@ -486,8 +489,9 @@ static void ParseStartupArguments(int argc, char* argv[])
         if (n < 0 || n > treasury::SHARE_MAX_PERCENT)
             StartupRefuse(strprintf("-treasuryshare is 0 to %d percent, not '%s'", treasury::SHARE_MAX_PERCENT,
                                     treasuryShare.c_str()), "");
-        nTreasurySharePercent = n;
+        poolSet.nTreasurySharePercent = n;
     }
+    SetPoolSettings(poolSet);
 
     string poolStatusFile = argval2(argc, argv, "/poolstatusfile", "-poolstatusfile");
     if (!poolStatusFile.empty())

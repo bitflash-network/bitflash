@@ -10458,6 +10458,118 @@ static int RunRulesV4SelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The pool settings (CPoolSettings, main.h): the GUI's save button replaces
+// them while the miner, pool and announcement threads read them. Two writers
+// do what the GUI does (the save button's SetPoolSettings, the "Use" button's
+// SetParticipantPool) while readers take copies as the threads do; every copy
+// must be one whole set, never a mix of two. Strings too long for the small
+// string buffer, so a race would touch freed memory. `make tests` runs it in
+// the plain build; the audit's TSan build reports any access outside the lock.
+static int RunPoolSettingsSelfTest()
+{
+    printf("pool-settings self-test\n");
+    int nFail = 0;
+    const CPoolSettings saved = GetPoolSettings();
+
+    CPoolSettings def;
+    nFail += Check(def.strParticipantPool.empty() && def.strPoolName == "Bitflash Pool" &&
+                   def.strPoolDashboardUrl.empty() && def.dPoolFeePercent == 0.0 &&
+                   def.nTreasurySharePercent == 0 && !def.fPoolFeeToTreasury,
+                   "the defaults: no pool, \"Bitflash Pool\", no dashboard, no fee, no treasury share") ? 0 : 1;
+
+    CPoolSettings a, b;
+    a.strParticipantPool = std::string(96, 'a');
+    a.strPoolName = std::string(80, 'A');
+    a.strPoolDashboardUrl = "https://a.example/" + std::string(64, 'a');
+    a.dPoolFeePercent = 1.25;
+    a.nTreasurySharePercent = 1;
+    a.fPoolFeeToTreasury = true;
+    b.strParticipantPool = std::string(112, 'b');
+    b.strPoolName = std::string(72, 'B');
+    b.strPoolDashboardUrl = "https://b.example/" + std::string(88, 'b');
+    b.dPoolFeePercent = 2.5;
+    b.nTreasurySharePercent = 2;
+    b.fPoolFeeToTreasury = false;
+
+    SetPoolSettings(a);
+    CPoolSettings r = GetPoolSettings();
+    nFail += Check(r.strParticipantPool == a.strParticipantPool && r.strPoolName == a.strPoolName &&
+                   r.strPoolDashboardUrl == a.strPoolDashboardUrl && r.dPoolFeePercent == a.dPoolFeePercent &&
+                   r.nTreasurySharePercent == a.nTreasurySharePercent && r.fPoolFeeToTreasury == a.fPoolFeeToTreasury,
+                   "SetPoolSettings then GetPoolSettings: the same six values") ? 0 : 1;
+    SetParticipantPool(b.strParticipantPool);
+    r = GetPoolSettings();
+    nFail += Check(GetParticipantPool() == b.strParticipantPool && r.strParticipantPool == b.strParticipantPool &&
+                   r.strPoolName == a.strPoolName && r.dPoolFeePercent == a.dPoolFeePercent,
+                   "SetParticipantPool changes the pool only") ? 0 : 1;
+
+    // The rest of each set, apart from the participant pool the "Use"
+    // button changes on its own.
+    struct Same
+    {
+        static bool Rest(const CPoolSettings& x, const CPoolSettings& y)
+        {
+            return x.strPoolName == y.strPoolName && x.strPoolDashboardUrl == y.strPoolDashboardUrl &&
+                   x.dPoolFeePercent == y.dPoolFeePercent && x.nTreasurySharePercent == y.nTreasurySharePercent &&
+                   x.fPoolFeeToTreasury == y.fPoolFeeToTreasury;
+        }
+    };
+
+    std::atomic<bool> fStop(false);
+    std::atomic<int> nMixed(0), nReads(0), nWrites(0);
+    std::vector<std::thread> threads;
+    threads.emplace_back([&]() {
+        for (int i = 0; i < 20000; i++)
+        {
+            SetPoolSettings((i & 1) ? b : a);
+            nWrites++;
+        }
+    });
+    threads.emplace_back([&]() {
+        for (int i = 0; i < 20000; i++)
+        {
+            SetParticipantPool((i & 1) ? a.strParticipantPool : b.strParticipantPool);
+            nWrites++;
+        }
+    });
+    for (int t = 0; t < 3; t++)
+    {
+        threads.emplace_back([&, t]() {
+            while (!fStop)
+            {
+                if (t == 2)
+                {
+                    std::string s = GetParticipantPool();
+                    if (s != a.strParticipantPool && s != b.strParticipantPool)
+                        nMixed++;
+                }
+                else
+                {
+                    CPoolSettings c = GetPoolSettings();
+                    if ((c.strParticipantPool != a.strParticipantPool && c.strParticipantPool != b.strParticipantPool) ||
+                        !(Same::Rest(c, a) || Same::Rest(c, b)))
+                        nMixed++;
+                }
+                nReads++;
+            }
+        });
+    }
+    threads[0].join();
+    threads[1].join();
+    fStop = true;
+    for (size_t i = 2; i < threads.size(); i++)
+        threads[i].join();
+    printf("  %d writes, %d reads\n", nWrites.load(), nReads.load());
+    nFail += Check(nWrites == 40000 && nReads > 0 && nMixed == 0,
+                   "two writers (save, \"Use\") and three readers at once: every copy is one whole set") ? 0 : 1;
+
+    SetPoolSettings(saved);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // The treasury: the script the keys in treasury.cpp make, what pays it, and
 // the coinbase split. Runs against both networks' tables; mainnet may be
 // unconfigured, and then everything that would pay it must say so.
@@ -15995,6 +16107,26 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fPreview, "poolcreate everpool shows the record, the id and the fee, and sends nothing "
                                      "without \"send\"") ? 0 : 1;
 
+            // Mainnet is closed to burns in this release
+            // (POOL_REGISTRY_MAINNET_OPEN): "send" and "publishzero" are
+            // refused before any other check, and the preview says so. The
+            // wallet is left unlocked: nothing may reach it.
+            {
+                const std::string strClosed = "registered pools open on mainnet in a later release";
+                json pZeroG = { { "name", "bitflash" }, { "spacing", 10 }, { "window", 2160 }, { "retarget", 720 },
+                                { "uncledepth", 3 }, { "unclepct", 80 } };
+                const bool fClosed = !POOL_REGISTRY_MAINNET_OPEN && !IsTestNet() && !PoolBurnsOpen();
+                json rgs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+                json rgz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZeroG, "publishzero" }), &strAll);
+                nFail += Check(fClosed && RpcOk(rc) && rc["result"]["send"].get<std::string>().find(strClosed) == 0 &&
+                               !RpcOk(rgs) && RpcError(rgs).find(strClosed) == 0 &&
+                               !RpcOk(rgz) && RpcError(rgz).find(strClosed) == 0,
+                               "mainnet: \"send\" and \"publishzero\" are refused (registered pools open in a later "
+                               "release), the preview still works and says so") ? 0 : 1;
+            }
+            // The checks behind the gate, with the made-up mainnet registry.
+            PoolBurnsOpenForTest(true);
+
             // "send" goes through every check to the wallet's burn path:
             // here a locked wallet is the first thing to say no.
             const bool fEncWas = fWalletEncrypted, fLockWas = fWalletLocked;
@@ -16120,6 +16252,28 @@ static int RunPoolIndexSelfTest()
                            "pool zero's own record is recognised byte for byte; \"send\" refuses it, only "
                            "\"publishzero\" reaches the burn, and only for pool zero") ? 0 : 1;
 
+            // Testnet is open: with no test switch, "send" passes the gate
+            // and every check and reaches the wallet's burn path, and the
+            // preview says how to send.
+            PoolBurnsOpenForTest(false);
+            {
+                SelectChainParams(true);
+                const bool fOpen = PoolBurnsOpen();
+                json pTest = { { "name", "testpool" } };
+                json rtp = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pTest }), &strAll);
+                fWalletEncrypted = true;
+                fWalletLocked = true;
+                json rts = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pTest, "send" }), &strAll);
+                fWalletEncrypted = fEncWas;
+                fWalletLocked = fLockWas;
+                SelectChainParams(false);
+                nFail += Check(fOpen && !PoolBurnsOpen() && RpcOk(rtp) && rtp["result"]["sent"] == false &&
+                               rtp["result"]["send"].get<std::string>().find("burns 1 BTF") != std::string::npos &&
+                               !RpcOk(rts) && RpcError(rts) == "wallet is locked",
+                               "testnet: \"send\" is not gated and reaches the wallet's burn path; mainnet is "
+                               "closed again") ? 0 : 1;
+            }
+
             // The node's index back to empty for what follows.
             CPoolIndex blank;
             blank.SetPath(blankPath);
@@ -16143,6 +16297,7 @@ static int RunPoolIndexSelfTest()
     }
 
     remove(path.c_str());
+    PoolBurnsOpenForTest(false);
     pindexBest = pindexBestSaved;
     pindexGenesisBlock = pindexGenesisSaved;
     nBestHeight = nBestHeightSaved;
@@ -21607,6 +21762,8 @@ int RunSelfTest(const std::string& name)
         return RunReplyParsersSelfTest();
     if (name == "managed-tor")
         return RunManagedTorSelfTest();
+    if (name == "pool-settings")
+        return RunPoolSettingsSelfTest();
     if (name == "treasury")
         return RunTreasurySelfTest();
     if (name == "chat-link")

@@ -187,12 +187,28 @@ extern std::atomic<int> nMineMode;
 // stored mode alone when this is true, so a flag is never silently overruled by
 // something a previous session wrote.
 extern bool   fMineModeFromCommandLine;
-extern string strParticipantPool; // participant: pool .btf address
-extern string strPoolName;        // operator: announced pool name
-extern string strPoolDashboardUrl; // operator: optional dashboard URL
+// The pool settings the GUI's save button changes while the miner, pool,
+// stratum bridge and announcement threads read them. They live behind
+// cs_poolSettings (a leaf lock: nothing else is taken while it is held), and
+// are only reached through these calls: readers get a copy, writers replace
+// them whole (or the participant pool alone).
+struct CPoolSettings
+{
+    string strParticipantPool;  // participant: pool .btf address
+    string strPoolName;         // operator: announced pool name
+    string strPoolDashboardUrl; // operator: optional dashboard URL
+    double dPoolFeePercent;     // operator: announced fee percent
+    int nTreasurySharePercent;  // solo: percent of each block to the treasury (treasury.h)
+    bool fPoolFeeToTreasury;    // operator: the pool fee goes to the treasury
+    CPoolSettings() : strPoolName("Bitflash Pool"), dPoolFeePercent(0.0), nTreasurySharePercent(0),
+                      fPoolFeeToTreasury(false) {}
+};
+CPoolSettings GetPoolSettings();
+void SetPoolSettings(const CPoolSettings& settings);
+string GetParticipantPool();
+void SetParticipantPool(const string& strPool);
 extern string strPoolStatusFile;   // operator: optional JSON status output path
 extern string strPoolRoundsFile;   // operator: optional public round proof path
-extern double dPoolFeePercent;     // operator: announced fee percent
 extern bool   fStratumBridge;      // participant helper: local Stratum bridge
 extern int    nStratumBridgePort;  // local bridge listen port, default 3333
 extern string strStratumBridgeBind; // bridge listen address, default 127.0.0.1

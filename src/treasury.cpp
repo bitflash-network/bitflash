@@ -4,9 +4,6 @@
 #include "headers.h"
 #include "treasury.h"
 
-int  nTreasurySharePercent = 0;
-bool fPoolFeeToTreasury    = false;
-
 namespace {
 
 // Mainnet: filled the day the three holders hand over their keys (see

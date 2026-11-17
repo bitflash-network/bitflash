@@ -144,12 +144,41 @@ int64 nPayTxFeePerKB = 0;
 CAddress addrIncoming;
 std::atomic<int> nMineMode(MINE_RELAY);
 bool   fMineModeFromCommandLine = false;
-string strParticipantPool;           // participant mode: pool .btf address
-string strPoolName       = "Bitflash Pool";
-string strPoolDashboardUrl;
+// The pool settings (main.h): written by argument parsing, wallet loading and
+// the GUI's save button, read by the mining, pool and announcement threads.
+static CCriticalSection cs_poolSettings;
+static CPoolSettings poolSettings;
+
+CPoolSettings GetPoolSettings()
+{
+    CPoolSettings copy;
+    CRITICAL_BLOCK(cs_poolSettings)
+        copy = poolSettings;
+    return copy;
+}
+
+void SetPoolSettings(const CPoolSettings& settings)
+{
+    CRITICAL_BLOCK(cs_poolSettings)
+        poolSettings = settings;
+}
+
+string GetParticipantPool()
+{
+    string str;
+    CRITICAL_BLOCK(cs_poolSettings)
+        str = poolSettings.strParticipantPool;
+    return str;
+}
+
+void SetParticipantPool(const string& strPool)
+{
+    CRITICAL_BLOCK(cs_poolSettings)
+        poolSettings.strParticipantPool = strPool;
+}
+
 string strPoolStatusFile;
 string strPoolRoundsFile;
-double dPoolFeePercent   = 0.0;
 bool   fStratumBridge    = false;
 bool   fP2PoolMode       = false;
 unsigned short nP2PoolPort = 3333;
@@ -6144,6 +6173,9 @@ static bool PoolParticipantMiner()
     // ------------------------------------------------------------------
     // Step 1: resolve .btf address -> meeting node
     // ------------------------------------------------------------------
+    // One copy for the whole attempt: the GUI may change the pool meanwhile,
+    // and the next attempt takes the new one.
+    const string strParticipantPool = GetParticipantPool();
     if (strParticipantPool.empty()) {
         LogPrint("worker", "[worker] no pool selected\n");
         SetParticipantMiningStatus("no pool selected");
@@ -6665,7 +6697,7 @@ static void ThreadStratumBridgeClient(void* arg)
 
 void ThreadStratumBridge(void*)
 {
-    if (strParticipantPool.empty())
+    if (GetParticipantPool().empty())
     {
         printf("Stratum bridge: no pool selected. Use /stratumbridge=POOL_BTF_ADDRESS\n");
         return;
@@ -6712,7 +6744,7 @@ void ThreadStratumBridge(void*)
 
     printf("Stratum bridge: listening on %s:%d for pool %s\n",
            strStratumBridgeBind.c_str(),
-           nStratumBridgePort, strParticipantPool.c_str());
+           nStratumBridgePort, GetParticipantPool().c_str());
 
     while (!fShutdown)
     {
@@ -6736,7 +6768,7 @@ void ThreadStratumBridge(void*)
 
         StratumBridgeClientCtx* ctx = new StratumBridgeClientCtx();
         ctx->miner = miner;
-        ctx->pool = strParticipantPool;
+        ctx->pool = GetParticipantPool();
         if (_beginthread(ThreadStratumBridgeClient, 0, ctx) == (uintptr_t)-1)
         {
             delete ctx;
@@ -6940,7 +6972,8 @@ bool BitcoinMiner(int nThreadId)
         // operator mode, where the pool fee is the way (-poolfeeto).
         if (nMineMode != MINE_OPERATOR)
         {
-            int64 nShare = treasury::ShareOf(pblock->vtx[0].vout[0].nValue, nTreasurySharePercent);
+            int64 nShare = treasury::ShareOf(pblock->vtx[0].vout[0].nValue,
+                                              GetPoolSettings().nTreasurySharePercent);
             CScript scriptTreasury;
             if (nShare > 0 && treasury::Script(scriptTreasury))
             {

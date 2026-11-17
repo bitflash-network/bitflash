@@ -864,6 +864,11 @@ static void QueuePayouts(int blockHeight,
                          const std::map<std::string, uint64>& shareCount,
                          uint64 total)
 {
+    // One copy of the fee settings for the whole round, so the fee recorded
+    // is the fee applied even if the GUI saves new settings meanwhile.
+    const CPoolSettings poolSet = GetPoolSettings();
+    const double dPoolFeePercent = poolSet.dPoolFeePercent;
+    const bool fPoolFeeToTreasury = poolSet.fPoolFeeToTreasury;
     PoolRoundProof round;
     round.id = PayoutIdForBlock(blockHeight);
     round.blockHeight = blockHeight;
@@ -1162,12 +1167,13 @@ static void WritePoolStatusJsonLocked()
     j["network"] = IsTestNet() ? "bitflash-testnet" : "bitflash";
     j["updatedAt"] = GetTime();
 
+    const CPoolSettings poolSet = GetPoolSettings();
     j["operator"] = {
-        {"name", strPoolName},
+        {"name", poolSet.strPoolName},
         {"btfAddress", BtfLocalAddress()},
-        {"feePercent", dPoolFeePercent},
-        {"feeTo", fPoolFeeToTreasury && treasury::Configured() ? "treasury" : "operator"},
-        {"dashboardUrl", strPoolDashboardUrl},
+        {"feePercent", poolSet.dPoolFeePercent},
+        {"feeTo", poolSet.fPoolFeeToTreasury && treasury::Configured() ? "treasury" : "operator"},
+        {"dashboardUrl", poolSet.strPoolDashboardUrl},
         {"roundsFile", "pool_rounds.json"}
     };
 
@@ -3301,7 +3307,7 @@ void ThreadRPCServer(void*)
     LogPrint("pool", "[pool] ============================================\n");
     LogPrint("pool", "[pool] Pool server starting\n");
     LogPrint("pool", "[pool] .btf address: %s\n", BtfLocalAddress().c_str());
-    LogPrint("pool", "[pool] fee: %.2f%%\n", dPoolFeePercent);
+    LogPrint("pool", "[pool] fee: %.2f%%\n", GetPoolSettings().dPoolFeePercent);
 
     if (RebuildJob()) {
         LogPrint("pool", "[pool] initial job %s seeded at height %d\n",
