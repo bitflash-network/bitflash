@@ -10034,6 +10034,27 @@ static int RunP2PoolRegisteredSelfTest()
         }
     }
 
+    // ---- AddHistory says whether a part was taken in full
+    {
+        p2pool::ShareChain c(rulesA, false);
+        vector<p2pool::Share> whole, gap;
+        for (size_t i = 0; i < 10; i++)
+        {
+            p2pool::Share s;
+            mirrorA.GetShare(lineA[i], s);
+            whole.push_back(s);
+            if (i != 4)
+                gap.push_back(s);
+        }
+        bool fWhole1 = false, fWhole2 = true, fWhole3 = false;
+        bool fOk1 = c.AddHistory(gap, 9, main, err, &fWhole1);
+        bool fOk2 = c.AddHistory(whole, 9, main, err, &fWhole2);
+        bool fOk3 = c.AddHistory(whole, 9, main, err, &fWhole3);
+        nFail += Check(fOk1 && !fWhole1 && fOk2 && fWhole2 && fOk3 && fWhole3 && c.Size() == 10,
+                       "AddHistory reports a part it stopped early on (a parent missing) as not taken in full, "
+                       "and one taken or already held as taken in full") ? 0 : 1;
+    }
+
     // ---- a fetch: pools/<id>.part, a restart, the catch-up, the line complete
     poolreg::PoolRecord recB = recA;
     recB.name = "regtest-b";
