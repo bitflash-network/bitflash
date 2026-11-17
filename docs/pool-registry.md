@@ -640,9 +640,11 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
   (pending, unknown id, waiting for its line), as it does today while pool
-  zero's history is on its way. A mined pool that no peer announces, with
-  nothing of it on this node, starts its line here 2 minutes after it
-  becomes active; peers are asked `poolwho` meanwhile.
+  zero's history is on its way. A mined pool with nothing of it on this
+  node starts its line here 2 minutes after it becomes active if no peer
+  announces it, or after 10 minutes if peers announce it but none has a
+  share of it yet (they answer `p2xnone`, and are asked again a minute
+  later); peers are asked `poolwho` meanwhile.
 - The node carries the pool it mines (keeps its chain in
   `pools/<poolid>.dat`, relays it, announces it), plus pool zero, plus what the
   draw gives it (section 10), plus any given with `-poolcarry=<poolid>`

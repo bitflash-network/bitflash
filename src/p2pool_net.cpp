@@ -3849,11 +3849,15 @@ static const size_t MAX_REG_SERVED_POOLS = 8;
 // A mined pool that no peer announces and nothing of which is here: its
 // line starts on this node after this long.
 static const int64 REG_START_GRACE = 2 * 60;
+static const int64 REG_START_LONGEST = 10 * 60;
 static const int64 REG_CATCHUP_WAIT = 5 * 60;
 static const int64 REG_PART_EXPIRY = 24 * 60 * 60;
 // A peer that said it holds nothing of a pool is not asked for it again for
-// this long.
-static const int64 REG_NONE_FORGET = 10 * 60;
+// this long. Short: a node announces the pool it mines before it has shares
+// (section 8), so an announcer with nothing yet is the usual case at a
+// pool's start, and it has shares a spacing or two later. Each ask costs it
+// a p2xnone, 8 an interval at most.
+static const int64 REG_NONE_FORGET = 60;
 static const int64 REG_RETRY_SECS = 30;
 static const int64 REG_STATUS_SECS = 10;
 static const int64 POOLWHO_INTERVAL = 10 * 60;
@@ -4453,11 +4457,17 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
         AskHistory(rp->state, pAsk);
         return false;
     }
-    // Nobody announces it. A mined pool with nothing of it here starts its
-    // line on this node after a grace; and peers are asked who carries it.
-    if (rp->fMined && rp->nFetch == FETCH_IDLE && rp->state.chain->Empty() && nNow - rp->nWantedSince >= REG_START_GRACE)
+    // Nobody to ask. A mined pool with nothing of it here starts its line on
+    // this node after a grace, unless a peer announces it (it mines it and
+    // has no share yet: its line is a spacing or two away), and in any case
+    // after REG_START_LONGEST; and peers are asked who carries it.
+    bool fAnnounced = false;
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && !fAnnounced; ++it)
+        fAnnounced = !it->first->fDisconnect && it->second.setInv.count(rp->id) != 0;
+    if (rp->fMined && rp->nFetch == FETCH_IDLE && rp->state.chain->Empty() &&
+        ((!fAnnounced && nNow - rp->nWantedSince >= REG_START_GRACE) || nNow - rp->nWantedSince >= REG_START_LONGEST))
     {
-        printf("p2pool: registered pool %s: no peer announces it; its line starts here\n", rp->id.GetHex().c_str());
+        printf("p2pool: registered pool %s: no peer has its line; it starts here\n", rp->id.GetHex().c_str());
         return true;
     }
     if (nNow - rp->nWhoAt >= POOLWHO_INTERVAL)
@@ -4864,7 +4874,14 @@ static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStrea
             it->second.nSyncAskedAt = 0;
             RegConnOf(pfrom).mapNoneAt[id] = nNow;
             if (rp->pFetchPeer == pfrom)
+            {
                 rp->nAskAt = 0;
+                // Nothing of the line taken yet: the fetch has not begun,
+                // and a mined pool may still start its own line after its
+                // grace if no announcer ever has shares.
+                if (rp->nFetch == FETCH_RUNNING && rp->hashResume == 0 && rp->state.chain->Empty())
+                    rp->nFetch = FETCH_IDLE;
+            }
         }
         return true;
     }
