@@ -9521,6 +9521,777 @@ static int RunP2PoolLocalNodeSelfTest()
     return nFail ? 1 : 0;
 }
 
+// ---- p2pool-registered: an Everpool pool on the wire, and pool zero beside it
+// docs/pool-registry.md, sections 8, 9 and 17, and the "Routing", "Pool zero
+// isolation", "Resumable fetches" and lock-free items of section 15: the
+// NODE_POOLREG negotiation, poolinv, the p2x* messages and their routing, a
+// paced serve from a resume point, a fetch through pools/<id>.part to a
+// complete line, the template of a chosen pool, and a 1.2.34 peer that is
+// sent nothing of any of it.
+
+// A peer past its version that reads the registry.
+static CNode* NewRegTestNode(bool fInbound, const char* pszBtf = "")
+{
+    CNode* p = NewP2PoolTestNode(fInbound);
+    p->nServices = NODE_P2POOL | NODE_POOLREG;
+    p->strBtfAddr = pszBtf;
+    return p;
+}
+
+template <typename T>
+static void SendRegItem(CNode* pnode, const char* pszCommand, const uint256& id, const T& item)
+{
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << id << item;
+    SendP2PoolTest(pnode, pszCommand, ss);
+}
+
+static void SendRegPart(CNode* pnode, const uint256& id, int nTip, unsigned char nFlag, const vector<p2pool::Share>& v)
+{
+    vector<p2pool::ShareX> vx(v.begin(), v.end());
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << id << nTip << nFlag << vx;
+    SendP2PoolTest(pnode, "p2xshares", ss);
+}
+
+// The last part of a history a peer was sent: its flag and its shares.
+static bool LastRegPart(CNode* pnode, unsigned char& nFlagOut, vector<p2pool::ShareX>& vOut)
+{
+    vector<unsigned char> payload;
+    if (!LastSent(pnode, "p2xshares", payload) || payload.empty())
+        return false;
+    try
+    {
+        CDataStream ss((const char*)&payload[0], (const char*)&payload[0] + payload.size(), SER_NETWORK, VERSION);
+        uint256 id;
+        int nTip;
+        vOut.clear();
+        ss >> id >> nTip >> nFlagOut >> vOut;
+    }
+    catch (std::exception&)
+    {
+        return false;
+    }
+    return true;
+}
+
+// The pool id and resume point of the last p2xsync a peer was sent.
+static bool LastRegSync(CNode* pnode, uint256& idOut, uint256& resumeOut)
+{
+    vector<unsigned char> payload;
+    if (!LastSent(pnode, "p2xsync", payload) || payload.size() != 64)
+        return false;
+    memcpy(idOut.begin(), &payload[0], 32);
+    memcpy(resumeOut.begin(), &payload[32], 32);
+    return true;
+}
+
+// The ids of the last poolinv a peer was sent.
+static vector<uint256> LastPoolInv(CNode* pnode)
+{
+    vector<uint256> v;
+    vector<unsigned char> payload;
+    if (!LastSent(pnode, "poolinv", payload) || payload.empty())
+        return v;
+    try
+    {
+        CDataStream ss((const char*)&payload[0], (const char*)&payload[0] + payload.size(), SER_NETWORK, VERSION);
+        ss >> v;
+    }
+    catch (std::exception&)
+    {
+        v.clear();
+    }
+    return v;
+}
+
+static void SendPoolInv(CNode* pnode, const vector<uint256>& v)
+{
+    SendP2PoolTestItem(pnode, "poolinv", v);
+}
+
+// n bytes of a registered-class message waiting on a connection, framed as
+// a message so what was sent after it can still be read back.
+static void FillRegQueue(CNode* pnode, size_t n)
+{
+    CRITICAL_BLOCK(pnode->cs_vSend)
+    {
+        uint64 nFrom = pnode->nSendDrained + pnode->vSend.size();
+        pnode->PushMessage("p2xfill", vector<char>(n, 0));
+        pnode->vRegSpans.push_back(std::make_pair(nFrom, pnode->nSendDrained + (uint64)pnode->vSend.size()));
+    }
+}
+
+// Whether a peer was sent anything of the registry: a p2x* or pool* message.
+static bool SentRegMessage(CNode* pnode)
+{
+    foreach(const SentMessage& m, SentTo(pnode))
+        if (m.strCommand.compare(0, 3, "p2x") == 0 || m.strCommand.compare(0, 4, "pool") == 0)
+            return true;
+    return false;
+}
+
+static size_t RegShares(const uint256& id)
+{
+    P2PoolRegStatusInfo st;
+    return P2PoolRegStatus(id, st) ? st.nShares : 0;
+}
+
+static int RunP2PoolRegisteredSelfTest()
+{
+    printf("p2pool-registered self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    string err;
+
+    TestMainView main;
+    main.nBits = 0x1d00ffff;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    auto payTo = [](unsigned char c) {
+        CScript s;
+        s << OP_DUP << OP_HASH160 << uint160(c) << OP_EQUALVERIFY << OP_CHECKSIG;
+        return vector<unsigned char>(s.begin(), s.end());
+    };
+    CBigNum bnFloor;
+    bnFloor.SetCompact(0x207fffff);
+    P2PoolResetForTest(bnFloor, false);
+    const unsigned char* magic = (const unsigned char*)pchMessageStart;
+    uint256 idZero = 0;
+    poolreg::PoolId(poolreg::PoolZero().Encode(), magic, idZero.begin());
+
+    poolreg::PoolRecord recA = poolreg::PoolZero();
+    recA.nSpacing = 30; recA.nWindow = 360; recA.nRetarget = 120; recA.nUncleDepth = 2;
+    recA.nUnclePct = 90; recA.nFloor = 0x1f0fffff; recA.name = "regtest-a";
+    p2pool::PoolRules rulesA;
+    bool fRules = p2pool::RulesForRegistered(recA, magic, rulesA, err);
+    {
+        poolreg::PoolRecord recLocal = recA;
+        recLocal.fLocal = true;
+        p2pool::PoolRules r;
+        unsigned char id[32];
+        poolreg::PoolId(recA.Encode(), magic, id);
+        nFail += Check(fRules && rulesA.nAnchor == p2pool::ANCHOR_P2X && memcmp(rulesA.poolId.begin(), id, 32) == 0 &&
+                       rulesA.nSpacing == 30 && rulesA.nUncleDepth == 2 &&
+                       !p2pool::RulesForRegistered(poolreg::PoolZero(), magic, r, err) &&
+                       !p2pool::RulesForRegistered(recLocal, magic, r, err),
+                       "a registered pool's rules: its record's parameters, its id, the p2x anchor; "
+                       "never pool zero's record or a local one") ? 0 : 1;
+    }
+    uint256 idA = rulesA.poolId;
+
+    // ---- the lock-free path takes every pool's commands
+    {
+        const char* vYes[] = { "p2pshare", "p2lhello", "p2xshare", "p2xgetsh", "p2xsync", "p2xshares", "p2xnone",
+                               "poolinv", "poolwho", "poolat" };
+        const char* vNo[] = { "version", "inv", "block", "tx", "btfpeers" };
+        bool fYes = true, fNo = true;
+        for (size_t i = 0; i < sizeof(vYes) / sizeof(vYes[0]); i++)
+            fYes = fYes && P2PoolCommand(vYes[i]);
+        for (size_t i = 0; i < sizeof(vNo) / sizeof(vNo[0]); i++)
+            fNo = fNo && !P2PoolCommand(vNo[i]);
+        nFail += Check(fYes && fNo, "the p2x* and pool* commands take the lock-free path, and nothing else new does") ? 0 : 1;
+        nFail += Check((nLocalServices & NODE_POOLREG) != 0 && NODE_POOLREG == (1 << 3),
+                       "this node says NODE_POOLREG, bit 3") ? 0 : 1;
+    }
+
+    // ---- mined, active, nothing of it here yet
+    nFail += Check(P2PoolRegAddForTest(recA, true, false, true, err), "a registered pool to mine joins this node") ? 0 : 1;
+    p2pool::ShareChain mirrorA(rulesA, false);
+    unsigned int t = (unsigned int)main.nNow - 30 * 60;
+    vector<uint256> lineA;
+    {
+        string why;
+        p2pool::Share g = RulesShare(mirrorA, main, 0, payTo(1), t);
+        bool fReady = P2PoolMinedReady(why);
+        bool fSubmit = P2PoolSubmitShare(g, err);
+        size_t nZero;
+        CRITICAL_BLOCK(cs_p2pool)
+            nZero = P2PoolChain().Size();
+        nFail += Check(!fReady && why.find("waiting") != std::string::npos && !fSubmit && nZero == 0 && RegShares(idA) == 0,
+                       "no template and no share while its line is not here, and never pool zero in its place") ? 0 : 1;
+    }
+    CNode* pOld = NewP2PoolTestNode(true);             // a 1.2.34 node: NODE_P2POOL only
+    CNode* pNew = NewRegTestNode(false, "BF1announcer");
+    {
+        P2PoolOnVersion(pOld);
+        P2PoolOnVersion(pNew);
+        nFail += Check(CountSent(pOld, "poolinv") == 0 && CountSent(pNew, "poolinv") == 0,
+                       "nothing complete to announce: no poolinv after the version") ? 0 : 1;
+        P2PoolRegTickForTest();
+        vector<unsigned char> who;
+        nFail += Check(CountSent(pNew, "poolwho") == 1 && LastSent(pNew, "poolwho", who) && who.size() == 32 &&
+                       memcmp(&who[0], idA.begin(), 32) == 0 && CountSent(pOld, "poolwho") == 0,
+                       "nobody announces it: a peer that reads the registry is asked who carries it, a 1.2.34 peer is not") ? 0 : 1;
+        P2PoolRegAgeForTest(121);
+        P2PoolRegTickForTest();
+        string why;
+        vector<uint256> inv = LastPoolInv(pNew);
+        nFail += Check(P2PoolRegFetchForTest(idA) == P2PoolRegStatusInfo::FETCH_COMPLETE && P2PoolMinedReady(why) &&
+                       inv.size() == 1 && inv[0] == idA && CountSent(pOld, "poolinv") == 0,
+                       "after its grace its line starts here, and it is announced to the peer that reads the registry only") ? 0 : 1;
+    }
+
+    // ---- a line mined here, with an uncle and a side branch
+    uint256 sUncle = 0, sSide1 = 0, sSide2 = 0;
+    {
+        bool fBuilt = true;
+        uint256 prev = 0;
+        for (int i = 0; i < 40 && fBuilt; i++)
+        {
+            vector<uint256> uncles;
+            if (i == 31)
+                uncles.push_back(sUncle);
+            p2pool::Share s = RulesShare(mirrorA, main, prev, payTo((unsigned char)(1 + i % 3)), t + 30 * i, uncles);
+            fBuilt = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err);
+            prev = s.GetId();
+            lineA.push_back(prev);
+            if (i == 30)
+            {
+                p2pool::Share u = RulesShare(mirrorA, main, lineA[29], payTo(9), t + 30 * 30 + 5);
+                fBuilt = fBuilt && mirrorA.Add(u, main, err) && P2PoolSubmitShare(u, err);
+                sUncle = u.GetId();
+            }
+        }
+        p2pool::Share b1 = RulesShare(mirrorA, main, lineA[20], payTo(8), t + 30 * 21 + 7);
+        fBuilt = fBuilt && mirrorA.Add(b1, main, err) && P2PoolSubmitShare(b1, err);
+        p2pool::Share b2 = RulesShare(mirrorA, main, b1.GetId(), payTo(8), t + 30 * 22 + 7);
+        fBuilt = fBuilt && mirrorA.Add(b2, main, err) && P2PoolSubmitShare(b2, err);
+        sSide1 = b1.GetId();
+        sSide2 = b2.GetId();
+        P2PoolRegStatusInfo st;
+        nFail += Check(fBuilt && P2PoolRegStatus(idA, st) && st.nShares == 43 && st.nTipHeight == 39 &&
+                       mirrorA.Tip() == lineA[39] && CountSent(pNew, "p2xshare") == 0 && !SentRegMessage(pOld),
+                       "a line of 40 mined here, an uncle and a side branch; nothing pushed to a peer that announced nothing") ? 0 : 1;
+        if (!fBuilt) printf("       line: %s\n", err.c_str());
+    }
+
+    // ---- poolinv in: acted on at once, then at most once a minute
+    {
+        SendPoolInv(pNew, vector<uint256>(1, idA));
+        uint256 idSync, resume;
+        bool fAsked = CountSent(pNew, "p2xsync") == 1 && LastRegSync(pNew, idSync, resume) && idSync == idA &&
+                      resume == lineA[39];
+        p2pool::Share s = RulesShare(mirrorA, main, lineA[39], payTo(1), t + 30 * 40);
+        bool fPushed = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err) && CountSent(pNew, "p2xshare") == 1;
+        lineA.push_back(s.GetId());
+        nFail += Check(fAsked && fPushed,
+                       "a peer announcing a pool this node carries is asked from this node's tip, and pushed its shares") ? 0 : 1;
+        SendPoolInv(pNew, vector<uint256>());
+        s = RulesShare(mirrorA, main, lineA[40], payTo(2), t + 30 * 41);
+        bool fStill = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err) && CountSent(pNew, "p2xshare") == 2;
+        lineA.push_back(s.GetId());
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        s = RulesShare(mirrorA, main, lineA[41], payTo(3), t + 30 * 42);
+        bool fStopped = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err) && CountSent(pNew, "p2xshare") == 2;
+        lineA.push_back(s.GetId());
+        nFail += Check(fStill && fStopped,
+                       "a second poolinv within a minute is acted on a minute after the first, not before") ? 0 : 1;
+        SendPoolInv(pNew, vector<uint256>(1, idA));
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        nFail += Check(!SentRegMessage(pOld) && pNew->nMisbehavior == 0, "and a 1.2.34 peer still hears nothing of it") ? 0 : 1;
+    }
+
+    // ---- what comes in: decided on the pool id before anything else
+    CNode* pIn = NewRegTestNode(true);
+    {
+        p2pool::Share s = RulesShare(mirrorA, main, lineA.back(), payTo(4), t + 30 * 43);
+        int nTokens = P2PoolRegisteredShareWorkTokens();
+        size_t nBefore = RegShares(idA);
+        SendRegItem(pIn, "p2xshare", uint256(777), p2pool::ShareX(s));
+        SendRegItem(pIn, "p2xshare", idZero, p2pool::ShareX(s));
+        size_t nZero;
+        CRITICAL_BLOCK(cs_p2pool)
+            nZero = P2PoolChain().Size();
+        nFail += Check(RegShares(idA) == nBefore && P2PoolRegisteredShareWorkTokens() == nTokens && pIn->nMisbehavior == 0 &&
+                       nZero == 0 && P2PoolRegisteredOrphanCount() == 0,
+                       "a share pushed for a pool not carried, pool zero's id included, is dropped unread; nobody scored") ? 0 : 1;
+        // A node from before the registry that sent one anyway: unread too.
+        SendRegItem(pOld, "p2xshare", idA, p2pool::ShareX(s));
+        nFail += Check(RegShares(idA) == nBefore && !SentRegMessage(pOld) && pOld->nMisbehavior == 0,
+                       "and from a peer without NODE_POOLREG, unread") ? 0 : 1;
+
+        SendRegItem(pIn, "p2xsync", uint256(777), uint256(0));
+        SendRegItem(pIn, "p2xsync", idZero, uint256(0));
+        SendRegItem(pIn, "p2xgetsh", uint256(778), vector<uint256>(1, lineA[0]));
+        vector<unsigned char> none;
+        bool fNone = CountSent(pIn, "p2xnone") == 3 && LastSent(pIn, "p2xnone", none) && none.size() == 32;
+        for (int i = 0; i < 8; i++)
+            SendRegItem(pIn, "p2xsync", uint256(800 + i), uint256(0));
+        nFail += Check(fNone && CountSent(pIn, "p2xnone") == 8 && pIn->nMisbehavior == 0,
+                       "a request about a pool not carried, or pool zero's id, gets p2xnone, 8 an interval; the rest unread") ? 0 : 1;
+
+        // The share of another pool sent under this pool's id: invalid.
+        poolreg::PoolRecord recX = recA;
+        recX.name = "regtest-x";
+        p2pool::PoolRules rulesX;
+        p2pool::RulesForRegistered(recX, magic, rulesX, err);
+        p2pool::ShareChain mirrorX(rulesX, false);
+        p2pool::Share sx = RulesShare(mirrorX, main, 0, payTo(5), t);
+        CNode* pLiar = NewRegTestNode(true);
+        SendRegItem(pLiar, "p2xshare", idA, p2pool::ShareX(sx));
+        nFail += Check(pLiar->nMisbehavior > 0 && RegShares(idA) == nBefore,
+                       "a share whose message id differs from its own pool id is scored as invalid") ? 0 : 1;
+        P2PoolForgetDeferred(pLiar);
+        delete pLiar;
+
+        // A good one from an inbound peer: taken, relayed to the announcer.
+        size_t nPushed = CountSent(pNew, "p2xshare");
+        SendRegItem(pIn, "p2xshare", idA, p2pool::ShareX(s));
+        mirrorA.Add(s, main, err);
+        lineA.push_back(s.GetId());
+        nFail += Check(RegShares(idA) == nBefore + 1 && CountSent(pNew, "p2xshare") == nPushed + 1 &&
+                       CountSent(pIn, "p2xshare") == 0 && pIn->nMisbehavior == 0,
+                       "a pushed share of a carried pool is taken and relayed to the peers that announced it") ? 0 : 1;
+        nFail += Check(!P2PoolPeerProven(pIn), "a peer that sent only registered shares is not proven for pool zero") ? 0 : 1;
+    }
+
+    // ---- section 8: pool zero beside all that
+    p2pool::ShareChain zeroMirror(bnFloor, false);
+    CNode* pZ = NewP2PoolTestNode(false);
+    {
+        uint256 zeroTip = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            p2pool::Share z = ChainShare(zeroMirror, main, zeroTip, payTo(3), t + 10 * i);
+            zeroMirror.Add(z, main, err);
+            SendP2PoolTestItem(pZ, "p2pshare", z);
+            zeroTip = z.GetId();
+        }
+        P2PoolRefillBudgetsForTest();
+        P2PoolDrainRegisteredBudgetsForTest();
+        p2pool::Share base = RulesShare(mirrorA, main, lineA.back(), payTo(6), t + 30 * 44);
+        for (int i = 0; i < 300; i++)
+        {
+            p2pool::Share o = base;
+            o.data.hashPrevShare = uint256(5000 + i);
+            o.data.nShareHeight = 45;
+            o.coinbase.vin[0].scriptSig = CScript() << (main.nTip + 1) << (int64)(t + i) << p2pool::AnchorPush(rulesA, o.data);
+            o.hashMerkleRoot = o.coinbase.GetHash();
+            SendRegItem(pIn, "p2xshare", idA, p2pool::ShareX(o));
+        }
+        size_t nZero;
+        CRITICAL_BLOCK(cs_p2pool)
+            nZero = P2PoolChain().Size();
+        nFail += Check(nZero == 5 && P2PoolRegisteredOrphanCount() == 256 && P2PoolOrphanCount() == 0 &&
+                       P2PoolShareWorkTokens() == 32 && P2PoolHistoryServeTokens() == 4 && P2PoolHistoryAskTokens() == 2 &&
+                       P2PoolDeferredCount() == 0,
+                       "a registered pool's orphans fill its class's queue; pool zero's budgets, queue and held entries "
+                       "are untouched") ? 0 : 1;
+        CNode* pZeroPeer = NewP2PoolTestNode(true);
+        SendP2PoolTest(pZeroPeer, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        SendP2PoolTest(pIn, "p2psync", CDataStream(SER_NETWORK, VERSION));
+        nFail += Check(CountSent(pZeroPeer, "p2pshares") == 1 && CountSent(pIn, "p2pshares") == 1 &&
+                       P2PoolHistoryServeTokens() == 2 && P2PoolDeferredCount() == 0,
+                       "and a pool zero history request is served at once, from pool zero's own budget") ? 0 : 1;
+        P2PoolForgetDeferred(pZeroPeer);
+        delete pZeroPeer;
+        P2PoolRefillBudgetsForTest();
+    }
+
+    // ---- paced serves from a resume point (section 17)
+    {
+        CNode* pR = NewRegTestNode(false);
+        unsigned char nFlag = 9;
+        vector<p2pool::ShareX> v;
+        SendRegItem(pR, "p2xsync", idA, uint256(0));
+        bool fWhole = LastRegPart(pR, nFlag, v) && nFlag == 1 && !v.empty() && v.front().data.nShareHeight == 0 &&
+                      v.back().GetId() == lineA.back();
+        bool fUncleIn = false, fSideIn = false;
+        foreach(const p2pool::ShareX& s, v)
+        {
+            fUncleIn = fUncleIn || s.GetId() == sUncle;
+            fSideIn = fSideIn || s.GetId() == sSide1;
+        }
+        nFail += Check(fWhole && fUncleIn && !fSideIn,
+                       "an ask from nothing gets the whole line with the uncle it names, oldest first, flagged as its end") ? 0 : 1;
+        SendRegItem(pR, "p2xsync", idA, lineA[35]);
+        bool fOnLine = LastRegPart(pR, nFlag, v) && !v.empty() && v.front().data.nShareHeight == 33;
+        SendRegItem(pR, "p2xsync", idA, sUncle);
+        bool fAsUncle = LastRegPart(pR, nFlag, v) && !v.empty() && v.front().data.nShareHeight == 28;
+        size_t nParts = CountSent(pR, "p2xshares");
+        SendRegItem(pR, "p2xsync", idA, sSide2);
+        bool fFourth = CountSent(pR, "p2xshares") == nParts;
+        nFail += Check(fOnLine && fAsUncle, "a resume point on the line, or held as an uncle, is served from it less the uncle depth") ? 0 : 1;
+        nFail += Check(fFourth && pR->nMisbehavior == 0, "a fourth ask in an interval is dropped, silently") ? 0 : 1;
+        P2PoolRegAgeForTest(601);
+        SendRegItem(pR, "p2xsync", idA, sSide2);
+        bool fSide = LastRegPart(pR, nFlag, v) && !v.empty() && v.front().data.nShareHeight == 18;
+        SendRegItem(pR, "p2xsync", idA, uint256(999));
+        bool fNotHeld = LastRegPart(pR, nFlag, v) && !v.empty() && v.front().data.nShareHeight == 0;
+        nFail += Check(fSide && fNotHeld,
+                       "a resume point on a side branch is served from where it meets the line, one not held gets the "
+                       "whole line") ? 0 : 1;
+        P2PoolForgetDeferred(pR);
+        delete pR;
+
+        // One serve in flight per (connection, pool): a new ask replaces it.
+        CNode* pQ = NewRegTestNode(false);
+        size_t nServes = P2PoolRegisteredServesForTest();
+        FillRegQueue(pQ, 300 * 1000);
+        SendRegItem(pQ, "p2xsync", idA, uint256(0));
+        SendRegItem(pQ, "p2xsync", idA, lineA[10]);
+        bool fOne = P2PoolRegisteredServesForTest() == nServes + 1 && CountSent(pQ, "p2xshares") == 0;
+        CRITICAL_BLOCK(pQ->cs_vSend)
+        {
+            pQ->nSendDrained += pQ->vSend.size();
+            pQ->vSend.clear();
+        }
+        P2PoolServeDeferred();
+        bool fReplaced = LastRegPart(pQ, nFlag, v) && !v.empty() && v.front().data.nShareHeight == 8 &&
+                         P2PoolRegisteredServesForTest() == nServes;
+        nFail += Check(fOne && fReplaced,
+                       "a serve waits on its reader's queue; a second ask replaces it, and is what is served") ? 0 : 1;
+        P2PoolForgetDeferred(pQ);
+        delete pQ;
+    }
+
+    // ---- 8 serve slots, 4 for unproven inbound peers, slow serves end
+    {
+        P2PoolRefillBudgetsForTest();
+        size_t nServes0 = P2PoolRegisteredServesForTest();
+        vector<CNode*> vPeers;
+        bool fUnproven = true;
+        for (int i = 0; i < 4; i++)
+        {
+            CNode* p = NewRegTestNode(true);
+            vPeers.push_back(p);
+            FillRegQueue(p, 300 * 1000);
+            SendRegItem(p, "p2xsync", idA, uint256(0));
+            fUnproven = fUnproven && P2PoolRegisteredServesForTest() == nServes0 + i + 1;
+        }
+        P2PoolRefillBudgetsForTest();
+        CNode* pU5 = NewRegTestNode(true);
+        FillRegQueue(pU5, 300 * 1000);
+        size_t nHeld = P2PoolRegisteredDeferredCount();
+        SendRegItem(pU5, "p2xsync", idA, uint256(0));
+        bool fWaits = P2PoolRegisteredServesForTest() == nServes0 + 4 && P2PoolRegisteredDeferredCount() == nHeld + 1;
+        bool fProven = true;
+        for (int i = 0; i < 4; i++)
+        {
+            CNode* p = NewRegTestNode(false);
+            vPeers.push_back(p);
+            FillRegQueue(p, 300 * 1000);
+            SendRegItem(p, "p2xsync", idA, uint256(0));
+            fProven = fProven && P2PoolRegisteredServesForTest() == nServes0 + 5 + i;
+        }
+        nFail += Check(fUnproven && fWaits && fProven,
+                       "unproven inbound peers hold at most 4 of the 8 serve slots; a fifth waits, peers this node dialled "
+                       "are served") ? 0 : 1;
+        // Every slot taken by a serve older than 15 minutes that moved
+        // nothing (its reader slow, not stalled): an ask that waits ends the
+        // slowest, flagged ended early.
+        P2PoolRegAgeServeStartsForTest(901);
+        CNode* p9 = NewRegTestNode(false);
+        FillRegQueue(p9, 300 * 1000);
+        SendRegItem(p9, "p2xsync", idA, uint256(0));
+        size_t nEnded = 0;
+        foreach(CNode* p, vPeers)
+        {
+            unsigned char nFlag = 9;
+            vector<p2pool::ShareX> v;
+            if (LastRegPart(p, nFlag, v) && nFlag == 2 && v.empty())
+                nEnded++;
+        }
+        bool fSlow = nEnded == 1 && CountSent(p9, "p2xshares") == 0 && P2PoolRegisteredServesForTest() == nServes0 + 8;
+        nFail += Check(fSlow,
+                       "with every slot taken, the slowest serve older than 15 minutes under 1 KB/s ends and the ask is served") ? 0 : 1;
+        if (!fSlow)
+        {
+            printf("       ended %u, parts to the new asker %u, serves %u (from %u)\n", (unsigned)nEnded,
+                   (unsigned)CountSent(p9, "p2xshares"), (unsigned)P2PoolRegisteredServesForTest(), (unsigned)nServes0);
+            foreach(CNode* p, vPeers)
+            {
+                vector<SentMessage> vm = SentTo(p);
+                printf("       peer: %u messages, %u bytes queued:", (unsigned)vm.size(), (unsigned)p->vSend.size());
+                foreach(const SentMessage& m, vm)
+                    printf(" %s/%u", m.strCommand.c_str(), (unsigned)m.payload.size());
+                printf("\n");
+            }
+        }
+        // A serve whose part has not left in 5 minutes ends; the held ask
+        // gets a slot.
+        P2PoolRegAgeForTest(301);
+        P2PoolServeDeferred();
+        nFail += Check(P2PoolRegisteredServesForTest() == nServes0 + 1 && P2PoolRegisteredDeferredCount() == nHeld,
+                       "serves whose part has not drained in 5 minutes end, and the ask that waited is served") ? 0 : 1;
+        vPeers.push_back(pU5);
+        vPeers.push_back(p9);
+        foreach(CNode* p, vPeers)
+        {
+            P2PoolForgetDeferred(p);
+            delete p;
+        }
+    }
+
+    // ---- a fetch: pools/<id>.part, a restart, the catch-up, the line complete
+    poolreg::PoolRecord recB = recA;
+    recB.name = "regtest-b";
+    recB.nWindow = 720;
+    p2pool::PoolRules rulesB;
+    p2pool::RulesForRegistered(recB, magic, rulesB, err);
+    const uint256 idB = rulesB.poolId;
+    const string strPartB = tmp + "/pools/" + idB.GetHex() + ".part";
+    const string strDatB = tmp + "/pools/" + idB.GetHex() + ".dat";
+    p2pool::ShareChain mirrorB(rulesB, false);
+    vector<p2pool::Share> lineB;
+    {
+        unsigned int tB = (unsigned int)main.nNow - 30 * 140;
+        uint256 prev = 0;
+        for (int i = 0; i < 132; i++)
+        {
+            p2pool::Share s = RulesShare(mirrorB, main, prev, payTo((unsigned char)(20 + i % 4)), tB + 30 * i);
+            mirrorB.Add(s, main, err);
+            prev = s.GetId();
+            lineB.push_back(s);
+        }
+    }
+    nFail += Check(P2PoolRegAddForTest(recB, false, true, true, err) && P2PoolRegFetchForTest(idB) == 0,
+                   "a pool given with -poolcarry joins, with nothing of it here") ? 0 : 1;
+    CNode* pF = NewRegTestNode(false, "BF1fetchpeer");
+    {
+        P2PoolOnVersion(pF);
+        SendPoolInv(pF, vector<uint256>(1, idB));
+        P2PoolRegTickForTest();
+        uint256 idSync, resume;
+        bool fAsked = LastRegSync(pF, idSync, resume) && idSync == idB && resume == 0 &&
+                      P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_RUNNING;
+        nFail += Check(fAsked, "a peer announcing it is asked for its line") ? 0 : 1;
+
+        vector<p2pool::Share> part1(lineB.begin(), lineB.begin() + 100);
+        SendRegPart(pF, idB, 130, 0, part1);
+        P2PoolRegStatusInfo st;
+        bool fTaken = RegShares(idB) == 100 && FileExists(strPartB.c_str()) && !FileExists(strDatB.c_str()) &&
+                      P2PoolRegStatus(idB, st) && !st.fAnnounced && !st.fCarried;
+        size_t nNone = CountSent(pNew, "p2xnone");
+        SendRegItem(pNew, "p2xsync", idB, uint256(0));
+        bool fNotServed = CountSent(pNew, "p2xnone") == nNone + 1;
+        nFail += Check(fTaken && fNotServed && pF->nMisbehavior == 0,
+                       "a part is kept in pools/<id>.part; not complete, the pool is neither announced, nor served, "
+                       "nor written to its .dat") ? 0 : 1;
+
+        // Quiet for more than 5 minutes: the window is closed, the next part
+        // is not taken, and the fetch asks again from where it stopped.
+        P2PoolRegAgeForTest(301);
+        vector<p2pool::Share> part2(lineB.begin() + 100, lineB.begin() + 131);
+        SendRegPart(pF, idB, 130, 1, part2);
+        bool fClosed = RegShares(idB) == 100;
+        P2PoolRegTickForTest();
+        bool fResumed = LastRegSync(pF, idSync, resume) && idSync == idB && resume == lineB[99].GetId();
+        nFail += Check(fClosed && fResumed,
+                       "a part more than 5 minutes after the last is not taken; the fetch resumes from its newest share") ? 0 : 1;
+
+        // A restart: the partial file read back, the fetch resumed.
+        bool fReload = P2PoolRegReloadForTest(idB);
+        bool fBack = fReload && RegShares(idB) == 100 && P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_RUNNING;
+        size_t nSyncs = CountSent(pF, "p2xsync");
+        P2PoolRegTickForTest();
+        bool fAgain = CountSent(pF, "p2xsync") == nSyncs + 1 && LastRegSync(pF, idSync, resume) &&
+                      resume == lineB[99].GetId();
+        nFail += Check(fBack && fAgain, "after a restart its partial file is read back and the fetch resumes from it") ? 0 : 1;
+
+        // The rest of the snapshot, then the catch-up.
+        vector<p2pool::Share> part3(lineB.begin() + 97, lineB.begin() + 131);
+        SendRegPart(pF, idB, 130, 1, part3);
+        bool fCatchup = RegShares(idB) == 131 && P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_CATCHUP &&
+                        LastRegSync(pF, idSync, resume) && resume == lineB[130].GetId() && FileExists(strPartB.c_str());
+        nFail += Check(fCatchup, "the end of the snapshot taken in full: the same peer is asked once more, from the new tip") ? 0 : 1;
+        SendRegPart(pF, idB, 131, 1, vector<p2pool::Share>(1, lineB[131]));
+        bool fComplete = RegShares(idB) == 132 && P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_COMPLETE &&
+                         !FileExists(strPartB.c_str()) && FileExists(strDatB.c_str()) && P2PoolRegStatus(idB, st) &&
+                         st.fAnnounced && st.fCarried && pF->nMisbehavior == 0;
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        vector<uint256> inv = LastPoolInv(pNew);
+        nFail += Check(fComplete && inv.size() == 2 && std::find(inv.begin(), inv.end(), idB) != inv.end(),
+                       "the catch-up's end taken: the line is complete, written to its .dat, the partial file gone, "
+                       "and it is announced") ? 0 : 1;
+        // Read back from its .dat, complete.
+        bool fDat = P2PoolRegReloadForTest(idB) && RegShares(idB) == 132 &&
+                    P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_COMPLETE;
+        nFail += Check(fDat, "a complete line comes back from pools/<id>.dat at start, complete") ? 0 : 1;
+
+        // Two shares over 256 x 1024 bytes in one part: refused, scored.
+        CNode* pBig = NewRegTestNode(false);
+        SendRegItem(pBig, "p2xsync", idB, uint256(0));
+        vector<p2pool::Share> vBig(2, lineB[0]);
+        vector<unsigned char> vJunk(140 * 1024, OP_NOP);
+        for (size_t i = 0; i < vBig.size(); i++)
+            vBig[i].coinbase.vout[0].scriptPubKey = CScript(vJunk.begin(), vJunk.end());
+        SendRegPart(pBig, idB, 131, 1, vBig);
+        nFail += Check(pBig->nMisbehavior > 0, "a part of two shares over 256 x 1024 bytes is refused and its sender scored") ? 0 : 1;
+        P2PoolForgetDeferred(pBig);
+        delete pBig;
+    }
+
+    // ---- p2xnone moves a fetch on; an unanswered catch-up completes the line
+    {
+        poolreg::PoolRecord recC = recA;
+        recC.name = "regtest-c";
+        p2pool::PoolRules rulesC;
+        p2pool::RulesForRegistered(recC, magic, rulesC, err);
+        const uint256 idC = rulesC.poolId;
+        p2pool::ShareChain mirrorC(rulesC, false);
+        vector<p2pool::Share> lineC;
+        uint256 prev = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            p2pool::Share s = RulesShare(mirrorC, main, prev, payTo(30), (unsigned int)main.nNow - 600 + 30 * i);
+            mirrorC.Add(s, main, err);
+            prev = s.GetId();
+            lineC.push_back(s);
+        }
+        P2PoolRegAddForTest(recC, false, true, true, err);
+        CNode* pG = NewRegTestNode(false);
+        CNode* pH = NewRegTestNode(true);
+        P2PoolOnVersion(pG);
+        P2PoolOnVersion(pH);
+        SendPoolInv(pG, vector<uint256>(1, idC));
+        SendPoolInv(pH, vector<uint256>(1, idC));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        bool fFirst = CountSent(pG, "p2xsync") == 1 && CountSent(pH, "p2xsync") == 0;
+        SendRegItem(pG, "p2xnone", idC, 0);
+        P2PoolRegTickForTest();
+        bool fMoved = CountSent(pH, "p2xsync") == 1 && CountSent(pG, "p2xsync") == 1;
+        nFail += Check(fFirst && fMoved,
+                       "a peer this node dialled is asked first; its p2xnone moves the fetch to another announcer") ? 0 : 1;
+        SendRegPart(pH, idC, 9, 1, lineC);
+        bool fCatch = P2PoolRegFetchForTest(idC) == P2PoolRegStatusInfo::FETCH_CATCHUP && CountSent(pH, "p2xsync") == 2;
+        P2PoolRegAgeForTest(150);
+        P2PoolRegTickForTest();
+        bool fWaitsOut = P2PoolRegFetchForTest(idC) == P2PoolRegStatusInfo::FETCH_CATCHUP;
+        P2PoolRegAgeForTest(151);
+        P2PoolRegTickForTest();
+        nFail += Check(fCatch && fWaitsOut && P2PoolRegFetchForTest(idC) == P2PoolRegStatusInfo::FETCH_COMPLETE &&
+                       RegShares(idC) == 10,
+                       "a catch-up unanswered for 5 minutes leaves the line complete, not before") ? 0 : 1;
+        P2PoolForgetDeferred(pG);
+        P2PoolForgetDeferred(pH);
+        delete pG;
+        delete pH;
+    }
+
+    // ---- the registry decides what is carried, never what is valid
+    {
+        P2PoolRegSetStatusForTest(idB, POOL_PENDING);
+        P2PoolRegTickForTest();
+        p2pool::Share s = RulesShare(mirrorB, main, lineB[131].GetId(), payTo(20), (unsigned int)main.nNow - 30 * 8);
+        SendRegItem(pF, "p2xshare", idB, p2pool::ShareX(s));
+        P2PoolRegStatusInfo st;
+        bool fDropped = RegShares(idB) == 132 && pF->nMisbehavior == 0 && P2PoolRegStatus(idB, st) && !st.fCarried &&
+                        FileExists(strDatB.c_str());
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        vector<uint256> inv = LastPoolInv(pNew);
+        nFail += Check(fDropped && std::find(inv.begin(), inv.end(), idB) == inv.end(),
+                       "a pool whose record is no longer active is not carried nor announced; its line stays on disk") ? 0 : 1;
+        P2PoolRegSetStatusForTest(idB, POOL_ACTIVE);
+        P2PoolRegTickForTest();
+        SendRegItem(pF, "p2xshare", idB, p2pool::ShareX(s));
+        nFail += Check(RegShares(idB) == 133 && P2PoolRegStatus(idB, st) && st.fCarried,
+                       "back on the chain, it is carried again, its shares judged as before") ? 0 : 1;
+
+        string why;
+        P2PoolRegSetStatusForTest(idA, POOL_PENDING);
+        bool fPending = !P2PoolMinedReady(why) && why.find("pending") != std::string::npos;
+        p2pool::Share sa = RulesShare(mirrorA, main, lineA.back(), payTo(1), (unsigned int)main.nNow - 30 * 5);
+        bool fRefused = !P2PoolSubmitShare(sa, err);
+        P2PoolRegSetStatusForTest(idA, POOL_UNKNOWN);
+        bool fUnknown = !P2PoolMinedReady(why) && why.find("not recorded") != std::string::npos;
+        P2PoolRegSetStatusForTest(idA, POOL_ACTIVE);
+        nFail += Check(fPending && fRefused && fUnknown && P2PoolMinedReady(why),
+                       "the pool mined, pending or not on the chain: no template, no share, and the reason said") ? 0 : 1;
+    }
+
+    // ---- the template of the chosen pool: "p2x", its id and the share data
+    strP2PoolPayTo = Hash160ToAddress(uint160(5));
+    {
+        CBlock block;
+        CTransaction cb;
+        cb.vin.resize(1);
+        cb.vin[0].prevout.SetNull();
+        cb.vout.resize(1);
+        block.vtx.push_back(cb);
+        unsigned int nSigOps = 0, nBytes = 0;
+        p2pool::ShareData d;
+        bool fBuilt = P2PoolCoinbaseForTest(block, 1000, 0x1f0fffff, 0, d, nSigOps, nBytes);
+        const CTransaction& c = block.vtx[0];
+        vector<unsigned char> anchor = p2pool::AnchorPush(rulesA, d);
+        vector<unsigned char> sig(c.vin[0].scriptSig.begin(), c.vin[0].scriptSig.end());
+        bool fAnchor = anchor.size() == 67 && memcmp(&anchor[0], "p2x", 3) == 0 && memcmp(&anchor[3], idA.begin(), 32) == 0 &&
+                       std::search(sig.begin(), sig.end(), anchor.begin(), anchor.end()) != sig.end();
+        uint256 commit;
+        nFail += Check(fBuilt && d.fX && !d.fSalt && d.poolId == idA && d.hashPrevShare == lineA.back() && fAnchor &&
+                       !p2pool::FindCommitment(c, commit) && p2pool::CheckAnchor(rulesA, c, d) && sig.size() <= 100,
+                       "the template of -p2pool=<pool id>: its id in the share data, \"p2x\" with its id in the coinbase, "
+                       "no \"p2p\"") ? 0 : 1;
+    }
+    strP2PoolPayTo.clear();
+
+    // ---- poolwho, poolat: hints, as p2ppeers
+    {
+        CNode* pW = NewRegTestNode(true);
+        CDataStream ss(SER_NETWORK, VERSION);
+        ss << idA;
+        SendP2PoolTest(pW, "poolwho", ss);
+        vector<unsigned char> at;
+        bool fAt = LastSent(pW, "poolat", at) && at.size() > 32 &&
+                   std::string(at.begin(), at.end()).find("BF1announcer") != std::string::npos &&
+                   std::string(at.begin(), at.end()).find("BF1fetchpeer") == std::string::npos;
+        CDataStream sz(SER_NETWORK, VERSION);
+        sz << idZero;
+        SendP2PoolTest(pW, "poolwho", sz);
+        bool fZeroNo = CountSent(pW, "poolat") == 1;
+        CDataStream sat(SER_NETWORK, VERSION);
+        sat << idA << vector<string>(1, "BF1somebody");
+        SendP2PoolTest(pW, "poolat", sat);
+        nFail += Check(fAt && fZeroNo && pW->nMisbehavior == 0,
+                       "poolwho is answered with the peers whose poolinv names the pool, never for pool zero; "
+                       "a poolat nobody asked for is ignored") ? 0 : 1;
+        P2PoolForgetDeferred(pW);
+        delete pW;
+    }
+
+    // ---- a 1.2.34 node was sent nothing of any of it
+    {
+        bool fClean = true;
+        foreach(const SentMessage& m, SentTo(pOld))
+            if (m.strCommand.compare(0, 3, "p2x") == 0 || m.strCommand.compare(0, 4, "pool") == 0)
+                fClean = false;
+        nFail += Check(fClean && pOld->nMisbehavior == 0, "a peer without NODE_POOLREG was sent no p2x* and no pool* message") ? 0 : 1;
+        string errInv;
+        bool fInv;
+        CRITICAL_BLOCK(cs_p2pool)
+            fInv = P2PoolChain().CheckInvariants(errInv) && P2PoolChain().Size() == 5;
+        nFail += Check(fInv, "pool zero's share chain holds its five shares and its invariants after all that") ? 0 : 1;
+    }
+
+    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF };
+    for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
+    {
+        P2PoolForgetDeferred(vAll[i]);
+        delete vAll[i];
+    }
+    P2PoolResetForTest(bnProofOfWorkLimit, true);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // Rules v3: OP_CHECKLOCKTIMEVERIFY, lock-time finality in blocks, BIP16
 // enforced, and the hash-time-locked script an atomic swap is made of. The
 // rules are driven here through their flags, not the activation time, so the
@@ -21260,6 +22031,8 @@ int RunSelfTest(const std::string& name)
         return RunP2PoolLocalSelfTest();
     if (name == "p2pool-local-node")
         return RunP2PoolLocalNodeSelfTest();
+    if (name == "p2pool-registered")
+        return RunP2PoolRegisteredSelfTest();
     if (name == "p2pool-chain")
         return RunP2PoolChainSelfTest();
     if (name == "p2pool-share")
