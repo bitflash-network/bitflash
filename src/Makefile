@@ -696,6 +696,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=decoder-canonical
 	./bitflash-node -selftest=debug-log-buffer
 	./bitflash-node -selftest=pow-v2
+	./bitflash-node -selftest=pow-unavailable
 	./bitflash-node -selftest=dgb-pow
 	./bitflash-node -selftest=rvn-kawpow
 	./bitflash-node -selftest=sigpipe

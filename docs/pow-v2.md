@@ -68,9 +68,26 @@ input — which is all a third-party miner ever has.
 
 A node on older code rejects every block after its network's switch as
 "RandomX proof-of-work does not match nBits" and stops following the chain. A
-node on this code accepts both sides and keeps one RandomX cache per version,
-allocated on first use; after the switch the v1 cache is only ever needed to
-verify old blocks during a fresh sync.
+node on this code accepts both sides and keeps one RandomX cache per version;
+after the switch the v1 cache is only ever needed to verify old blocks during
+a fresh sync.
+
+### Memory needed at startup
+
+Each cache takes about 256 MB, and the node sets them up when it starts, not
+on the first block:
+
+- the v2 cache always;
+- the v1 cache too while the best chain still ends before the switch (a new
+  node at genesis, or one stopped before finishing its sync).
+
+So a node needs about 256 MB of free memory at startup, or about 512 MB until
+its sync has passed the switch. If a cache cannot be set up, the node does not
+start and says why: a node that cannot compute a block's proof of work cannot
+tell good work from bad, and refuses every block it cannot check rather than
+treating it as valid. A v1 cache needed later (an old fork) that cannot be set
+up refuses only the blocks that need it, never scores their sender, and is
+tried again at most once a minute.
 
 ## What a pool sends
 

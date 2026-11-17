@@ -150,7 +150,7 @@ static void PrintUsage()
     printf("            wallet-crypto, wallet-encrypt, wallet-portability,\n");
     printf("            net-message,\n");
     printf("            consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, p2pool-lan,\n");
-    printf("            parse-money, debug-log-buffer, pow-v2, sigpipe, script-eval, bignum-int, script-opcodes, rules-v2, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, network-params, socks5-proxy,\n");
+    printf("            parse-money, debug-log-buffer, pow-v2, pow-unavailable, sigpipe, script-eval, bignum-int, script-opcodes, rules-v2, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, network-params, socks5-proxy,\n");
     printf("            reply-parsers,\n");
     // This list had drifted behind the dispatch table in selftest.cpp: several
     // suites that exist were not named here, so nobody could find them without
@@ -1182,7 +1182,15 @@ int main(int argc, char* argv[])
     {
         if (!LoadBlockIndex())
         {
-            FatalStartupError(fHeadlessStartup, "Cannot load the block index.", "");
+            if (RandomXSetupFailed())
+                FatalStartupError(fHeadlessStartup,
+                                  "RandomX could not be set up, so this node cannot check proof of work and will not start.",
+                                  "It needs about 256 MB of free memory for its cache, and 256 MB more while the node "
+                                  "still has blocks from before the PoW v2 switch to check (a new node, or one that "
+                                  "has not finished syncing). Close other programs, or run the node on a machine "
+                                  "with more memory.");
+            else
+                FatalStartupError(fHeadlessStartup, "Cannot load the block index.", "");
             return 1;
         }
     }
