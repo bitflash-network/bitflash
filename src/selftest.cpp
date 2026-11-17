@@ -14422,9 +14422,13 @@ public:
 
 // A work hash that costs nothing, counted: SHA256d of the header.
 uint64 g_nTicketTestHashes = 0;
+// Set: the hash fails the way a hash function that could not run does.
+bool g_fTicketTestHashFails = false;
 uint256 TicketTestWork(const unsigned char* pHeader80)
 {
     g_nTicketTestHashes++;
+    if (g_fTicketTestHashFails)
+        return 0;
     return Hash(pHeader80, pHeader80 + 80);
 }
 
@@ -14673,6 +14677,11 @@ static int RunPoolTicketsSelfTest()
             ok(pooltkt::EpochInRange(w, 9) && pooltkt::EpochInRange(w, 10) && pooltkt::EpochInRange(w, 11) &&
                !pooltkt::EpochInRange(w, 8) && !pooltkt::EpochInRange(w, 12),
                "the previous, the current and the next epoch by the tip, and no other");
+            w.Grow(7379, 0);
+            ok(pooltkt::EpochInRange(w, 9), "the previous epoch counts through handoff: still at 720e + 179");
+            w.Grow(7380, 0);
+            ok(!pooltkt::EpochInRange(w, 9) && pooltkt::EpochInRange(w, 10) && pooltkt::EpochInRange(w, 11),
+               "and no longer from 720e + 180, when its guardians let go");
             w.Grow(7799, 0);
             ok(!pooltkt::PastDeadline(w, 11), "before the deadline block of epoch 11 (7800)");
             w.Grow(7800, 0);
@@ -14974,11 +14983,22 @@ static int RunPoolTicketsSelfTest()
                "a relay once the deadline block is on the chain is dropped, unhashed and unscored");
             ok(book.Accept(wd, tb, hashSeed11, true) == TICKET_HELD, "the same ticket in an answer is taken");
             ok(book.Accept(wd, tc, hashSeed10, false) == TICKET_DROP_DEADLINE &&
-               book.Accept(wd, td, hashSeed9, false) == TICKET_DROP_DEADLINE,
-               "relays for the current and the previous epoch are past their deadline");
-            ok(book.Accept(wd, tc, hashSeed10, true) == TICKET_HELD && book.Accept(wd, td, hashSeed9, true) == TICKET_HELD &&
+               book.Accept(w, td, hashSeed9, false) == TICKET_DROP_DEADLINE,
+               "relays for the current epoch, and for the previous one during handoff, are past their deadline");
+            ok(book.Accept(wd, tc, hashSeed10, true) == TICKET_HELD && book.Accept(w, td, hashSeed9, true) == TICKET_HELD &&
                book.Held(11) == 2 && book.Held(10) == 1 && book.Held(9) == 1,
                "and taken in answers: three epochs held");
+            // The previous epoch after its linger (the tip is past 720e + 180).
+            CGuardTicket te;
+            TicketTestMake(params, hashSeed9, 9, 14, 0, te, h);
+            nBefore = g_nTicketTestHashes;
+            ok(book.Accept(wd, te, hashSeed9, true) == TICKET_DROP_EPOCH && g_nTicketTestHashes == nBefore,
+               "once the linger is over the previous epoch's tickets are not taken, even in an answer: no hash, nobody scored");
+            CTicketSync syncLate;
+            book.Sync(wd, syncLate);
+            ok(syncLate.vExpired.size() == 1 && syncLate.vExpired[0] == 9 && !book.Has(9) && book.Held(10) == 1 &&
+               book.Held(11) == 2,
+               "and what was held for it is forgotten when the chain is followed");
         }
 
         // ---- the 4096 cap, the checked set's limit, and the attacker's share
@@ -15139,11 +15159,84 @@ static int RunPoolTicketsSelfTest()
                     iGone = i;
                 }
             ok(nGone == 16800 - GUARD_MAX_CHECKED, "416 bodies, none of them held, left to make room");
+            ok(bookC.Gone(11) == nGone && bookC.IsGone(11, vMore[iGone].BodyHash()) &&
+               !bookC.IsGone(11, vMore[vIdx.back()].BodyHash()),
+               "each of them is remembered by its tag, and no body still checked is");
+
+            // The replay that used to be hashed for free: bodies that left,
+            // sent again and again in turn.
             uint64 nBefore = g_nTicketTestHashes;
-            int v = bookC.Accept(w, vMore[iGone], hashSeed11, false);
-            ok(TicketPassed(v) && g_nTicketTestHashes == nBefore + 1 && bookC.Checked(11) == GUARD_MAX_CHECKED &&
-               TicketTestBodies(bookC, 11) == setExpectMore,
-               "a body that left is checked again when it comes again, and the held set does not change");
+            bool fFree = true;
+            unsigned int nReplayed = 0;
+            for (int nRound = 0; nRound < 3; nRound++)
+                for (size_t i = 0; i < vMore.size(); i++)
+                    if (!bookC.IsChecked(11, vMore[i].BodyHash()))
+                    {
+                        std::vector<unsigned char> vb = vMore[i].Bytes();
+                        CGuardTicket tOut;
+                        fFree = bookC.Precheck(w, &vb[0], vb.size(), 11, hashSeed11, nRound == 1, tOut) == TICKET_DROP_SEEN &&
+                                bookC.Accept(w, vMore[i], hashSeed11, nRound == 1) == TICKET_DROP_SEEN && fFree;
+                        nReplayed++;
+                    }
+            ok(fFree && nReplayed == 3 * 416 && g_nTicketTestHashes == nBefore && bookC.Checked(11) == GUARD_MAX_CHECKED &&
+               bookC.Gone(11) == 416 && TicketTestBodies(bookC, 11) == setExpectMore,
+               "a loose body that left the full checked set is dropped as seen before any hash, every time it comes back");
+            {
+                // Another node has another salt: the same bodies, other tags.
+                CTicketBook bookOtherSalt(params);
+                ok(bookOtherSalt.Accept(w, vMore[vIdx.back()], hashSeed11, false) == TICKET_HELD &&
+                   !bookOtherSalt.IsGone(11, vMore[iGone].BodyHash()),
+                   "a body is gone only where it left");
+            }
+            // A body Verify passed while its other copy came and left: Add
+            // drops it too.
+            {
+                uint256 hwGone = 0;
+                ok(bookC.Verify(vMore[iGone], hashSeed11, hwGone) == TICKET_VERIFIED &&
+                   bookC.Add(w, vMore[iGone], hashSeed11, hwGone) == TICKET_DROP_SEEN &&
+                   bookC.Checked(11) == GUARD_MAX_CHECKED,
+                   "Add drops a gone body as seen");
+            }
+
+            // The tags are bounded too. With a limit of 100: 300 more loose
+            // bodies push 300 more out of the checked set.
+            CTicketBook bookD = bookC;
+            bookD.SetGoneLimit(100);
+            std::vector<CGuardTicket> vExtra;
+            bool fExtra = true;
+            for (unsigned int i = 0; i < 300; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                fExtra = TicketTestMake(params, hashSeed11, 11, 1000 + i, 5 * 1000000, t, h) && fExtra;
+                vExtra.push_back(t);
+                fExtra = TicketPassed(bookD.Accept(w, t, hashSeed11, false)) && fExtra;
+            }
+            unsigned int nTagged = 0, nForgotten = 0;
+            size_t iForgotten = 0;
+            std::vector<CGuardTicket> vEvery = vMore;
+            vEvery.insert(vEvery.end(), vExtra.begin(), vExtra.end());
+            for (size_t i = 0; i < vEvery.size(); i++)
+                if (!bookD.IsChecked(11, vEvery[i].BodyHash()))
+                {
+                    if (bookD.IsGone(11, vEvery[i].BodyHash()))
+                        nTagged++;
+                    else
+                    {
+                        nForgotten++;
+                        iForgotten = i;
+                    }
+                }
+            ok(fExtra && bookD.Checked(11) == GUARD_MAX_CHECKED && bookD.Gone(11) == 100 && nTagged == 100 &&
+               nForgotten == 416 + 300 - 100,
+               "the tags stop at their limit: 716 bodies left, 100 remembered");
+            const std::set<uint256> setHeldD = TicketTestBodies(bookD, 11);
+            nBefore = g_nTicketTestHashes;
+            int v = bookD.Accept(w, vEvery[iForgotten], hashSeed11, false);
+            ok(TicketPassed(v) && v != TICKET_HELD && g_nTicketTestHashes == nBefore + 1 &&
+               bookD.Checked(11) == GUARD_MAX_CHECKED && bookD.Gone(11) == 100 &&
+               TicketTestBodies(bookD, 11) == setHeldD,
+               "a body whose tag was forgotten is checked again (one hash), still not held, and the held set does not change");
         }
 
         // ---- a seed reorged out
@@ -15227,22 +15320,187 @@ static int RunPoolTicketsSelfTest()
             ok(fRebuilt && book.Held(11) == 21 && book.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11b &&
                book.Own(11, tGot, hGot) && tGot == tOwnB,
                "the set is built again on the new seed, with a new own ticket");
-            // A node that takes a ticket before it follows the chain drops the old set then.
-            ok(bookNoSync.Held(11) == 21 && bookNoSync.Accept(wr, tOwnB, hashSeed11b, false) == TICKET_HELD &&
-               bookNoSync.Held(11) == 1 && bookNoSync.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11b &&
-               !bookNoSync.Own(11, tGot, hGot),
-               "a ticket on the new seed never joins a set checked against the old one");
+            // A node that is handed a ticket before it follows the chain: the
+            // ticket is checked with no lock held (Verify), and adding it
+            // forgets nothing.
+            {
+                uint64 nHashes = g_nTicketTestHashes;
+                uint256 hwB = 0, hwOld = 0;
+                std::vector<unsigned char> vbB = tOwnB.Bytes();
+                CGuardTicket tPre;
+                ok(bookNoSync.Held(11) == 21 &&
+                   bookNoSync.Precheck(wr, &vbB[0], vbB.size(), 11, hashSeed11b, false, tPre) == TICKET_PRECHECK_OK &&
+                   tPre == tOwnB && g_nTicketTestHashes == nHashes,
+                   "Precheck passes a ticket on to step 3 with its own verdict, and no hash");
+                const CTicketBook bookBefore = bookNoSync;
+                ok(bookBefore.Verify(tOwnB, hashSeed11b, hwB) == TICKET_VERIFIED && hwB == hOwnB &&
+                   g_nTicketTestHashes == nHashes + 1 && bookNoSync.Held(11) == 21,
+                   "Verify is the signature and the work, on a const book: one hash, the work hash out, nothing held");
+                ok(bookNoSync.Add(wr, tOwnB, hashSeed11b, hwB) == TICKET_DROP_OTHER_SEED &&
+                   bookNoSync.Accept(wr, tOwnB, hashSeed11b, false) == TICKET_DROP_OTHER_SEED &&
+                   bookNoSync.Held(11) == 21 && bookNoSync.Checked(11) == 21 &&
+                   bookNoSync.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11 &&
+                   bookNoSync.Own(11, tGot, hGot) && tGot == tOwn,
+                   "a ticket on the new seed never joins a set checked against the old one, and does not erase it: dropped, unscored");
+                CTicketSync syncNo;
+                bookNoSync.Sync(wr, syncNo);
+                ok(syncNo.vSeedGone.size() == 1 && syncNo.vSeedGone[0] == 11 && !bookNoSync.Has(11) &&
+                   bookNoSync.Add(wr, tOwnB, hashSeed11b, hwB) == TICKET_HELD && bookNoSync.Held(11) == 1 &&
+                   bookNoSync.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11b && !bookNoSync.Own(11, tGot, hGot),
+                   "Sync drops the old set, and then the ticket is held under the new seed");
+
+                // The reorg lands between Verify and Add: a ticket prechecked
+                // and hashed on the old branch, added after the chain moved.
+                TicketTestView wOld;
+                wOld.v = w.v;   // branch 0, where hashSeed11 is the seed
+                CTicketBook bookRace(params);
+                bool fRace = bookRace.Accept(wOld, v11[0], hashSeed11, false) == TICKET_HELD;
+                std::vector<unsigned char> vb1 = v11[1].Bytes();
+                fRace = bookRace.Precheck(wOld, &vb1[0], vb1.size(), 11, hashSeed11, false, tPre) == TICKET_PRECHECK_OK && fRace;
+                fRace = bookRace.Verify(tPre, hashSeed11, hwOld) == TICKET_VERIFIED && fRace;
+                // ... the tip changes here, before the lock is taken again.
+                ok(fRace && bookRace.Add(wr, tPre, hashSeed11, hwOld) == TICKET_DROP_OTHER_SEED &&
+                   bookRace.Held(11) == 1 && bookRace.Checked(11) == 1 && !bookRace.IsChecked(11, tPre.BodyHash()) &&
+                   bookRace.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11,
+                   "a reorg between Verify and Add: the ticket checked against the old seed is dropped, unscored, and nothing is erased");
+                bookRace.Sync(wr, syncNo);
+                ok(syncNo.vSeedGone.size() == 1 && !bookRace.Has(11) &&
+                   bookRace.Add(wr, tPre, hashSeed11, hwOld) == TICKET_DROP_OTHER_SEED && !bookRace.Has(11) &&
+                   bookRace.Add(wr, tOwnB, hashSeed11b, hwB) == TICKET_HELD && bookRace.Held(11) == 1,
+                   "after Sync the old ticket is still refused and one on the new seed is held");
+                // The seed not buried any more when Add runs (a shorter branch).
+                TicketTestView wShort;
+                wShort.v.assign(wr.v.begin(), wr.v.begin() + 7229);
+                CTicketBook bookShort(params);
+                ok(bookShort.Add(wShort, tOwnB, hashSeed11b, hwB) == TICKET_DROP_NO_SEED && !bookShort.Has(11),
+                   "a seed with 29 confirmations when Add runs: dropped, nothing made");
+                // And a work hash Verify never gives.
+                uint256 hashOver = hashTarget;
+                ++hashOver;
+                ok(bookShort.Add(wr, tOwnB, hashSeed11b, uint256(0)) == TICKET_DROP_NO_HASH &&
+                   bookShort.Add(wr, tOwnB, hashSeed11b, hashOver) == TICKET_BAD_WORK && !bookShort.Has(11),
+                   "Add takes no zero work hash and none over the target");
+                // Three epochs held and a fourth offered: nothing is erased to make room.
+                TicketTestView wNext;
+                wNext.v = w.v;
+                wNext.Grow(7950, 0);   // epoch 11, with epoch 12's seed (7920) buried
+                CGuardTicket t12;
+                uint256 h12 = 0;
+                TicketTestMake(params, wNext.v[7920], 12, 500, 0, t12, h12);
+                CTicketBook bookThree(params);
+                bool fThree = bookThree.Accept(w, v11[0], hashSeed11, false) == TICKET_HELD;
+                CGuardTicket t10, t9;
+                uint256 hx = 0;
+                TicketTestMake(params, hashSeed10, 10, 501, 0, t10, hx);
+                TicketTestMake(params, hashSeed9, 9, 502, 0, t9, hx);
+                fThree = bookThree.Accept(w, t10, hashSeed10, true) == TICKET_HELD &&
+                         bookThree.Accept(w, t9, hashSeed9, true) == TICKET_HELD && fThree;
+                ok(fThree && bookThree.Epochs().size() == 3 &&
+                   bookThree.Accept(wNext, t12, wNext.v[7920], false) == TICKET_DROP_EPOCH && bookThree.Epochs().size() == 3 &&
+                   bookThree.Held(9) == 1,
+                   "three epochs held and a ticket for a fourth: not taken until Sync has forgotten the oldest");
+                bookThree.Sync(wNext, syncNo);
+                ok(syncNo.vExpired.size() == 1 && syncNo.vExpired[0] == 9 &&
+                   bookThree.Accept(wNext, t12, wNext.v[7920], false) == TICKET_HELD && bookThree.Epochs().size() == 3,
+                   "after Sync it is");
+            }
+
+            // A hash that could not be computed (zero) is nobody's ticket.
+            {
+                CTicketBook bookZero(params);
+                CGuardTicket tz, tzMade;
+                uint256 hz = 0, hzOut = 1;
+                uint64 nTries = 7;
+                unsigned char skz[32];
+                TicketTestKey(600, skz);
+                TicketTestMake(params, hashSeed11b, 11, 600, 0, tz, hz);
+                g_fTicketTestHashFails = true;
+                const int vZero = bookZero.Accept(wr, tz, hashSeed11b, false);
+                const int vZeroVerify = bookZero.Verify(tz, hashSeed11b, hzOut);
+                const bool fMadeZero = pooltkt::MakeTicket(params, hashSeed11b, 11, skz, 128, 0, 1000, tzMade, hzOut, nTries);
+                g_fTicketTestHashFails = false;
+                ok(vZero == TICKET_DROP_NO_HASH && vZeroVerify == TICKET_DROP_NO_HASH && TicketDropped(TICKET_DROP_NO_HASH) &&
+                   !TicketScored(TICKET_DROP_NO_HASH) && !TicketPassed(TICKET_DROP_NO_HASH) &&
+                   !bookZero.Has(11) && !bookZero.IsChecked(11, tz.BodyHash()),
+                   "a work hash of zero is a failed hash: the ticket is dropped, unscored, and not remembered");
+                ok(!fMadeZero && nTries == 0, "and no ticket is made from one");
+                ok(bookZero.Accept(wr, tz, hashSeed11b, false) == TICKET_HELD, "the same ticket is held once the hash works");
+            }
 
             // A deeper one, through the current epoch's draw seed (block 7140).
+            const uint256 hashDraw10b = wr.v[7140];
+            std::vector<uint256> vOldSeeds;
+            std::vector<uint256> vDrawPools;
+            for (unsigned int j = 0; j < 40; j++)
+            {
+                std::string s = strprintf("guard-selftest-redraw-pool/%u", j);
+                vDrawPools.push_back(Hash(s.begin(), s.end()));
+            }
+            // This node's ticket for the current epoch, and where it stood.
+            CGuardTicket tOwn10;
+            uint256 hOwn10 = 0;
+            TicketTestMake(params, hashSeed10, 10, 999, 0, tOwn10, hOwn10);
+            std::vector<int> vRanksBefore, vRanksOld, vRanksNew;
+            bool fRanks = book.AddOwn(wr, tOwn10, hashSeed10) == TICKET_HELD &&
+                          book.OwnRanks(wr, 10, vDrawPools, vRanksBefore, fSettled) && fSettled;
+            book.OldDrawSeeds(10, vOldSeeds);
+            ok(fRanks && vOldSeeds.empty(), "no old draw seed while the draw stands");
             wr.Cut(7100);
             wr.Grow(7300, 2);
             book.Sync(wr, sync);
             ok(sync.vSeedGone.size() == 1 && sync.vSeedGone[0] == 11 && sync.vRedraw.size() == 1 && sync.vRedraw[0] == 10 &&
-               book.Held(10) == 5 && book.Held(9) == 3,
+               book.Held(10) == 6 && book.Held(9) == 3,
                "a reorg through a settled draw seed is a redraw; the tickets of that epoch stay");
+            book.OldDrawSeeds(10, vOldSeeds);
+            ok(wr.v[7140] != hashDraw10b && sync.vRedrawOldSeed.size() == 1 && sync.vRedrawOldSeed[0] == hashDraw10b &&
+               sync.vRedrawUntil.size() == 1 && sync.vRedrawUntil[0] == 7300 + GUARD_LINGER_BLOCKS &&
+               vOldSeeds.size() == 1 && vOldSeeds[0] == hashDraw10b,
+               "the redraw names the seed drawn with before, kept until the later linger ends (180 blocks from here)");
             ok(book.Draw(wr, 10, idPool, vPlaces, fSettled) && fSettled, "drawn again");
+            book.OwnRanksBySeed(wr, 10, hashDraw10b, vDrawPools, vRanksOld);
+            ok(book.OwnRanks(wr, 10, vDrawPools, vRanksNew, fSettled) && vRanksOld == vRanksBefore && vRanksNew != vRanksOld,
+               "this node's places by the old seed are the ones it had, and the new seed gives others: it holds both");
             book.Sync(wr, sync);
-            ok(sync.vRedraw.empty() && sync.vSeedGone.empty(), "and settled again");
+            book.OldDrawSeeds(10, vOldSeeds);
+            ok(sync.vRedraw.empty() && sync.vSeedGone.empty() && vOldSeeds.size() == 1, "and settled again, the old seed still kept");
+            wr.Grow(7479, 2);
+            book.Sync(wr, sync);
+            book.OldDrawSeeds(10, vOldSeeds);
+            ok(vOldSeeds.size() == 1 && sync.vRedraw.empty() && sync.vExpired.size() == 1 && sync.vExpired[0] == 9 &&
+               !book.Has(9),
+               "kept one block before that linger ends (the previous epoch's tickets went at 720e + 180)");
+            wr.Grow(7480, 2);
+            book.Sync(wr, sync);
+            book.OldDrawSeeds(10, vOldSeeds);
+            ok(vOldSeeds.empty() && sync.vExpired.empty() && book.Held(10) == 6, "and forgotten when it does");
+            {
+                // A redraw early in the handoff: the epoch's own linger end is the later one.
+                TicketTestView we;
+                we.v = w.v;
+                we.Cut(7175);   // the draw of epoch 10 settled at 7169
+                CTicketBook bookEarly(params);
+                CTicketSync syncEarly;
+                bool fEarly = bookEarly.Accept(we, tOwn10, hashSeed10, true) == TICKET_HELD &&
+                              bookEarly.Draw(we, 10, idPool, vPlaces, fSettled) && fSettled;
+                const uint256 hashDrawEarly = we.v[7140];
+                we.Cut(7130);
+                we.Grow(7180, 3);
+                bookEarly.Sync(we, syncEarly);
+                ok(fEarly && syncEarly.vRedraw.size() == 1 && syncEarly.vRedrawOldSeed[0] == hashDrawEarly &&
+                   syncEarly.vRedrawUntil[0] == pooltkt::LingerEndHeight(10),
+                   "a redraw before the epoch starts: the old seed is kept until 720e + 180");
+                // The same seed drawn with and reorged out again is one entry; at most four are kept.
+                for (int nBranch = 4; nBranch < 10; nBranch++)
+                {
+                    bookEarly.Draw(we, 10, idPool, vPlaces, fSettled);
+                    we.Cut(7130);
+                    we.Grow(7180, nBranch);
+                    bookEarly.Sync(we, syncEarly);
+                }
+                bookEarly.OldDrawSeeds(10, vOldSeeds);
+                ok(vOldSeeds.size() == GUARD_MAX_OLD_DRAW_SEEDS && syncEarly.vRedraw.size() == 1,
+                   "seven redraws of one epoch: the last four old seeds are kept");
+            }
 
             // Epochs before the previous one are forgotten.
             const uint256 hashSeed11c = wr.v[7200];
@@ -15252,9 +15510,16 @@ static int RunPoolTicketsSelfTest()
             ok(book.Accept(wr, tc, hashSeed11c, false) == TICKET_HELD, "a ticket for epoch 11 on the third branch");
             wr.Grow(8700, 2);   // epoch 12
             book.Sync(wr, sync);
-            ok(sync.vExpired.size() == 2 && sync.vExpired[0] == 9 && sync.vExpired[1] == 10 && sync.vSeedGone.empty() &&
+            ok(sync.vExpired.size() == 1 && sync.vExpired[0] == 10 && sync.vSeedGone.empty() &&
                book.Held(11) == 1 && !book.Has(10) && !book.Has(9) && book.Epochs().size() == 1,
-               "in epoch 12, epochs 9 and 10 are forgotten and 11 (the previous) is kept");
+               "in epoch 12, epoch 10 is forgotten and 11 (the previous) is kept");
+            wr.Grow(8819, 2);
+            book.Sync(wr, sync);
+            ok(sync.vExpired.empty() && book.Held(11) == 1, "kept through the handoff, to 720e + 179");
+            wr.Grow(8820, 2);
+            book.Sync(wr, sync);
+            ok(sync.vExpired.size() == 1 && sync.vExpired[0] == 11 && book.Epochs().empty(),
+               "and forgotten at 720e + 180");
         }
 
         // ---- pool-tickets.dat
@@ -15306,7 +15571,9 @@ static int RunPoolTicketsSelfTest()
                 wLate.v = w.v;
                 wLate.Grow(7850, 0);
                 CTicketBook bookLate(params);
-                ok(pooltkt::RestoreTickets(bookLate, wLate, vFile) == 30, "after the deadline the file is still taken");
+                ok(pooltkt::RestoreTickets(bookLate, wLate, vFile) == 26 && bookLate.Held(11) == 13 && bookLate.Held(10) == 13 &&
+                   !bookLate.Has(9),
+                   "after the deadline the file is still taken, except the previous epoch once its linger is over");
                 // A file whose seed was reorged out while the node was down.
                 TicketTestView wFork;
                 wFork.v = w.v;

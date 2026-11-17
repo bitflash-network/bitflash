@@ -102,7 +102,11 @@ bool EpochInRange(const CTicketChainView& view, int64 nEpoch)
     const int nCur = EpochOf(view.TipHeight());
     if (nCur < 0 || nEpoch < 1)
         return false;
-    return nEpoch >= (int64)nCur - 1 && nEpoch <= (int64)nCur + 1;
+    // The previous epoch only through handoff: its guardians let go at the
+    // current epoch's 720e + 180, and nobody needs its tickets after.
+    if (nEpoch == (int64)nCur - 1)
+        return (int64)view.TipHeight() < LingerEndHeight(nCur);
+    return nEpoch == (int64)nCur || nEpoch == (int64)nCur + 1;
 }
 
 } // namespace pooltkt
@@ -316,6 +320,10 @@ bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned i
             return false;
         t.SetNonce(nNonceStart + i);
         uint256 hashWork = t.WorkHash(params, hashSeed);
+        // Zero is a hash that was not computed: under every target, and no
+        // ticket. Not counted as a try.
+        if (hashWork == 0)
+            return false;
         nTriesOut = i + 1;
         if (hashWork <= hashTarget)
         {
@@ -329,6 +337,23 @@ bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned i
     return false;
 }
 
+int VerifyTicket(const CTicketParams& params, const CGuardTicket& ticket, const uint256& hashSeed,
+                 uint256& hashWorkOut)
+{
+    hashWorkOut = 0;
+    if (!ticket.VerifySig())
+        return TICKET_BAD_SIG;
+    const uint256 hashWork = ticket.WorkHash(params, hashSeed);
+    // A hash that could not be computed must not pass for the best work
+    // there is, and is not the sender's fault either.
+    if (hashWork == 0)
+        return TICKET_DROP_NO_HASH;
+    if (hashWork > params.Target())
+        return TICKET_BAD_WORK;
+    hashWorkOut = hashWork;
+    return TICKET_VERIFIED;
+}
+
 } // namespace pooltkt
 
 // ---- the tickets a node holds ---------------------------------------------
@@ -340,6 +365,9 @@ const char* TicketVerdictName(int v)
     case TICKET_HELD:            return "held";
     case TICKET_OUTRANKED:       return "outranked for its key";
     case TICKET_PAST_CAP:        return "past the cap";
+    case TICKET_PRECHECK_OK:     return "to be checked";
+    case TICKET_VERIFIED:        return "signature and work passed";
+    case TICKET_DROP_NO_HASH:    return "work hash not computed";
     case TICKET_DROP_EPOCH:      return "epoch out of range";
     case TICKET_DROP_NO_SEED:    return "seed not buried here";
     case TICKET_DROP_OTHER_SEED: return "another seed";
@@ -354,14 +382,44 @@ const char* TicketVerdictName(int v)
     return "?";
 }
 
-CTicketBook::CTicketBook(const CTicketParams& paramsIn) : params(paramsIn)
+CTicketBook::CTicketBook(const CTicketParams& paramsIn) : params(paramsIn), nMaxGone(GUARD_MAX_GONE)
 {
+    // Without random bytes the tags still work; they are only no longer
+    // this node's secret.
+    memset(salt, 0, sizeof(salt));
+    (void)RAND_bytes(salt, sizeof(salt));
 }
 
 void CTicketBook::Clear()
 {
     mapEpochs.clear();
     mapDrawnSeed.clear();
+    mapOldDrawSeed.clear();
+}
+
+uint64 CTicketBook::GoneTag(const uint256& hashBody) const
+{
+    uint256 h = hashBody;   // begin() is not const
+    unsigned char buf[32 + 32];
+    memcpy(buf, salt, 32);
+    memcpy(buf + 32, h.begin(), 32);
+    uint256 hashTag = Hash(buf, buf + sizeof(buf));
+    uint64 n = 0;
+    for (int i = 0; i < 8; i++)
+        n |= (uint64)(*(hashTag.begin() + i)) << (8 * i);
+    return n;
+}
+
+// An epoch nobody takes tickets for any more: before the previous one, or the
+// previous one after its linger (the rule of EpochInRange, for what is held).
+static bool EpochOver(const CTicketChainView& view, unsigned int nEpoch)
+{
+    const int nCur = pooltkt::EpochOf(view.TipHeight());
+    if (nCur < 0)
+        return false;
+    if ((int64)nEpoch < (int64)nCur - 1)
+        return true;
+    return (int64)nEpoch == (int64)nCur - 1 && (int64)view.TipHeight() >= pooltkt::LingerEndHeight(nCur);
 }
 
 int CTicketBook::Precheck(const CTicketChainView& view, const unsigned char* p, size_t n,
@@ -391,10 +449,17 @@ int CTicketBook::Precheck(const CTicketChainView& view, const unsigned char* p, 
     if (!fAnswer && pooltkt::PastDeadline(view, nEpoch))
         return TICKET_DROP_DEADLINE;
     std::map<unsigned int, CTicketEpoch>::const_iterator it = mapEpochs.find(nEpoch);
-    if (it != mapEpochs.end() && it->second.hashSeed == hashSeed &&
-        it->second.mapChecked.count(ticketOut.BodyHash()))
-        return TICKET_DROP_SEEN;
-    return TICKET_HELD;
+    if (it != mapEpochs.end() && it->second.hashSeed == hashSeed)
+    {
+        const uint256 hashBody = ticketOut.BodyHash();
+        if (it->second.mapChecked.count(hashBody))
+            return TICKET_DROP_SEEN;
+        // A loose body that left the full checked set: it passed once and
+        // can never be held under this seed, so it is not hashed again.
+        if (!it->second.setGone.empty() && it->second.setGone.count(GoneTag(hashBody)))
+            return TICKET_DROP_SEEN;
+    }
+    return TICKET_PRECHECK_OK;
 }
 
 void CTicketBook::Unhold(CTicketEpoch& ep, const std::vector<unsigned char>& key)
@@ -418,6 +483,15 @@ void CTicketBook::RememberChecked(CTicketEpoch& ep, const uint256& hashBody, con
     {
         std::set<std::pair<uint256, uint256> >::iterator itLast = ep.setLoose.end();
         --itLast;
+        // Remembered by its tag from here on. When the tags are full too
+        // (65536 bodies that each cost a ticket of work), one of them goes:
+        // the lowest, which the salt makes nobody's choice.
+        if (nMaxGone > 0)
+        {
+            while (ep.setGone.size() >= nMaxGone)
+                ep.setGone.erase(ep.setGone.begin());
+            ep.setGone.insert(GoneTag(itLast->second));
+        }
         ep.mapChecked.erase(itLast->second);
         ep.setLoose.erase(itLast);
     }
@@ -426,34 +500,45 @@ void CTicketBook::RememberChecked(CTicketEpoch& ep, const uint256& hashBody, con
         ep.setLoose.insert(std::make_pair(hashWork, hashBody));
 }
 
-int CTicketBook::CheckAndAdd(const CGuardTicket& ticket, const uint256& hashSeed)
+int CTicketBook::Verify(const CGuardTicket& ticket, const uint256& hashSeed, uint256& hashWorkOut) const
 {
-    // Step 3: the signature, then the work.
-    if (!ticket.VerifySig())
-        return TICKET_BAD_SIG;
-    const uint256 hashWork = ticket.WorkHash(params, hashSeed);
+    return pooltkt::VerifyTicket(params, ticket, hashSeed, hashWorkOut);
+}
+
+int CTicketBook::Add(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
+                     const uint256& hashWork)
+{
+    // What Verify gives is never zero and never over the target.
+    if (hashWork == 0)
+        return TICKET_DROP_NO_HASH;
     if (hashWork > params.Target())
         return TICKET_BAD_WORK;
 
+    // The chain may have moved while the ticket was hashed: the seed it was
+    // checked against must still be its epoch's buried seed here.
     const unsigned int nEpoch = ticket.Epoch();
+    if (!pooltkt::EpochInRange(view, nEpoch))
+        return TICKET_DROP_EPOCH;
+    uint256 hashChainSeed = 0;
+    bool fBuried = false;
+    if (!pooltkt::TicketSeed(view, nEpoch, hashChainSeed, fBuried) || !fBuried)
+        return TICKET_DROP_NO_SEED;
+    if (hashChainSeed != hashSeed)
+        return TICKET_DROP_OTHER_SEED;
+
     std::map<unsigned int, CTicketEpoch>::iterator itEp = mapEpochs.find(nEpoch);
+    // A set checked against another seed is Sync's to drop, not this
+    // ticket's: until then the ticket waits (it comes again, or in an
+    // answer), and never joins that set.
     if (itEp != mapEpochs.end() && itEp->second.hashSeed != hashSeed)
-    {
-        // The seed this epoch was checked against is no longer the chain's
-        // (the caller's Precheck said so): what was held goes, as in Sync.
-        mapEpochs.erase(itEp);
-        itEp = mapEpochs.end();
-    }
+        return TICKET_DROP_OTHER_SEED;
     if (itEp == mapEpochs.end())
     {
-        // Never more than three epochs, whoever forgets to Sync: the oldest
-        // goes first, and an epoch older than all three is not taken.
-        while (mapEpochs.size() >= TICKET_FILE_EPOCHS)
-        {
-            if (mapEpochs.begin()->first > nEpoch)
-                return TICKET_DROP_EPOCH;
-            mapEpochs.erase(mapEpochs.begin());
-        }
+        // Never more than three epochs. With three held and this a fourth,
+        // one of them is over and Sync has not been run: not taken until it
+        // is.
+        if (mapEpochs.size() >= TICKET_FILE_EPOCHS)
+            return TICKET_DROP_EPOCH;
         CTicketEpoch epNew;
         epNew.nEpoch = nEpoch;
         epNew.hashSeed = hashSeed;
@@ -463,6 +548,8 @@ int CTicketBook::CheckAndAdd(const CGuardTicket& ticket, const uint256& hashSeed
 
     const uint256 hashBody = ticket.BodyHash();
     if (ep.mapChecked.count(hashBody))
+        return TICKET_DROP_SEEN;
+    if (!ep.setGone.empty() && ep.setGone.count(GoneTag(hashBody)))
         return TICKET_DROP_SEEN;
 
     const std::vector<unsigned char> key = ticket.Key();
@@ -510,9 +597,13 @@ int CTicketBook::Accept(const CTicketChainView& view, const unsigned char* p, si
 {
     CGuardTicket ticket;
     int v = Precheck(view, p, n, nMsgEpoch, hashMsgSeed, fAnswer, ticket);
-    if (v != TICKET_HELD)
+    if (v != TICKET_PRECHECK_OK)
         return v;
-    return CheckAndAdd(ticket, hashMsgSeed);
+    uint256 hashWork = 0;
+    v = Verify(ticket, hashMsgSeed, hashWork);
+    if (v != TICKET_VERIFIED)
+        return v;
+    return Add(view, ticket, hashMsgSeed, hashWork);
 }
 
 int CTicketBook::Accept(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashMsgSeed, bool fAnswer)
@@ -556,11 +647,11 @@ bool CTicketBook::Own(unsigned int nEpoch, CGuardTicket& ticketOut, uint256& has
 void CTicketBook::Sync(const CTicketChainView& view, CTicketSync& out)
 {
     out = CTicketSync();
-    const int nCur = pooltkt::EpochOf(view.TipHeight());
+    const int64 nTip = view.TipHeight();
     for (std::map<unsigned int, CTicketEpoch>::iterator it = mapEpochs.begin(); it != mapEpochs.end(); )
     {
         const unsigned int e = it->first;
-        if (nCur >= 0 && (int64)e < (int64)nCur - 1)
+        if (EpochOver(view, e))
         {
             out.vExpired.push_back(e);
             mapEpochs.erase(it++);
@@ -576,10 +667,27 @@ void CTicketBook::Sync(const CTicketChainView& view, CTicketSync& out)
         }
         ++it;
     }
+    // Seeds drawn with before a redraw: forgotten when their linger is over.
+    for (std::map<unsigned int, std::vector<std::pair<uint256, int64> > >::iterator it = mapOldDrawSeed.begin();
+         it != mapOldDrawSeed.end(); )
+    {
+        std::vector<std::pair<uint256, int64> >& v = it->second;
+        for (size_t i = 0; i < v.size(); )
+        {
+            if (nTip >= v[i].second)
+                v.erase(v.begin() + i);
+            else
+                i++;
+        }
+        if (v.empty())
+            mapOldDrawSeed.erase(it++);
+        else
+            ++it;
+    }
     for (std::map<unsigned int, uint256>::iterator it = mapDrawnSeed.begin(); it != mapDrawnSeed.end(); )
     {
         const unsigned int e = it->first;
-        if (nCur >= 0 && (int64)e < (int64)nCur - 1)
+        if (EpochOver(view, e))
         {
             mapDrawnSeed.erase(it++);
             continue;
@@ -588,12 +696,59 @@ void CTicketBook::Sync(const CTicketChainView& view, CTicketSync& out)
         bool fSettled = false;
         if (!pooltkt::DrawSeed(view, e, hashSeed, fSettled) || hashSeed != it->second)
         {
+            // Section 10, Handoff: every node drawn by either seed holds the
+            // pool until the later linger ends. The old seed stays until the
+            // epoch's own linger end, and never less than a linger's length
+            // from here, so the nodes drawn by the new seed have the same
+            // time to pull as at any handoff.
+            int64 nUntil = pooltkt::LingerEndHeight(e);
+            if (nUntil < nTip + GUARD_LINGER_BLOCKS)
+                nUntil = nTip + GUARD_LINGER_BLOCKS;
+            std::vector<std::pair<uint256, int64> >& v = mapOldDrawSeed[e];
+            bool fKnown = false;
+            for (size_t i = 0; i < v.size(); i++)
+                if (v[i].first == it->second)
+                {
+                    if (v[i].second < nUntil)
+                        v[i].second = nUntil;
+                    fKnown = true;
+                }
+            if (!fKnown)
+            {
+                if (v.size() >= GUARD_MAX_OLD_DRAW_SEEDS)
+                    v.erase(v.begin());
+                v.push_back(std::make_pair(it->second, nUntil));
+            }
             out.vRedraw.push_back(e);
+            out.vRedrawOldSeed.push_back(it->second);
+            out.vRedrawUntil.push_back(nUntil);
             mapDrawnSeed.erase(it++);
             continue;
         }
         ++it;
     }
+}
+
+void CTicketBook::OldDrawSeeds(unsigned int nEpoch, std::vector<uint256>& out) const
+{
+    out.clear();
+    std::map<unsigned int, std::vector<std::pair<uint256, int64> > >::const_iterator it = mapOldDrawSeed.find(nEpoch);
+    if (it == mapOldDrawSeed.end())
+        return;
+    for (size_t i = 0; i < it->second.size(); i++)
+        out.push_back(it->second[i].first);
+}
+
+size_t CTicketBook::Gone(unsigned int nEpoch) const
+{
+    std::map<unsigned int, CTicketEpoch>::const_iterator it = mapEpochs.find(nEpoch);
+    return it == mapEpochs.end() ? 0 : it->second.setGone.size();
+}
+
+bool CTicketBook::IsGone(unsigned int nEpoch, const uint256& hashBody) const
+{
+    std::map<unsigned int, CTicketEpoch>::const_iterator it = mapEpochs.find(nEpoch);
+    return it != mapEpochs.end() && it->second.setGone.count(GoneTag(hashBody)) != 0;
 }
 
 bool CTicketBook::Has(unsigned int nEpoch) const
@@ -694,26 +849,33 @@ bool CTicketBook::OwnRanks(const CTicketChainView& view, unsigned int nEpoch, co
         return false;
     if (fSettledOut)
         mapDrawnSeed[nEpoch] = hashDraw;
+    OwnRanksBySeed(view, nEpoch, hashDraw, vPools, vRankOut);
+    return true;
+}
+
+void CTicketBook::OwnRanksBySeed(const CTicketChainView& view, unsigned int nEpoch, const uint256& hashDrawSeed,
+                                 const std::vector<uint256>& vPools, std::vector<int>& vRankOut) const
+{
+    vRankOut.assign(vPools.size(), -1);
     uint256 hashSeed = 0, hashHeldSeed = 0;
     bool fBuried = false;
     if (!pooltkt::TicketSeed(view, nEpoch, hashSeed, fBuried) || !Seed(nEpoch, hashHeldSeed) || hashSeed != hashHeldSeed)
-        return true;
+        return;
     // Only a ticket other nodes hold too can be drawn: this node's own, if
     // it is in the held set.
     CGuardTicket own;
     uint256 hashOwnWork = 0;
     CHeldTicket held;
     if (!Own(nEpoch, own, hashOwnWork) || !HeldByKey(nEpoch, own.PubKey(), held) || held.hashWork != hashOwnWork)
-        return true;
+        return;
     std::vector<CHeldTicket> vTickets;
     Tickets(nEpoch, vTickets);
     const unsigned int nPlaces = GUARD_PLACES + GUARD_RESERVE;
     for (size_t i = 0; i < vPools.size(); i++)
     {
-        unsigned int r = pooltkt::RankOf(hashDraw, vPools[i], vTickets, hashOwnWork, nPlaces);
+        unsigned int r = pooltkt::RankOf(hashDrawSeed, vPools[i], vTickets, hashOwnWork, nPlaces);
         vRankOut[i] = r < nPlaces ? (int)r : -1;
     }
-    return true;
 }
 
 // ---- the draw -------------------------------------------------------------

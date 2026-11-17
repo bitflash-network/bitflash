@@ -53,6 +53,12 @@ static const unsigned int GUARD_RESERVE = 8;
 // Tickets held per epoch, and bodies remembered as checked.
 static const unsigned int GUARD_MAX_TICKETS = 4096;
 static const unsigned int GUARD_MAX_CHECKED = 16384;
+// Bodies that left a full checked set, remembered by a salted 64-bit tag so
+// that a replay of one costs no hash. A std::set node is about 48 bytes:
+// under 4 MB an epoch.
+static const unsigned int GUARD_MAX_GONE = 65536;
+// Draw seeds an epoch was drawn with before a redraw, kept through the linger.
+static const unsigned int GUARD_MAX_OLD_DRAW_SEEDS = 4;
 // The guard budget (section 11).
 static const unsigned int GUARD_MAX_POOLS = 8;
 static const int64 GUARD_DEFAULT_BYTES = 128 * 1024 * 1024;
@@ -115,7 +121,9 @@ bool PastDeadline(const CTicketChainView& view, int64 nEpoch);
 // above, so the block has 30 confirmations.
 bool DrawSeed(const CTicketChainView& view, int64 nEpoch, uint256& hashOut, bool& fSettledOut);
 // Whether a ticket's epoch is the previous, the current or the next one by
-// the view's tip (and has a seed at all: epoch 1 or later).
+// the view's tip (and has a seed at all: epoch 1 or later). The previous
+// epoch counts only through handoff: while the tip is below the current
+// epoch's LingerEndHeight (720e + 180).
 bool EpochInRange(const CTicketChainView& view, int64 nEpoch);
 
 } // namespace pooltkt
@@ -204,8 +212,11 @@ bool XOnlyPubKey(const unsigned char seckey[32], unsigned char pubkeyOut[32]);
 // Make a ticket: try nonces from nNonceStart, at most nMaxTries of them,
 // until the work is at or under the target, then sign. False when none was
 // found (nTriesOut says how many were hashed; the caller goes on from
-// nNonceStart + nTriesOut) or when pfStop became true. The node runs this in
-// a thread of its own at idle priority; nothing here sleeps or yields.
+// nNonceStart + nTriesOut) or when pfStop became true. A work hash of zero is
+// a hash that could not be computed, never a ticket: MakeTicket stops there
+// and returns false with fewer than nMaxTries counted, and the caller waits
+// before it tries that nonce again. The node runs this in a thread of its own
+// at idle priority; nothing here sleeps or yields.
 bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned int nEpoch,
                 const unsigned char seckey[32], unsigned short nCapacityMB,
                 uint64 nNonceStart, uint64 nMaxTries,
@@ -224,12 +235,18 @@ enum TicketVerdict
     // ticket with a lower work hash, or the set is full of lower ones.
     TICKET_OUTRANKED = 1,
     TICKET_PAST_CAP = 2,
+    // Not final. Precheck: steps 1 and 2 passed, the ticket goes on to step
+    // 3. VerifyTicket: the signature and the work passed, the ticket goes on
+    // to Add.
+    TICKET_PRECHECK_OK = 5,
+    TICKET_VERIFIED = 6,
     // Step 2, before any hash, nobody scored.
     TICKET_DROP_EPOCH = 10,       // not the previous, current or next epoch
     TICKET_DROP_NO_SEED = 11,     // its seed block is not on this chain with 30 confirmations
     TICKET_DROP_OTHER_SEED = 12,  // the message names another seed than this chain's
     TICKET_DROP_DEADLINE = 13,    // an unasked relay after the deadline
     TICKET_DROP_SEEN = 14,        // a body already checked
+    TICKET_DROP_NO_HASH = 15,     // this node could not compute the work hash (it came out zero)
     // The sender's fault, scored.
     TICKET_BAD_FRAMING = 20,      // not 118 bytes, or no "BTFG"
     TICKET_BAD_MAGIC = 21,        // another network's
@@ -239,9 +256,22 @@ enum TicketVerdict
 };
 
 inline bool TicketPassed(int v) { return v == TICKET_HELD || v == TICKET_OUTRANKED || v == TICKET_PAST_CAP; }
-inline bool TicketDropped(int v) { return v >= TICKET_DROP_EPOCH && v <= TICKET_DROP_SEEN; }
+inline bool TicketDropped(int v) { return v >= TICKET_DROP_EPOCH && v <= TICKET_DROP_NO_HASH; }
 inline bool TicketScored(int v) { return v >= TICKET_BAD_FRAMING; }
 const char* TicketVerdictName(int v);
+
+namespace pooltkt
+{
+
+// Step 3 without the set: the signature, then the work against the seed.
+// Touches no CTicketBook, so it runs with no lock held, on any thread.
+// TICKET_VERIFIED with the work hash, TICKET_BAD_SIG, TICKET_BAD_WORK, or
+// TICKET_DROP_NO_HASH when the hash came out zero (this node's failure, not
+// the sender's: nobody scored, nothing remembered).
+int VerifyTicket(const CTicketParams& params, const CGuardTicket& ticket, const uint256& hashSeed,
+                 uint256& hashWorkOut);
+
+} // namespace pooltkt
 
 // A held ticket with its work hash.
 class CHeldTicket
@@ -267,6 +297,10 @@ public:
     // those of them not held, by (work hash, body hash).
     std::map<uint256, uint256> mapChecked;
     std::set<std::pair<uint256, uint256> > setLoose;
+    // Tags of the loose bodies that left a full checked set. A loose body is
+    // never held again under the same seed (a key's ticket and the cap's
+    // cutoff only go down), so a replay of one is a body already seen.
+    std::set<uint64> setGone;
     // This node's own ticket for the epoch, if it made one.
     bool fOwn;
     CGuardTicket own;
@@ -285,8 +319,13 @@ public:
     std::vector<unsigned int> vSeedGone;
     // Epochs too old to keep (before the previous one), forgotten.
     std::vector<unsigned int> vExpired;
-    // Epochs whose draw seed is not the one last drawn with: a redraw.
+    // Epochs whose draw seed is not the one last drawn with: a redraw. With
+    // each, the seed it was drawn with before, and the height until which the
+    // nodes drawn by that seed keep their pools: the later of the epoch's
+    // LingerEndHeight and 180 blocks past the tip the redraw was seen at.
     std::vector<unsigned int> vRedraw;
+    std::vector<uint256> vRedrawOldSeed;
+    std::vector<int64> vRedrawUntil;
 };
 
 // One place in a pool's draw.
@@ -310,18 +349,27 @@ public:
     const CTicketParams& Params() const { return params; }
 
     // Steps 1 and 2 of the check: everything that costs no hash. Returns
-    // TICKET_HELD when the ticket is to be checked in full (step 3), and the
-    // reason otherwise. fAnswer: it came in answer to this node's own
+    // TICKET_PRECHECK_OK when the ticket is to be checked in full (step 3),
+    // and the reason otherwise. fAnswer: it came in answer to this node's own
     // poolgettkt (or from its own file), so the deadline does not apply.
     // Tickets that waited in a queue come through here again when they leave.
     int Precheck(const CTicketChainView& view, const unsigned char* p, size_t n,
                  unsigned int nMsgEpoch, const uint256& hashMsgSeed, bool fAnswer,
                  CGuardTicket& ticketOut) const;
-    // Step 3 and the set: the signature, then the work, then one per key and
-    // the cap. Only for a ticket Precheck passed, on the same view. The
-    // caller charges the ticket RandomX budget before calling.
-    int CheckAndAdd(const CGuardTicket& ticket, const uint256& hashSeed);
-    // Both, for a caller with no budget to mind.
+    // Step 3, with no lock: pooltkt::VerifyTicket with this book's
+    // parameters, which never change after construction. The caller charges
+    // the ticket RandomX budget before calling, and holds no lock across it.
+    int Verify(const CGuardTicket& ticket, const uint256& hashSeed, uint256& hashWorkOut) const;
+    // The set: one per key and the cap, for a ticket Verify passed against
+    // hashSeed with that work hash. The chain may have moved since Precheck,
+    // so the seed is looked at again: TICKET_DROP_EPOCH, TICKET_DROP_NO_SEED
+    // or TICKET_DROP_OTHER_SEED when hashSeed is no longer the buried seed of
+    // the ticket's epoch on this view, and TICKET_DROP_OTHER_SEED too when
+    // the book still holds that epoch under another seed (Sync was not run
+    // since the reorg). Add never forgets an epoch: that is Sync's.
+    int Add(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
+            const uint256& hashWork);
+    // All three, for a caller with no budget and no lock to mind.
     int Accept(const CTicketChainView& view, const unsigned char* p, size_t n,
                unsigned int nMsgEpoch, const uint256& hashMsgSeed, bool fAnswer);
     int Accept(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashMsgSeed, bool fAnswer);
@@ -332,9 +380,10 @@ public:
     int AddOwn(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed);
     bool Own(unsigned int nEpoch, CGuardTicket& ticketOut, uint256& hashWorkOut) const;
 
-    // Follow the chain: forget epochs before the previous one, drop the sets
-    // of an epoch whose seed block is no longer the active chain's, and say
-    // which settled draws changed seed.
+    // Follow the chain: forget epochs before the previous one (and the
+    // previous one once its linger is over), drop the sets of an epoch whose
+    // seed block is no longer the active chain's, and say which settled draws
+    // changed seed. Run on every change of tip, before any Add.
     void Sync(const CTicketChainView& view, CTicketSync& out);
 
     // What is held for an epoch, lowest work hash first (the order they are
@@ -342,6 +391,11 @@ public:
     bool Has(unsigned int nEpoch) const;
     size_t Held(unsigned int nEpoch) const;
     size_t Checked(unsigned int nEpoch) const;
+    // Loose bodies remembered only by their tag, and whether one is.
+    size_t Gone(unsigned int nEpoch) const;
+    bool IsGone(unsigned int nEpoch, const uint256& hashBody) const;
+    // The self-test: a smaller limit than GUARD_MAX_GONE.
+    void SetGoneLimit(size_t n) { nMaxGone = n; }
     bool Seed(unsigned int nEpoch, uint256& hashOut) const;
     void Tickets(unsigned int nEpoch, std::vector<CHeldTicket>& out) const;
     bool HeldByKey(unsigned int nEpoch, const unsigned char pubkey[32], CHeldTicket& out) const;
@@ -360,6 +414,15 @@ public:
     // Costs pools times tickets SHA256d.
     bool OwnRanks(const CTicketChainView& view, unsigned int nEpoch, const std::vector<uint256>& vPools,
                   std::vector<int>& vRankOut, bool& fSettledOut);
+    // The same under a draw seed the caller names (one of OldDrawSeeds): the
+    // pools this node was drawn for before a redraw, while it still holds the
+    // tickets of that epoch.
+    void OwnRanksBySeed(const CTicketChainView& view, unsigned int nEpoch, const uint256& hashDrawSeed,
+                        const std::vector<uint256>& vPools, std::vector<int>& vRankOut) const;
+    // The seeds an epoch was drawn with before a redraw and whose linger is
+    // not over: nodes drawn by any of them, or by the present seed, hold the
+    // pool. Not saved in the file.
+    void OldDrawSeeds(unsigned int nEpoch, std::vector<uint256>& out) const;
 
     // Forget everything (the self-test, and a change of network).
     void Clear();
@@ -370,7 +433,14 @@ private:
     CTicketParams params;
     std::map<unsigned int, CTicketEpoch> mapEpochs;
     std::map<unsigned int, uint256> mapDrawnSeed;
+    // Per epoch: (seed drawn with before a redraw, height its linger ends).
+    std::map<unsigned int, std::vector<std::pair<uint256, int64> > > mapOldDrawSeed;
+    // The salt of the replay tags, this node's own, so nobody can aim a body
+    // at another body's tag.
+    unsigned char salt[32];
+    size_t nMaxGone;
 
+    uint64 GoneTag(const uint256& hashBody) const;
     void RememberChecked(CTicketEpoch& ep, const uint256& hashBody, const uint256& hashWork, bool fHeld);
     void Unhold(CTicketEpoch& ep, const std::vector<unsigned char>& key);
 };
@@ -490,7 +560,9 @@ bool LoadTicketFile(const std::string& strPath, const CTicketParams& params,
                     std::vector<CTicketFileEpoch>& vOut, std::string& strWhyOut);
 // Feeds what a file held back through the checks, own tickets included.
 // Returns how many are held after. For the self-test and for callers with no
-// budget to mind.
+// budget to mind: it hashes every ticket where it stands (up to 3 x 4096
+// RandomX hashes), so the node does not call it at start; there the file's
+// tickets go through the ticket budget queue like an answer.
 size_t RestoreTickets(CTicketBook& book, const CTicketChainView& view, const std::vector<CTicketFileEpoch>& vFile);
 
 } // namespace pooltkt
