@@ -55,6 +55,9 @@ jobs:
       - name: Run local pool messages fuzz smoke (hello, handle, shares, paced serves)
         run: make fuzz-p2plocal-smoke
 
+      - name: Run registered pool messages fuzz smoke (poolinv, p2x*, poolwho, fetches and paced serves)
+        run: make fuzz-p2preg-smoke
+
       - name: Run pool registry index fuzz smoke (anchors, pool-registry.dat, the fold under reorgs)
         run: make fuzz-poolindex-smoke
 
