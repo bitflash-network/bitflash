@@ -581,7 +581,11 @@ piece of shared P2Pool state in `p2pool_net.cpp` is split into two classes,
   (`P2PoolPeerProven`) stays exactly as in 1.2.34. Registered-class messages
   never score a peer for routing (above); a peer that sends an invalid share of
   a registered pool is scored, as it would be for an invalid pool zero share,
-  because only a dishonest peer does that.
+  because only a dishonest peer does that. A peer is proven for a registered
+  pool as for pool zero (dialled, or it sent a share of that pool this node
+  took), per (connection, pool); the shares a proven peer sends unasked are
+  hashed on a budget of that (connection, pool) and one of the pool, as a
+  local pool's members in session are (section 18), never on pool zero's.
 
 The rule covers every other piece of shared state too, and Phase B lists each
 in the code: the global cap on deferred entries (`MAX_DEFERRED`) and the
@@ -636,7 +640,9 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
   (pending, unknown id, waiting for its line), as it does today while pool
-  zero's history is on its way.
+  zero's history is on its way. A mined pool that no peer announces, with
+  nothing of it on this node, starts its line here 2 minutes after it
+  becomes active; peers are asked `poolwho` meanwhile.
 - The node carries the pool it mines (keeps its chain in
   `pools/<poolid>.dat`, relays it, announces it), plus pool zero, plus what the
   draw gives it (section 10), plus any given with `-poolcarry=<poolid>`
@@ -1311,7 +1317,7 @@ pool's share chain is kept on disk throughout. Nothing is re-anchored by hand.
   guardian of both the old and the new set gone at once during a handoff (the
   new set pulls from miners and announcing peers, or the pool revives).
 - P2Pool local: the self-tests of section 18.
-- Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended).
+- Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended), and for the registered pools' messages (`fuzz_p2preg`).
 
 ### Testnet proof with real coins (Phase D)
 
@@ -1401,7 +1407,7 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 |---|---|---|
 | A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
 | B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
-| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | after B1 |
+| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) in progress |
 | C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | after B2 |
 | D | the testnet proof of section 15 | after C |
 
