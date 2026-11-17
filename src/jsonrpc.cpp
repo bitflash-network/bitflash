@@ -802,8 +802,9 @@ static json rpc_gettreasuryinfo(const json&)
     j["script"] = ScriptToJson(s);
     j["howToPay"] = "sendtoaddress treasury <amount>, donate <amount>, or an output {\"treasury\": amount} in createrawtransaction";
     j["mining"] = "-treasuryshare=PCT (solo), -poolfeeto=treasury (pool operator)";
-    j["treasuryShare"] = nTreasurySharePercent;
-    j["poolFeeTo"] = fPoolFeeToTreasury ? "treasury" : "operator";
+    const CPoolSettings poolSet = GetPoolSettings();
+    j["treasuryShare"] = poolSet.nTreasurySharePercent;
+    j["poolFeeTo"] = poolSet.fPoolFeeToTreasury ? "treasury" : "operator";
     return j;
 }
 
@@ -4857,6 +4858,12 @@ static json PoolIndexStateJson()
     return j;
 }
 
+// What "send" and "publishzero" answer on mainnet while registered pools are
+// closed there (PoolBurnsOpen); the preview says the same in its "send" field.
+static const char* const POOL_BURNS_CLOSED =
+    "registered pools open on mainnet in a later release; the preview above is what would be recorded, and "
+    "nothing was sent";
+
 // poolcreate everpool {params} ["send"]
 //
 // Every rule of section 1 is checked before anything is sent: the record's
@@ -4932,12 +4939,19 @@ static json CreateEverpool(const json& p)
     if (strAct != "send" && strAct != "publishzero")
     {
         j["sent"] = false;
-        j["send"] = fZero ? "this is pool zero, already in every node; the same call with \"publishzero\" as its "
-                            "third parameter burns 1 BTF to publish its record on the chain once (section 4)"
-                          : "the same call with \"send\" as its third parameter burns 1 BTF and records this pool; "
-                            "it is active once the burn has 30 confirmations";
+        if (!PoolBurnsOpen())
+            j["send"] = POOL_BURNS_CLOSED;
+        else
+            j["send"] = fZero ? "this is pool zero, already in every node; the same call with \"publishzero\" as its "
+                                "third parameter burns 1 BTF to publish its record on the chain once (section 4)"
+                              : "the same call with \"send\" as its third parameter burns 1 BTF and records this pool; "
+                                "it is active once the burn has 30 confirmations";
         return j;
     }
+    // Mainnet cannot carry or mine a registered pool yet: a burn there would
+    // cost 1 BTF for nothing (POOL_REGISTRY_MAINNET_OPEN, poolindex.h).
+    if (!PoolBurnsOpen())
+        throw runtime_error(POOL_BURNS_CLOSED);
     // Pool zero is in every node without a burn: publishing its record is a
     // deliberate act of its own word, never what "send" does by accident.
     if (fZero && strAct != "publishzero")

@@ -1131,7 +1131,7 @@ public:
             {
                 if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
                 if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
-                if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
+                if (strKey == "strParticipantPool") { string s; ssValue >> s; SetParticipantPool(s); }
             }
         }
 
@@ -1486,7 +1486,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 {
                     if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
                     if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
-                    if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
+                    if (strKey == "strParticipantPool") { string s; ssValue >> s; SetParticipantPool(s); }
                 }
             }
         }
@@ -1579,12 +1579,13 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
 
     printf("nTransactionFee = %lld\n", nTransactionFee);
     printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
+    const CPoolSettings poolSet = GetPoolSettings();
     printf("nMineMode = %d, strParticipantPool = %s, fGenerateBitcoins = %d (%s)\n",
-           nMineMode.load(), strParticipantPool.c_str(), fGenerateBitcoins.load(),
+           nMineMode.load(), poolSet.strParticipantPool.c_str(), fGenerateBitcoins.load(),
            fMineModeFromCommandLine ? "from the command line, wallet.dat ignored"
                                     : "remembered from wallet.dat, or the default");
     printf("strPoolName = %s, dPoolFeePercent = %.2f, strPoolDashboardUrl = %s (from CLI/default, not wallet.dat)\n",
-           strPoolName.c_str(), dPoolFeePercent, strPoolDashboardUrl.c_str());
+           poolSet.strPoolName.c_str(), poolSet.dPoolFeePercent, poolSet.strPoolDashboardUrl.c_str());
 
     return true;
 }

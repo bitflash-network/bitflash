@@ -1187,6 +1187,18 @@ void PoolIndexState(int& nHeightOut, bool& fSyncedOut, bool& fRebuildingOut)
         fSyncedOut = pindexBest && pindexBest->GetBlockHash() == hash;
 }
 
+static std::atomic<bool> fPoolBurnsOpenForTest(false);
+
+bool PoolBurnsOpen()
+{
+    return POOL_REGISTRY_MAINNET_OPEN || IsTestNet() || fPoolBurnsOpenForTest;
+}
+
+void PoolBurnsOpenForTest(bool fOpen)
+{
+    fPoolBurnsOpenForTest = fOpen;
+}
+
 bool PoolIndexSynced()
 {
     // The index's tip under its lock, then the chain's under cs_main: never
