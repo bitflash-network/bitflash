@@ -33,6 +33,7 @@
 #include "btfchatwallet.h"
 #include "chatdir.h"
 #include "poolindex.h"
+#include "poolticket.h"
 #include <functional>
 #include "community.h"
 #include "explorer.h"
@@ -14377,6 +14378,1347 @@ static int RunChainWorkSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- pool-tickets: guardian tickets and the draw --------------------------
+// docs/pool-registry.md, section 10 ("Epochs and seeds", "Who can be drawn:
+// candidates and tickets", "The draw") and the Phase C items of section 15
+// that need no network: the ticket's bytes, header, work hash and score as
+// fixed vectors, the lowest-hash rule for one key and for the 4096 cap, the
+// deadline for relays and not for answers, the same-body check before the
+// hash, a bad-signature copy ahead of the real ticket, the checked set at
+// its limit, a failing body checked twice, a seed reorged out, the file, the
+// draw over a fixed set, the guard budget by line work, and the share of
+// places an attacker's tickets win against section 12's estimate.
+
+namespace {
+
+class TicketTestView : public CTicketChainView
+{
+public:
+    std::vector<uint256> v;
+
+    int TipHeight() const { return (int)v.size() - 1; }
+    bool HashAt(int nHeight, uint256& hashOut) const
+    {
+        if (nHeight < 0 || nHeight >= (int)v.size())
+            return false;
+        hashOut = v[nHeight];
+        return true;
+    }
+    // Blocks up to nTip; the new ones belong to branch nBranch.
+    void Grow(int nTip, int nBranch)
+    {
+        while ((int)v.size() <= nTip)
+        {
+            std::string s = strprintf("guard-selftest-block/%d/%d", nBranch, (int)v.size());
+            v.push_back(Hash(s.begin(), s.end()));
+        }
+    }
+    void Cut(int nTip)
+    {
+        if ((int)v.size() > nTip + 1)
+            v.resize(nTip + 1);
+    }
+};
+
+// A work hash that costs nothing, counted: SHA256d of the header.
+uint64 g_nTicketTestHashes = 0;
+uint256 TicketTestWork(const unsigned char* pHeader80)
+{
+    g_nTicketTestHashes++;
+    return Hash(pHeader80, pHeader80 + 80);
+}
+
+void TicketTestKey(unsigned int i, unsigned char seckey[32])
+{
+    std::string s = strprintf("guard-selftest-key/%u", i);
+    uint256 h = Hash(s.begin(), s.end());
+    memcpy(seckey, h.begin(), 32);
+}
+
+// Key i's ticket for the epoch, trying nonces from nNonce.
+bool TicketTestMake(const CTicketParams& params, const uint256& hashSeed, unsigned int nEpoch, unsigned int iKey,
+                    uint64 nNonce, CGuardTicket& t, uint256& hashWork)
+{
+    unsigned char sk[32];
+    TicketTestKey(iKey, sk);
+    uint64 nTries = 0;
+    return pooltkt::MakeTicket(params, hashSeed, nEpoch, sk, 128, nNonce, 100000, t, hashWork, nTries);
+}
+
+// A held ticket that is only a work hash and a name: what the draw reads.
+CHeldTicket TicketTestFake(const std::string& strTag, unsigned int i)
+{
+    CHeldTicket h;
+    std::string s = strprintf("%s/%u", strTag.c_str(), i);
+    h.hashWork = Hash(s.begin(), s.end());
+    h.hashBody = h.hashWork;
+    for (int k = 0; k < 4; k++)
+        h.ticket.body[12 + k] = (unsigned char)((i >> (8 * k)) & 0xff);
+    return h;
+}
+
+unsigned int TicketTestFakeIndex(const std::vector<unsigned char>& key)
+{
+    return key.size() < 4 ? 0 : (unsigned int)(key[0] | (key[1] << 8) | (key[2] << 16) | (key[3] << 24));
+}
+
+std::set<uint256> TicketTestBodies(const CTicketBook& book, unsigned int nEpoch)
+{
+    std::vector<CHeldTicket> v;
+    book.Tickets(nEpoch, v);
+    std::set<uint256> s;
+    for (size_t i = 0; i < v.size(); i++)
+        s.insert(v[i].hashBody);
+    return s;
+}
+
+void TicketTestLine(void* pCtx, const uint256& poolId, CGuardLine& lineOut)
+{
+    std::map<uint256, CGuardLine>* m = (std::map<uint256, CGuardLine>*)pCtx;
+    std::map<uint256, CGuardLine>::const_iterator it = m->find(poolId);
+    if (it != m->end())
+        lineOut = it->second;
+}
+
+CGuardLine TicketTestLineOf(unsigned int nWork, int64 nMB, unsigned int nShares = 2900)
+{
+    CGuardLine l;
+    l.fKnown = true;
+    l.nShares = nShares;
+    l.nBytes = nMB * 1024 * 1024;
+    l.bnWork = CBigNum((unsigned int)nWork);
+    return l;
+}
+
+int TicketTestChoice(const std::vector<CGuardDecision>& v, const uint256& id)
+{
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].poolId == id)
+            return v[i].nChoice;
+    return -1;
+}
+
+// A file as SaveTicketFile writes one, with any version, magic and content.
+std::string TicketTestFile(int nVersion, const unsigned char magic[4], const std::vector<CTicketFileEpoch>& vEpochs,
+                           const std::string& strExtra = std::string())
+{
+    CDataStream ss(SER_DISK);
+    unsigned char m[4];
+    memcpy(m, magic, 4);
+    ss << nVersion << FLATDATA(m) << vEpochs;
+    std::string data(ss.begin(), ss.end());
+    data += strExtra;
+    uint256 h = Hash(data.begin(), data.end());
+    data.append((const char*)h.begin(), 32);
+    return data;
+}
+
+bool TicketTestRefused(const std::string& path, const std::string& data, const CTicketParams& params, const char* pszWhy)
+{
+    std::string err, why;
+    if (!WriteFileAtomicPrivate(path, data, err))
+        return false;
+    std::vector<CTicketFileEpoch> v;
+    if (pooltkt::LoadTicketFile(path, params, v, why))
+        return false;
+    return v.empty() && why.compare(0, strlen(pszWhy), pszWhy) == 0;
+}
+
+double TicketTestLogChoose(double n, double k)
+{
+    return lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1);
+}
+
+// The fixed inputs of the pinned vectors.
+const unsigned char* TicketVectorKey()
+{
+    static unsigned char sk[32];
+    for (int i = 0; i < 32; i++)
+        sk[i] = (unsigned char)(i + 1);
+    return sk;
+}
+uint256 TicketVectorHash(const char* psz)
+{
+    std::string s(psz);
+    return Hash(s.begin(), s.end());
+}
+static const unsigned int TICKET_VECTOR_EPOCH = 100;
+static const uint64 TICKET_VECTOR_NONCE_START = 0x100000000ULL;
+
+struct TicketVector
+{
+    bool fTestNet;
+    uint64 nNonce;
+    const char* pszBody;
+    const char* pszSig;
+    const char* pszHeader;
+    const char* pszWork;
+    const char* pszScore;
+};
+
+// Found by -selftest=pool-tickets-grind. The body, the signature, the work
+// header, the RandomX work hash and the score of one ticket on each network.
+static const TicketVector g_ticketVectors[2] = {
+    { false, 0x10000022aULL,
+      "bf205cfd425446476400000084bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b080002a02000001000000",
+      "1d71804158dd0b40f569fa88c72ae5bed5ec9e5c4d193a4cb86a54c9321152960be23cd193a5ba7df6ee6feca830ebebb9d6b57739fa2b0b2f7107c930d606f5",
+      "42544647fc7cb29f8ab19f098a6012e6ff8976611d77376086e7eac7de63c9ae4d2e1a4a820107b10832e38be36c85a3c28fd0aee320b49a294658f3943dbb0abadc0e28401cb16affff071f2a020000",
+      "0005520d87e4ab8c6d7ac0f617312729b11df2742fba38b8b79a3662520bb7e1",
+      "d8411e4c1974d70d381ce6534b02ecced35b148bd6ebeff5e8c95726d5359ba6" },
+    { true, 0x1000010daULL,
+      "cee2c0ff425446476400000084bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b08000da10000001000000",
+      "0e3dc90e7f79c374a3d7691f3e2c3718b8fc0f8e10fbc7f1bc39833a7b855b9fab175c1b688cd8b0c03e19ad0ab7180adb5ca7201f2a3088debe5a8a32184cf3",
+      "42544647fc7cb29f8ab19f098a6012e6ff8976611d77376086e7eac7de63c9ae4d2e1a4a8979a8d3f3b2c348a92a7ff9ee4576333fc70cc27f549af4e0211a832d48094c5060a86affff071fda100000",
+      "0001a8ac8b6fe4977757b0f985b9123e71a7ac722dafe29bdb362b4a213ecde7",
+      "49a11e8079b33b1340c5c1c6de25e53f6b513e7588e7cde58249a9dfe3979ec9" },
+};
+
+} // namespace
+
+// Prints the vectors above, and what a ticket costs on this machine: run by
+// hand when the ticket format gets a new version.
+static int RunPoolTicketsGrind()
+{
+    printf("pool-tickets-grind\n");
+    const bool fTestNetSaved = IsTestNet();
+    RandomXInit();
+    for (int n = 0; n < 2; n++)
+    {
+        SelectChainParams(n == 1);
+        CTicketParams params = CTicketParams::Network();
+        const uint256 hashSeed = TicketVectorHash("guard-selftest-ticket-seed");
+        CGuardTicket t;
+        uint256 hashWork = 0;
+        uint64 nTries = 0, nTotal = 0;
+        int64 nStart = GetTime();
+        bool fFound = false;
+        while (!fFound && nTotal < 2000000)
+        {
+            fFound = pooltkt::MakeTicket(params, hashSeed, TICKET_VECTOR_EPOCH, TicketVectorKey(), 128,
+                                         TICKET_VECTOR_NONCE_START + nTotal, 256, t, hashWork, nTries);
+            nTotal += nTries;
+            if (!fFound && nTotal % 4096 == 0)
+            {
+                printf("  ... %u tries\n", (unsigned int)nTotal);
+                fflush(stdout);
+            }
+        }
+        int64 nMs = (GetTime() - nStart) * 1000;
+        if (nMs < 1)
+            nMs = 1;
+        printf("%s: target %08x, %s after %u tries in %.1f s (%.1f hashes/s on the verification VM)\n",
+               n == 1 ? "testnet" : "mainnet", params.nBits, fFound ? "found" : "NOT found",
+               (unsigned int)nTotal, nMs / 1000.0, nTotal * 1000.0 / nMs);
+        if (!fFound)
+            continue;
+        unsigned char header[80];
+        t.WorkHeader(params, hashSeed, header);
+        const uint256 hashScore = pooltkt::Score(TicketVectorHash("guard-selftest-draw-seed"),
+                                                 TicketVectorHash("guard-selftest-pool-1"), hashWork);
+        printf("    { %s, 0x%llxULL,\n", n == 1 ? "true" : "false", (unsigned long long)t.Nonce());
+        printf("      \"%s\",\n", HexStr(t.body, t.body + sizeof(t.body), false).c_str());
+        printf("      \"%s\",\n", HexStr(t.sig, t.sig + sizeof(t.sig), false).c_str());
+        printf("      \"%s\",\n", HexStr(header, header + 80, false).c_str());
+        printf("      \"%s\",\n", hashWork.GetHex().c_str());
+        printf("      \"%s\" },\n", hashScore.GetHex().c_str());
+        fflush(stdout);
+    }
+    SelectChainParams(fTestNetSaved);
+    return 0;
+}
+
+static int RunPoolTicketsSelfTest()
+{
+    fflush(stdout);
+    printf("pool-tickets self-test\n");
+
+    int nFail = 0;
+    auto ok = [&nFail](bool f, const char* psz) { if (!Check(f, psz)) nFail++; };
+    const bool fTestNetSaved = IsTestNet();
+    const std::string path = GetAppDir() + "/pool-tickets-selftest.dat";
+    remove(path.c_str());
+    try
+    {
+        // ---- epochs and seeds
+        ok(pooltkt::EpochOf(-1) == -1 && pooltkt::EpochOf(0) == 0 && pooltkt::EpochOf(719) == 0 &&
+           pooltkt::EpochOf(720) == 1 && pooltkt::EpochOf(7919) == 10,
+           "epoch e is heights 720e to 720e + 719");
+        ok(pooltkt::TicketSeedHeight(5) == 2880 && pooltkt::TicketDeadlineHeight(5) == 3480 &&
+           pooltkt::DrawSeedHeight(5) == 3540 && pooltkt::DrawSettleHeight(5) == 3569 &&
+           pooltkt::LingerEndHeight(5) == 3780,
+           "epoch 5: ticket seed 2880, deadline 3480, draw seed 3540, settled at 3569, linger ends at 3780");
+        {
+            TicketTestView w;
+            uint256 h = 0;
+            bool f = true;
+            ok(!pooltkt::TicketSeed(w, 1, h, f) && !pooltkt::EpochInRange(w, 1), "no chain, no seed and no epoch");
+            w.Grow(28, 0);
+            ok(pooltkt::TicketSeed(w, 1, h, f) && h == w.v[0] && !f,
+               "epoch 1 is seeded by the genesis block, not buried with 29 confirmations");
+            ok(!pooltkt::TicketSeed(w, 0, h, f) && !pooltkt::TicketSeed(w, 2, h, f),
+               "epoch 0 has no ticket seed, and epoch 2 none before block 720");
+            w.Grow(29, 0);
+            ok(pooltkt::TicketSeed(w, 1, h, f) && f, "buried with 30");
+            ok(pooltkt::EpochInRange(w, 1) && !pooltkt::EpochInRange(w, 0) && !pooltkt::EpochInRange(w, 2),
+               "in epoch 0 only epoch 1 (the next) can have tickets");
+            w.Grow(659, 0);
+            ok(!pooltkt::DrawSeed(w, 1, h, f), "no draw seed for epoch 1 at height 659");
+            w.Grow(660, 0);
+            ok(pooltkt::DrawSeed(w, 1, h, f) && h == w.v[660] && !f, "the draw seed is block 720e - 60, not settled at first");
+            w.Grow(688, 0);
+            ok(pooltkt::DrawSeed(w, 1, h, f) && !f, "not settled at 720e - 32");
+            w.Grow(689, 0);
+            ok(pooltkt::DrawSeed(w, 1, h, f) && f, "settled at 720e - 31");
+            w.Grow(7300, 0);
+            ok(pooltkt::EpochInRange(w, 9) && pooltkt::EpochInRange(w, 10) && pooltkt::EpochInRange(w, 11) &&
+               !pooltkt::EpochInRange(w, 8) && !pooltkt::EpochInRange(w, 12),
+               "the previous, the current and the next epoch by the tip, and no other");
+            w.Grow(7799, 0);
+            ok(!pooltkt::PastDeadline(w, 11), "before the deadline block of epoch 11 (7800)");
+            w.Grow(7800, 0);
+            ok(pooltkt::PastDeadline(w, 11), "the deadline is having block 720e - 120");
+        }
+
+        // ---- the ticket's bytes
+        const unsigned char* skVec = TicketVectorKey();
+        unsigned char pkVec[32];
+        ok(pooltkt::XOnlyPubKey(skVec, pkVec), "the x-only key of a secret key");
+        {
+            const unsigned char magic[4] = { 0xf1, 0xf2, 0xf3, 0xf4 };
+            CGuardTicket t;
+            t.SetBody(magic, 0x01020304, pkVec, 0x0180, 0x1122334455667788ULL);
+            const std::string strBody = HexStr(t.body, t.body + sizeof(t.body), false);
+            ok(strBody == "f1f2f3f4" "42544647" "04030201" + HexStr(pkVec, pkVec + 32, false) + "8001" "8877665544332211",
+               "the body: magic, \"BTFG\", epoch, key, capacity, nonce, 54 bytes, little-endian");
+            ok(t.HasMagic(magic) && t.HasTag() && t.Epoch() == 0x01020304 && t.CapacityMB() == 0x0180 &&
+               t.Nonce() == 0x1122334455667788ULL && memcmp(t.PubKey(), pkVec, 32) == 0,
+               "and read back");
+            ok(t.Sign(skVec) && t.VerifySig(), "signed and verified (BIP340)");
+            std::vector<unsigned char> vb = t.Bytes();
+            CGuardTicket t2;
+            ok(vb.size() == 118 && t2.FromBytes(&vb[0], vb.size()) && t2 == t, "118 bytes, and back");
+            ok(!t2.FromBytes(&vb[0], 117) && !t2.FromBytes(&vb[0], 119) && !t2.FromBytes(NULL, 118),
+               "117 or 119 bytes are not a ticket");
+            CDataStream ss(SER_NETWORK);
+            ss << t;
+            ok(ss.size() == 118 && std::vector<unsigned char>(ss.begin(), ss.end()) == vb, "serialized as the same 118 bytes");
+
+            unsigned char digest[32], expect[32];
+            t.SigHash(digest);
+            std::string strMsg = "Bitflash/guard-ticket/1";
+            strMsg.append((const char*)t.body, sizeof(t.body));
+            SHA256((const unsigned char*)strMsg.data(), strMsg.size(), expect);
+            ok(memcmp(digest, expect, 32) == 0, "the signed digest is SHA256(\"Bitflash/guard-ticket/1\" || body)");
+            CGuardTicket t3 = t;
+            ok(t3.Sign(skVec) && t3 == t, "one key and one body give one signature");
+            t3.body[45] ^= 1;
+            ok(!t3.VerifySig(), "a changed body does not verify");
+            t3 = t;
+            t3.sig[10] ^= 1;
+            ok(!t3.VerifySig(), "a changed signature does not verify");
+            t3 = t;
+            memset(t3.body + 12, 0xff, 32);
+            ok(!t3.VerifySig(), "a key that is not on the curve does not verify");
+
+            CTicketParams p;
+            memcpy(p.magic, magic, 4);
+            p.nBits = 0x1f07ffff;
+            p.nTime = 0x11223344;
+            uint256 hashSeed = TicketVectorHash("guard-selftest-ticket-seed");
+            unsigned char header[80];
+            t.WorkHeader(p, hashSeed, header);
+            uint256 hashBody = t.BodyHash();
+            ok(hashBody == Hash(t.body, t.body + 54) &&
+               HexStr(header, header + 80, false) ==
+                   "42544647" + HexStr(hashSeed.begin(), hashSeed.end(), false) +
+                   HexStr(hashBody.begin(), hashBody.end(), false) + "44332211" "ffff071f" "88776655",
+               "the work header: \"BTFG\", the seed, SHA256d of the body, the time, the target, the nonce's low 32 bits");
+            CBlock b;
+            b.nVersion = GUARD_TICKET_HEADER_VERSION;
+            b.hashPrevBlock = hashSeed;
+            b.hashMerkleRoot = hashBody;
+            b.nTime = p.nTime;
+            b.nBits = p.nBits;
+            b.nNonce = 0x55667788;
+            ok(memcmp(BEGIN(b.nVersion), header, 80) == 0, "the same 80 bytes as a block header with those fields");
+            ok(p.Target() == CBigNum().SetCompact(0x1f07ffff).getuint256() &&
+               p.Target().GetHex() == "0007ffff00000000000000000000000000000000000000000000000000000000",
+               "the ticket target: 13 zero bits");
+        }
+
+        // ---- the fixed vectors, with the real work (RandomX, PoW v2)
+        RandomXInit();
+        for (int n = 0; n < 2; n++)
+        {
+            const TicketVector& tv = g_ticketVectors[n];
+            SelectChainParams(tv.fTestNet);
+            const CTicketParams params = CTicketParams::Network();
+            const uint256 hashSeed = TicketVectorHash("guard-selftest-ticket-seed");
+            CGuardTicket t;
+            t.SetBody(params.magic, TICKET_VECTOR_EPOCH, pkVec, 128, tv.nNonce);
+            bool fSigned = t.Sign(skVec);
+            unsigned char header[80];
+            t.WorkHeader(params, hashSeed, header);
+            const uint256 hashWork = t.WorkHash(params, hashSeed);
+            CBlock b;
+            memcpy(BEGIN(b.nVersion), header, 80);
+            const uint256 hashScore = pooltkt::Score(TicketVectorHash("guard-selftest-draw-seed"),
+                                                     TicketVectorHash("guard-selftest-pool-1"), hashWork);
+            const std::string strNet = tv.fTestNet ? "testnet" : "mainnet";
+            ok(memcmp(params.magic, pchMessageStart, 4) == 0 && params.nTime == PoWV2Time() && params.fnWork == NULL &&
+               params.nBits == (tv.fTestNet ? GUARD_TICKET_BITS_TESTNET : GUARD_TICKET_BITS_MAINNET),
+               (strNet + ": the network's ticket parameters").c_str());
+            ok(fSigned && HexStr(t.body, t.body + sizeof(t.body), false) == tv.pszBody,
+               (strNet + " vector: the body").c_str());
+            ok(HexStr(t.sig, t.sig + sizeof(t.sig), false) == tv.pszSig && t.VerifySig(),
+               (strNet + " vector: the signature").c_str());
+            ok(HexStr(header, header + 80, false) == tv.pszHeader, (strNet + " vector: the work header").c_str());
+            ok(hashWork.GetHex() == tv.pszWork && hashWork <= params.Target(),
+               (strNet + " vector: the work hash, at or under the target").c_str());
+            ok(hashWork == b.GetPoWHash() && PoWVersionAt(b.nTime) == 2,
+               (strNet + " vector: the work hash is the block header's PoW v2 hash").c_str());
+            ok(hashScore.GetHex() == tv.pszScore, (strNet + " vector: the score").c_str());
+
+            // The whole check with the real work: the ticket taken, and the
+            // same key's next nonce refused for its work.
+            TicketTestView w;
+            w.Grow(71500, 0);              // epoch 99, before epoch 100's deadline
+            w.v[72000 - 720] = hashSeed;   // the ticket seed of epoch 100
+            CTicketBook book(params);
+            ok(book.Accept(w, t, hashSeed, false) == TICKET_HELD && book.Held(TICKET_VECTOR_EPOCH) == 1,
+               (strNet + ": the vector is taken as a relayed ticket").c_str());
+            CGuardTicket tBad = t;
+            tBad.SetNonce(tv.nNonce + 1);
+            tBad.Sign(skVec);
+            ok(tBad.WorkHash(params, hashSeed) > params.Target() &&
+               book.Accept(w, tBad, hashSeed, false) == TICKET_BAD_WORK && TicketScored(TICKET_BAD_WORK) &&
+               !book.IsChecked(TICKET_VECTOR_EPOCH, tBad.BodyHash()),
+               (strNet + ": work over the target is refused, scored and not remembered").c_str());
+            // The other network's ticket is another network's.
+            CTicketParams pOther = params;
+            pOther.magic[0] ^= 0xff;
+            CTicketBook bookOther(pOther);
+            ok(bookOther.Accept(w, t, hashSeed, false) == TICKET_BAD_MAGIC, (strNet + ": refused under another magic").c_str());
+            // Making one with the real work, at a target every other hash meets.
+            CTicketParams pEasy = params;
+            pEasy.nBits = 0x207fffff;
+            CGuardTicket tEasy;
+            uint256 hashEasy = 0;
+            uint64 nTries = 0;
+            ok(pooltkt::MakeTicket(pEasy, hashSeed, TICKET_VECTOR_EPOCH, skVec, 64, 7, 64, tEasy, hashEasy, nTries) &&
+               nTries >= 1 && tEasy.VerifySig() && tEasy.WorkHash(pEasy, hashSeed) == hashEasy &&
+               hashEasy <= pEasy.Target() && tEasy.Nonce() == 7 + nTries - 1 && tEasy.CapacityMB() == 64,
+               (strNet + ": a ticket made with the real work").c_str());
+        }
+        SelectChainParams(fTestNetSaved);
+
+        // ---- the held set, with a work hash that costs nothing
+        CTicketParams params;
+        params.magic[0] = 0xfa; params.magic[1] = 0xce; params.magic[2] = 0xb0; params.magic[3] = 0x0c;
+        params.nBits = 0x203fffff;   // one hash in four
+        params.nTime = 1;
+        params.fnWork = TicketTestWork;
+        const uint256 hashTarget = params.Target();
+
+        TicketTestView w;
+        w.Grow(7300, 0);
+        const uint256 hashSeed11 = w.v[7200], hashSeed10 = w.v[6480], hashSeed9 = w.v[5760];
+        {
+            CTicketBook book(params);
+            CGuardTicket t;
+            uint256 hw = 0;
+            ok(TicketTestMake(params, hashSeed11, 11, 1, 0, t, hw) && hw <= hashTarget, "a ticket made");
+            std::vector<unsigned char> vb = t.Bytes();
+
+            // Step 1, all before any hash.
+            uint64 nBefore = g_nTicketTestHashes;
+            ok(book.Accept(w, &vb[0], 117, 11, hashSeed11, false) == TICKET_BAD_FRAMING, "117 bytes: bad framing, scored");
+            std::vector<unsigned char> vx = vb;
+            vx[0] ^= 1;
+            ok(book.Accept(w, &vx[0], vx.size(), 11, hashSeed11, false) == TICKET_BAD_MAGIC, "another network's magic: scored");
+            vx = vb;
+            vx[5] ^= 1;
+            ok(book.Accept(w, &vx[0], vx.size(), 11, hashSeed11, false) == TICKET_BAD_FRAMING, "no \"BTFG\": bad framing, scored");
+            ok(book.Accept(w, &vb[0], vb.size(), 10, hashSeed11, false) == TICKET_BAD_EPOCH &&
+               TicketScored(TICKET_BAD_EPOCH) && TicketScored(TICKET_BAD_FRAMING) && TicketScored(TICKET_BAD_MAGIC),
+               "a body epoch that is not the message's: scored");
+
+            // Step 2: innocent, before any hash.
+            ok(book.Accept(w, &vb[0], vb.size(), 11, hashSeed10, false) == TICKET_DROP_OTHER_SEED &&
+               TicketDropped(TICKET_DROP_OTHER_SEED) && !TicketScored(TICKET_DROP_OTHER_SEED),
+               "a message naming another seed is dropped, unscored");
+            for (unsigned int e = 0; e <= 13; e++)
+            {
+                if (e >= 9 && e <= 11)
+                    continue;
+                CGuardTicket tOut;
+                uint256 hwOut = 0;
+                TicketTestMake(params, hashSeed11, e, 1, 0, tOut, hwOut);
+                nBefore = g_nTicketTestHashes;   // making it hashed; taking it must not
+                if (book.Accept(w, tOut, hashSeed11, true) != TICKET_DROP_EPOCH || g_nTicketTestHashes != nBefore)
+                {
+                    ok(false, "an epoch outside previous, current and next is dropped, unscored");
+                    break;
+                }
+                if (e == 13)
+                    ok(true, "an epoch outside previous, current and next is dropped, unscored (0 to 8, 12, 13)");
+            }
+            {
+                TicketTestView wEarly;
+                wEarly.v.assign(w.v.begin(), w.v.begin() + 7229);   // tip 7228: the seed has 29 confirmations
+                ok(book.Accept(wEarly, t, hashSeed11, false) == TICKET_DROP_NO_SEED, "a seed with 29 confirmations: dropped, unscored");
+                ok(g_nTicketTestHashes == nBefore && book.Held(11) == 0 && !book.Has(11),
+                   "none of those cost a hash or left anything behind");
+                wEarly.Grow(7229, 0);
+                CTicketBook bookEarly(params);
+                ok(bookEarly.Accept(wEarly, t, hashSeed11, false) == TICKET_HELD, "with 30 it is taken");
+            }
+
+            // A bad-signature copy ahead of the real ticket.
+            CGuardTicket tForged = t;
+            tForged.sig[3] ^= 0x40;
+            nBefore = g_nTicketTestHashes;
+            ok(book.Accept(w, tForged, hashSeed11, false) == TICKET_BAD_SIG && TicketScored(TICKET_BAD_SIG) &&
+               g_nTicketTestHashes == nBefore && !book.IsChecked(11, t.BodyHash()),
+               "a copy with a bad signature: scored, no hash, nothing remembered");
+            ok(book.Accept(w, t, hashSeed11, false) == TICKET_HELD && book.Held(11) == 1 &&
+               g_nTicketTestHashes == nBefore + 1 && book.IsChecked(11, t.BodyHash()),
+               "the real ticket after it is held, for one hash");
+            CHeldTicket held;
+            ok(book.HeldByKey(11, t.PubKey(), held) && held.ticket == t && held.hashWork == hw &&
+               held.hashBody == t.BodyHash(), "held under its key with its work hash");
+
+            // The same body again: dropped before the hash, whatever its signature.
+            nBefore = g_nTicketTestHashes;
+            ok(book.Accept(w, t, hashSeed11, false) == TICKET_DROP_SEEN &&
+               book.Accept(w, t, hashSeed11, true) == TICKET_DROP_SEEN &&
+               book.Accept(w, tForged, hashSeed11, false) == TICKET_DROP_SEEN &&
+               g_nTicketTestHashes == nBefore && !TicketScored(TICKET_DROP_SEEN),
+               "a replay of a checked body costs no hash and scores nobody");
+
+            // A body whose work fails: checked and scored every time.
+            unsigned char sk2[32], pk2[32];
+            TicketTestKey(2, sk2);
+            pooltkt::XOnlyPubKey(sk2, pk2);
+            CGuardTicket tFail;
+            bool fFailFound = false;
+            for (uint64 nNonce = 0; nNonce < 1000 && !fFailFound; nNonce++)
+            {
+                tFail.SetBody(params.magic, 11, pk2, 128, nNonce);
+                fFailFound = tFail.WorkHash(params, hashSeed11) > hashTarget;
+            }
+            tFail.Sign(sk2);
+            nBefore = g_nTicketTestHashes;
+            ok(fFailFound && book.Accept(w, tFail, hashSeed11, false) == TICKET_BAD_WORK &&
+               book.Accept(w, tFail, hashSeed11, false) == TICKET_BAD_WORK &&
+               g_nTicketTestHashes == nBefore + 2 && !book.IsChecked(11, tFail.BodyHash()) && book.Checked(11) == 1,
+               "a failing body sent twice is hashed and scored twice, and not remembered");
+
+            // One ticket per key: the lowest work hash, whatever the order.
+            std::vector<CGuardTicket> vSame;
+            std::vector<uint256> vSameWork;
+            for (uint64 j = 0; j < 4; j++)
+            {
+                CGuardTicket tj;
+                uint256 hj = 0;
+                TicketTestMake(params, hashSeed11, 11, 3, j * 1000000, tj, hj);
+                vSame.push_back(tj);
+                vSameWork.push_back(hj);
+            }
+            size_t iLow = 0, iHigh = 0;
+            for (size_t j = 1; j < vSame.size(); j++)
+            {
+                if (vSameWork[j] < vSameWork[iLow]) iLow = j;
+                if (vSameWork[j] > vSameWork[iHigh]) iHigh = j;
+            }
+            size_t iMid = 0;
+            while (iMid == iLow || iMid == iHigh) iMid++;
+            ok(book.Accept(w, vSame[iHigh], hashSeed11, false) == TICKET_HELD &&
+               book.Accept(w, vSame[iMid], hashSeed11, false) == TICKET_HELD &&
+               book.Held(11) == 2 && book.HeldByKey(11, vSame[0].PubKey(), held) && held.ticket == vSame[iMid],
+               "a key's second ticket with a lower work hash replaces its first");
+            ok(book.Accept(w, vSame[iHigh], hashSeed11, false) == TICKET_DROP_SEEN,
+               "the replaced one is still a checked body");
+            ok(book.Accept(w, vSame[iLow], hashSeed11, false) == TICKET_HELD && book.Held(11) == 2 &&
+               book.HeldByKey(11, vSame[0].PubKey(), held) && held.ticket == vSame[iLow],
+               "and the lowest replaces that");
+            {
+                CTicketBook book2(params);
+                bool fOrder = book2.Accept(w, vSame[iLow], hashSeed11, false) == TICKET_HELD &&
+                              book2.Accept(w, vSame[iHigh], hashSeed11, false) == TICKET_OUTRANKED &&
+                              book2.Accept(w, vSame[iMid], hashSeed11, false) == TICKET_OUTRANKED &&
+                              book2.Held(11) == 1 && book2.Checked(11) == 3 &&
+                              book2.HeldByKey(11, vSame[0].PubKey(), held) && held.ticket == vSame[iLow];
+                ok(fOrder && TicketPassed(TICKET_OUTRANKED) && !TicketScored(TICKET_OUTRANKED),
+                   "in the other order the higher ones are outranked: checked, not held, the same ticket kept");
+            }
+        }
+
+        // ---- the deadline: relays, not answers
+        {
+            TicketTestView wd;
+            wd.v = w.v;
+            wd.Grow(7799, 0);
+            CTicketBook book(params);
+            CGuardTicket ta, tb, tc, td;
+            uint256 h = 0;
+            TicketTestMake(params, hashSeed11, 11, 10, 0, ta, h);
+            TicketTestMake(params, hashSeed11, 11, 11, 0, tb, h);
+            TicketTestMake(params, hashSeed10, 10, 12, 0, tc, h);
+            TicketTestMake(params, hashSeed9, 9, 13, 0, td, h);
+            ok(book.Accept(wd, ta, hashSeed11, false) == TICKET_HELD, "a relay one block before the deadline is taken");
+            wd.Grow(7800, 0);
+            uint64 nBefore = g_nTicketTestHashes;
+            ok(book.Accept(wd, tb, hashSeed11, false) == TICKET_DROP_DEADLINE && g_nTicketTestHashes == nBefore &&
+               !TicketScored(TICKET_DROP_DEADLINE),
+               "a relay once the deadline block is on the chain is dropped, unhashed and unscored");
+            ok(book.Accept(wd, tb, hashSeed11, true) == TICKET_HELD, "the same ticket in an answer is taken");
+            ok(book.Accept(wd, tc, hashSeed10, false) == TICKET_DROP_DEADLINE &&
+               book.Accept(wd, td, hashSeed9, false) == TICKET_DROP_DEADLINE,
+               "relays for the current and the previous epoch are past their deadline");
+            ok(book.Accept(wd, tc, hashSeed10, true) == TICKET_HELD && book.Accept(wd, td, hashSeed9, true) == TICKET_HELD &&
+               book.Held(11) == 2 && book.Held(10) == 1 && book.Held(9) == 1,
+               "and taken in answers: three epochs held");
+        }
+
+        // ---- the 4096 cap, the checked set's limit, and the attacker's share
+        const unsigned int nKeys = 6000, nAttack = 1500;
+        std::vector<CGuardTicket> vAll;
+        std::vector<uint256> vAllWork;
+        {
+            bool fMade = true;
+            for (unsigned int i = 0; i < nKeys; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                fMade = TicketTestMake(params, hashSeed11, 11, 1000 + i, 0, t, h) && fMade;
+                vAll.push_back(t);
+                vAllWork.push_back(h);
+            }
+            ok(fMade, "6000 tickets from 6000 keys");
+        }
+        // What every node should end with: the 4096 lowest work hashes.
+        std::set<uint256> setExpect;
+        std::set<std::vector<unsigned char> > setAttackKeys;
+        {
+            std::vector<std::pair<uint256, uint256> > vOrder;
+            for (unsigned int i = 0; i < nKeys; i++)
+            {
+                vOrder.push_back(std::make_pair(vAllWork[i], vAll[i].BodyHash()));
+                if (i < nAttack)
+                    setAttackKeys.insert(vAll[i].Key());
+            }
+            std::sort(vOrder.begin(), vOrder.end());
+            for (unsigned int i = 0; i < GUARD_MAX_TICKETS; i++)
+                setExpect.insert(vOrder[i].second);
+        }
+        CTicketBook bookA(params), bookB(params);
+        {
+            int nHeldA = 0, nCapA = 0, nOtherA = 0, nOtherB = 0;
+            for (unsigned int i = 0; i < nKeys; i++)
+            {
+                int v = bookA.Accept(w, vAll[i], hashSeed11, false);
+                if (v == TICKET_HELD) nHeldA++; else if (v == TICKET_PAST_CAP) nCapA++; else nOtherA++;
+                int v2 = bookB.Accept(w, vAll[nKeys - 1 - i], hashSeed11, false);
+                if (!TicketPassed(v2)) nOtherB++;
+            }
+            ok(bookA.Held(11) == GUARD_MAX_TICKETS && bookB.Held(11) == GUARD_MAX_TICKETS,
+               "6000 tickets sent: 4096 held");
+            ok(nOtherA == 0 && nOtherB == 0 && nHeldA + nCapA == (int)nKeys && nCapA > 0 && nHeldA > (int)GUARD_MAX_TICKETS &&
+               TicketPassed(TICKET_PAST_CAP) && !TicketScored(TICKET_PAST_CAP),
+               "past the cap a lower work hash takes the highest one's place, and a higher one is not held; nobody scored");
+            ok(TicketTestBodies(bookA, 11) == setExpect, "the held set is the 4096 lowest work hashes");
+            ok(TicketTestBodies(bookB, 11) == setExpect, "and the same set when they arrive in the opposite order");
+            ok(bookA.Checked(11) == nKeys && bookB.Checked(11) == nKeys, "every body that passed is remembered, held or not");
+            std::vector<CHeldTicket> vHeld;
+            bookA.Tickets(11, vHeld);
+            bool fSorted = vHeld.size() == GUARD_MAX_TICKETS;
+            for (size_t i = 1; i < vHeld.size() && fSorted; i++)
+                fSorted = vHeld[i - 1].hashWork < vHeld[i].hashWork;
+            ok(fSorted, "listed lowest work hash first");
+            uint64 nBefore = g_nTicketTestHashes;
+            bool fAllSeen = true;
+            for (unsigned int i = 0; i < nKeys && fAllSeen; i += 97)
+                fAllSeen = bookA.Accept(w, vAll[i], hashSeed11, false) == TICKET_DROP_SEEN;
+            ok(fAllSeen && g_nTicketTestHashes == nBefore, "a ticket that lost its place is not hashed again");
+
+            // Section 12: the attacker's share of the set follows its share of the tickets.
+            unsigned int nAttackHeld = 0;
+            for (size_t i = 0; i < vHeld.size(); i++)
+                if (setAttackKeys.count(vHeld[i].ticket.Key()))
+                    nAttackHeld++;
+            const double dShare = (double)nAttackHeld / vHeld.size();
+            printf("       attacker with 1500 of 6000 tickets holds %u of the 4096 places in the set (%.4f; A/(H+A) = 0.2500)\n",
+                   nAttackHeld, dShare);
+            ok(dShare > 0.22 && dShare < 0.28, "an attacker with a quarter of the tickets holds about a quarter of the set");
+
+            // And of the places drawn from that set.
+            const uint256 hashDraw = TicketVectorHash("guard-selftest-draw-seed");
+            unsigned int nPlaces = 0, nAttackPlaces = 0;
+            for (unsigned int j = 0; j < 1000; j++)
+            {
+                std::vector<CDrawPlace> vPlaces;
+                std::string s = strprintf("guard-selftest-pool/%u", j);
+                pooltkt::Draw(hashDraw, Hash(s.begin(), s.end()), vHeld, 16, vPlaces);
+                for (size_t k = 0; k < vPlaces.size(); k++)
+                {
+                    nPlaces++;
+                    if (setAttackKeys.count(vPlaces[k].key))
+                        nAttackPlaces++;
+                }
+            }
+            const double dPlaces = (double)nAttackPlaces / nPlaces;
+            printf("       and %u of the %u places of 1000 pools drawn from it (%.4f)\n", nAttackPlaces, nPlaces, dPlaces);
+            ok(nPlaces == 16000 && fabs(dPlaces - dShare) < 0.02,
+               "its share of the places of 1000 pools is its share of the set");
+        }
+        {
+            // The checked set at its limit: 6000 keys, 2700 of them with four
+            // more tickets each, 16800 bodies in a shuffled order.
+            std::vector<CGuardTicket> vMore = vAll;
+            std::vector<uint256> vMoreWork = vAllWork;
+            for (unsigned int i = 0; i < 2700; i++)
+                for (uint64 j = 1; j <= 4; j++)
+                {
+                    CGuardTicket t;
+                    uint256 h = 0;
+                    TicketTestMake(params, hashSeed11, 11, 1000 + i, j * 1000000, t, h);
+                    vMore.push_back(t);
+                    vMoreWork.push_back(h);
+                }
+            std::vector<unsigned int> vIdx(vMore.size());
+            for (unsigned int i = 0; i < vIdx.size(); i++)
+                vIdx[i] = i;
+            uint64 nRng = 0x9e3779b97f4a7c15ULL;
+            for (size_t i = vIdx.size() - 1; i > 0; i--)
+            {
+                nRng = nRng * 6364136223846793005ULL + 1442695040888963407ULL;
+                std::swap(vIdx[i], vIdx[(size_t)((nRng >> 33) % (i + 1))]);
+            }
+            // Expected: each key's lowest, then the 4096 lowest of those.
+            std::map<std::vector<unsigned char>, std::pair<uint256, uint256> > mapBest;
+            for (size_t i = 0; i < vMore.size(); i++)
+            {
+                const std::pair<uint256, uint256> k(vMoreWork[i], vMore[i].BodyHash());
+                std::map<std::vector<unsigned char>, std::pair<uint256, uint256> >::iterator it = mapBest.find(vMore[i].Key());
+                if (it == mapBest.end())
+                    mapBest[vMore[i].Key()] = k;
+                else if (k < it->second)
+                    it->second = k;
+            }
+            std::vector<std::pair<uint256, uint256> > vBest;
+            for (std::map<std::vector<unsigned char>, std::pair<uint256, uint256> >::iterator it = mapBest.begin(); it != mapBest.end(); ++it)
+                vBest.push_back(it->second);
+            std::sort(vBest.begin(), vBest.end());
+            std::set<uint256> setExpectMore;
+            for (unsigned int i = 0; i < GUARD_MAX_TICKETS; i++)
+                setExpectMore.insert(vBest[i].second);
+
+            CTicketBook bookC(params);
+            unsigned int nPassed = 0;
+            for (size_t i = 0; i < vIdx.size(); i++)
+                if (TicketPassed(bookC.Accept(w, vMore[vIdx[i]], hashSeed11, false)))
+                    nPassed++;
+            ok(vMore.size() == 16800 && nPassed == 16800, "16800 bodies that pass: none refused for want of room");
+            ok(bookC.Checked(11) == GUARD_MAX_CHECKED && bookC.Held(11) == GUARD_MAX_TICKETS,
+               "the checked set stops at 16384, the held set at 4096");
+            const std::set<uint256> setHeldC = TicketTestBodies(bookC, 11);
+            ok(setHeldC == setExpectMore,
+               "several tickets per key and the cap together: each key's lowest, then the 4096 lowest, whatever the order");
+            bool fHeldChecked = true;
+            for (std::set<uint256>::const_iterator it = setHeldC.begin(); it != setHeldC.end() && fHeldChecked; ++it)
+                fHeldChecked = bookC.IsChecked(11, *it);
+            ok(fHeldChecked && bookC.IsChecked(11, vMore[vIdx.back()].BodyHash()),
+               "no held body left the checked set, and the last one to arrive is in it");
+            unsigned int nGone = 0;
+            size_t iGone = 0;
+            for (size_t i = 0; i < vMore.size(); i++)
+                if (!bookC.IsChecked(11, vMore[i].BodyHash()))
+                {
+                    nGone++;
+                    iGone = i;
+                }
+            ok(nGone == 16800 - GUARD_MAX_CHECKED, "416 bodies, none of them held, left to make room");
+            uint64 nBefore = g_nTicketTestHashes;
+            int v = bookC.Accept(w, vMore[iGone], hashSeed11, false);
+            ok(TicketPassed(v) && g_nTicketTestHashes == nBefore + 1 && bookC.Checked(11) == GUARD_MAX_CHECKED &&
+               TicketTestBodies(bookC, 11) == setExpectMore,
+               "a body that left is checked again when it comes again, and the held set does not change");
+        }
+
+        // ---- a seed reorged out
+        {
+            TicketTestView wr;
+            wr.v = w.v;   // tip 7300, branch 0
+            CTicketBook book(params);
+            std::vector<CGuardTicket> v11;
+            bool fAll = true;
+            for (unsigned int i = 0; i < 20; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed11, 11, 100 + i, 0, t, h);
+                v11.push_back(t);
+                fAll = book.Accept(wr, t, hashSeed11, false) == TICKET_HELD && fAll;
+            }
+            for (unsigned int i = 0; i < 5; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed10, 10, 200 + i, 0, t, h);
+                fAll = book.Accept(wr, t, hashSeed10, true) == TICKET_HELD && fAll;
+            }
+            for (unsigned int i = 0; i < 3; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed9, 9, 300 + i, 0, t, h);
+                fAll = book.Accept(wr, t, hashSeed9, true) == TICKET_HELD && fAll;
+            }
+            CGuardTicket tOwn, tGot;
+            uint256 hOwn = 0, hGot = 0;
+            TicketTestMake(params, hashSeed11, 11, 999, 0, tOwn, hOwn);
+            fAll = book.AddOwn(wr, tOwn, hashSeed11) == TICKET_HELD && fAll;
+            ok(fAll && book.Held(11) == 21 && book.Held(10) == 5 && book.Held(9) == 3 &&
+               book.Own(11, tGot, hGot) && tGot == tOwn && hGot == hOwn && !book.Own(10, tGot, hGot),
+               "three epochs held, and this node's own ticket for the next");
+            std::vector<CDrawPlace> vPlaces;
+            bool fSettled = false;
+            const uint256 idPool = TicketVectorHash("guard-selftest-pool-1");
+            ok(book.Draw(wr, 10, idPool, vPlaces, fSettled) && fSettled && vPlaces.size() == 5,
+               "the current epoch's draw is settled");
+            CTicketSync sync;
+            book.Sync(wr, sync);
+            ok(sync.vSeedGone.empty() && sync.vExpired.empty() && sync.vRedraw.empty(), "nothing changes while the chain stands");
+
+            // A reorg from block 7191: epoch 11's seed (block 7200) is another block.
+            wr.Cut(7190);
+            wr.Grow(7300, 1);
+            const uint256 hashSeed11b = wr.v[7200];
+            CTicketBook bookNoSync = book;
+            book.Sync(wr, sync);
+            ok(hashSeed11b != hashSeed11 && sync.vSeedGone.size() == 1 && sync.vSeedGone[0] == 11 &&
+               sync.vExpired.empty() && sync.vRedraw.empty(),
+               "a reorg through the seed block: epoch 11's seed is gone");
+            ok(!book.Has(11) && book.Held(11) == 0 && book.Checked(11) == 0 && !book.Own(11, tGot, hGot),
+               "its held set, its checked set and this node's own ticket are dropped");
+            ok(book.Held(10) == 5 && book.Held(9) == 3, "the epochs whose seeds stand keep theirs");
+            uint64 nBefore = g_nTicketTestHashes;
+            ok(book.Accept(wr, v11[0], hashSeed11, false) == TICKET_DROP_OTHER_SEED && g_nTicketTestHashes == nBefore,
+               "a ticket relayed with the old seed is dropped, unhashed and unscored");
+            size_t iFails = v11.size();
+            for (size_t i = 0; i < v11.size() && iFails == v11.size(); i++)
+                if (v11[i].WorkHash(params, hashSeed11b) > hashTarget)
+                    iFails = i;
+            ok(iFails < v11.size() && book.Accept(wr, v11[iFails], hashSeed11b, false) == TICKET_BAD_WORK,
+               "an old ticket passed off under the new seed fails its work and is scored");
+            bool fRebuilt = true;
+            for (unsigned int i = 0; i < 20; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed11b, 11, 100 + i, 0, t, h);
+                fRebuilt = book.Accept(wr, t, hashSeed11b, false) == TICKET_HELD && fRebuilt;
+            }
+            CGuardTicket tOwnB;
+            uint256 hOwnB = 0, hashHeldSeed = 0;
+            TicketTestMake(params, hashSeed11b, 11, 999, 0, tOwnB, hOwnB);
+            fRebuilt = book.AddOwn(wr, tOwnB, hashSeed11b) == TICKET_HELD && fRebuilt;
+            ok(fRebuilt && book.Held(11) == 21 && book.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11b &&
+               book.Own(11, tGot, hGot) && tGot == tOwnB,
+               "the set is built again on the new seed, with a new own ticket");
+            // A node that takes a ticket before it follows the chain drops the old set then.
+            ok(bookNoSync.Held(11) == 21 && bookNoSync.Accept(wr, tOwnB, hashSeed11b, false) == TICKET_HELD &&
+               bookNoSync.Held(11) == 1 && bookNoSync.Seed(11, hashHeldSeed) && hashHeldSeed == hashSeed11b &&
+               !bookNoSync.Own(11, tGot, hGot),
+               "a ticket on the new seed never joins a set checked against the old one");
+
+            // A deeper one, through the current epoch's draw seed (block 7140).
+            wr.Cut(7100);
+            wr.Grow(7300, 2);
+            book.Sync(wr, sync);
+            ok(sync.vSeedGone.size() == 1 && sync.vSeedGone[0] == 11 && sync.vRedraw.size() == 1 && sync.vRedraw[0] == 10 &&
+               book.Held(10) == 5 && book.Held(9) == 3,
+               "a reorg through a settled draw seed is a redraw; the tickets of that epoch stay");
+            ok(book.Draw(wr, 10, idPool, vPlaces, fSettled) && fSettled, "drawn again");
+            book.Sync(wr, sync);
+            ok(sync.vRedraw.empty() && sync.vSeedGone.empty(), "and settled again");
+
+            // Epochs before the previous one are forgotten.
+            const uint256 hashSeed11c = wr.v[7200];
+            CGuardTicket tc;
+            uint256 hc = 0;
+            TicketTestMake(params, hashSeed11c, 11, 100, 0, tc, hc);
+            ok(book.Accept(wr, tc, hashSeed11c, false) == TICKET_HELD, "a ticket for epoch 11 on the third branch");
+            wr.Grow(8700, 2);   // epoch 12
+            book.Sync(wr, sync);
+            ok(sync.vExpired.size() == 2 && sync.vExpired[0] == 9 && sync.vExpired[1] == 10 && sync.vSeedGone.empty() &&
+               book.Held(11) == 1 && !book.Has(10) && !book.Has(9) && book.Epochs().size() == 1,
+               "in epoch 12, epochs 9 and 10 are forgotten and 11 (the previous) is kept");
+        }
+
+        // ---- pool-tickets.dat
+        {
+            CTicketBook book(params);
+            bool fAll = true;
+            for (unsigned int i = 0; i < 12; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed11, 11, 400 + i, 0, t, h);
+                fAll = book.Accept(w, t, hashSeed11, false) == TICKET_HELD && fAll;
+                TicketTestMake(params, hashSeed10, 10, 400 + i, 0, t, h);
+                fAll = book.Accept(w, t, hashSeed10, true) == TICKET_HELD && fAll;
+                if (i < 4)
+                {
+                    TicketTestMake(params, hashSeed9, 9, 400 + i, 0, t, h);
+                    fAll = book.Accept(w, t, hashSeed9, true) == TICKET_HELD && fAll;
+                }
+            }
+            CGuardTicket tOwn11, tOwn10, tGot;
+            uint256 h = 0, hGot = 0;
+            TicketTestMake(params, hashSeed11, 11, 999, 0, tOwn11, h);
+            TicketTestMake(params, hashSeed10, 10, 999, 0, tOwn10, h);
+            fAll = book.AddOwn(w, tOwn11, hashSeed11) == TICKET_HELD && book.AddOwn(w, tOwn10, hashSeed10) == TICKET_HELD && fAll;
+            ok(fAll && pooltkt::SaveTicketFile(path, book), "three epochs and two own tickets saved");
+
+            std::vector<CTicketFileEpoch> vFile;
+            std::string why;
+            bool fRead = pooltkt::LoadTicketFile(path, params, vFile, why);
+            ok(fRead && why.empty() && vFile.size() == 3 && vFile[0].nEpoch == 9 && vFile[1].nEpoch == 10 && vFile[2].nEpoch == 11 &&
+               vFile[0].hashSeed == hashSeed9 && vFile[1].hashSeed == hashSeed10 && vFile[2].hashSeed == hashSeed11 &&
+               vFile[0].vTickets.size() == 4 && vFile[1].vTickets.size() == 13 && vFile[2].vTickets.size() == 13 &&
+               vFile[0].vOwn.empty() && vFile[1].vOwn.size() == 1 && vFile[1].vOwn[0] == tOwn10 &&
+               vFile[2].vOwn.size() == 1 && vFile[2].vOwn[0] == tOwn11,
+               "read back: each epoch with its seed, its tickets and this node's own");
+            CTicketBook bookBack(params);
+            uint64 nBefore = g_nTicketTestHashes;
+            size_t nHeld = pooltkt::RestoreTickets(bookBack, w, vFile);
+            bool fSame = nHeld == 30 && g_nTicketTestHashes == nBefore + 30;
+            for (unsigned int e = 9; e <= 11 && fSame; e++)
+                fSame = TicketTestBodies(bookBack, e) == TicketTestBodies(book, e);
+            ok(fSame && bookBack.Own(11, tGot, hGot) && tGot == tOwn11 && bookBack.Own(10, tGot, hGot) && tGot == tOwn10 &&
+               !bookBack.Own(9, tGot, hGot),
+               "every ticket of the file checked again (one hash each): the same sets and own tickets after a restart");
+            {
+                // Tickets past the deadline come back too (the file is an answer).
+                TicketTestView wLate;
+                wLate.v = w.v;
+                wLate.Grow(7850, 0);
+                CTicketBook bookLate(params);
+                ok(pooltkt::RestoreTickets(bookLate, wLate, vFile) == 30, "after the deadline the file is still taken");
+                // A file whose seed was reorged out while the node was down.
+                TicketTestView wFork;
+                wFork.v = w.v;
+                wFork.Cut(7190);
+                wFork.Grow(7300, 1);
+                CTicketBook bookFork(params);
+                ok(pooltkt::RestoreTickets(bookFork, wFork, vFile) == 17 && bookFork.Held(11) == 0 && !bookFork.Own(11, tGot, hGot) &&
+                   bookFork.Held(10) == 13 && bookFork.Held(9) == 4,
+                   "an epoch whose seed is no longer the chain's is not restored; the others are");
+            }
+            ok(pooltkt::SaveTicketFile(path, bookBack), "saved again");
+            std::string strFile, strFile2;
+            {
+                FILE* f = fopen(path.c_str(), "rb");
+                char buf[65536];
+                size_t n;
+                while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+                    strFile2.append(buf, n);
+                if (f) fclose(f);
+            }
+            strFile = TicketTestFile(1, params.magic, vFile);
+            ok(strFile == strFile2 && strFile.size() == 4 + 4 + 1 + 3 * (4 + 32 + 1 + 1) + 32 * 118 + 32,
+               "the same bytes: version, magic, the epochs, the hash of all of it");
+
+            // Refusals.
+            std::string strBad = strFile;
+            strBad[strBad.size() / 2] ^= 0x01;
+            ok(TicketTestRefused(path, strBad, params, "checksum"), "a flipped byte: refused (checksum)");
+            strBad = strFile;
+            strBad[strBad.size() - 1] ^= 0x80;
+            ok(TicketTestRefused(path, strBad, params, "checksum"), "a flipped byte in the hash: refused");
+            ok(TicketTestRefused(path, strFile.substr(0, strFile.size() / 2), params, "checksum"), "half a file: refused");
+            ok(TicketTestRefused(path, strFile.substr(0, 20), params, "too short"), "twenty bytes: refused");
+            ok(TicketTestRefused(path, std::string(), params, "too short"), "an empty file: refused");
+            ok(TicketTestRefused(path, TicketTestFile(2, params.magic, vFile), params, "another version"),
+               "version 2, intact: refused");
+            ok(TicketTestRefused(path, TicketTestFile(0, params.magic, vFile), params, "another version"),
+               "version 0, intact: refused");
+            CTicketParams pOther = params;
+            pOther.magic[3] ^= 0x01;
+            ok(TicketTestRefused(path, TicketTestFile(1, pOther.magic, vFile), params, "another network"),
+               "another network's file, intact: refused");
+            ok(TicketTestRefused(path, strFile, pOther, "another network"), "this file on another network: refused");
+            ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vFile, std::string(1, '\0')), params, "trailing bytes"),
+               "a byte after the epochs: refused");
+            {
+                std::vector<CTicketFileEpoch> vBad = vFile;
+                vBad[2].vTickets[3].body[8] ^= 0x01;
+                ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vBad), params, "inconsistent"),
+                   "a ticket of another epoch among an epoch's: refused");
+                vBad = vFile;
+                vBad[1].vOwn.push_back(vBad[1].vOwn[0]);
+                ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vBad), params, "inconsistent"),
+                   "two own tickets for an epoch: refused");
+                vBad = vFile;
+                std::swap(vBad[0], vBad[1]);
+                ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vBad), params, "inconsistent"),
+                   "epochs out of order: refused");
+                vBad = vFile;
+                vBad.push_back(vBad[2]);
+                vBad[3].nEpoch = 12;
+                for (size_t i = 0; i < vBad[3].vTickets.size(); i++)
+                    vBad[3].vTickets[i].body[8] = 12;
+                vBad[3].vOwn.clear();
+                ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vBad), params, "inconsistent"),
+                   "four epochs: refused");
+                vBad = vFile;
+                vBad[2].vTickets.resize(GUARD_MAX_TICKETS + 1, vBad[2].vTickets[0]);
+                ok(TicketTestRefused(path, TicketTestFile(1, params.magic, vBad), params, "inconsistent"),
+                   "4097 tickets in an epoch: refused");
+                // A ticket in the file that does not pass is simply not held.
+                vBad = vFile;
+                vBad[2].vTickets[vBad[2].vTickets[0] == tOwn11 ? 1 : 0].sig[0] ^= 0x01;
+                std::string err;
+                std::vector<CTicketFileEpoch> vRead;
+                CTicketBook bookBadSig(params);
+                ok(WriteFileAtomicPrivate(path, TicketTestFile(1, params.magic, vBad), err) &&
+                   pooltkt::LoadTicketFile(path, params, vRead, why) &&
+                   pooltkt::RestoreTickets(bookBadSig, w, vRead) == 29 && bookBadSig.Held(11) == 12,
+                   "a file with one bad signature in it: that ticket is not held, the rest are");
+            }
+            ok(TicketTestRefused(path, std::string(4 * 1024 * 1024 + 1, '\0'), params, "too large"), "over 4 MB: refused");
+            remove(path.c_str());
+            ok(!pooltkt::LoadTicketFile(path, params, vFile, why) && why == "no file" && vFile.empty(), "no file: nothing read");
+
+            // A full set.
+            ok(pooltkt::SaveTicketFile(path, bookA) && pooltkt::LoadTicketFile(path, params, vFile, why) &&
+               vFile.size() == 1 && vFile[0].vTickets.size() == GUARD_MAX_TICKETS,
+               "a full epoch of 4096 saved and read");
+            CTicketBook bookFull(params);
+            ok(pooltkt::RestoreTickets(bookFull, w, vFile) == GUARD_MAX_TICKETS &&
+               TicketTestBodies(bookFull, 11) == TicketTestBodies(bookA, 11),
+               "and restored to the same 4096");
+            remove(path.c_str());
+        }
+
+        // ---- the draw over a fixed set
+        {
+            const uint256 hashDraw = TicketVectorHash("guard-selftest-draw-seed");
+            const uint256 idPool1 = TicketVectorHash("guard-selftest-pool-1");
+            const uint256 idPool2 = TicketVectorHash("guard-selftest-pool-2");
+            ok(hashDraw.GetHex() == "13f090f31d96a24be57b572541574382ccae9d6a06c9c5529c1574c37df68c3a" &&
+               idPool1.GetHex() == "5ae5217e1dec19772e3a06faad28908aceec7ddfbab6ae28a6824b8c4248456a",
+               "the draw's fixed inputs");
+            std::vector<CHeldTicket> vT;
+            for (unsigned int i = 0; i < 40; i++)
+            {
+                CHeldTicket h = TicketTestFake("x", i);
+                std::string s = "guard-selftest-work";
+                s.push_back((char)i);
+                h.hashWork = Hash(s.begin(), s.end());
+                h.hashBody = h.hashWork;
+                vT.push_back(h);
+            }
+            ok(vT[0].hashWork.GetHex() == "f3938ee3a703140aad9f24a8a201963275485ab02cdafb796312eea79ca9395f" &&
+               pooltkt::Score(hashDraw, idPool1, vT[0].hashWork).GetHex() ==
+                   "02f08dcc7e2b965ced86017c998ab53da44750ab40493971d3ec7c8946a9ddbe",
+               "the score: SHA256d(\"Bitflash/guard/1\" || draw seed || pool id || work hash), as a fixed vector");
+            static const unsigned int expect1[16] = { 0, 15, 38, 22, 21, 39, 32, 17, 1, 23, 25, 27, 3, 13, 5, 7 };
+            static const unsigned int expect2[16] = { 9, 31, 19, 25, 14, 0, 7, 22, 10, 30, 36, 33, 29, 32, 35, 20 };
+            std::vector<CDrawPlace> v1, v2, v1b;
+            pooltkt::Draw(hashDraw, idPool1, vT, 16, v1);
+            pooltkt::Draw(hashDraw, idPool2, vT, 16, v2);
+            bool f1 = v1.size() == 16, f2 = v2.size() == 16, fAsc = true;
+            for (unsigned int k = 0; k < 16 && f1 && f2; k++)
+            {
+                f1 = TicketTestFakeIndex(v1[k].key) == expect1[k] && v1[k].hashWork == vT[expect1[k]].hashWork &&
+                     v1[k].hashScore == pooltkt::Score(hashDraw, idPool1, v1[k].hashWork);
+                f2 = TicketTestFakeIndex(v2[k].key) == expect2[k];
+                if (k > 0)
+                    fAsc = fAsc && v1[k - 1].hashScore < v1[k].hashScore;
+            }
+            ok(f1 && fAsc, "a pool's 8 guardians and 8 reserve over 40 fixed tickets, lowest score first");
+            ok(f2, "another pool has another order of the same tickets");
+            std::vector<CHeldTicket> vRev(vT.rbegin(), vT.rend());
+            pooltkt::Draw(hashDraw, idPool1, vRev, 16, v1b);
+            bool fSameOrder = v1b.size() == 16;
+            for (unsigned int k = 0; k < 16 && fSameOrder; k++)
+                fSameOrder = v1b[k].hashWork == v1[k].hashWork;
+            ok(fSameOrder, "the draw does not depend on the order the tickets are held in");
+            bool fRank = true;
+            for (unsigned int i = 0; i < 40 && fRank; i++)
+            {
+                unsigned int nExpect = 16;
+                for (unsigned int k = 0; k < 16; k++)
+                    if (expect1[k] == i)
+                        nExpect = k;
+                fRank = pooltkt::RankOf(hashDraw, idPool1, vT, vT[i].hashWork, 16) == nExpect;
+            }
+            ok(fRank, "a ticket's own rank, computed alone, is its place in the draw (16: no place)");
+            std::vector<CDrawPlace> v3;
+            pooltkt::Draw(w.v[7140], idPool1, vT, 16, v3);
+            bool fDiffers = false;
+            for (unsigned int k = 0; k < 16; k++)
+                fDiffers = fDiffers || v3[k].hashWork != v1[k].hashWork;
+            ok(fDiffers, "another draw seed, another order");
+            std::vector<CHeldTicket> vFew(vT.begin(), vT.begin() + 12);
+            bool fEvery = true;
+            for (unsigned int j = 0; j < 20 && fEvery; j++)
+            {
+                std::string s = strprintf("guard-selftest-pool/%u", j);
+                std::vector<CDrawPlace> v;
+                pooltkt::Draw(hashDraw, Hash(s.begin(), s.end()), vFew, 16, v);
+                std::set<unsigned int> seen;
+                for (size_t k = 0; k < v.size(); k++)
+                    seen.insert(TicketTestFakeIndex(v[k].key));
+                fEvery = v.size() == 12 && seen.size() == 12;
+            }
+            ok(fEvery, "with 16 tickets or fewer every candidate has a place in every pool");
+            std::vector<CDrawPlace> vNone;
+            pooltkt::Draw(hashDraw, idPool1, std::vector<CHeldTicket>(), 16, vNone);
+            ok(vNone.empty(), "no tickets, no guardians");
+        }
+
+        // ---- the draw from a node's book, and its own ranks
+        {
+            TicketTestView wd;
+            wd.v = w.v;
+            CTicketBook book(params), bookNoOwn(params);
+            CGuardTicket tOwn;
+            uint256 hOwn = 0;
+            for (unsigned int i = 0; i < 29; i++)
+            {
+                CGuardTicket t;
+                uint256 h = 0;
+                TicketTestMake(params, hashSeed11, 11, 500 + i, 0, t, h);
+                book.Accept(wd, t, hashSeed11, false);
+                bookNoOwn.Accept(wd, t, hashSeed11, false);
+            }
+            TicketTestMake(params, hashSeed11, 11, 999, 0, tOwn, hOwn);
+            book.AddOwn(wd, tOwn, hashSeed11);
+            const uint256 idPool = TicketVectorHash("guard-selftest-pool-1");
+            std::vector<CDrawPlace> vPlaces;
+            bool fSettled = true;
+            ok(book.Held(11) == 30 && !book.Draw(wd, 11, idPool, vPlaces, fSettled) && vPlaces.empty(),
+               "no draw for epoch 11 before its seed block (7860)");
+            wd.Grow(7860, 0);
+            ok(book.Draw(wd, 11, idPool, vPlaces, fSettled) && !fSettled && vPlaces.size() == 16,
+               "a draw from block 720e - 60, not settled");
+            wd.Grow(7888, 0);
+            ok(book.Draw(wd, 11, idPool, vPlaces, fSettled) && !fSettled, "not settled at 720e - 32");
+            wd.Grow(7889, 0);
+            ok(book.Draw(wd, 11, idPool, vPlaces, fSettled) && fSettled, "settled at 720e - 31");
+            std::vector<CHeldTicket> vHeld;
+            book.Tickets(11, vHeld);
+            std::vector<CDrawPlace> vDirect;
+            pooltkt::Draw(wd.v[7860], idPool, vHeld, 16, vDirect);
+            bool fSame = vDirect.size() == vPlaces.size();
+            for (size_t k = 0; k < vPlaces.size() && fSame; k++)
+                fSame = vPlaces[k].key == vDirect[k].key && vPlaces[k].hashScore == vDirect[k].hashScore &&
+                        vPlaces[k].nCapacityMB == 128;
+            ok(fSame, "it is the draw of the held tickets with the hash of block 720e - 60");
+
+            std::vector<uint256> vPools;
+            for (unsigned int j = 0; j < 60; j++)
+            {
+                std::string s = strprintf("guard-selftest-pool/%u", j);
+                vPools.push_back(Hash(s.begin(), s.end()));
+            }
+            std::vector<int> vRanks;
+            ok(book.OwnRanks(wd, 11, vPools, vRanks, fSettled) && fSettled && vRanks.size() == vPools.size(), "own ranks for 60 pools");
+            bool fRanks = true;
+            int nGuard = 0, nReserve = 0, nNone = 0;
+            for (size_t j = 0; j < vPools.size() && fRanks; j++)
+            {
+                std::vector<CDrawPlace> v;
+                book.Draw(wd, 11, vPools[j], v, fSettled);
+                int nExpect = -1;
+                for (size_t k = 0; k < v.size(); k++)
+                    if (v[k].key == tOwn.Key())
+                        nExpect = (int)k;
+                fRanks = vRanks[j] == nExpect;
+                if (nExpect < 0) nNone++; else if (nExpect < 8) nGuard++; else nReserve++;
+            }
+            printf("       own ticket among 30: guardian of %d, reserve of %d, neither for %d of 60 pools\n", nGuard, nReserve, nNone);
+            ok(fRanks && nGuard > 0 && nReserve > 0 && nNone > 0,
+               "each is the own ticket's place in that pool's draw: guardian, reserve or neither");
+            ok(bookNoOwn.OwnRanks(wd, 11, vPools, vRanks, fSettled) && vRanks.size() == 60 &&
+               std::count(vRanks.begin(), vRanks.end(), -1) == 60,
+               "a node with no ticket of its own is drawn for nothing");
+            ok(!book.OwnRanks(wd, 12, vPools, vRanks, fSettled), "and there are no ranks before a draw seed");
+        }
+
+        // ---- the guard budget: by line work
+        {
+            const int64 MB = 1024 * 1024;
+            std::map<uint256, CGuardLine> lines;
+            std::vector<uint256> vPools;
+            std::vector<int> vRanks;
+            std::vector<CGuardDecision> vOut;
+            for (unsigned int i = 0; i < 10; i++)
+            {
+                vPools.push_back(uint256(i + 1));
+                vRanks.push_back(i % 8);
+                lines[uint256(i + 1)] = TicketTestLineOf(100 + i, 10);
+            }
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, GUARD_DEFAULT_BYTES, GUARD_MAX_POOL_BYTES,
+                                   GUARD_MAX_POOLS, vOut);
+            bool f = vOut.size() == 10;
+            for (unsigned int i = 0; i < 10 && f; i++)
+                f = vOut[i].poolId == uint256(10 - i) && vOut[i].nChoice == (i < 8 ? GUARD_KEEP : GUARD_NO_ROOM);
+            ok(f, "drawn for ten pools with shares: the eight with the heaviest lines are kept");
+
+            lines.clear(); vPools.clear(); vRanks.clear();
+            // A..F guardian places, G empty, H not pulled yet, I not drawn, J reserve.
+            const uint256 idA(1), idB(2), idC(3), idD(4), idE(5), idF(6), idG(7), idH(8), idI(9), idJ(10);
+            lines[idA] = TicketTestLineOf(900, 40);
+            lines[idB] = TicketTestLineOf(800, 40);
+            lines[idC] = TicketTestLineOf(700, 40);
+            lines[idD] = TicketTestLineOf(600, 40);
+            lines[idE] = TicketTestLineOf(500, 8);
+            lines[idF] = TicketTestLineOf(400, 70);
+            lines[idG] = TicketTestLineOf(0, 0, 0);
+            lines[idI] = TicketTestLineOf(5000, 1);
+            lines[idJ] = TicketTestLineOf(1000, 10);
+            const uint256 ids[10] = { idJ, idI, idH, idG, idF, idE, idD, idC, idB, idA };
+            const int ranks[10] = { 9, -1, 0, 1, 2, 3, 4, 5, 6, 7 };
+            for (int i = 0; i < 10; i++)
+            {
+                vPools.push_back(ids[i]);
+                vRanks.push_back(ranks[i]);
+            }
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, 128 * MB, 64 * MB, 8, vOut);
+            ok(TicketTestChoice(vOut, idA) == GUARD_KEEP && TicketTestChoice(vOut, idB) == GUARD_KEEP &&
+               TicketTestChoice(vOut, idC) == GUARD_KEEP && TicketTestChoice(vOut, idD) == GUARD_NO_ROOM,
+               "128 MB: three lines of 40 MB are kept and the fourth is not, never in part");
+            ok(TicketTestChoice(vOut, idE) == GUARD_KEEP, "a lighter pool whose 8 MB still fit is kept after it");
+            ok(TicketTestChoice(vOut, idF) == GUARD_NO_ROOM, "a line over 64 MB is not guarded");
+            ok(TicketTestChoice(vOut, idG) == GUARD_EMPTY, "a pool with no shares takes no slot");
+            ok(TicketTestChoice(vOut, idH) == GUARD_PULL, "a pool whose line is not known yet is to be pulled");
+            ok(TicketTestChoice(vOut, idI) == GUARD_NOT_DRAWN, "a pool this node has no place in is not guarded, whatever its work");
+            ok(TicketTestChoice(vOut, idJ) == GUARD_NO_ROOM,
+               "a reserve place takes only the room left: the heaviest pool, in reserve, with none left");
+            ok(vOut.size() == 10 && vOut[0].poolId == idA && vOut[8].poolId == idJ && vOut[9].poolId == idI,
+               "ranked: the node's guardian places by work, then its reserve places, then the rest");
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, 256 * MB, 64 * MB, 8, vOut);
+            ok(TicketTestChoice(vOut, idD) == GUARD_KEEP && TicketTestChoice(vOut, idJ) == GUARD_KEEP &&
+               TicketTestChoice(vOut, idF) == GUARD_NO_ROOM,
+               "with a larger budget the fourth line and the reserve pool are kept; the 70 MB line still is not");
+
+            lines.clear(); vPools.clear(); vRanks.clear();
+            for (unsigned int i = 0; i < 13; i++)
+            {
+                vPools.push_back(uint256(i + 1));
+                vRanks.push_back(0);
+                lines[uint256(i + 1)] = i < 8 ? TicketTestLineOf(50 + i, 1) : TicketTestLineOf(0, 0, 0);
+            }
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, 128 * MB, 64 * MB, 8, vOut);
+            int nKeep = 0, nEmpty = 0;
+            for (size_t i = 0; i < vOut.size(); i++)
+            {
+                if (vOut[i].nChoice == GUARD_KEEP) nKeep++;
+                if (vOut[i].nChoice == GUARD_EMPTY) nEmpty++;
+            }
+            ok(nKeep == 8 && nEmpty == 5, "eight pools with shares at once, and empty pools beside them");
+            lines.clear(); vPools.clear(); vRanks.clear();
+            vPools.push_back(idA); vRanks.push_back(0);
+            lines[idA] = TicketTestLineOf(1, 64);
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, 128 * MB, 64 * MB, 8, vOut);
+            bool f64 = vOut.size() == 1 && vOut[0].nChoice == GUARD_KEEP;
+            lines[idA].nBytes += 1;
+            pooltkt::ChooseGuarded(vPools, vRanks, TicketTestLine, &lines, 128 * MB, 64 * MB, 8, vOut);
+            ok(f64 && vOut.size() == 1 && vOut[0].nChoice == GUARD_NO_ROOM, "exactly 64 MB fits, one byte more does not");
+        }
+
+        // ---- section 12: the attacker's places follow its share of the tickets
+        {
+            const uint256 hashDraw = TicketVectorHash("guard-selftest-draw-seed");
+            // A quarter of 512 tickets, 4000 pools.
+            const unsigned int nT = 512, nA = 128, nPools = 4000;
+            std::vector<CHeldTicket> vT;
+            for (unsigned int i = 0; i < nT; i++)
+                vT.push_back(TicketTestFake("guard-selftest-stat", i));   // the first 128 are the attacker's
+            std::vector<unsigned int> vHist(17, 0);
+            uint64 nAttackPlaces = 0;
+            unsigned int nTopTwo = 0;
+            for (unsigned int j = 0; j < nPools; j++)
+            {
+                std::string s = strprintf("guard-selftest-statpool/%u", j);
+                std::vector<CDrawPlace> v;
+                pooltkt::Draw(hashDraw, Hash(s.begin(), s.end()), vT, 16, v);
+                unsigned int k = 0;
+                for (size_t i = 0; i < v.size(); i++)
+                    if (TicketTestFakeIndex(v[i].key) < nA)
+                        k++;
+                vHist[k]++;
+                nAttackPlaces += k;
+                if (TicketTestFakeIndex(v[0].key) < nA && TicketTestFakeIndex(v[1].key) < nA)
+                    nTopTwo++;
+            }
+            const double dShare = (double)nAttackPlaces / (16.0 * nPools);
+            // How many of a pool's 16 places the attacker holds: 16 tickets
+            // drawn without replacement from 512 of which 128 are its own.
+            double dChi = 0;
+            std::vector<double> vExp(9, 0.0), vObs(9, 0.0);
+            for (unsigned int k = 0; k <= 16; k++)
+            {
+                double p = exp(TicketTestLogChoose(nA, k) + TicketTestLogChoose(nT - nA, 16 - k) - TicketTestLogChoose(nT, 16));
+                vExp[k < 8 ? k : 8] += p * nPools;
+                vObs[k < 8 ? k : 8] += vHist[k];
+            }
+            for (unsigned int b = 0; b < 9; b++)
+                dChi += (vObs[b] - vExp[b]) * (vObs[b] - vExp[b]) / vExp[b];
+            printf("       attacker with 128 of 512 tickets: %.4f of the places of %u pools (A/(H+A) = 0.2500); "
+                   "places per pool against the expected counts, chi-square %.2f on 8 degrees of freedom; "
+                   "both of a pool's first two places in %u pools (expected %.0f)\n",
+                   dShare, nPools, dChi, nTopTwo, nPools * (128.0 / 512.0) * (127.0 / 511.0));
+            ok(fabs(dShare - 0.25) < 0.01, "each place goes to the attacker with about its share of the tickets");
+            ok(dChi < 30.0, "and place by place independently: the count per pool has the expected distribution");
+            ok(fabs(nTopTwo - nPools * (128.0 / 512.0) * (127.0 / 511.0)) < 60.0, "the first two places together, about the share squared");
+
+            // All 16 places of a pool: about (A / (H + A))^16. Three quarters
+            // of 512 tickets, 10000 pools.
+            const unsigned int nA2 = 384, nPools2 = 10000;
+            unsigned int nCaptured = 0;
+            for (unsigned int j = 0; j < nPools2; j++)
+            {
+                std::string s = strprintf("guard-selftest-capture/%u", j);
+                std::vector<CDrawPlace> v;
+                pooltkt::Draw(hashDraw, Hash(s.begin(), s.end()), vT, 16, v);
+                bool fAll = v.size() == 16;
+                for (size_t i = 0; i < v.size() && fAll; i++)
+                    fAll = TicketTestFakeIndex(v[i].key) < nA2;
+                if (fAll)
+                    nCaptured++;
+            }
+            double dExact = 1.0;
+            for (unsigned int i = 0; i < 16; i++)
+                dExact *= (double)(nA2 - i) / (double)(nT - i);
+            const double dEstimate = pow((double)nA2 / nT, 16.0);
+            printf("       attacker with 384 of 512 tickets holds all 16 places of %u of %u pools: %.5f "
+                   "(section 12's (A/(H+A))^16 = %.5f; exactly, without replacement, %.5f)\n",
+                   nCaptured, nPools2, (double)nCaptured / nPools2, dEstimate, dExact);
+            ok(fabs(nCaptured - dExact * nPools2) < 5.0 * sqrt(dExact * nPools2),
+               "capturing all 16 places of a pool happens as often as the share to the 16th says");
+            ok(dExact < dEstimate && dExact > 0.85 * dEstimate, "the estimate of section 12 is the upper side of the exact value");
+        }
+    }
+    catch (std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    SelectChainParams(fTestNetSaved);
+    remove(path.c_str());
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "pool-tickets: all passed" : "pool-tickets: FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // ---- pool-index: the pool registry read off the active chain -------------
 // docs/pool-registry.md, sections 3, 4 and 7: appearances and the 30
 // confirmations, duplicates, a reorg on either side of 30, a record on both
@@ -20573,6 +21915,10 @@ int RunSelfTest(const std::string& name)
         return RunChainWorkSelfTest();
     if (name == "pool-index")
         return RunPoolIndexSelfTest();
+    if (name == "pool-tickets")
+        return RunPoolTicketsSelfTest();
+    if (name == "pool-tickets-grind")
+        return RunPoolTicketsGrind();
     if (name == "consensus-safety")
         return RunConsensusSafetySelfTest();
     if (name == "reorg-safety")
@@ -20737,6 +22083,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, pool-index, pool-tickets\n");
     return 1;
 }
