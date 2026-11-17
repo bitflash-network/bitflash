@@ -8,6 +8,8 @@
 #include <list>
 #ifndef WIN32
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 using namespace p2pool;
@@ -536,8 +538,9 @@ static void WriteShares(const string& strFile, int nTipHeight, const vector<Shar
     string tmp = strFile + ".new";
     if (pRecord)
     {
-        // A registered pool's: public, as its pool is; its record in front.
-        CAutoFile file(fopen(tmp.c_str(), "wb"));
+        // A registered pool's, its record in front. Nothing secret in it,
+        // but owner-only like every file this node writes for itself.
+        CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
         if (!file)
             return;
         file << REG_SHARES_FORMAT << *pRecord << nTipHeight << v;
@@ -4184,7 +4187,16 @@ static void RegAppendPart(const string& strPart, const vector<unsigned char>& re
     if (strPart.empty())
         return;
     _mkdir(RegDir().c_str());
+#ifdef WIN32
+    // The data directory's ACL already keeps other accounts out.
     FILE* f = fopen(strPart.c_str(), "ab");
+#else
+    // Owner-only, and never through a link someone left in its place.
+    int fd = open(strPart.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+    FILE* f = fd < 0 ? NULL : fdopen(fd, "ab");
+    if (fd >= 0 && !f)
+        close(fd);
+#endif
     if (!f)
         return;
     fseek(f, 0, SEEK_END);
