@@ -28,6 +28,11 @@ enum
     // P2Pool drops them unread, so a miner whose peers are all such nodes
     // hears no share at all. A P2Pool miner looks for peers with this bit.
     NODE_P2POOL  = (1 << 2),
+    // Reads the pool registry and speaks the registered pools' messages
+    // (poolinv, p2x*, poolwho/poolat; docs/pool-registry.md, section 8).
+    // Nothing of those goes to a peer that does not say this, and nothing
+    // sent to such a peer changes: a 1.2.34 node sees pool zero only.
+    NODE_POOLREG = (1 << 3),
 };
 
 

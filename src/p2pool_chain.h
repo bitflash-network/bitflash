@@ -74,6 +74,11 @@ public:
 // record's parameters, its id, and its key C for the "p2l" anchor.
 bool RulesForLocal(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, PoolRules& out, string& errOut);
 
+// Share rules v1 for a registered pool (sections 5 to 7): its record's
+// parameters, its id on the network with this message start, and the "p2x"
+// anchor. Pool zero's own record is refused: pool zero keeps its own form.
+bool RulesForRegistered(const poolreg::PoolRecord& rec, const unsigned char magic[4], PoolRules& out, string& errOut);
+
 // Expected hashes to meet a target, capped at 2^64-1: a share's weight.
 uint64_t WorkOf(unsigned int nBits);
 
@@ -121,7 +126,12 @@ public:
     // whole retarget behind them, are checked in full; the deeper ones on
     // their work alone. False on a share bad in itself; a share refused on
     // innocent grounds ends the part there, since the rest builds on it.
-    bool AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut);
+    // *pfWhole (if given) says whether every share of the part was taken (or
+    // was already here): false when the part ended early that way, so a
+    // fetch does not count it as taken in full (docs/pool-registry.md,
+    // section 17).
+    bool AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut,
+                    bool* pfWhole = NULL);
 
     // The line behind the tip, HISTORY_SHARES deep, with the uncles it names,
     // oldest first: what a starting peer is sent.
@@ -133,6 +143,9 @@ public:
     bool Has(const uint256& id) const { return mapShares.count(id) != 0; }
     uint256 Tip() const { return hashTip; }
     int Height(const uint256& id) const;
+    // The work of the tip's line over the last window of shares (or as many
+    // as are held): a pool's recent share work, for ordering pools.
+    uint256 TipLineWork() const;
     size_t Size() const { return mapShares.size(); }
     // Serialized bytes of every share held, and of those held on work alone.
     size_t Bytes() const { return nBytes; }
