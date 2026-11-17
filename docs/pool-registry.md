@@ -784,9 +784,11 @@ new hash code) of this 80-byte header:
 
 The ticket is valid when that hash is at or under the ticket target, the
 signature verifies, the magic is this network's and the epoch is the
-previous, the current or the next one by this node's tip (the previous is
-needed through handoff, until `720e + 180`). The **work hash** is that RandomX
-hash.
+previous, the current or the next one by this node's tip. The previous epoch
+is needed only through handoff: with the tip in epoch `c`, tickets of epoch
+`c - 1` are taken, held and served while the tip is below `720c + 180`, the
+height at which that epoch's guardians let go, and are dropped and forgotten
+from that height on. The **work hash** is that RandomX hash.
 
 **Byte orders.** Hashes enter `SHA256d` in their internal byte order (as the
 node serializes a `uint256`); the work hash and the score are compared as
@@ -798,10 +800,14 @@ Phase C pins vectors for the body, the header, the work hash and the score.
   onion is the authentication of the node (`docs/rendezvous.md`), so a ticket
   names a node anyone can dial and check. (The signature is not part of the
   work or the score, so a second signature over the same body gains nothing.)
-- The **ticket target** is set in Phase C from measurement on this bench and
-  the 202; the aim is a few minutes of one core per node per day, at idle
-  priority. The work makes a ticket cost something to make and something to
-  check, so tickets cannot be minted by the million or used to flood.
+- The **ticket target** is the compact value `0x1f07ffff` on both networks:
+  one hash in 8192 meets it, so a ticket takes about 8192 hashes to make and
+  one to check. It was measured in Phase C on the verification (light)
+  RandomX VM, on one core at idle priority on a busy four-core server: 33 to
+  55 hashes a second, so 2.5 to 4 minutes of that core for a ticket, once a
+  day. The aim was a few minutes of one core per node per day. The work makes
+  a ticket cost something to make and something to check, so tickets cannot
+  be minted by the million or used to flood.
 - **One ticket per `.btf` key per epoch.** If a key has more than one valid
   ticket for an epoch, the one with the lowest work hash is the ticket; every
   node keeps that one, so views converge.
@@ -811,7 +817,9 @@ Phase C pins vectors for the body, the header, the work hash and the score.
      ticket whose body epoch is not the message's epoch is the sender's fault
      and scored;
   2. **innocent drops, before any hash, nobody scored:** an epoch outside
-     previous, current and next by this node's tip; a ticket seed block this
+     previous, current and next by this node's tip (the previous one counts
+     only while the tip is below the current epoch's `720e + 180`); a ticket
+     seed block this
      node does not have on its active chain with at least 30 confirmations
      (a syncing node, or one on the other side of a reorg at an epoch
      boundary, judges such a ticket on a view the sender may not share); a
@@ -840,10 +848,27 @@ Phase C pins vectors for the body, the header, the work hash and the score.
     up to 16384 per epoch; when full, the body with the highest work hash
     among those not in the held set leaves to make room for the newcomer, and
     a new body is never refused for want of room;
-  - the set belongs to one seed: it is emptied with the held set when the
-    epoch's seed block leaves the active chain.
+  - a body that leaves that way is still remembered, by a **replay tag**: 64
+    bits of a hash of the body under a salt each node picks for itself. A
+    body not in the held set can never enter it under the same seed (a key's
+    ticket and the cap's cutoff only go down), so a body whose tag is
+    remembered is dropped in step 2 like one in the checked set, before any
+    hash, nobody scored. Without the tags, two such bodies sent in turn would
+    each cost a signature check and a hash every time, unscored. Up to 65536
+    tags are kept per epoch (a few megabytes); past that one tag is
+    forgotten for each new one, and a body whose tag was forgotten is checked
+    again when it comes again. Filling the tags takes that many bodies that
+    each cost a ticket of work, and what is left is bounded by the ticket
+    budget. The salt keeps anyone from aiming a body at another body's tag,
+    and makes the tags mean nothing on another node;
+  - the set and its tags belong to one seed: they are emptied with the held
+    set when the epoch's seed block leaves the active chain.
 
-  A ticket that passes is kept and relayed. Only a failure in step 1 or 3
+  A ticket that passes and enters the held set is held and relayed; one that
+  passes but is not held (outranked for its key, or past the cap) stays in
+  the checked set and is not relayed. A connection whose relays keep coming back
+  outranked or past the cap is not scored for it, and is served last from
+  the ticket budget. Only a failure in step 1 or 3
   scores the sender, once per message: a `pooltkt` is read up to its first
   invalid ticket, and the rest of it is dropped. An unasked relay that finds
   the ticket budget empty is dropped, unscored (the ticket will come again,
@@ -999,7 +1024,8 @@ every announcing peer.
   `720e + 180` (six hours into the new epoch), then drop it unless they mine
   it, carry it by `-poolcarry`, or were drawn again. A redraw after a deep
   reorg is handled the same way: every node drawn by either seed holds P until
-  the later linger ends.
+  the later linger ends, which is the later of height `720e + 180` and 180
+  blocks after the node saw the draw seed change.
 - A guardian that leaves early, or never answers, is simply one guardian fewer;
   the reserve, the lingering set, the miners and every node that announces P
   are all asked.
@@ -1153,6 +1179,12 @@ grinding tickets after the draw seed is known until 16 of them top one pool,
 costs about 16 times H tickets for near-certain capture of that one pool: the
 same order. Raising H is the honest answer: every guarding node makes one
 ticket a day.
+
+The estimate (A / (H + A))^16 treats the 16 places as independent. They are
+drawn without replacement from the held set, so the true figure is a little
+lower, and the difference shows only when the set is small: with 384 attacker
+tickets among 512, the estimate gives 100 pools in 10,000 and the exact count
+is 92.5. With thousands of tickets the two agree.
 
 These counts are in tickets, and a ticket is a fixed number of hashes. Honest
 nodes make theirs at idle priority on one core; a miner's rig in RandomX fast
