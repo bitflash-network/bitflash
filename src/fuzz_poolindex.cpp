@@ -17,9 +17,10 @@
 //           that is no tag (a 34-byte "p2p...") changes nothing.
 //
 //   mode 1  CPoolIndex::Load: the rest is the file. Flag bit 2 puts the
-//           file's version (2) in front, bit 3 appends the checksum the file
-//           ends with, so the bytes behind both reach the reader and the
-//           consistency check. A file that loads must hold together
+//           file's version (POOL_INDEX_FILE_VERSION) in front, bit 3
+//           appends the checksum the file ends with, so the bytes behind
+//           both reach the reader and the consistency check. A file that
+//           loads must hold together
 //           (CheckConsistent), answer every query, write itself back
 //           (Save) to a file that loads to the same registry (Digest), and
 //           take one more block and lose it again: when DisconnectAbove says
@@ -560,7 +561,7 @@ static void RunLoad(unsigned char nFlags, const uint8_t* data, size_t size)
     string file;
     if (nFlags & F_LOAD_VERSION)
     {
-        int nVersion = 2;
+        int nVersion = POOL_INDEX_FILE_VERSION;
         file.append((const char*)&nVersion, 4);
     }
     file.append((const char*)data, size);
@@ -790,7 +791,7 @@ static void WriteSeeds(const string& strDir)
         }
         CheckHolds(reg, "seed");
         CDataStream ss(SER_DISK);
-        ss << 2 << reg;
+        ss << POOL_INDEX_FILE_VERSION << reg;
         string body(ss.begin(), ss.end());
         uint256 h = Hash(body.begin(), body.end());
         string full = body + string((const char*)h.begin(), 32);

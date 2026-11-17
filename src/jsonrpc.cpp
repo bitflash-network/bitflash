@@ -748,8 +748,9 @@ static uint256 SendBurn(const vector<unsigned char>& data, int64 nValue, const s
     scriptPubKey << OP_RETURN << data;
     CWalletTx wtx;
     wtx.mapValue["comment"] = strComment;
-    if (!SendMoney(scriptPubKey, nValue, wtx))
-        throw runtime_error("send failed: insufficient balance once the fee is counted");
+    string strError;
+    if (!SendMoney(scriptPubKey, nValue, wtx, -1, &strError))
+        throw runtime_error("send failed: " + (strError.empty() ? string("see debug.log") : strError));
     return wtx.GetHash();
 }
 
@@ -4772,13 +4773,66 @@ static void AddRegistryJson(json& j, const CPoolInfo& info, bool fFull)
     j["lastanchors"] = a;
 }
 
-static json RegisteredPoolJson(const CPoolInfo& info, bool fFull)
+// Section 12: a pool named like pool zero ("bitflash") with a fee is the
+// classic lure. Names are not unique and cost nothing to copy; every entry
+// lists the other pools whose names look the same, pool zero's included.
+static const char* POOL_NAME_NOTE =
+    "names are not unique: anyone can record a pool under any name, pool zero's (\"bitflash\") included; a pool "
+    "is its id (the fingerprint is only its first 8 hex digits), its age (first height), its fee and its work";
+
+// Names that look the same: equal once case, '-' and '_' are set aside.
+static string PoolNameKey(const string& s)
+{
+    string k;
+    for (size_t i = 0; i < s.size(); i++)
+        if (s[i] != '-' && s[i] != '_')
+            k += (char)tolower((unsigned char)s[i]);
+    return k;
+}
+
+static uint256 PoolZeroId()
+{
+    uint256 id = 0;
+    poolreg::PoolId(poolreg::PoolZero().Encode(), (const unsigned char*)pchMessageStart, id.begin());
+    return id;
+}
+
+// The other pools named like strName (by PoolNameKey): pool zero first,
+// then the recorded pools; never the pool itself.
+static json SameNameJson(const uint256& idSelf, const string& strName, const vector<CPoolInfo>& vReg)
+{
+    json a = json::array();
+    const string key = PoolNameKey(strName);
+    const uint256 idZero = PoolZeroId();
+    if (idSelf != idZero && PoolNameKey(poolreg::PoolZero().name) == key)
+    {
+        json z;
+        z["id"] = idZero.GetHex();
+        z["fingerprint"] = idZero.GetHex().substr(0, 8);
+        z["poolzero"] = true;
+        a.push_back(z);
+    }
+    for (size_t i = 0; i < vReg.size(); i++)
+    {
+        if (vReg[i].fZero || vReg[i].id == idSelf || PoolNameKey(vReg[i].rec.name) != key)
+            continue;
+        json o;
+        o["id"] = vReg[i].id.GetHex();
+        o["fingerprint"] = vReg[i].id.GetHex().substr(0, 8);
+        o["poolzero"] = false;
+        a.push_back(o);
+    }
+    return a;
+}
+
+static json RegisteredPoolJson(const CPoolInfo& info, bool fFull, const vector<CPoolInfo>& vReg)
 {
     json j;
     j["name"] = info.rec.name;
     j["local"] = false;
     j["id"] = info.id.GetHex();
     j["fingerprint"] = info.id.GetHex().substr(0, 8);
+    j["samename"] = SameNameJson(info.id, info.rec.name, vReg);
     j["feebps"] = info.rec.nFeeBps;
     if (fFull)
     {
@@ -4793,9 +4847,13 @@ static json RegisteredPoolJson(const CPoolInfo& info, bool fFull)
 
 static json PoolIndexStateJson()
 {
+    int nHeight = -1;
+    bool fSynced = false, fRebuilding = false;
+    PoolIndexState(nHeight, fSynced, fRebuilding);
     json j;
-    j["height"] = PoolIndexHeight();
-    j["synced"] = PoolIndexSynced();
+    j["height"] = nHeight;
+    j["synced"] = fSynced;
+    j["rebuilding"] = fRebuilding;
     return j;
 }
 
@@ -4811,6 +4869,9 @@ static json CreateEverpool(const json& p)
         throw runtime_error("poolcreate everpool {\"name\", \"spacing\", \"window\", \"retarget\", \"floor\", "
                             "\"uncledepth\", \"unclepct\", \"feebps\", \"feeaddress\"} [\"send\"]");
     string strAct;
+    if (p.size() > 3)
+        throw runtime_error("poolcreate everpool takes three parameters at most: the mode, the pool and \"send\", "
+                            "\"dryrun\" or \"publishzero\"");
     if (p.size() > 2)
     {
         string s = p[2].is_string() ? p[2].get<string>() : string();
@@ -4838,12 +4899,17 @@ static json CreateEverpool(const json& p)
     CPoolInfo info;
     bool fZero = PoolIndexLookup(id, info) && info.fZero;
     bool fRecorded = info.nAppearances > 0;
+    vector<CPoolInfo> vReg;
+    PoolIndexList(vReg);
 
     json j;
     j["name"] = rec.name;
     j["local"] = false;
     j["id"] = id.GetHex();
     j["fingerprint"] = id.GetHex().substr(0, 8);
+    j["samename"] = SameNameJson(id, rec.name, vReg);
+    if (!j["samename"].empty())
+        j["note"] = POOL_NAME_NOTE;
     j["poolzero"] = fZero;
     json fee;
     fee["bps"] = rec.nFeeBps;
@@ -4880,23 +4946,56 @@ static json CreateEverpool(const json& p)
     if (!fZero && strAct == "publishzero")
         throw runtime_error("\"publishzero\" is for pool zero's own record only; this is another pool: \"send\"");
 
-    // Burning a record that is already on the chain changes nothing (same
-    // id, same age): refused, rather than spending 1 BTF on nothing.
-    if (fRecorded)
-        throw runtime_error(strprintf("this pool is already recorded, first at block %d: burning it again changes "
-                                      "nothing", info.first.nHeight));
-    if (!j["index"]["synced"].get<bool>())
-        throw runtime_error("the pool index has not read up to the tip of the chain yet, so it cannot say whether "
-                            "this pool is already recorded; try again once it has");
-    CRITICAL_BLOCK(cs_mapTransactions)
+    // Everything from here to the burn under cs_main: no block can be
+    // connected between "the index is at the tip and does not have this
+    // pool" and the send, so a burn mined in between cannot make one pool
+    // burn 1 BTF twice. cs_main is taken first and the index's lock only
+    // inside it (the index never takes cs_main while holding its own lock).
+    uint256 txid = 0;
+    CRITICAL_BLOCK(cs_main)
     {
-        for (map<uint256, CTransaction>::const_iterator it = mapTransactions.begin(); it != mapTransactions.end(); ++it)
-            for (size_t i = 0; i < it->second.vout.size(); i++)
-                if (it->second.vout[i].scriptPubKey == script)
-                    throw runtime_error("a transaction recording this pool is already waiting to be mined: " +
-                                        it->first.GetHex());
+        // "At the tip" means this node's tip: while it is still catching up,
+        // the burn may be in a block it has not read yet.
+        if (IsInitialBlockDownload())
+            throw runtime_error("this node is still catching up with the network, so it cannot say whether this "
+                                "pool is already recorded; try again once it has the chain");
+        if (!PoolIndexSynced())
+            throw runtime_error("the pool index has not read up to the tip of the chain yet, so it cannot say "
+                                "whether this pool is already recorded; try again once it has");
+        // Burning a record that is already on the chain changes nothing
+        // (same id, same age): refused, rather than spending 1 BTF on
+        // nothing. Looked up again now that the chain cannot move.
+        CPoolInfo now;
+        if (PoolIndexLookup(id, now) && now.nAppearances > 0)
+            throw runtime_error(strprintf("this pool is already recorded, first at block %d: burning it again "
+                                          "changes nothing", now.first.nHeight));
+        // The same burn not in a block yet: in the memory pool, or in this
+        // wallet (which sends its unconfirmed transactions again until they
+        // are mined, even when the memory pool has dropped them).
+        vector<unsigned char> recOut;
+        poolreg::PoolRecord recSeen;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            for (map<uint256, CTransaction>::const_iterator it = mapTransactions.begin(); it != mapTransactions.end(); ++it)
+                for (size_t i = 0; i < it->second.vout.size(); i++)
+                    if (PoolBurnedRecord(it->second.vout[i], recOut, recSeen) && recOut == record)
+                        throw runtime_error("a transaction recording this pool is already waiting to be mined: " +
+                                            it->first.GetHex());
+        }
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            {
+                if (it->second.GetDepthInMainChain() > 0)
+                    continue;
+                for (size_t i = 0; i < it->second.vout.size(); i++)
+                    if (PoolBurnedRecord(it->second.vout[i], recOut, recSeen) && recOut == record)
+                        throw runtime_error("this wallet already has a transaction recording this pool that is not "
+                                            "in a block yet, and sends it again until it is: " + it->first.GetHex());
+            }
+        }
+        txid = SendBurn(record, poolreg::MIN_BURN, "Everpool pool " + rec.name);
     }
-    uint256 txid = SendBurn(record, poolreg::MIN_BURN, "Everpool pool " + rec.name);
     j["sent"] = true;
     j["txid"] = txid.GetHex();
     j["status"] = fZero ? "active: pool zero always is; the burn publishes its record"
@@ -5081,16 +5180,20 @@ static json PoolZeroJson()
     return j;
 }
 
-// poollist: pool zero, the pools recorded on the chain (from the registry
-// index, in the order of their first appearance), and this node's local
-// pools; never another node's local pool.
+// poollist: the index's state, the note on names, and the pools: pool zero,
+// the pools recorded on the chain (from the registry index), and this node's
+// local pools; never another node's local pool.
 static json rpc_poollist(const json&)
 {
     json a = json::array();
+    json out;
+    out["index"] = PoolIndexStateJson();
+    out["note"] = POOL_NAME_NOTE;
     vector<CPoolInfo> vReg;
     PoolIndexList(vReg);
     json z = PoolZeroJson();
     z["rules"] = PoolRulesSummary(poolreg::PoolZero());
+    z["samename"] = SameNameJson(PoolZeroId(), poolreg::PoolZero().name, vReg);
     if (!vReg.empty() && vReg[0].fZero)
         AddRegistryJson(z, vReg[0], false);
     a.push_back(z);
@@ -5105,7 +5208,7 @@ static json rpc_poollist(const json&)
         return x.nAnchorsInWindow > y.nAnchorsInWindow;
     });
     for (size_t i = 0; i < vRest.size(); i++)
-        a.push_back(RegisteredPoolJson(vRest[i], false));
+        a.push_back(RegisteredPoolJson(vRest[i], false, vReg));
     vector<string> vNames;
     P2PoolLocalNames(vNames);
     for (size_t i = 0; i < vNames.size(); i++)
@@ -5114,7 +5217,8 @@ static json rpc_poollist(const json&)
         if (P2PoolLocalStatus(vNames[i], st))
             a.push_back(LocalPoolJson(vNames[i], st, false));
     }
-    return a;
+    out["pools"] = a;
+    return out;
 }
 
 // poolinfo local:<name> | <pool id>
@@ -5141,9 +5245,13 @@ static json rpc_poolinfo(const json& p)
     id.SetHex(s);
     CPoolInfo info;
     bool fKnown = PoolIndexLookup(id, info);
+    vector<CPoolInfo> vReg;
+    PoolIndexList(vReg);
     if (s == z["id"].get<string>())
     {
         z["rules"] = PoolRulesJson(poolreg::PoolZero());
+        z["samename"] = SameNameJson(id, poolreg::PoolZero().name, vReg);
+        z["note"] = POOL_NAME_NOTE;
         if (fKnown && info.fZero)
             AddRegistryJson(z, info, true);
         z["index"] = PoolIndexStateJson();
@@ -5151,7 +5259,8 @@ static json rpc_poolinfo(const json& p)
     }
     if (fKnown)
     {
-        json j = RegisteredPoolJson(info, true);
+        json j = RegisteredPoolJson(info, true, vReg);
+        j["note"] = POOL_NAME_NOTE;
         std::vector<CPoolAppearance> vAppear;
         PoolIndexAppearances(id, vAppear);
         json a = json::array();

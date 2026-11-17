@@ -10,9 +10,6 @@ static const unsigned char TAG_P2P[3] = { 'p', '2', 'p' };
 static const unsigned char TAG_P2X[3] = { 'p', '2', 'x' };
 static const unsigned char TAG_P2L[3] = { 'p', '2', 'l' };
 
-// The file: a version, the registry, and the hash of both. Version 2 added
-// dropped anchors and the locator.
-static const int POOL_INDEX_FILE_VERSION = 2;
 // The file grows by burns of 1 BTF and by a bounded number of recent anchors;
 // far past anything real, and a bound on what a damaged file can ask this
 // node to read.
@@ -69,10 +66,28 @@ static uint256 IdOf(const std::vector<unsigned char>& record, const unsigned cha
     return id;
 }
 
-static std::string Fingerprint(const uint256& id)
+// The full id in the log: a fingerprint is 32 bits, and two pools can share
+// one (and a name) by design of whoever made the second.
+static std::string IdText(const uint256& id)
 {
     uint256 h = id;
-    return poolreg::IdHex(h.begin()).substr(0, 8);
+    return poolreg::IdHex(h.begin());
+}
+
+bool PoolBurnedRecord(const CTxOut& out, std::vector<unsigned char>& recordOut, poolreg::PoolRecord& recOut)
+{
+    // The cheap tests first: most outputs are neither burns nor OP_RETURN.
+    if (out.nValue < poolreg::MIN_BURN)
+        return false;
+    const CScript& script = out.scriptPubKey;
+    if (script.size() < 2 || script[0] != OP_RETURN)
+        return false;
+    std::vector<unsigned char> s(script.begin(), script.end());
+    std::string err;
+    if (!poolreg::ParseScript(s, recOut, err))
+        return false;
+    recordOut.assign(s.begin() + 2, s.end());
+    return true;
 }
 
 // The latest sweep at or below a height.
@@ -183,24 +198,15 @@ bool CPoolRegistry::ConnectBlock(const CBlock& block, int nHeightIn, const uint2
         for (unsigned int o = 0; o < tx.vout.size(); o++)
         {
             const CTxOut& out = tx.vout[o];
-            // The cheap tests first: most outputs are neither burns nor
-            // OP_RETURN.
-            if (out.nValue < poolreg::MIN_BURN)
-                continue;
-            const CScript& script = out.scriptPubKey;
-            if (script.size() < 2 || script[0] != OP_RETURN)
-                continue;
-            std::vector<unsigned char> s(script.begin(), script.end());
             poolreg::PoolRecord rec;
-            std::string err;
-            if (!poolreg::ParseScript(s, rec, err))
+            std::vector<unsigned char> record;
+            if (!PoolBurnedRecord(out, record, rec))
                 continue;
             if (!fTxid)
             {
                 txid = tx.GetHash();
                 fTxid = true;
             }
-            std::vector<unsigned char> record(s.begin() + 2, s.end());
             uint256 id = IdOf(record, magic);
             CPoolAppearance a;
             a.nHeight = nHeightIn;
@@ -217,7 +223,7 @@ bool CPoolRegistry::ConnectBlock(const CBlock& block, int nHeightIn, const uint2
                     printf("pool index: pool zero's own record burned in block %d\n", nHeightIn);
                 else
                     printf("pool index: pool %s \"%s\" appears in block %d\n",
-                           Fingerprint(id).c_str(), rec.name.c_str(), nHeightIn);
+                           IdText(id).c_str(), rec.name.c_str(), nHeightIn);
             }
             e.vAppear.push_back(a);
         }
@@ -290,7 +296,7 @@ bool CPoolRegistry::DisconnectAbove(int nHeightIn, const uint256& hashAt)
                 std::string err;
                 poolreg::Parse(it->second.record, rec, err);
                 printf("pool index: pool %s \"%s\" left the active chain (reorg below block %d)\n",
-                       Fingerprint(it->first).c_str(), rec.name.c_str(), nHeightIn + 1);
+                       IdText(it->first).c_str(), rec.name.c_str(), nHeightIn + 1);
             }
             mapPools.erase(it++);
         }
@@ -918,6 +924,16 @@ void CPoolIndex::Tip(int& nHeightOut, uint256& hashOut) const
     }
 }
 
+void CPoolIndex::State(int& nHeightOut, uint256& hashOut, bool& fRebuildingOut) const
+{
+    CRITICAL_BLOCK(cs)
+    {
+        nHeightOut = reg.Height();
+        hashOut = reg.TipHash();
+        fRebuildingOut = fShadow;
+    }
+}
+
 bool CPoolIndex::Lookup(const uint256& id, CPoolInfo& out) const
 {
     bool f = false;
@@ -1001,7 +1017,6 @@ CPoolIndex& PoolIndex()
     return index;
 }
 
-bool fPoolIndexAutoStart = true;
 static std::atomic<bool> g_fPoolIndexRunning(false);
 
 static void ThreadPoolIndex(void* parg)
@@ -1098,7 +1113,7 @@ void PoolIndexStart()
     return;
 #else
     static bool fStarted = false;
-    if (fStarted || !fPoolIndexAutoStart)
+    if (fStarted)
         return;
     fStarted = true;
     PoolIndex().SetPath(GetAppDir() + "/pool-registry.dat");
@@ -1114,11 +1129,19 @@ void PoolIndexStart()
 
 void PoolIndexStop()
 {
+    // Best effort: a pass ends at the next block and the save is one write,
+    // so 30 s is far more than either takes; a disk that hangs longer is
+    // left behind with a line in the log.
     PoolIndex().RequestStop();
     for (int i = 0; i < 300 && g_fPoolIndexRunning; i++)
         Sleep(100);
     if (g_fPoolIndexRunning)
         printf("pool index: the thread did not stop within 30 s\n");
+}
+
+bool PoolIndexRunning()
+{
+    return g_fPoolIndexRunning;
 }
 
 bool PoolIndexLookup(const uint256& id, CPoolInfo& out)
@@ -1149,6 +1172,19 @@ void PoolIndexAnchors(const uint256& id, std::vector<CPoolAnchor>& vRecent, int&
 int PoolIndexHeight()
 {
     return PoolIndex().Height();
+}
+
+void PoolIndexState(int& nHeightOut, bool& fSyncedOut, bool& fRebuildingOut)
+{
+    // One read of the index under its lock, then the chain's tip under
+    // cs_main: the height and "synced" describe the same moment.
+    uint256 hash = 0;
+    PoolIndex().State(nHeightOut, hash, fRebuildingOut);
+    fSyncedOut = false;
+    if (nHeightOut < 0)
+        return;
+    CRITICAL_BLOCK(cs_main)
+        fSyncedOut = pindexBest && pindexBest->GetBlockHash() == hash;
 }
 
 bool PoolIndexSynced()
