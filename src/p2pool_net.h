@@ -26,6 +26,12 @@
 // inside it: the template code takes cs_main first).
 bool P2PoolProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv);
 
+// Whether a command is a P2Pool message, which ProcessMessages hands to
+// P2PoolProcessMessage without cs_main: pool zero's ("p2p..."), a local
+// pool's ("p2l..."), a registered pool's ("p2x...") and the registry's
+// ("pool...", docs/pool-registry.md section 8).
+bool P2PoolCommand(const string& strCommand);
+
 // After the version handshake: ask the peer for its line if ours is empty.
 void P2PoolOnVersion(CNode* pfrom);
 
@@ -128,8 +134,10 @@ void P2PoolDrainBudgetsForTest();
 // hello that matches no pool of this node, and a handle it does not hold on
 // that connection, get silence, and nobody is scored for them.
 
-// The share chain this node's miners work on: pool zero's, or the local
-// pool's that P2PoolLocalMine named. Under cs_p2pool.
+// The share chain this node's miners work on: pool zero's, the local pool's
+// that P2PoolLocalMine named, or the registered pool's of -p2pool=<pool id>
+// once it has joined (P2PoolMinedReady says whether it may be mined on).
+// Under cs_p2pool.
 p2pool::ShareChain& P2PoolMinedChain();
 // A number that changes whenever a share joins that chain: the stratum
 // checks then whether the uncles its job names are still the ones the next
@@ -163,12 +171,16 @@ bool P2PoolLocalLeave(const string& strName, string& errOut);
 // startup, before any template is built.
 bool P2PoolLocalMine(const string& strName, string& errOut);
 // What -p2pool=<value> asks to mine (docs/pool-registry.md, section 9):
-// pool zero (true, strLocalOut empty: no value, any value that is not a
-// pool id, or pool zero's own id), a local pool (true, its name, from
-// "local:<name>"), or nothing a node may start with (false, and why: an
-// Everpool pool's id, which this release cannot mine yet, or 40 to 80 hex
-// digits that are not 64, a mistyped id). The value is never echoed back.
-bool P2PoolParseChoice(const string& strValue, string& strLocalOut, string& errOut);
+// pool zero (true, strLocalOut empty and idRegOut 0: no value, any value
+// that is not a pool id, or pool zero's own id), a local pool (true, its
+// name, from "local:<name>"), an Everpool pool (true, its id in idRegOut,
+// from 64 hex digits), or nothing a node may start with (false, and why: 40
+// to 80 hex digits that are not 64, a mistyped id). The value is never
+// echoed back.
+bool P2PoolParseChoice(const string& strValue, string& strLocalOut, uint256& idRegOut, string& errOut);
+// -poolcarry=<pool id>[,<pool id>...]: added to vOut (no repeats); false on
+// anything that is not a pool id, pool zero's id, or more than 8 in all.
+bool P2PoolParseCarry(const string& strValue, vector<uint256>& vOut, string& errOut);
 struct P2PoolLocalStatusInfo
 {
     enum
@@ -198,6 +210,70 @@ void P2PoolLocalDialList(vector<string>& out);
 // Whether some local pool of this node (not one being left) still lists
 // that peer. Takes cs_p2pool: callers may hold cs_vNodes, not the other way.
 bool P2PoolLocalStillListed(const string& strPeer);
+
+// ---- Registered pools (docs/pool-registry.md, sections 8, 9, 11 and 17)
+//
+// A pool recorded on the chain, mined with -p2pool=<pool id> or carried
+// with -poolcarry=<pool id>. Its messages, only between peers that say
+// NODE_POOLREG:
+//   poolinv    vector<uint256>, at most 32: the pools this node announces
+//              (carried, complete, and holding shares or mined); after the
+//              version, and again when the set changes, at most once a minute
+//   p2xshare   pool id, ShareX: pushed only to peers that announced the pool
+//   p2xgetsh   pool id, vector<uint256>
+//   p2xsync    pool id, uint256 resume point (a share id, or 0)
+//   p2xshares  pool id, int snapshot tip height, end flag, vector<ShareX>
+//              (at most 100 shares and 256 x 1024 bytes but for one share)
+//   p2xnone    pool id: this node holds nothing of that pool
+//   poolwho    pool id: who carries it? (hints, as p2ppeers)
+//   poolat     pool id, vector<string>: .btf addresses, the answer
+// Whether the pool is active on this node's chain decides only whether it
+// is carried, mined and announced; never whether a share of it is valid.
+
+static const size_t MAX_POOL_CARRY = 8;
+// The pool mined (fMine) or one more carried. Before P2PoolInit, which reads
+// back their files (pools/<id>.dat, or pools/<id>.part for a fetch in
+// progress); a pool with no file here joins once the registry index names
+// it. False for pool zero's id, or a ninth -poolcarry pool.
+bool P2PoolRegWant(const uint256& id, bool fMine, string& errOut);
+// The pools wanted: the mined one first, then those carried.
+void P2PoolRegWanted(vector<uint256>& out);
+// Whether this node's miners can be given a template now; why not
+// otherwise (a registered pool mined: unknown, pending, its line still on
+// its way). Always true for pool zero and a local pool.
+bool P2PoolMinedReady(string& whyOut);
+struct P2PoolRegStatusInfo
+{
+    enum { FETCH_IDLE = 0, FETCH_RUNNING, FETCH_CATCHUP, FETCH_COMPLETE };
+    bool fMined;
+    bool fCarry;
+    bool fCarried;          // its shares taken, relayed and served
+    bool fAnnounced;
+    int nStatus;            // PoolStatus, as this node last read it
+    int nFetch;
+    size_t nShares;
+    int nTipHeight;
+    uint256 work;           // the tip line's work over the last window
+    size_t nAnnouncers;     // peers whose latest poolinv names it
+    size_t nServes;         // paced serves of it in flight
+};
+// A wanted pool's state on this node; false for a pool not wanted here.
+bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out);
+
+// Self-tests and fuzz: a registered pool from its record, active, mined or
+// carried (fFiles false: no files); its status set; its fetch state (-1: no
+// such pool); the message thread's once-a-second pass made now; every time
+// the registered pools keep made nSecs older; and a pool dropped from
+// memory and read back from its files, as at a restart.
+bool P2PoolRegAddForTest(const poolreg::PoolRecord& rec, bool fMine, bool fCarry, bool fFiles, string& errOut);
+void P2PoolRegSetStatusForTest(const uint256& id, int nStatus);
+int P2PoolRegFetchForTest(const uint256& id);
+void P2PoolRegTickForTest();
+void P2PoolRegAgeForTest(int64 nSecs);
+// Self-tests: the paced serves in flight made nSecs older, their last part
+// left as recent as it was (slow, not stalled).
+void P2PoolRegAgeServeStartsForTest(int64 nSecs);
+bool P2PoolRegReloadForTest(const uint256& id);
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.

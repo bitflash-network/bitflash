@@ -9254,17 +9254,20 @@ static int RunP2PoolLocalNodeSelfTest()
         std::string strZero = poolreg::IdHex(idZero), strUpper = strZero;
         for (size_t i = 0; i < strUpper.size(); i++)
             strUpper[i] = (char)toupper((unsigned char)strUpper[i]);
-        bool fZero = P2PoolParseChoice("", strName, err) && strName.empty() &&
-                     P2PoolParseChoice("1", strName, err) && strName.empty() &&
-                     P2PoolParseChoice(strZero, strName, err) && strName.empty() &&
-                     P2PoolParseChoice(strUpper, strName, err) && strName.empty();
-        bool fLocal = P2PoolParseChoice("local:home", strName, err) && strName == "home";
-        bool fRefused = !P2PoolParseChoice("local:", strName, err) && !P2PoolParseChoice("local:a b", strName, err) &&
-                        !P2PoolParseChoice(std::string(64, 'c'), strName, err) &&
-                        !P2PoolParseChoice(std::string(50, 'c'), strName, err) &&
+        uint256 idReg;
+        bool fZero = P2PoolParseChoice("", strName, idReg, err) && strName.empty() && idReg == 0 &&
+                     P2PoolParseChoice("1", strName, idReg, err) && strName.empty() && idReg == 0 &&
+                     P2PoolParseChoice(strZero, strName, idReg, err) && strName.empty() && idReg == 0 &&
+                     P2PoolParseChoice(strUpper, strName, idReg, err) && strName.empty() && idReg == 0;
+        bool fLocal = P2PoolParseChoice("local:home", strName, idReg, err) && strName == "home" && idReg == 0;
+        bool fReg = P2PoolParseChoice(std::string(64, 'c'), strName, idReg, err) && strName.empty() &&
+                    idReg.GetHex() == std::string(64, 'c');
+        bool fRefused = !P2PoolParseChoice("local:", strName, idReg, err) && !P2PoolParseChoice("local:a b", strName, idReg, err) &&
+                        !P2PoolParseChoice(std::string(50, 'c'), strName, idReg, err) &&
                         err.find(std::string(50, 'c')) == std::string::npos;
-        nFail += Check(fZero && fLocal && fRefused,
-                       "-p2pool: alone or with pool zero's id is pool zero, local:<name> a local pool; another id refuses") ? 0 : 1;
+        nFail += Check(fZero && fLocal && fReg && fRefused,
+                       "-p2pool: alone or with pool zero's id is pool zero, local:<name> a local pool, 64 hex digits "
+                       "an Everpool pool; a mistyped id refuses") ? 0 : 1;
         nFail += Check(!P2PoolLocalMine("nosuch", err) && P2PoolLocalMine("home", err),
                        "-p2pool=local:<name> naming no local pool here refuses to start; a pool here is mined") ? 0 : 1;
         bool fMined;

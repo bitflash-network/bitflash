@@ -4825,6 +4825,32 @@ static json SameNameJson(const uint256& idSelf, const string& strName, const vec
     return a;
 }
 
+// Whether this node carries a registered pool, and its share chain here
+// (docs/pool-registry.md, section 9): only for a pool mined or given with
+// -poolcarry. The work is the tip line's over the last window of shares.
+static void AddCarriedJson(json& j, const uint256& id)
+{
+    P2PoolRegStatusInfo st;
+    if (!P2PoolRegStatus(id, st))
+    {
+        j["carried"] = false;
+        return;
+    }
+    j["carried"] = st.fCarried;
+    j["mined"] = st.fMined;
+    j["poolcarry"] = st.fCarry;
+    json c;
+    static const char* const vFetch[] = { "nothing yet", "fetching its line", "catching up", "complete" };
+    c["state"] = vFetch[std::max(0, std::min(3, st.nFetch))];
+    c["announced"] = st.fAnnounced;
+    c["shares"] = (uint64_t)st.nShares;
+    c["height"] = st.nTipHeight;
+    c["work"] = st.work.GetHex();
+    c["announcers"] = (uint64_t)st.nAnnouncers;
+    c["serves"] = (uint64_t)st.nServes;
+    j["sharechain"] = c;
+}
+
 static json RegisteredPoolJson(const CPoolInfo& info, bool fFull, const vector<CPoolInfo>& vReg)
 {
     json j;
@@ -4842,6 +4868,7 @@ static json RegisteredPoolJson(const CPoolInfo& info, bool fFull, const vector<C
     else
         j["rules"] = PoolRulesSummary(info.rec);
     AddRegistryJson(j, info, fFull);
+    AddCarriedJson(j, info.id);
     return j;
 }
 
@@ -5198,13 +5225,26 @@ static json rpc_poollist(const json&)
         AddRegistryJson(z, vReg[0], false);
     a.push_back(z);
     // Section 9: by recent share work for carried pools, then by anchors,
-    // never by name. Nothing is carried yet, so: by anchors in the last 720
-    // blocks, ties in the order of first appearance (PoolIndexList's).
+    // never by name: carried pools first, by the work of their tip line over
+    // the last window, then the rest by anchors in the last 720 blocks, ties
+    // in the order of first appearance (PoolIndexList's).
     vector<CPoolInfo> vRest;
     for (size_t i = 0; i < vReg.size(); i++)
         if (!vReg[i].fZero)
             vRest.push_back(vReg[i]);
-    std::stable_sort(vRest.begin(), vRest.end(), [](const CPoolInfo& x, const CPoolInfo& y) {
+    map<uint256, uint256> mapWork;
+    for (size_t i = 0; i < vRest.size(); i++)
+    {
+        P2PoolRegStatusInfo st;
+        if (P2PoolRegStatus(vRest[i].id, st) && st.fCarried)
+            mapWork[vRest[i].id] = st.work;
+    }
+    std::stable_sort(vRest.begin(), vRest.end(), [&mapWork](const CPoolInfo& x, const CPoolInfo& y) {
+        bool fX = mapWork.count(x.id) != 0, fY = mapWork.count(y.id) != 0;
+        if (fX != fY)
+            return fX;
+        if (fX && mapWork[x.id] != mapWork[y.id])
+            return mapWork[y.id] < mapWork[x.id];
         return x.nAnchorsInWindow > y.nAnchorsInWindow;
     });
     for (size_t i = 0; i < vRest.size(); i++)

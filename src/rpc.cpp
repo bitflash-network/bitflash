@@ -163,14 +163,25 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
     string err;
     CRITICAL_BLOCK(cs_p2pool)
     {
+        // A registered pool (-p2pool=<pool id>) is mined only once its
+        // record is active on this node's chain and its line is here
+        // (docs/pool-registry.md, section 9); never pool zero in its place.
+        string strWhyNot;
+        if (!P2PoolMinedReady(strWhyNot))
+        {
+            LogPrint("pool", "[p2pool] no template yet: %s\n", strWhyNot.c_str());
+            return false;
+        }
         if (P2PoolAwaitingHistory())
         {
             LogPrint("pool", "[p2pool] no template yet: waiting for the share chain from peers\n");
             return false;
         }
-        // The pool this node mines: pool zero, or the local pool of
+        // The pool this node mines: pool zero, the local pool of
         // -p2pool=local:<name>, whose shares carry its id and whose coinbase
-        // carries its keyed "p2l" anchor (docs/pool-registry.md, section 18).
+        // carries its keyed "p2l" anchor (docs/pool-registry.md, section 18),
+        // or the registered pool of -p2pool=<pool id>, whose coinbase carries
+        // "p2x", its id and the share data's hash (section 7).
         p2pool::ShareChain& c = P2PoolMinedChain();
         const p2pool::PoolRules& rules = c.Rules();
         if (!rules.IsZero())
