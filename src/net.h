@@ -875,6 +875,11 @@ public:
     // there is budget (SendMessages). Under cs_vRecv and cs_vSend, as
     // mapAskFor: the message thread touches it holding one or the other.
     vector<uint256> vBlocksRefused;
+    // Blocks from this peer whose proof of work this node could not compute,
+    // in the window that started at nUnverifiedWindowStart (see
+    // MAX_UNVERIFIED_BLOCKS_PER_PEER). Message thread only, under cs_main.
+    int nUnverifiedBlocks;
+    int64 nUnverifiedWindowStart;
     // Database lookups left for transaction hashes this peer announces, and
     // when they were last topped up (TX_INV_LOOKUPS_PER_SEC).
     int nTxInvTokens;
@@ -951,6 +956,8 @@ public:
         hashBatchLastBlock = 0;
         fRecvMorePending = false;
         hashInvContinue = 0;
+        nUnverifiedBlocks = 0;
+        nUnverifiedWindowStart = 0;
         nTxInvTokens = TX_INV_LOOKUPS_MAX;
         nTxInvRefilled = GetTime();
         fDropWithoutDrain = false;

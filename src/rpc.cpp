@@ -2315,7 +2315,7 @@ int RunPoolStratumSelfTest()
           "and the refusal says the pool cannot check work, not that the share is bad");
 
     captured.clear();
-    json keep ={{"id", 4}, {"jsonrpc", "2.0"}, {"method", "keepalived"}, {"params", json{{"id", "00"}}}};
+    json keep = {{"id", 4}, {"jsonrpc", "2.0"}, {"method", "keepalived"}, {"params", json{{"id", "00"}}}};
     HandleLine(&cn, keep.dump(), roundShareCount, roundShareTotal, blocksFound);
     try { submitReply = json::parse(captured); } catch (...) {}
     check(submitReply.is_object() && submitReply["result"].value("status", "") == "KEEPALIVED",

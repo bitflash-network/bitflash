@@ -498,7 +498,23 @@ bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmine
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
 // Takes ownership of pblock on every path (kept as an orphan or deleted).
+// pfUnverified, when given, is set when the block was refused only because
+// this node could not compute its proof of work (RandomX not available here).
 bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL, bool* pfUnverified=NULL);
+// Blocks of that kind: a peer that sends more than this many in a window is
+// disconnected, never scored or banned (the fault is this node's).
+static const int MAX_UNVERIFIED_BLOCKS_PER_PEER = 8;
+static const int64 UNVERIFIED_BLOCKS_PEER_WINDOW = 60;
+// Every block refused that way; of those, the ones refused before any hash
+// because their parent already rules them out (CheckBlock); peers disconnected
+// for them; and the log lines written about them (one a minute at most).
+extern int64 nBlocksUnverified;
+extern int64 nBlocksUnverifiedByContext;
+extern int64 nUnverifiedPeersDropped;
+extern int64 nUnverifiedLogLines;
+// Self-test only: make the last of those lines nAge seconds old (negative:
+// none written yet), so the next one is written.
+void UnverifiedLogAgeForTest(int64 nAge);
 bool SelectCoins(int64 nTargetValue, std::set<CWalletTx*>& setCoinsRet);
 bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock);
 // True while this node is catching up: peers say the chain is well past us.
@@ -1754,7 +1770,9 @@ public:
     // machine that boots with a slow clock does not throw its tail away.
     // pfUnverified, when given, is set when the block was refused only because
     // this node could not compute its proof of work: nothing is known against
-    // the block, and no score is given for it.
+    // the block, and no score is given for it. A caller that gives it holds
+    // cs_main (or is the load at startup): with it, a v1-era block is looked
+    // up against its parent in mapBlockIndex when v1 has failed to set up.
     bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true, bool* pfUnverified=NULL) const;
     bool AcceptBlock(int* pnDoS=NULL);
 };

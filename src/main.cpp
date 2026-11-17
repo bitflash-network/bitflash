@@ -3799,6 +3799,76 @@ bool fFuzzSkipPoW = false;
 static thread_local bool tl_fPoWBudgetGate = false;
 static thread_local bool tl_fPoWBudgetRefused = false;
 
+// Blocks refused because this node could not compute their proof of work
+// (RandomX could not be set up here; see POW_HASH_UNAVAILABLE), and peers
+// disconnected for sending many. No score is given for them, so nothing else
+// slows a sender down: a node whose v1 verifier failed can be sent v1-era
+// blocks at network speed. Three log lines for each grew debug.log without
+// bound, so they get one line a minute at most, with how many there were
+// since the line before.
+static const int64 UNVERIFIED_LOG_INTERVAL = 60;
+static CCriticalSection cs_unverifiedLog;
+static int64 nUnverifiedLogLast = 0;          // when the last line was written (0: never)
+static int64 nUnverifiedBlocksQuiet = 0;      // blocks since that line
+static int64 nUnverifiedPeersQuiet = 0;       // peers disconnected since that line
+static std::string strUnverifiedLatest;       // the latest block, and who sent it
+int64 nBlocksUnverified = 0;
+int64 nBlocksUnverifiedByContext = 0;
+int64 nUnverifiedPeersDropped = 0;
+int64 nUnverifiedLogLines = 0;
+
+// Caller: cs_unverifiedLog held. Writes the line if the last one is a minute
+// old (or the wall clock went back past it).
+static void UnverifiedLogMaybeWrite()
+{
+    int64 nNow = GetTime();
+    if (nUnverifiedLogLast != 0 && nNow >= nUnverifiedLogLast && nNow - nUnverifiedLogLast < UNVERIFIED_LOG_INTERVAL)
+        return;
+    LogPrintAlways("net", "RandomX is not available on this node: %lld block(s) not accepted because their proof of work "
+                   "cannot be checked here, and %lld peer(s) disconnected for sending more than %d a minute, since the "
+                   "last such line (latest: %s); at most one such line a minute\n",
+                   (long long)nUnverifiedBlocksQuiet, (long long)nUnverifiedPeersQuiet,
+                   MAX_UNVERIFIED_BLOCKS_PER_PEER, strUnverifiedLatest.c_str());
+    nUnverifiedLogLast = nNow;
+    nUnverifiedBlocksQuiet = 0;
+    nUnverifiedPeersQuiet = 0;
+    nUnverifiedLogLines++;
+}
+
+static void NoteUnverifiedBlock(const uint256& hash, const CNode* pfrom)
+{
+    CRITICAL_BLOCK(cs_unverifiedLog)
+    {
+        nBlocksUnverified++;
+        nUnverifiedBlocksQuiet++;
+        strUnverifiedLatest = strprintf("block %s from %s", hash.ToString().substr(0,14).c_str(),
+                                        pfrom ? pfrom->addr.ToString().c_str() : "this node");
+        UnverifiedLogMaybeWrite();
+    }
+}
+
+static void NoteUnverifiedPeerDropped()
+{
+    CRITICAL_BLOCK(cs_unverifiedLog)
+    {
+        nUnverifiedPeersDropped++;
+        nUnverifiedPeersQuiet++;
+        UnverifiedLogMaybeWrite();
+    }
+}
+
+static void NoteUnverifiedByContext()
+{
+    CRITICAL_BLOCK(cs_unverifiedLog)
+        nBlocksUnverifiedByContext++;
+}
+
+void UnverifiedLogAgeForTest(int64 nAge)
+{
+    CRITICAL_BLOCK(cs_unverifiedLog)
+        nUnverifiedLogLast = nAge < 0 ? 0 : GetTime() - nAge;
+}
+
 bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime, bool* pfUnverified) const
 {
     if (pnDoS)
@@ -3866,6 +3936,25 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime, bool* pfUnverified) const
         return DoS(pnDoS, 100, error("CheckBlock() : nBits is not a positive target"));
     if (bnTarget > bnProofOfWorkLimit)
         return DoS(pnDoS, 100, error("CheckBlock() : nBits below minimum work"));
+    // A v1-era block whose known parent's median time is already past the
+    // switch can never be accepted: AcceptBlock refuses any block timed at or
+    // before its parent's median time past, whatever its work. (The parent's
+    // own time being past the switch is not enough: right after the switch
+    // the median can still be before it.) When the v1 verifier has already
+    // failed to set up here, such a block is refused as unverified now,
+    // before the hash below would start another 256 MB set-up for it under
+    // cs_main. Only then: with RandomX working this is never taken, and the
+    // block is hashed, scored and refused exactly as before.
+    if (pfUnverified && PoWVersionAt(nTime) == 1 && RandomXVerifierKnownUnavailable(1))
+    {
+        map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
+        if (mi != mapBlockIndex.end() && (*mi).second->GetMedianTimePast() >= (int64)PoWV2Time())
+        {
+            NoteUnverifiedByContext();
+            *pfUnverified = true;
+            return false;
+        }
+    }
     if (tl_fPoWBudgetGate)
     {
         tl_fPoWBudgetGate = false;
@@ -3884,14 +3973,14 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime, bool* pfUnverified) const
         // its work is unknown, and nothing is held against it or its sender:
         // no score, nothing recorded, so it can be fetched again once the
         // node can check it. Every node that can check it decides as before.
+        // Not logged here: ProcessBlock logs these at most once a minute
+        // (NoteUnverifiedBlock), and the check at load says so itself.
         uint256 hashPoW;
         if (!GetPoWHashChecked(hashPoW))
         {
             if (pfUnverified)
                 *pfUnverified = true;
-            return error("CheckBlock() : RandomX is not available on this node; the proof of work of block %s "
-                         "cannot be checked, so the block is not accepted",
-                         GetHash().ToString().substr(0,14).c_str());
+            return false;
         }
         if (hashPoW > CBigNum().SetCompact(nBits).getuint256())
             return DoS(pnDoS, 50, error("CheckBlock() : RandomX proof-of-work does not match nBits"));
@@ -4295,9 +4384,18 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS, bool* pfUnverified)
     }
 
     // Preliminary checks
-    if (!pblock->CheckBlock(pnDoS, true, pfUnverified))
+    bool fUnverified = false;
+    if (!pblock->CheckBlock(pnDoS, true, &fUnverified))
     {
         delete pblock;
+        if (fUnverified)
+        {
+            // Work this node could not check: one line a minute at most.
+            if (pfUnverified)
+                *pfUnverified = true;
+            NoteUnverifiedBlock(hash, pfrom);
+            return false;
+        }
         return error("ProcessBlock() : CheckBlock FAILED");
     }
 
@@ -4539,14 +4637,15 @@ bool LoadBlockIndex(bool fAllowNew)
     if (!RandomXInit())
         return error("LoadBlockIndex() : RandomXInit failed");
     // A node that cannot check proof of work must not follow any chain, so it
-    // does not start: the verifier of the version in force now is set up
-    // here, not on the first block. Once set up it is never released.
-    {
-        int nPoWVersion = PoWVersionAt((unsigned int)GetAdjustedTime());
-        if (!RandomXVerifierReady(nPoWVersion))
-            return error("LoadBlockIndex() : RandomX v%d could not be set up (it needs about 256 MB of free memory); "
-                         "this node cannot check proof of work and will not start", nPoWVersion);
-    }
+    // does not start: the v2 verifier is set up here, not on the first block.
+    // v2, not "the version in force now" by the local clock: both networks
+    // are past the switch, and a device whose clock reads a date before it
+    // would set up only v1 here and meet v2 later, mid-sync. Once set up a
+    // verifier is never released. (v1, needed only while the best chain is
+    // still before the switch, is checked once the index is loaded, below.)
+    if (!RandomXVerifierReady(2))
+        return error("LoadBlockIndex() : RandomX v2 could not be set up (it needs about 256 MB of free memory); "
+                     "this node cannot check proof of work and will not start");
 
     //
     // Load block index
@@ -4718,6 +4817,16 @@ bool LoadBlockIndex(bool fAllowNew)
         if (!block.AddToBlockIndex(nFile, nBlockPos))
             return error("LoadBlockIndex() : genesis block not accepted");
     }
+
+    // A best chain that ends before the switch (a new node at genesis, or one
+    // stopped mid-sync) still has v1 blocks to check. Without v1 every one of
+    // them would be refused as unverified and fetched again, for ever: a node
+    // that downloads and throws away the same blocks, never syncing, and
+    // never saying why. It does not start instead, and says why.
+    if (pindexBest && pindexBest->nTime < PoWV2Time() && !RandomXVerifierReady(1))
+        return error("LoadBlockIndex() : RandomX v1 could not be set up (it needs about 256 MB more free memory); "
+                     "the best chain here (height %d) ends before the PoW v2 switch, so this node still has v1 blocks "
+                     "to check and cannot sync without it; not starting", nBestHeight);
 
     return true;
 }
@@ -5620,10 +5729,30 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             // This node could not compute the block's proof of work: the
             // fault is here, not the sender's. Not taken, not scored, and not
             // remembered as asked for, so it is fetched again once this node
-            // can check it.
-            LogPrintAlways("net", "block %s from %s not accepted: RandomX is not available on this node to check its proof of work\n",
-                           inv.hash.ToString().substr(0,14).c_str(), pfrom->addr.ToString().c_str());
+            // can check it. Logged by ProcessBlock, at most once a minute.
             mapAlreadyAskedFor.erase(inv);
+            // Nothing slows such blocks down, so a peer that sends more than
+            // a few a minute is disconnected: never scored and never banned
+            // (its blocks may be good, the fault is here), only made to stop
+            // costing this node a parse, a lookup and a share of the minute's
+            // RandomX set-up attempt.
+            int64 nNow = GetTime();
+            if (nNow < pfrom->nUnverifiedWindowStart || nNow - pfrom->nUnverifiedWindowStart >= UNVERIFIED_BLOCKS_PEER_WINDOW)
+            {
+                pfrom->nUnverifiedWindowStart = nNow;
+                pfrom->nUnverifiedBlocks = 0;
+            }
+            if (++pfrom->nUnverifiedBlocks > MAX_UNVERIFIED_BLOCKS_PER_PEER && !pfrom->fDisconnect)
+            {
+                pfrom->fDisconnect = true;
+                pfrom->fDropWithoutDrain = true;
+                NoteUnverifiedPeerDropped();
+            }
+            // fContinue is left alone on purpose, as for a block the inbound
+            // budget refused below: asking this peer for the rest of its
+            // chain would only bring more blocks this node cannot check.
+            // hashInvContinue stays set, so the rest is asked for once this
+            // block arrives again and can be checked.
             return true;
         }
         if (fRefused)

@@ -104,18 +104,28 @@ void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold);
 
 // Set up the cache and verification VM of one version now. False when that
 // cannot be done (not enough memory for the 256 MB cache, or the VM could not
-// be created). Startup asks for the current version and refuses to run
-// without it: a node that cannot check proof of work must not follow any
-// chain. Once set up, a version's verifier is never released.
+// be created). Startup asks for v2 always, and for v1 too while the best
+// chain still ends before the switch, and refuses to run without them: a node
+// that cannot check proof of work must not follow any chain. Once set up, a
+// version's verifier is never released.
 bool RandomXVerifierReady(int nVersion);
 
 // True when the last attempt to set up a verifier failed (for the message a
-// failed startup gives).
+// failed startup gives). An attempt is only made when the retry delay allows
+// one, so a call turned away by the delay does not change it.
 bool RandomXSetupFailed();
+
+// True when that version's verifier is not set up and its last set-up
+// attempt failed. Makes no attempt and takes no lock: for callers that can
+// decide without the hash and want to avoid starting a set-up for nothing.
+// With RandomX working this is always false.
+bool RandomXVerifierKnownUnavailable(int nVersion);
 
 // Self-test only: while set, every verifier behaves as if RandomX could not
 // be set up, whatever was set up before, and no new miner VM can be made.
+// The per-version form does that for one version only.
 void RandomXForceUnavailableForTest(bool fUnavailable);
+void RandomXForceVersionUnavailableForTest(int nVersion, bool fUnavailable);
 
 // Create a VM for a mining thread (own VM, not shared) keyed for one version.
 // Uses that version's dataset (fast) if ready, otherwise its cache (light).

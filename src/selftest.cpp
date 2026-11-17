@@ -17635,6 +17635,14 @@ static int RunBlockIndexLoadSelfTest()
 // cache or the verification VM failing to be made.
 // ---------------------------------------------------------------------------
 
+static bool PoWUnavailableProcess(const CBlock& block, CNode* pfrom, int* pnDoS, bool* pfUnverified)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_main)
+        fOk = ProcessBlock(pfrom, new CBlock(block), pnDoS, pfUnverified);
+    return fOk;
+}
+
 static int RunPoWUnavailableSelfTest()
 {
     fflush(stdout);
@@ -17651,8 +17659,20 @@ static int RunPoWUnavailableSelfTest()
     std::vector<CNode*> vPeers;
     try
     {
-        if (!LoadBlockIndex() || pindexBest == NULL || pindexBest->nHeight != 0)
+        // ---- A new node (best chain at genesis, before the switch) still has
+        // v1 blocks to check: without v1 it does not start, rather than
+        // fetching and throwing away v1 blocks for ever.
+        {
+            RandomXForceVersionUnavailableForTest(1, true);
+            bool fLoaded = LoadBlockIndex();
+            RandomXForceVersionUnavailableForTest(1, false);
+            nFail += Check(!fLoaded && RandomXVerifierReady(2) && pindexBest != NULL && pindexBest->nTime < PoWV2Time(),
+                           "v2 set up, v1 not: a node at genesis (before the switch) refuses to start") ? 0 : 1;
+        }
+        if (!ReorgTestReload() || pindexBest == NULL || pindexBest->nHeight != 0)
             throw std::runtime_error("LoadBlockIndex failed");
+        nFail += Check(RandomXVerifierReady(1) && RandomXVerifierReady(2),
+                       "with both versions available it starts, both verifiers set up at startup") ? 0 : 1;
         LimitOrphanBlocks(0);
 
         // A1 A2 A3 meet their target; Bad is A1 with a nonce whose work misses
@@ -17827,6 +17847,137 @@ static int RunPoWUnavailableSelfTest()
             P2PDoSProcess(q, "block", ssBad);
             nFail += Check(q->nMisbehavior == 50 && !mapBlockIndex.count(hBad),
                            "and Bad is refused for its work and its sender scored 50, as before") ? 0 : 1;
+        }
+
+        // ---- One log line a minute at most, however many such blocks arrive.
+        {
+            RandomXForceUnavailableForTest(true);
+            UnverifiedLogAgeForTest(-1);
+            const int64 nBlocks0 = nBlocksUnverified, nLines0 = nUnverifiedLogLines;
+            CBlock V = Bad;
+            bool fAll = true;
+            for (int i = 0; i < 20; i++)
+            {
+                V.nNonce = Bad.nNonce + 1000 + i;
+                int nDoS = -1;
+                bool fUnverified = false;
+                fAll &= !PoWUnavailableProcess(V, NULL, &nDoS, &fUnverified) && nDoS == 0 && fUnverified;
+            }
+            nFail += Check(fAll && nBlocksUnverified == nBlocks0 + 20 && nUnverifiedLogLines == nLines0 + 1,
+                           "20 blocks that cannot be checked: all refused unscored, all counted, one log line") ? 0 : 1;
+            UnverifiedLogAgeForTest(UNVERIFIED_BLOCKS_PEER_WINDOW + 1);
+            V.nNonce = Bad.nNonce + 1100;
+            PoWUnavailableProcess(V, NULL, NULL, NULL);
+            V.nNonce = Bad.nNonce + 1101;
+            PoWUnavailableProcess(V, NULL, NULL, NULL);
+            nFail += Check(nBlocksUnverified == nBlocks0 + 22 && nUnverifiedLogLines == nLines0 + 2,
+                           "a minute later one more line (with the count since the last), then quiet again") ? 0 : 1;
+        }
+
+        // ---- A peer that keeps sending them is disconnected: not scored, not banned.
+        {
+            CNode* d = P2PDoSPeer(false);
+            d->strBtfAddr = "powunavailableselftest.btf";
+            vPeers.push_back(d);
+            const int64 nDropped0 = nUnverifiedPeersDropped;
+            CBlock V = Bad;
+            for (int i = 0; i < MAX_UNVERIFIED_BLOCKS_PER_PEER; i++)
+            {
+                V.nNonce = Bad.nNonce + 2000 + i;
+                CDataStream ss(SER_NETWORK);
+                ss << V;
+                P2PDoSProcess(d, "block", ss);
+            }
+            nFail += Check(!d->fDisconnect && d->nMisbehavior == 0 && nUnverifiedPeersDropped == nDropped0,
+                           strprintf("a peer that sent %d such blocks in a minute stays connected, unscored",
+                                     MAX_UNVERIFIED_BLOCKS_PER_PEER).c_str()) ? 0 : 1;
+            V.nNonce = Bad.nNonce + 2100;
+            CDataStream ss(SER_NETWORK);
+            ss << V;
+            P2PDoSProcess(d, "block", ss);
+            nFail += Check(d->fDisconnect && d->nMisbehavior == 0 && !BtfIsBanned(d->strBtfAddr) &&
+                           nUnverifiedPeersDropped == nDropped0 + 1 && !mapBlockIndex.count(V.GetHash()),
+                           "one more and it is disconnected, with no score and no ban") ? 0 : 1;
+            RandomXForceUnavailableForTest(false);
+        }
+
+        // ---- B1..B4: a v2-era branch off genesis, which becomes the best chain.
+        CBlock B[4];
+        {
+            const unsigned int T = PoWV2Time();
+            static const unsigned int nHintB[4] = { 14044, 104, 2035, 8495 };
+            uint256 hPrev = pindexGenesisBlock->GetBlockHash();
+            for (int i = 0; i < 4; i++)
+            {
+                B[i] = OrphanTestBlock(hPrev, i + 1, 21 + i, T + 120 * (i + 1), nHintB[i],
+                                       strprintf("B%d", i + 1).c_str());
+                hPrev = B[i].GetHash();
+            }
+            CNode* p = P2PDoSPeer(false);
+            vPeers.push_back(p);
+            for (int i = 0; i < 4; i++)
+            {
+                CDataStream ss(SER_NETWORK);
+                ss << B[i];
+                P2PDoSProcess(p, "block", ss);
+            }
+            nFail += Check(p->nMisbehavior == 0 && nBestHeight == 4 && pindexBest->GetBlockHash() == B[3].GetHash() &&
+                           pindexBest->GetMedianTimePast() >= (int64)T,
+                           "B1..B4 (v2-era) connect and are the best chain, its median time past the switch") ? 0 : 1;
+        }
+
+        // ---- A v1-era block on B4 is ruled out by its parent's median time:
+        // with RandomX working it is hashed and scored as before; with v1
+        // known to be unavailable it is refused before any hash.
+        {
+            CBlock C;
+            CTransaction cb;
+            cb.vin.resize(1);
+            cb.vin[0].prevout.SetNull();
+            cb.vin[0].scriptSig = CScript() << 5 << 31;
+            cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+            C.vtx.push_back(cb);
+            C.nVersion = 1;
+            C.hashPrevBlock = B[3].GetHash();
+            C.nTime = PoWV2Time() - 1;
+            C.nBits = bnProofOfWorkLimit.GetCompact();
+            C.hashMerkleRoot = C.BuildMerkleTree();
+            C.nNonce = 0;
+            while (C.GetPoWHash() <= hashTarget)
+                C.nNonce++;
+            const int64 nByContext0 = nBlocksUnverifiedByContext;
+            CNode* q = P2PDoSPeer(false);
+            vPeers.push_back(q);
+            CDataStream ss(SER_NETWORK);
+            ss << C;
+            P2PDoSProcess(q, "block", ss);
+            nFail += Check(q->nMisbehavior == 50 && nBlocksUnverifiedByContext == nByContext0 && !mapBlockIndex.count(C.GetHash()),
+                           "RandomX working: a v1-era child of B4 with bad work is hashed and its sender scored 50, as before") ? 0 : 1;
+
+            RandomXForceVersionUnavailableForTest(1, true);
+            const int64 nBlocks0 = nBlocksUnverified;
+            int nDoS = -1;
+            bool fUnverified = false;
+            C.nNonce++;
+            bool fOk = PoWUnavailableProcess(C, NULL, &nDoS, &fUnverified);
+            nFail += Check(!fOk && nDoS == 0 && fUnverified && nBlocksUnverifiedByContext == nByContext0 + 1 &&
+                           nBlocksUnverified == nBlocks0 + 1 && !mapBlockIndex.count(C.GetHash()),
+                           "v1 unavailable: the same kind of block is refused before any hash, unscored, as unverified") ? 0 : 1;
+            {
+                CBlock V = Bad;
+                V.nNonce = Bad.nNonce + 3000;
+                nDoS = -1;
+                fUnverified = false;
+                fOk = PoWUnavailableProcess(V, NULL, &nDoS, &fUnverified);
+                nFail += Check(!fOk && nDoS == 0 && fUnverified && nBlocksUnverifiedByContext == nByContext0 + 1,
+                               "while a v1-era block on a v1-era parent (genesis) goes to the hash, and is unverified there") ? 0 : 1;
+            }
+
+            // ---- Startup with v1 unavailable: a node whose best chain is past
+            // the switch starts (it has no v1 block left to check).
+            nFail += Check(ReorgTestReload() && nBestHeight == 4 && pindexBest->GetBlockHash() == B[3].GetHash(),
+                           "v1 unavailable, best chain past the switch: the node starts") ? 0 : 1;
+            RandomXForceVersionUnavailableForTest(1, false);
         }
     }
     catch (const std::exception& e)

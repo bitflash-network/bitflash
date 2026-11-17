@@ -192,7 +192,8 @@ phase_valgrind() {
     # Skipped under Valgrind only (ASan and TSan still run them); none is a memory finding.
     # RandomX under Valgrind does not get the hardware floating-point rounding modes, so the recorded nonce hints stop meeting the target:
     vgskip="orphan-blocks|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target
-block-index-load|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target"
+block-index-load|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target
+pow-unavailable|RandomX hashes differ under Valgrind (no hardware FP rounding modes); the recorded nonce hints stop meeting the target"
     # Per-minute rations on the wall clock, with no test clock to slow down; Valgrind's slowdown runs the minute out mid-test:
     vgskip="$vgskip
 chat-dos|per-minute rations on the wall clock; Valgrind's slowdown runs the minute out mid-test
