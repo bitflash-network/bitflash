@@ -195,6 +195,9 @@ bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out);
 void P2PoolLocalNames(vector<string>& out);
 // Every peer some local pool of this node lists, once each.
 void P2PoolLocalDialList(vector<string>& out);
+// Whether some local pool of this node (not one being left) still lists
+// that peer. Takes cs_p2pool: callers may hold cs_vNodes, not the other way.
+bool P2PoolLocalStillListed(const string& strPeer);
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.
@@ -219,16 +222,23 @@ void P2PoolDrainProvenWorkForTest(bool fPools, bool fSessions);
 void P2PoolRefillProvenWorkForTest();
 size_t P2PoolRegisteredDeferredCount();
 // Self-tests: a local pool's budget for its proven peers set to n tokens; a
-// session's count of wasted tokens set; a session's own tokens (-1 with no
-// session); the connections a local pool keeps state for.
+// session's count of wasted tokens set, and read (-1 with no session); a
+// session's own tokens (-1 with no session); the connections a local pool
+// keeps state for; whether this node asked a local pool's members for a
+// share lately.
 bool P2PoolLocalSetPoolTokensForTest(const string& strName, int n);
 bool P2PoolLocalSetWorkDebtForTest(const string& strName, CNode* pnode, int nDebt);
+int P2PoolLocalWorkDebtForTest(const string& strName, CNode* pnode);
 int P2PoolLocalSessionTokensForTest(const string& strName, CNode* pnode);
 size_t P2PoolLocalPeerEntriesForTest(const string& strName);
+bool P2PoolLocalAskedForTest(const string& strName, const uint256& id);
+bool P2PoolLocalNoteAskedForTest(const string& strName, const uint256& id);
 // Self-tests: the hellos sent and read on a connection made nSecs older.
 void P2PoolLocalAgeHelloForTest(CNode* pnode, int64 nSecs);
 // Self-tests: the message thread's check of one connection for a listed
-// peer reached at another onion than the one listed (true: dropped).
+// peer reached at another onion than the one listed (true: dropped), and
+// the drops made so far made nSecs older.
 bool P2PoolLocalDropWrongOnionForTest(CNode* pnode);
+void P2PoolLocalAgeWrongOnionDropsForTest(int64 nSecs);
 
 #endif

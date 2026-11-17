@@ -1661,6 +1661,17 @@ bool BtfListedDialFailed(const string& strPeer)
     return f;
 }
 
+bool BtfListedDialDue(const string& strPeer)
+{
+    return BtfDialDue(LISTED_DIAL_KEY + strPeer);
+}
+
+void BtfListedDialBackoffEndForTest(const string& strPeer)
+{
+    CRITICAL_BLOCK(cs_btfDialSched)
+        g_btfNextDial.erase(LISTED_DIAL_KEY + strPeer);
+}
+
 static int CountListedConnected(const set<string>& setAddr)
 {
     int n = 0;
@@ -1700,10 +1711,17 @@ static int DialLocalPoolPeers(const vector<string>& vListed, int nBudget)
         {
             nConnected++;
             // Keep the ref, as ThreadBtfConnect does, and remember the pin
-            // is this code's: poolpeers releases only a pin it took.
+            // is this code's: poolpeers releases only a pin it took. Not
+            // for a connection already gone from vNodes (nothing would
+            // release the pin), nor for a peer taken off every list since
+            // the list above was read. The check and the pin go together
+            // under cs_vNodes: a list changed after them is followed by the
+            // message thread's unpinning pass, which takes cs_vNodes too and
+            // finds the pin (p2pool_net.cpp, LocalUnpinUnlisted).
             CRITICAL_BLOCK(cs_vNodes)
             {
-                if (!pnode->fNetworkNode)
+                bool fLive = std::find(vNodes.begin(), vNodes.end(), pnode) != vNodes.end();
+                if (fLive && !pnode->fNetworkNode && P2PoolLocalStillListed(strPeer))
                 {
                     pnode->fNetworkNode = true;
                     pnode->fLocalPoolPin = true;

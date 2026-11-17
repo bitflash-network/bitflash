@@ -58,10 +58,12 @@ void BtfNoteP2PoolPeer(const string& strBtfAddr, bool fP2Pool);
 void BtfNoteP2PoolHints(const vector<string>& vBtfAddr);
 void BtfKnownP2PoolPeers(vector<string>& vOut, size_t nMax);
 // A listed peer of a local pool (ADDR@HOST.onion[:PORT]): dials of it are
-// scheduled apart from the address's ordinary dials, and whether its last
-// dial failed.
+// scheduled apart from the address's ordinary dials, whether its last dial
+// failed, and whether its backoff has run out (self-tests: end it now).
 void BtfNoteListedDialResult(const string& strPeer, bool fOk);
 bool BtfListedDialFailed(const string& strPeer);
+bool BtfListedDialDue(const string& strPeer);
+void BtfListedDialBackoffEndForTest(const string& strPeer);
 // The pinned onion seeds of the active network. The chat app starts from these
 // the same way a node does: no server to ask first.
 void BtfSeedOnions(vector<string>& vOut);
