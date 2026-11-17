@@ -52,6 +52,9 @@ jobs:
       - name: Run P2Pool share-chain fuzz smoke
         run: make fuzz-p2pool-smoke
 
+      - name: Run local pool messages fuzz smoke (hello, handle, shares, paced serves)
+        run: make fuzz-p2plocal-smoke
+
       - name: Run light-client peer fuzz smoke (headers, blocks, filters, merkle differential)
         run: make fuzz-light-peer-smoke
 

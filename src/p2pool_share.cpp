@@ -57,6 +57,11 @@ PoolRules::PoolRules()
     memset(anchorKey, 0, sizeof(anchorKey));
 }
 
+PoolRules::~PoolRules()
+{
+    OPENSSL_cleanse(anchorKey, sizeof(anchorKey));
+}
+
 uint64_t UnclePaid(uint64_t work, unsigned int nPct)
 {
     return work / 100 * nPct + (work % 100) * nPct / 100;
@@ -133,10 +138,13 @@ bool CheckAnchor(const PoolRules& rules, const CTransaction& coinbase, const Sha
     {
         // Pool zero's rule, frozen: exactly one "p2p" push, whatever else.
         uint256 hashCommit;
-        return !d.fX && FindCommitment(coinbase, hashCommit) && hashCommit == d.GetHash();
+        return !d.fX && !d.fSalt && FindCommitment(coinbase, hashCommit) && hashCommit == d.GetHash();
     }
-    // A share of another pool names that pool, and never pool zero's form.
+    // A share of another pool names that pool, and never pool zero's form; a
+    // local pool's carries its salt, a registered pool's none.
     if (!d.fX || d.poolId != rules.poolId || rules.poolId == 0)
+        return false;
+    if (d.fSalt != (rules.nAnchor == ANCHOR_P2L))
         return false;
     return CheckAnchorX(rules, coinbase, d);
 }

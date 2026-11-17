@@ -107,6 +107,10 @@ void AckTag(const unsigned char A[32], const std::string& O, const unsigned char
 // h = HMAC(A, "session" || O || nA || nB), first 8 bytes.
 void SessionHandle(const unsigned char A[32], const std::string& O, const unsigned char nA[32],
                    const unsigned char nB[32], unsigned char out[HANDLE_BYTES]);
+// The handle as the uint64 the messages carry: its 8 bytes read as a
+// little-endian number, as the node's serialization writes integers, so the
+// bytes on the wire are h on every host.
+uint64_t HandleValue(const unsigned char h[HANDLE_BYTES]);
 
 static const size_t MAX_LOCAL_POOLS = 4;        // per node
 static const size_t MAX_LISTED_PEERS = 16;      // per local pool
@@ -132,9 +136,10 @@ struct HelloLimiter
 class Sessions
 {
 public:
-    explicit Sessions(const Keys& keysIn) : keys(keysIn) {}
-
-    const Keys& GetKeys() const { return keys; }
+    // Keeps A alone of the keys, and wipes it when it goes (each copy its
+    // own).
+    explicit Sessions(const Keys& keysIn);
+    ~Sessions();
 
     // Initiator, step 1: the hello for a listed peer dialled at onion O.
     // False (send nothing) when the pool is at its session cap, the onion is
@@ -179,7 +184,7 @@ private:
     {
         unsigned char h[HANDLE_BYTES];
     };
-    Keys keys;
+    unsigned char A[32];
     std::map<uint64_t, Half> mapOut;        // hellos sent, waiting for a reply
     std::map<uint64_t, Half> mapPending;    // replies sent, waiting for an ack
     std::map<uint64_t, Handle> mapSession;

@@ -714,8 +714,29 @@ bool ShareChain::Heavier(const uint256& id, int64 nNow) const
 void ShareChain::History(vector<Share>& out) const
 {
     out.clear();
-    set<uint256> seen;
     vector<const Entry*> v;
+    HistoryEntries(v);
+    for (size_t i = 0; i < v.size(); i++)
+        out.push_back(v[i]->share);
+}
+
+void ShareChain::HistoryIds(vector<uint256>& idsOut, vector<int>& heightsOut) const
+{
+    idsOut.clear();
+    heightsOut.clear();
+    vector<const Entry*> v;
+    HistoryEntries(v);
+    for (size_t i = 0; i < v.size(); i++)
+    {
+        idsOut.push_back(v[i]->share.GetId());
+        heightsOut.push_back(v[i]->nHeight);
+    }
+}
+
+void ShareChain::HistoryEntries(vector<const Entry*>& v) const
+{
+    v.clear();
+    set<uint256> seen;
     uint256 cur = hashTip;
     for (unsigned int n = 0; n < rules.HistoryShares() && cur != 0; n++)
     {
@@ -734,8 +755,6 @@ void ShareChain::History(vector<Share>& out) const
     }
     // Oldest first, a parent always before its children.
     std::stable_sort(v.begin(), v.end(), [](const Entry* a, const Entry* b) { return a->nHeight < b->nHeight; });
-    for (size_t i = 0; i < v.size(); i++)
-        out.push_back(v[i]->share);
 }
 
 // The deepest share held on the line through 'id'. 'roots' remembers the
