@@ -351,6 +351,29 @@ int main()
             CHECK(b.OnHello(117, onB, hello, nB, 2001, reply), "a session closed makes room for one more");
         }
         {
+            // The other side lost its session (taken off the list and put
+            // back): its fresh hello on the same connection is answered, at
+            // the cap too, and the ack replaces the session in its place.
+            poollocal::Sessions b(kPw);
+            std::vector<poollocal::Sessions> peers(16, poollocal::Sessions(kPw));
+            int nOk = 0;
+            for (int i = 0; i < 16; i++)
+                if (Shake(peers[i], 1, b, 100 + i, ONION_B, onB, (unsigned char)(40 + 2 * i), 3000))
+                    nOk++;
+            unsigned char hOld[8], hNew[8];
+            bool fOld = nOk == 16 && b.SessionOf(100, hOld);
+            peers[0].Close(1);
+            bool fAgain = Shake(peers[0], 1, b, 100, ONION_B, onB, 90, 3100);
+            CHECK(fOld && fAgain && b.Count() == 16 && b.SessionOf(100, hNew) && memcmp(hOld, hNew, 8) != 0 &&
+                  !b.HasSession(100, hOld),
+                  "a member that lost its session opens a new one on the same connection, in place of the old");
+            poollocal::Hello h2, r2;
+            unsigned char nAgain[32]; Fill(nAgain, 32, 90);
+            poollocal::Sessions other(kPw);
+            other.StartHello(1, ONION_B, nAgain, h2);
+            CHECK(!b.OnHello(100, onB, h2, nB, 3101, r2), "a replayed hello still gets silence there");
+        }
+        {
             poollocal::HelloLimiter lim;
             CHECK(lim.Allow(1000), "a connection's first hello is read");
             CHECK(!lim.Allow(1059), "a second within the minute is dropped");

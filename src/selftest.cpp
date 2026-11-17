@@ -8501,6 +8501,26 @@ static int RunP2PoolLocalSelfTest()
                       last[12] == 2 && P2PoolRegisteredServesForTest() == nServes;
         nFail += Check(fEnded, "a share pruned from the chain before its part goes ends the serve early, flagged so") ? 0 : 1;
     }
+    {
+        // A member that lost its session (its operator took this node off
+        // the list and put it back) says hello again on the same
+        // connection: answered, and the new handle replaces the old one.
+        P2PoolLocalAgeHelloForTest(pM2, 120);
+        P2PoolLocalStatusInfo st0, st1;
+        bool fBefore = P2PoolLocalStatus("home", st0);
+        uint64 h2b = 0;
+        bool fRe = OpenLocalSession(pM2, keys.A, O, 0x64, h2b);
+        vector<uint256> vIds(1, g.GetId());
+        size_t nShares = CountSent(pM2, "p2lshare");
+        SendLocalItem(pM2, "p2lgetsh", h2, vIds);
+        bool fOldDead = CountSent(pM2, "p2lshare") == nShares;
+        SendLocalItem(pM2, "p2lgetsh", h2b, vIds);
+        bool fNewLive = CountSent(pM2, "p2lshare") == nShares + 1;
+        nFail += Check(fBefore && fRe && h2b != h2 && P2PoolLocalStatus("home", st1) && st1.nSessions == st0.nSessions &&
+                       fOldDead && fNewLive && pM2->nMisbehavior == 0,
+                       "a member that lost its session opens a new one on the same connection, in place of the old") ? 0 : 1;
+        h2 = h2b;
+    }
 
     // ---- leaving
     {

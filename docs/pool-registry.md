@@ -1859,7 +1859,10 @@ nodes that accept connections.
   receiver checks at most one `p2lhello` per connection per minute and 8 in
   the life of a connection, and keeps the last 256 `nA` of each pool to drop
   a repeated one; a reply not acked within 30 s is forgotten and holds no
-  session. At most 16 sessions per local pool, inbound and outbound
+  session. A member's hello on a connection that already holds a session
+  of that pool is answered, and its ack replaces that session: the other
+  side has lost it (its operator took this node off the list and put it
+  back). At most 16 sessions per local pool, inbound and outbound
   together; a hello beyond that gets the same silence as no match. Hellos
   over these limits are dropped unread, and nobody is scored for a hello that
   matches nothing (a non-member listing this node by mistake is not an
