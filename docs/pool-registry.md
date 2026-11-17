@@ -1882,10 +1882,18 @@ nodes that accept connections.
 
 A local pool spends from the registered class of section 8, never from pool
 zero's: its shares are checked through the registered RandomX budget (a
-member in session is proven, and its shares still draw on a budget of their
+member in session is proven, and its shares still draw on budgets of their
 own: one per session, twice the pool's share rate with a small burst, and
-one for all sessions together; a share over it is held, not hashed and not
-scored), its
+one per local pool for all its sessions together, one share every 8 s with
+a burst of 16, so the members of one pool cannot spend another's; a share
+over them is held, not hashed and not scored). Within a
+pool the sessions take turns for the pool's budget: the session that wasted
+fewer of its tokens lately goes first (a token is wasted when the share it
+paid for does not become this node's tip, and one that does pays one back),
+then the one that had a token longer ago, and a share that comes in live
+waits behind one held for a session ahead of it. A member flooding side
+shares from many sessions so falls behind every member whose shares extend
+the pool's line, and a session opened again starts at the back. Its
 orphans wait in the registered queue, its serves take the 8 registered slots
 and the per-(connection, pool) limits of sections 8 and 17, with the session
 in place of the pool. On top of that: at most 4 local pools per node, at most
@@ -1900,7 +1908,9 @@ The share chain lives in `pools/local/<id>.dat` (and a fetch in progress in
 member stops, the pool stops; when one comes back with its file, the pool
 goes on from there, and when none has the file any more, starting again from
 the same code and password gives the same id and a fresh chain. Nothing is
-left anywhere else to clean up.
+left anywhere else to clean up. The file starts with a format byte (1 in
+this release); a node reads its own format only, and starts a pool whose
+file has another one from its peers, saying so in its log.
 
 ### Using it
 

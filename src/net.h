@@ -57,6 +57,11 @@ bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut);
 void BtfNoteP2PoolPeer(const string& strBtfAddr, bool fP2Pool);
 void BtfNoteP2PoolHints(const vector<string>& vBtfAddr);
 void BtfKnownP2PoolPeers(vector<string>& vOut, size_t nMax);
+// A listed peer of a local pool (ADDR@HOST.onion[:PORT]): dials of it are
+// scheduled apart from the address's ordinary dials, and whether its last
+// dial failed.
+void BtfNoteListedDialResult(const string& strPeer, bool fOk);
+bool BtfListedDialFailed(const string& strPeer);
 // The pinned onion seeds of the active network. The chat app starts from these
 // the same way a node does: no server to ask first.
 void BtfSeedOnions(vector<string>& vOut);
@@ -814,6 +819,10 @@ public:
     bool fClient;
     bool fInbound;
     bool fNetworkNode;
+    // The fNetworkNode pin is the local pools' own (net.cpp,
+    // DialLocalPoolPeers): set only when that code pinned a connection
+    // nothing else had, cleared when anything else wants it kept too.
+    bool fLocalPoolPin;
     bool fDisconnect;
     // P2Pool history (p2pool_net.cpp): when we last sent this peer ours, when
     // we asked it for its own (0: not asked, or the answer is over), and how
@@ -973,6 +982,7 @@ public:
         fClient = false; // set by version message
         fInbound = fInboundIn;
         fNetworkNode = false;
+        fLocalPoolPin = false;
         fDisconnect = false;
         nP2PoolSyncServed = 0;
         nP2PoolSyncAskedAt = 0;

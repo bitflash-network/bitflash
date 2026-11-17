@@ -5212,18 +5212,24 @@ bool JsonRpcRecvRequest(btf_socket_t s, string& out, int nTimeoutSecs)
     SetRpcSocketTimeout(s, nTimeoutSecs);
     char buf[4096];
     int64 nStart = GetTime();
+    bool fWhole = false;
     while (GetTime() - nStart < nTimeoutSecs)
     {
         int r = recv(s, buf, sizeof(buf), 0);
-        if (r <= 0) return false;
+        if (r <= 0) break;
         out.append(buf, r);
         size_t nTotal = 0;
         int n = JsonRpcRequestLength(out, nTotal);
-        if (n < 0) return false;
+        if (n < 0) break;
         if (n > 0)
-            return true;
+        {
+            fWhole = true;
+            break;
+        }
     }
-    return false;
+    // The last chunk read may hold a password (HandleConnection wipes out).
+    OPENSSL_cleanse(buf, sizeof(buf));
+    return fWhole;
 }
 
 static void SendHttp(btf_socket_t s, int nCode, const string& strBody)
@@ -5248,6 +5254,21 @@ static void SendHttp(btf_socket_t s, int nCode, const string& strBody)
     }
 }
 
+static void WipeString(string& s)
+{
+    if (!s.empty())
+        OPENSSL_cleanse(&s[0], s.size());
+}
+
+// The request's copies, wiped however the handler returns: the headers hold
+// the RPC credential, the body a pool call's password.
+struct WipeOnReturn
+{
+    string& s;
+    explicit WipeOnReturn(string& sIn) : s(sIn) {}
+    ~WipeOnReturn() { WipeString(s); }
+};
+
 static bool Authorised(const string& strHeaders)
 {
     // The first Authorization header line, scheme Basic in any case; the
@@ -5259,9 +5280,24 @@ static bool Authorised(const string& strHeaders)
     if (v.empty()) return false;
     const string& value = v[0];
     if (value.size() < 6 || !HttpNameIs(value.substr(0, 5), "basic") || (value[5] != ' ' && value[5] != '\t'))
+    {
+        for (size_t i = 0; i < v.size(); i++)
+            WipeString(v[i]);
         return false;
-    string b64 = HttpTrim(value.substr(6));
-    return ConstantTimeEqual(Base64Decode(b64), g_rpcUser + ":" + g_rpcPassword);
+    }
+    string strRest = value.substr(6);
+    string b64 = HttpTrim(strRest);
+    WipeString(strRest);
+    string strGiven = Base64Decode(b64);
+    string strWant = g_rpcUser + ":" + g_rpcPassword;
+    bool fOk = ConstantTimeEqual(strGiven, strWant);
+    // The copies of the credential this made go with it.
+    WipeString(b64);
+    WipeString(strGiven);
+    WipeString(strWant);
+    for (size_t i = 0; i < v.size(); i++)
+        WipeString(v[i]);
+    return fOk;
 }
 
 int JsonRpcHandleRequest(const string& req, string& strReplyOut)
@@ -5272,6 +5308,7 @@ int JsonRpcHandleRequest(const string& req, string& strReplyOut)
         return 400;
     string headers = req.substr(0, nHeaderEnd);
     string body    = req.substr(nHeaderEnd + 4);
+    WipeOnReturn wipeHeaders(headers), wipeBody(body);
 
     if (!Authorised(headers))
         return 401;
@@ -5309,8 +5346,6 @@ int JsonRpcHandleRequest(const string& req, string& strReplyOut)
         reply = json{{"result", nullptr}, {"error", json{{"code", -32600}, {"message", e.what()}}}, {"id", nullptr}};
     }
     WipeJsonStrings(parsed);
-    if (!body.empty())
-        OPENSSL_cleanse(&body[0], body.size());
     strReplyOut = reply.dump();
     return 200;
 }
@@ -5320,14 +5355,14 @@ static void HandleConnection(btf_socket_t s)
     string req;
     if (!JsonRpcRecvRequest(s, req, 30))
     {
+        WipeString(req);
         rpc_close(s);
         return;
     }
     string strReply;
     int nCode = JsonRpcHandleRequest(req, strReply);
     // A pool call's password was in it.
-    if (!req.empty())
-        OPENSSL_cleanse(&req[0], req.size());
+    WipeString(req);
     if (nCode == 401)
     {
         // Same answer whether the user is unknown or the password is wrong,

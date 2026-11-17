@@ -89,15 +89,23 @@ static const size_t MAX_DEFERRED_ASKS = 8;
 // makes one share a spacing (20 s at the fastest a record allows), and each
 // reaches a node once per session but is hashed once (a share already held
 // costs no hash). A session: twice its pool's rate, with a burst for the
-// parents and uncles asked for after a gap. All sessions together: twice
-// the rate of four pools at the fastest spacing.
+// parents and uncles asked for after a gap. All sessions of one pool
+// together: one token every 8 s against one share every 20 s at the fastest
+// spacing, with a burst; each pool has its own, so the members of one pool
+// cannot spend another's (four pools, the most a node joins, get one token
+// every 2 s in all).
 static const int SESSION_WORK_BURST = 16;
-static const int PROVEN_WORK_BURST = 64;
-static const int64 PROVEN_WORK_SECS = 20 / (2 * 4);
+static const int POOL_WORK_BURST = 16;
+static const int64 POOL_WORK_SECS = 8;
 static int64 SessionWorkSecs(unsigned int nSpacing)
 {
     return std::max((int64)1, (int64)nSpacing / 2);
 }
+// Within a pool, the sessions take turns (ProvenBefore): the one that wasted
+// fewer of its tokens lately first. A token spent on a share that did not
+// become this node's tip is wasted; one that did pays one back. Capped, so a
+// session that turns honest is back in line within a few dozen shares.
+static const int MAX_WORK_DEBT = 64;
 
 // One class of P2Pool traffic. Under cs_p2pool.
 struct PoolClass
@@ -115,15 +123,11 @@ struct PoolClass
     // Histories asked of unproven peers: each one is up to three histories of
     // shares to hash. Peers this node dialled are asked as before.
     P2PoolBudget budgetHistoryAsk;
-    // The registered class only: RandomX hashes of shares that proven peers
-    // (members in session, every connection this node dialled among them)
-    // send unasked, for all sessions together; each session also has its
-    // own (PeerPool::budgetWork). Pool zero's proven peers draw on nothing,
-    // as in 1.2.34, and this one is never used for it. A member is a member
-    // only by password: a dishonest one could otherwise make every member
-    // hash side lines at a home pool's floor (about 4096 hashes a share) as
-    // fast as it found them, on the thread that also serves pool zero.
-    P2PoolBudget budgetProvenWork;
+    // Shares that proven peers of the registered class (members in session,
+    // every connection this node dialled among them) send unasked are not
+    // hashed on this class's budgets but on their pool's and their session's
+    // (PoolState::budgetProvenWork, PeerPool::budgetWork). Pool zero's proven
+    // peers draw on nothing, as in 1.2.34.
 
     map<uint256, vector<OrphanShare> > mapOrphanShares;
     set<uint256> setOrphanIds;
@@ -144,7 +148,7 @@ struct PoolClass
 
     explicit PoolClass(bool fZeroIn)
         : fZero(fZeroIn), budgetShareWork(32, 2), budgetHistoryServe(4, 60), budgetHistoryAsk(2, 60),
-          budgetProvenWork(PROVEN_WORK_BURST, PROVEN_WORK_SECS), nLastOrphanExpiry(0), nDeferredSeq(0) {}
+          nLastOrphanExpiry(0), nDeferredSeq(0) {}
 
     bool OrphanSeen(const uint256& id) const { return setOrphanSeen.count(id) != 0; }
     void MarkOrphanSeen(const uint256& id);
@@ -182,12 +186,16 @@ struct PeerPool
     size_t nServedShares;
     uint256 hashResume;
     // RandomX hashes of shares it sends unasked while proven (section 8,
-    // PoolClass::budgetProvenWork), sized from its pool's spacing.
+    // PoolState::budgetProvenWork), sized from its pool's spacing; when it
+    // last took one of its pool's, and how many it wasted lately (its place
+    // in the pool's turns, ProvenBefore).
     P2PoolBudget budgetWork;
+    int64 nLastWorkAt;
+    int nWorkDebt;
     explicit PeerPool(unsigned int nSpacing = 0)
         : nSyncServed(0), nSyncAskedAt(0), nHistoryRecv(0), nLastGood(0),
           nAsksSince(0), nAsks(0), nServedShares(0), hashResume(0),
-          budgetWork(SESSION_WORK_BURST, SessionWorkSecs(nSpacing)) {}
+          budgetWork(SESSION_WORK_BURST, SessionWorkSecs(nSpacing)), nLastWorkAt(0), nWorkDebt(0) {}
 };
 
 struct PeerRef
@@ -217,11 +225,20 @@ struct PoolState
     int64 nLastSave;
     int nAskedOnOpen;
     // Sessions of a pool other than zero, by connection (see "Local pools").
+    // An entry is erased on the message thread only, which holds references
+    // into it (PeerRef) outside cs_p2pool.
     map<CNode*, PeerPool> mapPeer;
+    // A pool other than zero: RandomX hashes of shares its proven peers send
+    // unasked, all its sessions together. A member is a member only by
+    // password: a dishonest one could otherwise make every member hash side
+    // lines at a home pool's floor (about 4096 hashes a share) as fast as it
+    // found them, on the thread that also serves pool zero. Unused for pool
+    // zero.
+    P2PoolBudget budgetProvenWork;
 
     PoolState(PoolClass* clsIn, ShareChain* chainIn, const string& strFileIn)
         : cls(clsIn), fZero(clsIn->fZero), chain(chainIn), strFile(strFileIn),
-          nFirstHistoryAsk(0), nLastSave(0), nAskedOnOpen(0) {}
+          nFirstHistoryAsk(0), nLastSave(0), nAskedOnOpen(0), budgetProvenWork(POOL_WORK_BURST, POOL_WORK_SECS) {}
 
     size_t SharesPerMessage() const { return fZero ? SHARES_PER_MESSAGE : REG_SHARES_PER_MESSAGE; }
     size_t PartBytes() const { return fZero ? HISTORY_PART_BYTES : REG_HISTORY_PART_BYTES; }
@@ -314,8 +331,10 @@ static void NoteRegSpan(CNode* pnode, uint64 nFrom)
         pnode->vRegSpans.pop_front();
     // Never more than a few hundred stretches still waiting: past that the
     // two neighbours with the least between them become one, and what lay
-    // between them counts with them. The least, so a pool zero history
-    // queued between two of them is never what is joined across.
+    // between them (pool zero's bytes, if any) counts with them from then
+    // on. A heuristic: the smallest gap is joined, so a pool zero history
+    // queued between two stretches is joined across only once every other
+    // gap waiting is at least as large.
     if (pnode->vRegSpans.size() > 512)
     {
         size_t iBest = 1;
@@ -412,6 +431,11 @@ static void PushGetSh(PoolState& ps, CNode* pnode, const vector<uint256>& vIds);
 static void PushSync(PoolState& ps, CNode* pnode);
 static void PushShares(PoolState& ps, CNode* pnode, int nTipHeight, const vector<Share>& part, bool fEnd);
 
+// A local pool's share file starts with this byte, the version of what
+// follows; a build reads its own version only. Pool zero's p2pool.dat has
+// none, as in 1.2.34.
+static const unsigned char LOCAL_SHARES_FORMAT = 1;
+
 static void LoadShares(PoolState& ps)
 {
     ShareChain& chain = *ps.chain;
@@ -426,6 +450,14 @@ static void LoadShares(PoolState& ps)
             file >> nTipHeight >> v;
         else
         {
+            unsigned char nFormat = 0;
+            file >> nFormat;
+            if (nFormat != LOCAL_SHARES_FORMAT)
+            {
+                printf("p2pool: a local pool's saved share chain is in format %u, this build reads format %u only; "
+                       "starting from peers\n", (unsigned)nFormat, (unsigned)LOCAL_SHARES_FORMAT);
+                return;
+            }
             vector<ShareL> vx;
             file >> nTipHeight >> vx;
             v.assign(vx.begin(), vx.end());
@@ -456,7 +488,7 @@ static void WriteShares(const string& strFile, int nTipHeight, const vector<Shar
         CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
         if (!file)
             return;
-        file << nTipHeight << v;
+        file << LOCAL_SHARES_FORMAT << nTipHeight << v;
     }
     else
     {
@@ -524,51 +556,126 @@ static bool PeerProven(PoolState& ps, CNode* pnode)
     return (!pnode->fInbound || Peer(ps, pnode).nLastGood != 0) && pnode->nMisbehavior == 0;
 }
 
-// Under cs_p2pool. The registered class's budgets for a proven peer's share:
-// its session's and the class's, both with a token left; fTake takes one of
-// each. False for a connection with no session in that pool.
+// Under cs_p2pool. The budgets for a proven peer's share in a pool other
+// than zero: its session's and its pool's, both with a token left; fTake
+// takes one of each. False for a connection with no session in that pool.
 static bool ProvenWorkLocked(PoolState& ps, CNode* pnode, bool fTake)
 {
     map<CNode*, PeerPool>::iterator it = ps.mapPeer.find(pnode);
     if (it == ps.mapPeer.end())
         return false;
     int64 nNow = GetTime();
-    if (it->second.budgetWork.Tokens(nNow) <= 0 || ps.cls->budgetProvenWork.Tokens(nNow) <= 0)
+    if (it->second.budgetWork.Tokens(nNow) <= 0 || ps.budgetProvenWork.Tokens(nNow) <= 0)
         return false;
     if (fTake)
     {
         it->second.budgetWork.Take(nNow);
-        ps.cls->budgetProvenWork.Take(nNow);
+        ps.budgetProvenWork.Take(nNow);
+        it->second.nLastWorkAt = nNow;
     }
     return true;
+}
+
+// Under cs_p2pool. Whether session a goes before session b for its pool's
+// next token: the one that wasted fewer lately, then the one that had a
+// token longer ago, then the older connection. A connection opened again
+// and again starts each time at the back of its turn (OpenSession), and a
+// member that floods side shares from many sessions falls behind every
+// member whose shares become the tip.
+static bool ProvenBefore(const PeerPool& a, const CNode* na, const PeerPool& b, const CNode* nb)
+{
+    if (a.nWorkDebt != b.nWorkDebt)
+        return a.nWorkDebt < b.nWorkDebt;
+    if (a.nLastWorkAt != b.nLastWorkAt)
+        return a.nLastWorkAt < b.nLastWorkAt;
+    return na->nTimeConnected < nb->nTimeConnected;
+}
+
+// Under cs_p2pool. The session behind a held share of a pool other than
+// zero that would be hashed on the proven budgets; NULL if the entry holds
+// no such share.
+static PeerPool* HeldProvenSession(const P2PoolDeferred& d)
+{
+    if (!d.fShare || !d.poolShare || d.poolShare->fZero)
+        return NULL;
+    map<CNode*, PeerPool>::iterator it = d.poolShare->mapPeer.find(d.pnode);
+    if (it == d.poolShare->mapPeer.end())
+        return NULL;
+    if ((d.pnode->fInbound && it->second.nLastGood == 0) || d.pnode->nMisbehavior != 0)
+        return NULL;
+    return &it->second;
+}
+
+// Under cs_p2pool. Whether another session of this pool holds a share that
+// goes before this connection's (ProvenBefore) and that its own session's
+// budget would let through: a share that comes in live waits behind it.
+// Held shares of unproven peers, and of other pools, draw on other budgets
+// and do not count.
+static bool ProvenAheadHeld(PoolState& ps, CNode* pnode)
+{
+    map<CNode*, PeerPool>::iterator itOwn = ps.mapPeer.find(pnode);
+    if (itOwn == ps.mapPeer.end())
+        return false;
+    int64 nNow = GetTime();
+    for (map<CNode*, P2PoolDeferred>::iterator it = ps.cls->mapDeferred.begin(); it != ps.cls->mapDeferred.end(); ++it)
+    {
+        if (it->first == pnode || it->second.poolShare != &ps || it->first->fDisconnect)
+            continue;
+        PeerPool* p = HeldProvenSession(it->second);
+        if (p && p->budgetWork.Tokens(nNow) > 0 && ProvenBefore(*p, it->first, itOwn->second, pnode))
+            return true;
+    }
+    return false;
+}
+
+// What a token a proven member spent came to: its share became this node's
+// tip (one wasted token paid back), or not (one more wasted).
+static void NoteProvenWork(PoolState& ps, CNode* pnode, bool fTip)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        map<CNode*, PeerPool>::iterator it = ps.mapPeer.find(pnode);
+        if (it != ps.mapPeer.end())
+        {
+            int& n = it->second.nWorkDebt;
+            n = fTip ? std::max(0, n - 1) : std::min(MAX_WORK_DEBT, n + 1);
+        }
+    }
 }
 
 // The shared budget behind WorkGate, for one peer's share. A share that
 // comes in live waits behind any held for an older connection: else whoever
 // sends the most, on fresh connections, takes every token as it refills, and
-// the held share of an honest peer that stayed is never reached.
+// the held share of an honest peer that stayed is never reached. A proven
+// member's share in a pool other than zero waits, the same way, behind one
+// held for a session ahead of it in its pool's turns.
 class PeerWorkGate : public WorkGate
 {
 public:
     PeerWorkGate(PoolState& psIn, CNode* pnodeIn, bool fFromQueueIn)
-        : ps(psIn), k(*psIn.cls), pnode(pnodeIn), fFromQueue(fFromQueueIn) {}
+        : ps(psIn), k(*psIn.cls), pnode(pnodeIn), fFromQueue(fFromQueueIn), fTookProven(false) {}
     bool Allow()
     {
         bool f;
         CRITICAL_BLOCK(cs_p2pool)
         {
             if (!k.fZero && PeerProven(ps, pnode))
-                f = ProvenWorkLocked(ps, pnode, true);
+            {
+                f = (fFromQueue || !ProvenAheadHeld(ps, pnode)) && ProvenWorkLocked(ps, pnode, true);
+                fTookProven = fTookProven || f;
+            }
             else
                 f = (fFromQueue || !k.OlderHeld(pnode, true)) && k.budgetShareWork.Take(GetTime());
         }
         return f;
     }
+    bool TookProven() const { return fTookProven; }
 private:
     PoolState& ps;
     PoolClass& k;
     CNode* pnode;
     bool fFromQueue;
+    bool fTookProven;
 };
 
 // Unproven peers go through the gate; in the registered class, proven ones
@@ -844,7 +951,7 @@ static bool AcceptShare(PoolState& ps, const Share& s, CNode* pfrom, bool fHisto
     PeerWorkGate gate(ps, pfrom, fFromQueue);
     NodeMainView main;
     vector<Share> todo(1, s);
-    bool fFirst = true, fGood = true;
+    bool fFirst = true, fGood = true, fFirstTip = false;
     if (pfGateClosed)
         *pfGateClosed = false;
     CRITICAL_BLOCK(cs_p2pool)
@@ -894,6 +1001,8 @@ static bool AcceptShare(PoolState& ps, const Share& s, CNode* pfrom, bool fHisto
             bnTipNext.SetCompact((*ps.chain).NextShareBits((*ps.chain).Tip()));
             if (fOk)
                 NoteChainGrew(ps);
+            if (fOk && fFirst)
+                fFirstTip = (*ps.chain).Tip() == id;
         }
         if (fOk)
         {
@@ -1059,6 +1168,8 @@ static bool AcceptShare(PoolState& ps, const Share& s, CNode* pfrom, bool fHisto
             *pfGateClosed = true;
         fFirst = false;
     }
+    if (gate.TookProven())
+        NoteProvenWork(ps, pfrom, fFirstTip);
     return fGood;
 }
 
@@ -1405,7 +1516,6 @@ void PoolClass::Reset()
     budgetShareWork.Reset();
     budgetHistoryServe.Reset();
     budgetHistoryAsk.Reset();
-    budgetProvenWork.Reset();
 }
 
 // A paced serve in flight for this (connection, pool), and whether one more
@@ -1465,8 +1575,72 @@ static void ServeNow(PoolState& ps, CNode* pfrom)
         StartRegServe(ps, pfrom);
 }
 
+// The registered class: the shares held for proven members, one at a time,
+// each to the session first in its pool's turns (ProvenBefore) among those
+// whose session and pool still have a token. The rest wait for the next
+// pass.
+static void ServeProvenHeld(PoolClass& k)
+{
+    for (size_t nServed = 0; nServed < MAX_DEFERRED; nServed++)
+    {
+        CNode* pnode = NULL;
+        Share s;
+        PoolState* pool = NULL;
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            int64 nNow = GetTime();
+            map<CNode*, P2PoolDeferred>::iterator itBest = k.mapDeferred.end();
+            PeerPool* pBest = NULL;
+            for (map<CNode*, P2PoolDeferred>::iterator it = k.mapDeferred.begin(); it != k.mapDeferred.end(); ++it)
+            {
+                if (it->first->fDisconnect)
+                    continue;
+                PeerPool* p = HeldProvenSession(it->second);
+                if (!p || p->budgetWork.Tokens(nNow) <= 0 || it->second.poolShare->budgetProvenWork.Tokens(nNow) <= 0)
+                    continue;
+                if (!pBest || ProvenBefore(*p, it->first, *pBest, itBest->first) ||
+                    (!ProvenBefore(*pBest, itBest->first, *p, it->first) && it->second.nSeq < itBest->second.nSeq))
+                {
+                    pBest = p;
+                    itBest = it;
+                }
+            }
+            if (itBest != k.mapDeferred.end())
+            {
+                pnode = itBest->first;
+                k.TakeDeferred(pnode, true, &s, &pool);
+            }
+        }
+        if (!pnode || !pool)
+            return;
+        // The entry keeps its reference on the node until the pass after
+        // this one, on this thread.
+        bool fGateClosed = false, fGood = true;
+        try { fGood = AcceptShare(*pool, s, pnode, false, &fGateClosed, true); }
+        catch (std::exception& e) { LogPrint("p2pool", "p2pool: held share: %s\n", e.what()); }
+        if (!fGood)
+            pnode->Misbehaving(20);
+        else if (fGateClosed)
+        {
+            CRITICAL_BLOCK(cs_p2pool)
+            {
+                map<CNode*, P2PoolDeferred>::iterator it = k.mapDeferred.find(pnode);
+                if (it != k.mapDeferred.end() && !it->second.fShare && pool->mapPeer.count(pnode))
+                {
+                    it->second.fShare = true;
+                    it->second.share = s;
+                    it->second.poolShare = pool;
+                }
+            }
+            return;
+        }
+    }
+}
+
 static void ServeDeferredClass(PoolClass& k)
 {
+    if (!k.fZero)
+        ServeProvenHeld(k);
     vector<P2PoolDeferredRef> v;
     bool fWorkLeft;
     CRITICAL_BLOCK(cs_p2pool)
@@ -1517,11 +1691,21 @@ static void ServeDeferredClass(PoolClass& k)
                 }
                 else
                 {
-                    // Whichever budget this connection's share would draw on.
+                    // An unproven peer's share, on the class's budget. A
+                    // proven member's waits for ServeProvenHeld (it was
+                    // given its turn before this pass); one whose session
+                    // has ended since goes.
                     map<CNode*, P2PoolDeferred>::iterator itD = k.mapDeferred.find(pnode);
                     PoolState* psHeld = itD != k.mapDeferred.end() && itD->second.fShare ? itD->second.poolShare : NULL;
-                    bool fRoom = psHeld && (PeerProven(*psHeld, pnode) ? ProvenWorkLocked(*psHeld, pnode, false)
-                                                                       : k.budgetShareWork.Tokens(GetTime()) > 0);
+                    bool fRoom = false;
+                    if (psHeld && !psHeld->mapPeer.count(pnode))
+                    {
+                        itD->second.fShare = false;
+                        itD->second.share = Share();
+                        itD->second.poolShare = NULL;
+                    }
+                    else if (psHeld && !PeerProven(*psHeld, pnode))
+                        fRoom = k.budgetShareWork.Tokens(GetTime()) > 0;
                     if (fRoom)
                         fTaken = k.TakeDeferred(pnode, true, &s, &pool);
                 }
@@ -1535,13 +1719,14 @@ static void ServeDeferredClass(PoolClass& k)
                     pnode->Misbehaving(20);
                 else if (fGateClosed)
                 {
-                    // Taken by somebody else in between: back in its place.
+                    // Taken by somebody else in between: back in its place
+                    // (a local pool's, only while its session lasts).
                     if (k.fZero)
                         fWorkLeft = false;
                     CRITICAL_BLOCK(cs_p2pool)
                     {
                         map<CNode*, P2PoolDeferred>::iterator it = k.mapDeferred.find(pnode);
-                        if (it != k.mapDeferred.end() && !it->second.fShare)
+                        if (it != k.mapDeferred.end() && !it->second.fShare && (k.fZero || pool->mapPeer.count(pnode)))
                         {
                             it->second.fShare = true;
                             it->second.share = s;
@@ -1644,6 +1829,8 @@ void P2PoolDrainBudgetsForTest()
     }
 }
 
+static void LocalDrainPoolWork(int64 nNow);
+
 void P2PoolDrainRegisteredBudgetsForTest()
 {
     CRITICAL_BLOCK(cs_p2pool)
@@ -1652,7 +1839,7 @@ void P2PoolDrainRegisteredBudgetsForTest()
         classReg.budgetShareWork.Drain(nNow);
         classReg.budgetHistoryServe.Drain(nNow);
         classReg.budgetHistoryAsk.Drain(nNow);
-        classReg.budgetProvenWork.Drain(nNow);
+        LocalDrainPoolWork(nNow);
     }
 }
 
@@ -1762,6 +1949,18 @@ struct LocalPool
 
 // Under cs_p2pool.
 static vector<LocalPool*> vLocalPools;
+
+// Sessions a poolpeers call ended on the RPC thread, for the message thread
+// to finish (LocalFinishClosings): the message thread holds references into
+// a pool's per-connection state (PeerRef) outside cs_p2pool, so only it may
+// erase that state. Each entry holds a reference on its node. Under
+// cs_p2pool.
+struct LocalClosing
+{
+    LocalPool* lp;
+    CNode* pnode;
+};
+static vector<LocalClosing> vLocalClosing;
 // Self-tests: whether the pools made from files and RPCs check RandomX work
 // (P2PoolResetForTest sets it; always true in a node).
 static bool fLocalCheckPoW = true;
@@ -2086,6 +2285,10 @@ static void PumpRegServes()
             }
             if (fSession)
                 PushReg(r.pnode, "p2lshares", h, r.nTipHeight, nFlag, part);
+            // Ended by this node's own pruning, not by the asker: the ask
+            // it made is not one of its three this interval.
+            if (fGone && peer.nAsks > 0)
+                peer.nAsks--;
             peer.nServedShares += part.size();
             peer.nSyncServed = nNow;
             r.nSent += nPartBytes;
@@ -2144,7 +2347,16 @@ static void OpenSession(LocalPool* lp, CNode* pnode, const unsigned char h[pooll
 {
     uint64 n = poollocal::HandleValue(h);
     lp->mapHandle[pnode] = n;
-    lp->state.mapPeer[pnode] = PeerPool(lp->state.chain->Rules().nSpacing);
+    // A session opened again on a connection whose state this pool still
+    // keeps (closed by poolpeers, the message thread not yet past it) keeps
+    // that state: what it spent stays spent, and its asks stay counted. A
+    // new one starts at the back of its pool's turns (ProvenBefore).
+    if (!lp->state.mapPeer.count(pnode))
+    {
+        PeerPool peer(lp->state.chain->Rules().nSpacing);
+        peer.nLastWorkAt = GetTime();
+        lp->state.mapPeer.insert(make_pair(pnode, peer));
+    }
     LogPrint("p2pool", "p2pool: local pool '%s': a member is in session (%u now)\n",
              lp->strName.c_str(), (unsigned)lp->mapHandle.size());
     // Its line, while this node has none, and from the first few members in
@@ -2216,6 +2428,14 @@ static void LocalForgetNode(CNode* pnode)
         lp->mapHelloAt.erase(pnode);
         lp->state.mapPeer.erase(pnode);
     }
+    for (size_t i = 0; i < vLocalClosing.size();)
+        if (vLocalClosing[i].pnode == pnode)
+        {
+            pnode->Release();
+            vLocalClosing.erase(vLocalClosing.begin() + i);
+        }
+        else
+            i++;
     if (it != mapLocalConn.end())
     {
         pnode->Release();
@@ -2223,9 +2443,11 @@ static void LocalForgetNode(CNode* pnode)
     }
 }
 
-// Under cs_p2pool: one pool's session with one connection ends (the peer was
-// taken off the pool's list); the connection and its other pools stay. What
-// the peer sends under the old handle is dropped unread from then on.
+// Under cs_p2pool, on any thread: one pool's session with one connection
+// ends (the peer was taken off the pool's list); the connection and its
+// other pools stay. What the peer sends under the old handle is dropped
+// unread from then on; the session's state, its serves and what it has held
+// go on the message thread (LocalFinishClosings).
 static void LocalCloseSession(LocalPool* lp, CNode* pnode)
 {
     map<CNode*, LocalConn>::iterator it = mapLocalConn.find(pnode);
@@ -2233,24 +2455,48 @@ static void LocalCloseSession(LocalPool* lp, CNode* pnode)
         lp->sessions.Close(it->second.nConn);
     lp->mapHandle.erase(pnode);
     lp->mapHelloAt.erase(pnode);
-    lp->state.mapPeer.erase(pnode);
-    for (std::list<RegServe>::iterator itS = lRegServes.begin(); itS != lRegServes.end();)
-        if (itS->pnode == pnode && itS->pool == &lp->state)
-            itS = lRegServes.erase(itS);
-        else
-            ++itS;
-    map<CNode*, P2PoolDeferred>::iterator itD = classReg.mapDeferred.find(pnode);
-    if (itD != classReg.mapDeferred.end())
+    pnode->AddRef();
+    LocalClosing c;
+    c.lp = lp;
+    c.pnode = pnode;
+    vLocalClosing.push_back(c);
+}
+
+// Under cs_p2pool, on the message thread: the sessions poolpeers closed are
+// taken down, unless one was opened again on the same connection since.
+static void LocalFinishClosings()
+{
+    vector<LocalClosing> v;
+    v.swap(vLocalClosing);
+    foreach(const LocalClosing& c, v)
     {
-        P2PoolDeferred& d = itD->second;
-        if (d.fShare && d.poolShare == &lp->state)
+        LocalPool* lp = c.lp;
+        CNode* pnode = c.pnode;
+        if (!lp->mapHandle.count(pnode))
         {
-            d.fShare = false;
-            d.share = Share();
-            d.poolShare = NULL;
+            lp->state.mapPeer.erase(pnode);
+            for (std::list<RegServe>::iterator itS = lRegServes.begin(); itS != lRegServes.end();)
+                if (itS->pnode == pnode && itS->pool == &lp->state)
+                    itS = lRegServes.erase(itS);
+                else
+                    ++itS;
+            map<CNode*, P2PoolDeferred>::iterator itD = classReg.mapDeferred.find(pnode);
+            if (itD != classReg.mapDeferred.end())
+            {
+                P2PoolDeferred& d = itD->second;
+                if (d.fShare && d.poolShare == &lp->state)
+                {
+                    d.fShare = false;
+                    d.share = Share();
+                    d.poolShare = NULL;
+                }
+                d.vSync.erase(std::remove(d.vSync.begin(), d.vSync.end(), &lp->state), d.vSync.end());
+                d.fSync = !d.vSync.empty();
+                if (!d.fShare && !d.fSync)
+                    classReg.EraseDeferred(itD);
+            }
         }
-        d.vSync.erase(std::remove(d.vSync.begin(), d.vSync.end(), &lp->state), d.vSync.end());
-        d.fSync = !d.vSync.empty();
+        pnode->Release();
     }
 }
 
@@ -2273,6 +2519,9 @@ static bool LocalDropWrongOnion(CNode* pnode, int64 nNow)
     string O;
     if (!DialledOnion(pnode, O))
         return false;
+    // Only for a listed onion worth reaching: one whose last dial failed
+    // (gone, or moved) is not, and dropping the connection that works for
+    // it every half hour cost the member that peer for nothing.
     bool fListedElsewhere = false;
     foreach(LocalPool* lp, vLocalPools)
     {
@@ -2282,7 +2531,7 @@ static bool LocalDropWrongOnion(CNode* pnode, int64 nNow)
             return false;
         foreach(const string& strPeer, lp->vPeers)
             if (strPeer.size() > pnode->strBtfAddr.size() && strPeer[pnode->strBtfAddr.size()] == '@' &&
-                strPeer.compare(0, pnode->strBtfAddr.size(), pnode->strBtfAddr) == 0)
+                strPeer.compare(0, pnode->strBtfAddr.size(), pnode->strBtfAddr) == 0 && !BtfListedDialFailed(strPeer))
                 fListedElsewhere = true;
     }
     if (!fListedElsewhere)
@@ -2308,6 +2557,14 @@ bool P2PoolLocalDropWrongOnionForTest(CNode* pnode)
 // Under cs_p2pool: a pool this node left.
 static void LocalRemove(LocalPool* lp)
 {
+    for (size_t i = 0; i < vLocalClosing.size();)
+        if (vLocalClosing[i].lp == lp)
+        {
+            vLocalClosing[i].pnode->Release();
+            vLocalClosing.erase(vLocalClosing.begin() + i);
+        }
+        else
+            i++;
     classReg.ForgetPool(&lp->state);
     for (std::list<RegServe>::iterator it = lRegServes.begin(); it != lRegServes.end();)
         if (it->pool == &lp->state)
@@ -2337,8 +2594,11 @@ static void LocalTick()
     static int64 nLast = 0;
     int64 nNow = GetTime();
     CRITICAL_BLOCK(cs_p2pool)
+    {
         if (vLocalPools.empty() && mapLocalConn.empty())
             return;
+        LocalFinishClosings();
+    }
     if (nNow == nLast)
     {
         PumpRegServes();
@@ -2382,6 +2642,7 @@ static void LocalResetForTest(bool fCheckPoW)
     nMinedChainSeq = 0;
     lRegServes.clear();
     mapLocalConn.clear();
+    vLocalClosing.clear();
     mapWrongOnionDropAt.clear();
     foreach(LocalPool* lp, vLocalPools)
     {
@@ -2741,40 +3002,49 @@ bool P2PoolLocalSetPeers(const string& strName, const vector<string>& vPeers, st
             errOut = "a listed peer is ADDRESS@HOST.onion[:PORT]";
             return false;
         }
-    // cs_vNodes before cs_p2pool, as LocalTick.
+    // The file first, with cs_p2pool alone: no disk write holds cs_vNodes.
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        LocalPool* lp = LocalByName(strName);
+        if (!lp)
+        {
+            errOut = "no local pool with that name on this node";
+            return false;
+        }
+        if (!WriteLocalConf(*lp, vPeers, errOut))
+            return false;
+        lp->vPeers = vPeers;
+        lp->mapHelloAt.clear();
+    }
+    // A peer taken off the list: the session this node opened by dialling it
+    // closes, and the connection is no longer kept for the pool, if this
+    // code is what kept it and no other pool lists it. cs_vNodes before
+    // cs_p2pool, as LocalTick.
     CRITICAL_BLOCK(cs_vNodes)
         CRITICAL_BLOCK(cs_p2pool)
         {
             LocalPool* lp = LocalByName(strName);
-            if (!lp)
-            {
-                errOut = "no local pool with that name on this node";
-                return false;
-            }
-            if (!WriteLocalConf(*lp, vPeers, errOut))
-                return false;
-            // A peer taken off the list: the session this node opened by
-            // dialling it closes, and the connection is no longer kept for
-            // the pool (one another pool still lists stays kept).
-            vector<string> vOld = lp->vPeers;
-            lp->vPeers = vPeers;
-            lp->mapHelloAt.clear();
             foreach(CNode* pnode, vNodes)
             {
                 string O;
-                if (pnode->fDisconnect || !DialledOnion(pnode, O) || Listed(*lp, pnode->strBtfAddr, O))
+                if (pnode->fDisconnect || !DialledOnion(pnode, O))
                     continue;
-                if (!ListedIn(vOld, pnode->strBtfAddr, O))
+                if (lp && lp->mapHandle.count(pnode) && !Listed(*lp, pnode->strBtfAddr, O))
+                    LocalCloseSession(lp, pnode);
+                if (!pnode->fLocalPoolPin)
                     continue;
-                LocalCloseSession(lp, pnode);
-                bool fListedElsewhere = false;
-                foreach(LocalPool* lpOther, vLocalPools)
-                    if (lpOther != lp && !lpOther->fLeaving && Listed(*lpOther, pnode->strBtfAddr, O))
-                        fListedElsewhere = true;
-                if (!fListedElsewhere && pnode->fNetworkNode)
+                bool fListed = false;
+                foreach(LocalPool* lpAny, vLocalPools)
+                    if (!lpAny->fLeaving && Listed(*lpAny, pnode->strBtfAddr, O))
+                        fListed = true;
+                if (!fListed)
                 {
-                    pnode->fNetworkNode = false;
-                    pnode->Release();
+                    pnode->fLocalPoolPin = false;
+                    if (pnode->fNetworkNode)
+                    {
+                        pnode->fNetworkNode = false;
+                        pnode->Release();
+                    }
                 }
             }
         }
@@ -2937,29 +3207,108 @@ size_t P2PoolRegisteredServesForTest()
     return n;
 }
 
-void P2PoolDrainProvenWorkForTest(bool fClass, bool fSessions)
+// Under cs_p2pool. Self-tests: every local pool's budget for its proven
+// peers emptied.
+static void LocalDrainPoolWork(int64 nNow)
+{
+    foreach(LocalPool* lp, vLocalPools)
+        lp->state.budgetProvenWork.Drain(nNow);
+}
+
+void P2PoolDrainProvenWorkForTest(bool fPools, bool fSessions)
 {
     CRITICAL_BLOCK(cs_p2pool)
     {
         int64 nNow = GetTime();
-        if (fClass)
-            classReg.budgetProvenWork.Drain(nNow);
-        if (fSessions)
-            foreach(LocalPool* lp, vLocalPools)
+        foreach(LocalPool* lp, vLocalPools)
+        {
+            if (fPools)
+                lp->state.budgetProvenWork.Drain(nNow);
+            if (fSessions)
                 for (map<CNode*, PeerPool>::iterator it = lp->state.mapPeer.begin(); it != lp->state.mapPeer.end(); ++it)
                     it->second.budgetWork.Drain(nNow);
+        }
     }
 }
 
 void P2PoolRefillProvenWorkForTest()
 {
     CRITICAL_BLOCK(cs_p2pool)
-    {
-        classReg.budgetProvenWork.Reset();
         foreach(LocalPool* lp, vLocalPools)
+        {
+            lp->state.budgetProvenWork.Reset();
             for (map<CNode*, PeerPool>::iterator it = lp->state.mapPeer.begin(); it != lp->state.mapPeer.end(); ++it)
                 it->second.budgetWork.Reset();
+        }
+}
+
+bool P2PoolLocalSetPoolTokensForTest(const string& strName, int n)
+{
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        LocalPool* lp = LocalByName(strName);
+        if (lp)
+        {
+            lp->state.budgetProvenWork.Drain(GetTime(), n);
+            f = true;
+        }
     }
+    return f;
+}
+
+bool P2PoolLocalSetWorkDebtForTest(const string& strName, CNode* pnode, int nDebt)
+{
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        LocalPool* lp = LocalByName(strName);
+        map<CNode*, PeerPool>::iterator it;
+        if (lp && (it = lp->state.mapPeer.find(pnode)) != lp->state.mapPeer.end())
+        {
+            it->second.nWorkDebt = nDebt;
+            f = true;
+        }
+    }
+    return f;
+}
+
+int P2PoolLocalSessionTokensForTest(const string& strName, CNode* pnode)
+{
+    int n = -1;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        LocalPool* lp = LocalByName(strName);
+        map<CNode*, PeerPool>::iterator it;
+        if (lp && (it = lp->state.mapPeer.find(pnode)) != lp->state.mapPeer.end())
+            n = it->second.budgetWork.Tokens(GetTime());
+    }
+    return n;
+}
+
+void P2PoolLocalAgeHelloForTest(CNode* pnode, int64 nSecs)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        map<CNode*, LocalConn>::iterator it = mapLocalConn.find(pnode);
+        if (it != mapLocalConn.end())
+        {
+            it->second.nLastHelloSent -= nSecs;
+            it->second.limiter.nLast -= nSecs;
+        }
+    }
+}
+
+size_t P2PoolLocalPeerEntriesForTest(const string& strName)
+{
+    size_t n = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        LocalPool* lp = LocalByName(strName);
+        if (lp)
+            n = lp->state.mapPeer.size();
+    }
+    return n;
 }
 
 size_t P2PoolRegisteredDeferredCount()

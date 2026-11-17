@@ -1645,6 +1645,22 @@ static int DialP2PoolPeers(int nBudget)
 // handshake is done (P2PoolOnVersion, and the message thread's tick).
 static const int LOCAL_POOL_DIALS_PER_ROUND = 2;
 
+// The dial schedule's key for a listed peer: no address starts with it.
+static const string LISTED_DIAL_KEY = "listed ";
+
+void BtfNoteListedDialResult(const string& strPeer, bool fOk)
+{
+    BtfNoteDialResult(LISTED_DIAL_KEY + strPeer, fOk);
+}
+
+bool BtfListedDialFailed(const string& strPeer)
+{
+    bool f;
+    CRITICAL_BLOCK(cs_btfDialSched)
+        f = g_btfDialFails.count(LISTED_DIAL_KEY + strPeer) != 0;
+    return f;
+}
+
 static int CountListedConnected(const set<string>& setAddr)
 {
     int n = 0;
@@ -1666,7 +1682,10 @@ static int DialLocalPoolPeers(const vector<string>& vListed, int nBudget)
         if (at == string::npos)
             continue;
         string strAddr = strPeer.substr(0, at), strOnion = strPeer.substr(at + 1);
-        if (strAddr == BtfLocalAddress() || BtfAlreadyConnected(strAddr) || !BtfDialDue(strAddr))
+        // Its own backoff, apart from the address's: a listed onion that
+        // does not answer must not hold back the ordinary dials of that
+        // address, nor they the listed onion.
+        if (strAddr == BtfLocalAddress() || BtfAlreadyConnected(strAddr) || !BtfDialDue(LISTED_DIAL_KEY + strPeer))
             continue;
         size_t nNodes;
         CRITICAL_BLOCK(cs_vNodes)
@@ -1676,14 +1695,22 @@ static int DialLocalPoolPeers(const vector<string>& vListed, int nBudget)
         nTried++;
         unsigned char noEnc[32] = {0};
         CNode* pnode = ConnectNodeBtfResolved(strAddr, "", strOnion, noEnc);
-        BtfNoteDialResult(strAddr, pnode != NULL);
+        BtfNoteListedDialResult(strPeer, pnode != NULL);
         if (pnode)
         {
             nConnected++;
-            if (!pnode->fNetworkNode)
-                pnode->fNetworkNode = true; // keep the ref, as ThreadBtfConnect does
-            else
-                pnode->Release();
+            // Keep the ref, as ThreadBtfConnect does, and remember the pin
+            // is this code's: poolpeers releases only a pin it took.
+            CRITICAL_BLOCK(cs_vNodes)
+            {
+                if (!pnode->fNetworkNode)
+                {
+                    pnode->fNetworkNode = true;
+                    pnode->fLocalPoolPin = true;
+                }
+                else
+                    pnode->Release();
+            }
         }
     }
     if (nTried)
@@ -2116,12 +2143,16 @@ void ThreadBtfConnect(void* parg)
             CNode* pnode = strOnion.empty() ? ConnectNodeBtf(strAddr)
                                             : ConnectNodeBtfResolved(strAddr, "", strOnion, noEnc);
             if (pnode)
-            {
-                if (!pnode->fNetworkNode)
-                    pnode->fNetworkNode = true; // keep the ref from ConnectNodeBtf
-                else
-                    pnode->Release(); // already pinned; drop the extra ref
-            }
+                CRITICAL_BLOCK(cs_vNodes)
+                {
+                    if (!pnode->fNetworkNode)
+                        pnode->fNetworkNode = true; // keep the ref from ConnectNodeBtf
+                    else
+                    {
+                        pnode->fLocalPoolPin = false; // the pin is ours too now
+                        pnode->Release(); // already pinned; drop the extra ref
+                    }
+                }
         }
         CATCH_PRINT_EXCEPTION("ThreadBtfConnect")
         for (int i = 0; i < 30 && !fShutdown; i++)
@@ -2287,6 +2318,7 @@ void ThreadSocketHandler2(void* parg)
                         {
                             pnode->AddRef();
                             swap(pnodeExtra->fNetworkNode, pnode->fNetworkNode);
+                            swap(pnodeExtra->fLocalPoolPin, pnode->fLocalPoolPin);
                             pnodeExtra->Release();
                         }
                         pnodeExtra->fDisconnect = true;
