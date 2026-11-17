@@ -891,8 +891,15 @@ bool CTxDB::LoadBlockIndex()
         // Not the "too far in the future" test: it is against the local
         // clock, and with no peers yet a machine that booted with a slow
         // clock would roll back, and mark failed, a good tail.
-        if (!block.CheckBlock(NULL, false))
+        bool fUnverified = false;
+        if (!block.CheckBlock(NULL, false, &fUnverified))
         {
+            // Not known to be bad: this node could not compute its proof of
+            // work. Rolling the chain back for that would throw away good
+            // blocks for a local fault, so the load stops instead.
+            if (fUnverified)
+                return error("LoadBlockIndex() : RandomX is not available, the block at height %d cannot be checked; "
+                             "not starting rather than treating it as bad", pindex->nHeight);
             printf("LoadBlockIndex() : *** bad block at height %d, hash=%s\n",
                    pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
             // Keep going: an older bad block further back wins, because
@@ -1131,7 +1138,7 @@ public:
             {
                 if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
                 if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
-                if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
+                if (strKey == "strParticipantPool") { string s; ssValue >> s; SetParticipantPool(s); }
             }
         }
 
@@ -1486,7 +1493,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 {
                     if (strKey == "nMineMode")          { int n = 0; ssValue >> n; nMineMode = n; fHaveStoredMineMode = true; }
                     if (strKey == "fGenerateBitcoins")  { int n = 0; ssValue >> n; fGenerateBitcoins = n; }
-                    if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
+                    if (strKey == "strParticipantPool") { string s; ssValue >> s; SetParticipantPool(s); }
                 }
             }
         }
@@ -1579,12 +1586,13 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
 
     printf("nTransactionFee = %lld\n", nTransactionFee);
     printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
+    const CPoolSettings poolSet = GetPoolSettings();
     printf("nMineMode = %d, strParticipantPool = %s, fGenerateBitcoins = %d (%s)\n",
-           nMineMode.load(), strParticipantPool.c_str(), fGenerateBitcoins.load(),
+           nMineMode.load(), poolSet.strParticipantPool.c_str(), fGenerateBitcoins.load(),
            fMineModeFromCommandLine ? "from the command line, wallet.dat ignored"
                                     : "remembered from wallet.dat, or the default");
     printf("strPoolName = %s, dPoolFeePercent = %.2f, strPoolDashboardUrl = %s (from CLI/default, not wallet.dat)\n",
-           strPoolName.c_str(), dPoolFeePercent, strPoolDashboardUrl.c_str());
+           poolSet.strPoolName.c_str(), poolSet.dPoolFeePercent, poolSet.strPoolDashboardUrl.c_str());
 
     return true;
 }

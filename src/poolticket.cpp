@@ -246,7 +246,14 @@ uint256 CGuardTicket::WorkHash(const CTicketParams& params, const uint256& hashS
     WorkHeader(params, hashSeed, header);
     if (params.fnWork)
         return params.fnWork(header);
-    return PoWHashHeader(header);
+    // PoWHashHeader answers all ones when RandomX is not available, which
+    // reads as work over the target and would score an honest sender. The
+    // checked form tells "not known" apart; zero is this file's sign for it
+    // (TICKET_DROP_NO_HASH, nobody scored).
+    uint256 hash;
+    if (!PoWHashHeaderChecked(header, hash))
+        return 0;
+    return hash;
 }
 
 bool CGuardTicket::Sign(const unsigned char seckey[32])

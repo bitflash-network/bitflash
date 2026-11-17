@@ -10459,6 +10459,118 @@ static int RunRulesV4SelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The pool settings (CPoolSettings, main.h): the GUI's save button replaces
+// them while the miner, pool and announcement threads read them. Two writers
+// do what the GUI does (the save button's SetPoolSettings, the "Use" button's
+// SetParticipantPool) while readers take copies as the threads do; every copy
+// must be one whole set, never a mix of two. Strings too long for the small
+// string buffer, so a race would touch freed memory. `make tests` runs it in
+// the plain build; the audit's TSan build reports any access outside the lock.
+static int RunPoolSettingsSelfTest()
+{
+    printf("pool-settings self-test\n");
+    int nFail = 0;
+    const CPoolSettings saved = GetPoolSettings();
+
+    CPoolSettings def;
+    nFail += Check(def.strParticipantPool.empty() && def.strPoolName == "Bitflash Pool" &&
+                   def.strPoolDashboardUrl.empty() && def.dPoolFeePercent == 0.0 &&
+                   def.nTreasurySharePercent == 0 && !def.fPoolFeeToTreasury,
+                   "the defaults: no pool, \"Bitflash Pool\", no dashboard, no fee, no treasury share") ? 0 : 1;
+
+    CPoolSettings a, b;
+    a.strParticipantPool = std::string(96, 'a');
+    a.strPoolName = std::string(80, 'A');
+    a.strPoolDashboardUrl = "https://a.example/" + std::string(64, 'a');
+    a.dPoolFeePercent = 1.25;
+    a.nTreasurySharePercent = 1;
+    a.fPoolFeeToTreasury = true;
+    b.strParticipantPool = std::string(112, 'b');
+    b.strPoolName = std::string(72, 'B');
+    b.strPoolDashboardUrl = "https://b.example/" + std::string(88, 'b');
+    b.dPoolFeePercent = 2.5;
+    b.nTreasurySharePercent = 2;
+    b.fPoolFeeToTreasury = false;
+
+    SetPoolSettings(a);
+    CPoolSettings r = GetPoolSettings();
+    nFail += Check(r.strParticipantPool == a.strParticipantPool && r.strPoolName == a.strPoolName &&
+                   r.strPoolDashboardUrl == a.strPoolDashboardUrl && r.dPoolFeePercent == a.dPoolFeePercent &&
+                   r.nTreasurySharePercent == a.nTreasurySharePercent && r.fPoolFeeToTreasury == a.fPoolFeeToTreasury,
+                   "SetPoolSettings then GetPoolSettings: the same six values") ? 0 : 1;
+    SetParticipantPool(b.strParticipantPool);
+    r = GetPoolSettings();
+    nFail += Check(GetParticipantPool() == b.strParticipantPool && r.strParticipantPool == b.strParticipantPool &&
+                   r.strPoolName == a.strPoolName && r.dPoolFeePercent == a.dPoolFeePercent,
+                   "SetParticipantPool changes the pool only") ? 0 : 1;
+
+    // The rest of each set, apart from the participant pool the "Use"
+    // button changes on its own.
+    struct Same
+    {
+        static bool Rest(const CPoolSettings& x, const CPoolSettings& y)
+        {
+            return x.strPoolName == y.strPoolName && x.strPoolDashboardUrl == y.strPoolDashboardUrl &&
+                   x.dPoolFeePercent == y.dPoolFeePercent && x.nTreasurySharePercent == y.nTreasurySharePercent &&
+                   x.fPoolFeeToTreasury == y.fPoolFeeToTreasury;
+        }
+    };
+
+    std::atomic<bool> fStop(false);
+    std::atomic<int> nMixed(0), nReads(0), nWrites(0);
+    std::vector<std::thread> threads;
+    threads.emplace_back([&]() {
+        for (int i = 0; i < 20000; i++)
+        {
+            SetPoolSettings((i & 1) ? b : a);
+            nWrites++;
+        }
+    });
+    threads.emplace_back([&]() {
+        for (int i = 0; i < 20000; i++)
+        {
+            SetParticipantPool((i & 1) ? a.strParticipantPool : b.strParticipantPool);
+            nWrites++;
+        }
+    });
+    for (int t = 0; t < 3; t++)
+    {
+        threads.emplace_back([&, t]() {
+            while (!fStop)
+            {
+                if (t == 2)
+                {
+                    std::string s = GetParticipantPool();
+                    if (s != a.strParticipantPool && s != b.strParticipantPool)
+                        nMixed++;
+                }
+                else
+                {
+                    CPoolSettings c = GetPoolSettings();
+                    if ((c.strParticipantPool != a.strParticipantPool && c.strParticipantPool != b.strParticipantPool) ||
+                        !(Same::Rest(c, a) || Same::Rest(c, b)))
+                        nMixed++;
+                }
+                nReads++;
+            }
+        });
+    }
+    threads[0].join();
+    threads[1].join();
+    fStop = true;
+    for (size_t i = 2; i < threads.size(); i++)
+        threads[i].join();
+    printf("  %d writes, %d reads\n", nWrites.load(), nReads.load());
+    nFail += Check(nWrites == 40000 && nReads > 0 && nMixed == 0,
+                   "two writers (save, \"Use\") and three readers at once: every copy is one whole set") ? 0 : 1;
+
+    SetPoolSettings(saved);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // The treasury: the script the keys in treasury.cpp make, what pays it, and
 // the coinbase split. Runs against both networks' tables; mainnet may be
 // unconfigured, and then everything that would pay it must say so.
@@ -17604,6 +17716,26 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fPreview, "poolcreate everpool shows the record, the id and the fee, and sends nothing "
                                      "without \"send\"") ? 0 : 1;
 
+            // Mainnet is closed to burns in this release
+            // (POOL_REGISTRY_MAINNET_OPEN): "send" and "publishzero" are
+            // refused before any other check, and the preview says so. The
+            // wallet is left unlocked: nothing may reach it.
+            {
+                const std::string strClosed = "registered pools open on mainnet in a later release";
+                json pZeroG = { { "name", "bitflash" }, { "spacing", 10 }, { "window", 2160 }, { "retarget", 720 },
+                                { "uncledepth", 3 }, { "unclepct", 80 } };
+                const bool fClosed = !POOL_REGISTRY_MAINNET_OPEN && !IsTestNet() && !PoolBurnsOpen();
+                json rgs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+                json rgz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZeroG, "publishzero" }), &strAll);
+                nFail += Check(fClosed && RpcOk(rc) && rc["result"]["send"].get<std::string>().find(strClosed) == 0 &&
+                               !RpcOk(rgs) && RpcError(rgs).find(strClosed) == 0 &&
+                               !RpcOk(rgz) && RpcError(rgz).find(strClosed) == 0,
+                               "mainnet: \"send\" and \"publishzero\" are refused (registered pools open in a later "
+                               "release), the preview still works and says so") ? 0 : 1;
+            }
+            // The checks behind the gate, with the made-up mainnet registry.
+            PoolBurnsOpenForTest(true);
+
             // "send" goes through every check to the wallet's burn path:
             // here a locked wallet is the first thing to say no.
             const bool fEncWas = fWalletEncrypted, fLockWas = fWalletLocked;
@@ -17729,6 +17861,28 @@ static int RunPoolIndexSelfTest()
                            "pool zero's own record is recognised byte for byte; \"send\" refuses it, only "
                            "\"publishzero\" reaches the burn, and only for pool zero") ? 0 : 1;
 
+            // Testnet is open: with no test switch, "send" passes the gate
+            // and every check and reaches the wallet's burn path, and the
+            // preview says how to send.
+            PoolBurnsOpenForTest(false);
+            {
+                SelectChainParams(true);
+                const bool fOpen = PoolBurnsOpen();
+                json pTest = { { "name", "testpool" } };
+                json rtp = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pTest }), &strAll);
+                fWalletEncrypted = true;
+                fWalletLocked = true;
+                json rts = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pTest, "send" }), &strAll);
+                fWalletEncrypted = fEncWas;
+                fWalletLocked = fLockWas;
+                SelectChainParams(false);
+                nFail += Check(fOpen && !PoolBurnsOpen() && RpcOk(rtp) && rtp["result"]["sent"] == false &&
+                               rtp["result"]["send"].get<std::string>().find("burns 1 BTF") != std::string::npos &&
+                               !RpcOk(rts) && RpcError(rts) == "wallet is locked",
+                               "testnet: \"send\" is not gated and reaches the wallet's burn path; mainnet is "
+                               "closed again") ? 0 : 1;
+            }
+
             // The node's index back to empty for what follows.
             CPoolIndex blank;
             blank.SetPath(blankPath);
@@ -17752,6 +17906,7 @@ static int RunPoolIndexSelfTest()
     }
 
     remove(path.c_str());
+    PoolBurnsOpenForTest(false);
     pindexBest = pindexBestSaved;
     pindexGenesisBlock = pindexGenesisSaved;
     nBestHeight = nBestHeightSaved;
@@ -22743,6 +22898,376 @@ static int RunBlockIndexLoadSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// pow-unavailable: a node that cannot compute RandomX accepts nothing it could
+// not check, blames nobody for it, remembers nothing against the block, and
+// does not start. RandomXForceUnavailableForTest stands in for the 256 MB
+// cache or the verification VM failing to be made.
+// ---------------------------------------------------------------------------
+
+static bool PoWUnavailableProcess(const CBlock& block, CNode* pfrom, int* pnDoS, bool* pfUnverified)
+{
+    bool fOk = false;
+    CRITICAL_BLOCK(cs_main)
+        fOk = ProcessBlock(pfrom, new CBlock(block), pnDoS, pfUnverified);
+    return fOk;
+}
+
+static int RunPoWUnavailableSelfTest()
+{
+    fflush(stdout);
+    printf("pow-unavailable self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    std::string strOldDataDir = strSetDataDir;
+    strSetDataDir = tmp;
+    std::vector<CNode*> vPeers;
+    try
+    {
+        // ---- A new node (best chain at genesis, before the switch) still has
+        // v1 blocks to check: without v1 it does not start, rather than
+        // fetching and throwing away v1 blocks for ever.
+        {
+            RandomXForceVersionUnavailableForTest(1, true);
+            bool fLoaded = LoadBlockIndex();
+            RandomXForceVersionUnavailableForTest(1, false);
+            nFail += Check(!fLoaded && RandomXVerifierReady(2) && pindexBest != NULL && pindexBest->nTime < PoWV2Time(),
+                           "v2 set up, v1 not: a node at genesis (before the switch) refuses to start") ? 0 : 1;
+        }
+        if (!ReorgTestReload() || pindexBest == NULL || pindexBest->nHeight != 0)
+            throw std::runtime_error("LoadBlockIndex failed");
+        nFail += Check(RandomXVerifierReady(1) && RandomXVerifierReady(2),
+                       "with both versions available it starts, both verifiers set up at startup") ? 0 : 1;
+        LimitOrphanBlocks(0);
+
+        // A1 A2 A3 meet their target; Bad is A1 with a nonce whose work misses
+        // it. All hashed while RandomX works.
+        CBlock A1, A2, A3;
+        OrphanTestChainA(A1, A2, A3);
+        const uint256 hashTarget = CBigNum().SetCompact(A1.nBits).getuint256();
+        CBlock Bad = A1;
+        Bad.nNonce++;
+        while (Bad.GetPoWHash() <= hashTarget)
+            Bad.nNonce++;
+        const uint256 hA1 = A1.GetHash(), hA2 = A2.GetHash(), hBad = Bad.GetHash();
+        const uint256 powA1 = A1.GetPoWHash();
+        nFail += Check(powA1 <= hashTarget && Bad.GetPoWHash() > hashTarget,
+                       "with RandomX working, A1's work meets the target and Bad's misses it") ? 0 : 1;
+        {
+            int nDoS = -1;
+            bool fUnverified = true;
+            nFail += Check(!Bad.CheckBlock(&nDoS, false, &fUnverified) && nDoS == 50 && !fUnverified,
+                           "and CheckBlock refuses Bad for its work, scored 50, as before") ? 0 : 1;
+        }
+
+        RandomXForceUnavailableForTest(true);
+
+        // ---- The hash functions: no hash is ever a pass.
+        {
+            uint256 h = 0;
+            bool fGot = A1.GetPoWHashChecked(h);
+            nFail += Check(!fGot && h == POW_HASH_UNAVAILABLE && A1.GetPoWHash() == POW_HASH_UNAVAILABLE &&
+                           A1.GetPoWHash() > hashTarget && A1.GetPoWHash() > CBigNum(bnProofOfWorkLimit).getuint256(),
+                           "unavailable: no hash, and the unchecked form is all ones, above every target (it was zero)") ? 0 : 1;
+            unsigned char data[80] = { 0 };
+            uint256 r = 0;
+            nFail += Check(!RandomXPoWHashChecked(2, data, sizeof(data), r) && r == POW_HASH_UNAVAILABLE &&
+                           RandomXPoWHash(1, data, sizeof(data)) == POW_HASH_UNAVAILABLE &&
+                           !RandomXVerifierReady(1) && !RandomXVerifierReady(2),
+                           "both versions report no verifier, and the raw hash is all ones too") ? 0 : 1;
+            void* vm = RandomXCreateMinerVM(2);
+            nFail += Check(vm == NULL && RandomXHashWithVM(NULL, data, sizeof(data)) == POW_HASH_UNAVAILABLE &&
+                           PoWHashHeaderWithVM(NULL, data) == POW_HASH_UNAVAILABLE,
+                           "no miner VM is made, and hashing without one is all ones: a miner never finds a block on nothing") ? 0 : 1;
+            RandomXDestroyMinerVM(vm);
+        }
+
+        // ---- CheckBlock: refused, no score, and said to be unverified.
+        {
+            int nDoS = -1;
+            bool fUnverified = false;
+            nFail += Check(!A1.CheckBlock(&nDoS, false, &fUnverified) && nDoS == 0 && fUnverified,
+                           "a block whose work meets its target is not accepted when the work cannot be checked, and costs nothing") ? 0 : 1;
+            nDoS = -1;
+            fUnverified = false;
+            nFail += Check(!Bad.CheckBlock(&nDoS, false, &fUnverified) && nDoS == 0 && fUnverified,
+                           "nor is one whose work misses it, and it is not scored for a fault that is ours") ? 0 : 1;
+        }
+
+        // ---- From peers: nothing taken, nobody scored, nothing remembered.
+        {
+            CNode* p = P2PDoSPeer(false);
+            vPeers.push_back(p);
+            CInv invBad(MSG_BLOCK, hBad), invA1(MSG_BLOCK, hA1), invA2(MSG_BLOCK, hA2);
+            mapAlreadyAskedFor[invBad] = GetTime();
+            mapAlreadyAskedFor[invA1] = GetTime();
+            int64 nRefusedBefore = nInboundBlocksRefused;
+            CDataStream ssBad(SER_NETWORK);
+            ssBad << Bad;
+            P2PDoSProcess(p, "block", ssBad);
+            CDataStream ssA1(SER_NETWORK);
+            ssA1 << A1;
+            P2PDoSProcess(p, "block", ssA1);
+            nFail += Check(p->nMisbehavior == 0 && nBestHeight == 0 &&
+                           !mapBlockIndex.count(hBad) && !mapBlockIndex.count(hA1) &&
+                           !mapOrphanBlocks.count(hBad) && !mapOrphanBlocks.count(hA1),
+                           "a peer sending either block is not scored, and neither is indexed, connected or held") ? 0 : 1;
+            nFail += Check(!mapAlreadyAskedFor.count(invBad) && !mapAlreadyAskedFor.count(invA1) &&
+                           nInboundBlocksRefused == nRefusedBefore,
+                           "and neither is remembered as asked for: both can be fetched again") ? 0 : 1;
+
+            // A2's parent is not here: an orphan is not held on unchecked work.
+            CDataStream ssA2(SER_NETWORK);
+            ssA2 << A2;
+            P2PDoSProcess(p, "block", ssA2);
+            nFail += Check(p->nMisbehavior == 0 && !mapOrphanBlocks.count(hA2) && mapOrphanBlocks.empty(),
+                           "an orphan is not held on work that could not be checked") ? 0 : 1;
+
+            // An inbound peer on the shared budget: the same, not scored.
+            InboundBlockBudgetResetForTest(3, true);
+            CNode* in = P2PDoSPeer(true);
+            vPeers.push_back(in);
+            CDataStream ssBad2(SER_NETWORK);
+            ssBad2 << Bad;
+            P2PDoSProcess(in, "block", ssBad2);
+            nFail += Check(in->nMisbehavior == 0 && !mapBlockIndex.count(hBad) && in->vBlocksRefused.empty(),
+                           "an inbound peer on the block budget is not scored either") ? 0 : 1;
+            InboundBlockBudgetResetForTest(32);
+        }
+
+        // ---- P2Pool: a share whose work cannot be checked is an innocent refusal.
+        {
+            CKey k;
+            k.MakeNewKey();
+            CScript script;
+            script << OP_DUP << OP_HASH160 << Hash160(k.GetPubKey()) << OP_EQUALVERIFY << OP_CHECKSIG;
+            vector<p2pool::WindowShare> window;
+            p2pool::WindowShare w;
+            w.payoutScript = vector<unsigned char>(script.begin(), script.end());
+            w.work = 300;
+            for (int i = 0; i < 4; i++)
+                window.push_back(w);
+            const unsigned int EASY = 0x207fffff, HARD = 0x1d00ffff;
+            const int HEIGHT = 61000;
+            CBigNum bnFloor;
+            bnFloor.SetCompact(EASY);
+            RandomXForceUnavailableForTest(false);
+            p2pool::Share s = MakeTestShare(window, EASY, HARD, HEIGHT);
+            bool fBlock = true;
+            string err;
+            bool fOkWorking = p2pool::CheckShare(s, window, HEIGHT, bnFloor, fBlock, err);
+            RandomXForceUnavailableForTest(true);
+            bool fOkDown = p2pool::CheckShare(s, window, HEIGHT, bnFloor, fBlock, err);
+            nFail += Check(fOkWorking && !fOkDown && err == p2pool::WORK_UNVERIFIABLE && p2pool::InnocentRefusal(err),
+                           "a valid share is refused while its work cannot be checked, as a \"here:\" refusal that blames nobody") ? 0 : 1;
+            fOkDown = p2pool::CheckShareWork(s, bnFloor, fBlock, err);
+            nFail += Check(!fOkDown && err == p2pool::WORK_UNVERIFIABLE,
+                           "and the same from the work check alone") ? 0 : 1;
+        }
+
+        // ---- Startup: the node does not start, and nothing on disk is marked bad.
+        {
+            RandomXForceUnavailableForTest(false);
+            int nDoS = 0;
+            nFail += Check(OrphanTestProcess(A1, NULL, &nDoS) && nBestHeight == 1 && pindexBest->GetBlockHash() == hA1,
+                           "with RandomX back, A1 connects") ? 0 : 1;
+            RandomXForceUnavailableForTest(true);
+            nFail += Check(!ReorgTestReload(),
+                           "with RandomX unavailable, loading the block index (startup) refuses") ? 0 : 1;
+            // Past the startup check, the check of the tail at load must stop,
+            // not roll A1 back as bad.
+            SelfTestFreeBlockIndex();
+            bool fTail;
+            {
+                CTxDB txdb("cr");
+                fTail = txdb.LoadBlockIndex();
+                txdb.Close();
+            }
+            nFail += Check(!fTail && (!mapBlockIndex.count(hA1) || !mapBlockIndex[hA1]->fFailed),
+                           "the check of the tail at load stops instead of marking A1 bad") ? 0 : 1;
+            RandomXForceUnavailableForTest(false);
+            nFail += Check(ReorgTestReload() && nBestHeight == 1 && pindexBest->GetBlockHash() == hA1 &&
+                           !mapBlockIndex[hA1]->fFailed,
+                           "with RandomX back, the node loads with A1 still its tip, nothing rolled back") ? 0 : 1;
+        }
+
+        // ---- RandomX back: everything as before, and nothing was held against either block.
+        {
+            nFail += Check(A1.GetPoWHash() == powA1 && RandomXVerifierReady(2),
+                           "the same hash as before the failure") ? 0 : 1;
+            CNode* p = P2PDoSPeer(false);
+            vPeers.push_back(p);
+            CDataStream ssA2(SER_NETWORK);
+            ssA2 << A2;
+            P2PDoSProcess(p, "block", ssA2);
+            CDataStream ssA3(SER_NETWORK);
+            ssA3 << A3;
+            P2PDoSProcess(p, "block", ssA3);
+            nFail += Check(p->nMisbehavior == 0 && nBestHeight == 3 && pindexBest->GetBlockHash() == A3.GetHash(),
+                           "the blocks refused while RandomX was down are taken once it is back (A2, then A3)") ? 0 : 1;
+            CNode* q = P2PDoSPeer(false);
+            vPeers.push_back(q);
+            CDataStream ssBad(SER_NETWORK);
+            ssBad << Bad;
+            P2PDoSProcess(q, "block", ssBad);
+            nFail += Check(q->nMisbehavior == 50 && !mapBlockIndex.count(hBad),
+                           "and Bad is refused for its work and its sender scored 50, as before") ? 0 : 1;
+        }
+
+        // ---- One log line a minute at most, however many such blocks arrive.
+        {
+            RandomXForceUnavailableForTest(true);
+            UnverifiedLogAgeForTest(-1);
+            const int64 nBlocks0 = nBlocksUnverified, nLines0 = nUnverifiedLogLines;
+            CBlock V = Bad;
+            bool fAll = true;
+            for (int i = 0; i < 20; i++)
+            {
+                V.nNonce = Bad.nNonce + 1000 + i;
+                int nDoS = -1;
+                bool fUnverified = false;
+                fAll &= !PoWUnavailableProcess(V, NULL, &nDoS, &fUnverified) && nDoS == 0 && fUnverified;
+            }
+            nFail += Check(fAll && nBlocksUnverified == nBlocks0 + 20 && nUnverifiedLogLines == nLines0 + 1,
+                           "20 blocks that cannot be checked: all refused unscored, all counted, one log line") ? 0 : 1;
+            UnverifiedLogAgeForTest(UNVERIFIED_BLOCKS_PEER_WINDOW + 1);
+            V.nNonce = Bad.nNonce + 1100;
+            PoWUnavailableProcess(V, NULL, NULL, NULL);
+            V.nNonce = Bad.nNonce + 1101;
+            PoWUnavailableProcess(V, NULL, NULL, NULL);
+            nFail += Check(nBlocksUnverified == nBlocks0 + 22 && nUnverifiedLogLines == nLines0 + 2,
+                           "a minute later one more line (with the count since the last), then quiet again") ? 0 : 1;
+        }
+
+        // ---- A peer that keeps sending them is disconnected: not scored, not banned.
+        {
+            CNode* d = P2PDoSPeer(false);
+            d->strBtfAddr = "powunavailableselftest.btf";
+            vPeers.push_back(d);
+            const int64 nDropped0 = nUnverifiedPeersDropped;
+            CBlock V = Bad;
+            for (int i = 0; i < MAX_UNVERIFIED_BLOCKS_PER_PEER; i++)
+            {
+                V.nNonce = Bad.nNonce + 2000 + i;
+                CDataStream ss(SER_NETWORK);
+                ss << V;
+                P2PDoSProcess(d, "block", ss);
+            }
+            nFail += Check(!d->fDisconnect && d->nMisbehavior == 0 && nUnverifiedPeersDropped == nDropped0,
+                           strprintf("a peer that sent %d such blocks in a minute stays connected, unscored",
+                                     MAX_UNVERIFIED_BLOCKS_PER_PEER).c_str()) ? 0 : 1;
+            V.nNonce = Bad.nNonce + 2100;
+            CDataStream ss(SER_NETWORK);
+            ss << V;
+            P2PDoSProcess(d, "block", ss);
+            nFail += Check(d->fDisconnect && d->nMisbehavior == 0 && !BtfIsBanned(d->strBtfAddr) &&
+                           nUnverifiedPeersDropped == nDropped0 + 1 && !mapBlockIndex.count(V.GetHash()),
+                           "one more and it is disconnected, with no score and no ban") ? 0 : 1;
+            RandomXForceUnavailableForTest(false);
+        }
+
+        // ---- B1..B4: a v2-era branch off genesis, which becomes the best chain.
+        CBlock B[4];
+        {
+            const unsigned int T = PoWV2Time();
+            static const unsigned int nHintB[4] = { 14044, 104, 2035, 8495 };
+            uint256 hPrev = pindexGenesisBlock->GetBlockHash();
+            for (int i = 0; i < 4; i++)
+            {
+                B[i] = OrphanTestBlock(hPrev, i + 1, 21 + i, T + 120 * (i + 1), nHintB[i],
+                                       strprintf("B%d", i + 1).c_str());
+                hPrev = B[i].GetHash();
+            }
+            CNode* p = P2PDoSPeer(false);
+            vPeers.push_back(p);
+            for (int i = 0; i < 4; i++)
+            {
+                CDataStream ss(SER_NETWORK);
+                ss << B[i];
+                P2PDoSProcess(p, "block", ss);
+            }
+            nFail += Check(p->nMisbehavior == 0 && nBestHeight == 4 && pindexBest->GetBlockHash() == B[3].GetHash() &&
+                           pindexBest->GetMedianTimePast() >= (int64)T,
+                           "B1..B4 (v2-era) connect and are the best chain, its median time past the switch") ? 0 : 1;
+        }
+
+        // ---- A v1-era block on B4 is ruled out by its parent's median time:
+        // with RandomX working it is hashed and scored as before; with v1
+        // known to be unavailable it is refused before any hash.
+        {
+            CBlock C;
+            CTransaction cb;
+            cb.vin.resize(1);
+            cb.vin[0].prevout.SetNull();
+            cb.vin[0].scriptSig = CScript() << 5 << 31;
+            cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+            C.vtx.push_back(cb);
+            C.nVersion = 1;
+            C.hashPrevBlock = B[3].GetHash();
+            C.nTime = PoWV2Time() - 1;
+            C.nBits = bnProofOfWorkLimit.GetCompact();
+            C.hashMerkleRoot = C.BuildMerkleTree();
+            C.nNonce = 0;
+            while (C.GetPoWHash() <= hashTarget)
+                C.nNonce++;
+            const int64 nByContext0 = nBlocksUnverifiedByContext;
+            CNode* q = P2PDoSPeer(false);
+            vPeers.push_back(q);
+            CDataStream ss(SER_NETWORK);
+            ss << C;
+            P2PDoSProcess(q, "block", ss);
+            nFail += Check(q->nMisbehavior == 50 && nBlocksUnverifiedByContext == nByContext0 && !mapBlockIndex.count(C.GetHash()),
+                           "RandomX working: a v1-era child of B4 with bad work is hashed and its sender scored 50, as before") ? 0 : 1;
+
+            RandomXForceVersionUnavailableForTest(1, true);
+            const int64 nBlocks0 = nBlocksUnverified;
+            int nDoS = -1;
+            bool fUnverified = false;
+            C.nNonce++;
+            bool fOk = PoWUnavailableProcess(C, NULL, &nDoS, &fUnverified);
+            nFail += Check(!fOk && nDoS == 0 && fUnverified && nBlocksUnverifiedByContext == nByContext0 + 1 &&
+                           nBlocksUnverified == nBlocks0 + 1 && !mapBlockIndex.count(C.GetHash()),
+                           "v1 unavailable: the same kind of block is refused before any hash, unscored, as unverified") ? 0 : 1;
+            {
+                CBlock V = Bad;
+                V.nNonce = Bad.nNonce + 3000;
+                nDoS = -1;
+                fUnverified = false;
+                fOk = PoWUnavailableProcess(V, NULL, &nDoS, &fUnverified);
+                nFail += Check(!fOk && nDoS == 0 && fUnverified && nBlocksUnverifiedByContext == nByContext0 + 1,
+                               "while a v1-era block on a v1-era parent (genesis) goes to the hash, and is unverified there") ? 0 : 1;
+            }
+
+            // ---- Startup with v1 unavailable: a node whose best chain is past
+            // the switch starts (it has no v1 block left to check).
+            nFail += Check(ReorgTestReload() && nBestHeight == 4 && pindexBest->GetBlockHash() == B[3].GetHash(),
+                           "v1 unavailable, best chain past the switch: the node starts") ? 0 : 1;
+            RandomXForceVersionUnavailableForTest(1, false);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    RandomXForceUnavailableForTest(false);
+    for (size_t i = 0; i < vPeers.size(); i++)
+        delete vPeers[i];
+    LimitOrphanBlocks(0);
+    DBFlush(true);
+    RemoveTree(tmp);
+    strSetDataDir = strOldDataDir;
+    printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 int RunSelfTest(const std::string& name)
 {
     // The self-tests load block indexes of their own; LoadBlockIndex never
@@ -22832,6 +23357,8 @@ int RunSelfTest(const std::string& name)
         return RunScriptOpcodesSelfTest();
     if (name == "orphan-blocks")
         return RunOrphanBlocksSelfTest();
+    if (name == "pow-unavailable")
+        return RunPoWUnavailableSelfTest();
     if (name == "block-index-load")
         return RunBlockIndexLoadSelfTest();
     if (name == "net-hardening")
@@ -22848,6 +23375,8 @@ int RunSelfTest(const std::string& name)
         return RunReplyParsersSelfTest();
     if (name == "managed-tor")
         return RunManagedTorSelfTest();
+    if (name == "pool-settings")
+        return RunPoolSettingsSelfTest();
     if (name == "treasury")
         return RunTreasurySelfTest();
     if (name == "chat-link")
@@ -22960,6 +23489,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, pool-index, pool-tickets\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, pool-index, pool-tickets\n");
     return 1;
 }

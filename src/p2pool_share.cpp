@@ -214,7 +214,9 @@ static bool CheckShareHash(const Share& share, bool& fBlockOut, string& errOut, 
         return true;
     }
 #endif
-    uint256 hashPoW = share.Header().GetPoWHash();
+    uint256 hashPoW;
+    if (!share.Header().GetPoWHashChecked(hashPoW))
+        return Fail(errOut, WORK_UNVERIFIABLE);
     if (CBigNum(hashPoW) > bnShare)
         return Fail(errOut, "RandomX work does not meet the share target");
     // A block only if it is one by its own nBits; whether the main chain

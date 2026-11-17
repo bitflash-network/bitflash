@@ -142,7 +142,7 @@ public:
     unsigned char magic[4];   // pchMessageStart
     unsigned int nBits;       // the ticket target
     unsigned int nTime;       // the work header's nTime: PoWV2Time()
-    TicketWorkFn fnWork;      // NULL: PoWHashHeader
+    TicketWorkFn fnWork;      // NULL: PoWHashHeaderChecked
 
     CTicketParams();
     // This node's network (pchMessageStart, PoWV2Time(), the network's target).
@@ -266,7 +266,7 @@ namespace pooltkt
 // Step 3 without the set: the signature, then the work against the seed.
 // Touches no CTicketBook, so it runs with no lock held, on any thread.
 // TICKET_VERIFIED with the work hash, TICKET_BAD_SIG, TICKET_BAD_WORK, or
-// TICKET_DROP_NO_HASH when the hash came out zero (this node's failure, not
+// TICKET_DROP_NO_HASH when the hash could not be computed (this node's failure, not
 // the sender's: nobody scored, nothing remembered).
 int VerifyTicket(const CTicketParams& params, const CGuardTicket& ticket, const uint256& hashSeed,
                  uint256& hashWorkOut);
