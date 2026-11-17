@@ -1068,6 +1068,12 @@ their uncles; with a few dozen miners a share is 1 to 3 KB, so a line is 3 to
 spacing (10 s for pool zero, 20 s or more for others) of 2 KB to each of up to 8 peers that carry the pool is under 2 KB/s per
 pool.
 
+A line bigger than the 64 MB a guardian gives one pool (shares near
+`MAX_SHARE_BYTES`, payouts to very many miners) is guarded by nobody on the
+default settings. It lives with its miners and with `-poolcarry` nodes, at
+pool zero's caps; if every one of them leaves, it restarts like any pool with
+no copy left (section 10, *Reviving*), and no coins already paid are lost.
+
 `-poolguard=0` brings all of it to zero.
 
 ## 12. Threat model, Sybil and DoS
@@ -1269,7 +1275,12 @@ pool's share chain is kept on disk throughout. Nothing is re-anchored by hand.
   reorged out, a restart that reads
   `pool-tickets.dat` back and a fresh node that fills its set by
   `poolgettkt`, the draw over a fixed ticket set, guard ranking by line work,
-  and a guardian pulling a pool it sees announced mid-epoch.
+  a guardian pulling a pool it sees announced mid-epoch, a guard budget full
+  in bytes and one full in pools (the pool that does not fit is not announced,
+  and the next node in its ranking holds it), a line over the per-pool guard
+  cap (guarded by nobody, still held by its miners and carriers), and every
+  guardian of both the old and the new set gone at once during a handoff (the
+  new set pulls from miners and announcing peers, or the pool revives).
 - P2Pool local: the self-tests of section 18.
 - Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended).
 
@@ -1291,7 +1302,10 @@ on the same network the whole time:
 4. **Dormant and revived from guardians.** Stop every miner of A; wait past an
    epoch change; check the new guardians pulled A's line from the old ones;
    start a fresh node with `-p2pool=<A>` and an empty data directory; it fetches
-   A's line from the guardians and its first block pays the old window.
+   A's line from the guardians and its first block pays the old window. Then
+   stop every guardian of A at once, old and new set, during the next handoff,
+   with one node still carrying A by `-poolcarry`: a fresh node fetches A's
+   line from that node through `poolwho`.
 5. **Revived from the record alone.** Delete every copy of A's line
    everywhere; a fresh miner restarts A from a first share, same id, and finds
    a block.
