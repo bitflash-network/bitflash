@@ -8627,8 +8627,9 @@ static int RunP2PoolLocalNodeSelfTest()
                        e0.find("local") != std::string::npos && e1 == e0,
                        "poolcreate with no mode is refused, naming everpool and local") ? 0 : 1;
         json r2 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", json({ { "name", "home" } }) }), &strAll);
-        nFail += Check(!RpcOk(r2) && RpcError(r2).find("not in this release") != std::string::npos,
-                       "poolcreate everpool says it is not in this release, and burns nothing") ? 0 : 1;
+        nFail += Check(RpcOk(r2) && r2["result"]["sent"] == false && !r2["result"].contains("txid") &&
+                           r2["result"]["burn"] == 1.0 && r2["result"]["name"] == "home",
+                       "poolcreate everpool without \"send\" shows the pool and burns nothing") ? 0 : 1;
         json r3 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "home" }, { "spacing", 10 } }) }), &strAll);
         json r4 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "home" }, { "colour", 1 } }) }), &strAll);
         json r5 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "a b" } }) }), &strAll);
@@ -15306,6 +15307,234 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fOk && deep.Rebuilds() == 1 && deep.Digest() == PoolIndexTestReference(pTipL2) &&
                            nWin == POOL_ANCHOR_WINDOW && v.size() == POOL_RECENT_ANCHORS && v[0].nHeight == 2402,
                            "one of 1441 reads the chain again, and is exact") ? 0 : 1;
+        }
+
+        // ---- the RPCs: poollist, poolinfo and poolcreate everpool answer
+        // from the node's index, here loaded with a made-up chain's registry
+        {
+            using nlohmann::json;
+            PoolIndexTestChain chain;
+            const std::string rpcPath = GetAppDir() + "/pool-registry-selftest-rpc.dat";
+            const std::string blankPath = GetAppDir() + "/pool-registry-selftest-blank.dat";
+            const std::string user = "selftest", pass = "selftest-password-0123456789";
+            JsonRpcConfigure(user, pass, "");
+            std::string strAll;
+            CBigNum bnFloor;
+            bnFloor.SetCompact(0x207fffff);
+            P2PoolResetForTest(bnFloor, false);
+
+            // A pool with a fee, burned at 5 (active at the tip, 60); one
+            // burned at 50 (pending); an id nobody burned, named by blocks
+            // 40 to 44; the fee pool named by 20 to 22; pool zero by the rest.
+            uint160 hFee;
+            memset(hFee.begin(), 0x11, 20);
+            const std::string strFeeAddr = Hash160ToAddress(hFee);
+            poolreg::PoolRecord fr;
+            fr.nSpacing = 30;
+            fr.nWindow = 720;
+            fr.nRetarget = 360;
+            fr.nFloor = poolreg::NETWORK_FLOOR;
+            fr.nUncleDepth = 2;
+            fr.nUnclePct = 80;
+            fr.nFeeBps = 150;
+            fr.nFeeType = poolreg::FEE_P2PKH;
+            memcpy(fr.feeHash, hFee.begin(), 20);
+            fr.name = "feepool";
+            std::string errFr;
+            const bool fFrOk = fr.Check(errFr);
+            const std::vector<unsigned char> recFee = fr.Encode();
+            const std::vector<unsigned char> recLate = PoolIndexTestRecord("late");
+            const uint256 idFee = PoolIndexTestId(recFee), idLate = PoolIndexTestId(recLate);
+            const uint256 idUnreg = PoolIndexTestId(PoolIndexTestRecord("nobody-burned-this"));
+            const CTransaction txFee = PoolIndexTestBurn(PoolIndexTestRecordScript(recFee), poolreg::MIN_BURN, 901);
+            const CTransaction txLate = PoolIndexTestBurn(PoolIndexTestRecordScript(recLate), poolreg::MIN_BURN, 902);
+            std::function<CBlock(int)> fill = [&](int n) {
+                std::vector<std::vector<unsigned char> > vp;
+                uint256 h = uint256((uint64)0x5000 + n);
+                if (n >= 40 && n < 45)
+                    vp.push_back(PoolIndexTestPush("p2x", &idUnreg, h));
+                else if (n >= 20 && n < 23)
+                    vp.push_back(PoolIndexTestPush("p2x", &idFee, h));
+                else
+                    vp.push_back(PoolIndexTestPush("p2p", NULL, h));
+                std::vector<CTransaction> vTx;
+                if (n == 5)
+                    vTx.push_back(txFee);
+                if (n == 50)
+                    vTx.push_back(txLate);
+                return PoolIndexTestBlock(n, vp, vTx);
+            };
+            CBlockIndex* pGen = chain.Add(NULL, PoolIndexTestPlain(0));
+            CBlockIndex* pTip = chain.Extend(pGen, 60, fill);
+            chain.SetMain(pTip);
+            CPoolIndex made(PoolIndexTestRead);
+            made.SetPath(rpcPath);
+            bool fOk = fFrOk && PoolIndexTestSync(made, 1000) && made.Save();
+            PoolIndex().SetPath(rpcPath);
+            fOk = fOk && PoolIndex().Load() && PoolIndexSynced() && PoolIndex().Digest() == made.Digest();
+            nFail += Check(fOk, "the node's index answers with a made-up chain's registry, at its tip") ? 0 : 1;
+            std::vector<CPoolAnchor> vZeroAnchors;
+            int nZeroWin = 0;
+            made.Anchors(idZero, vZeroAnchors, nZeroWin);
+
+            // poollist: pool zero first, then the recorded pools in the order
+            // of their first appearance; an id nobody burned is not a pool.
+            json rl = LocalNodeRpc(user, pass, "poollist", json::array(), &strAll);
+            bool fList = RpcOk(rl) && rl["result"].is_array() && rl["result"].size() >= 3;
+            if (fList)
+            {
+                json a = rl["result"];
+                json z = a[0], f = a[1], l = a[2];
+                fList = z["id"] == idZero.GetHex() && z["status"] == "active" && z["claims"] == nZeroWin &&
+                        z["firstheight"].is_null() && z["appearances"] == 0 &&
+                        f["id"] == idFee.GetHex() && f["name"] == "feepool" && f["local"] == false &&
+                        f["status"] == "active" && f["feebps"] == 150 && f["firstheight"] == 5 &&
+                        f["confirmations"] == 56 && f["appearances"] == 1 && f["claims"] == 3 &&
+                        f["rules"].is_string() && f["rules"].get<std::string>().find("fee 1.50%") != std::string::npos &&
+                        l["id"] == idLate.GetHex() && l["status"] == "pending" && l["firstheight"] == 50 &&
+                        l["confirmations"] == 11 && l["claims"] == 0;
+                for (size_t i = 0; i < a.size(); i++)
+                    fList = fList && a[i].value("id", std::string()) != idUnreg.GetHex();
+            }
+            nFail += Check(fList, "poollist: pool zero as entry zero, then each recorded pool with its status, fee, "
+                                  "rules, first appearance and claims; an id nobody burned is not listed") ? 0 : 1;
+
+            // poolinfo of a recorded pool: its record, every appearance and
+            // the last anchors, newest first.
+            json ri = LocalNodeRpc(user, pass, "poolinfo", json::array({ idFee.GetHex() }), &strAll);
+            bool fInfo = RpcOk(ri);
+            if (fInfo)
+            {
+                json j = ri["result"];
+                fInfo = j["status"] == "active" && j["record"] == HexStr(recFee.begin(), recFee.end(), false) &&
+                        j["rules"]["feebps"] == 150 && j["rules"]["feeaddress"] == strFeeAddr &&
+                        j["firstappearance"]["height"] == 5 && j["firstappearance"]["txid"] == txFee.GetHash().GetHex() &&
+                        j["firstappearance"]["burn"] == 1.0 && j["appearancelist"].size() == 1 &&
+                        j["lastanchors"].size() == 3 && j["lastanchors"][0]["height"] == 22 &&
+                        j["lastanchors"][2]["height"] == 20 && j["index"]["synced"] == true &&
+                        j["index"]["height"] == 60;
+            }
+            nFail += Check(fInfo, "poolinfo <id>: rules, record, first appearance, every appearance, last anchors, "
+                                  "and the index's height") ? 0 : 1;
+            json ru = LocalNodeRpc(user, pass, "poolinfo", json::array({ idUnreg.GetHex() }), &strAll);
+            json rn = LocalNodeRpc(user, pass, "poolinfo", json::array({ uint256(99).GetHex() }), &strAll);
+            json rb = LocalNodeRpc(user, pass, "poolinfo", json::array({ "not-an-id" }), &strAll);
+            json rz = LocalNodeRpc(user, pass, "poolinfo", json::array({ idZero.GetHex() }), &strAll);
+            nFail += Check(RpcOk(ru) && ru["result"]["status"] == "unknown" && ru["result"]["claims"] == 5 &&
+                           ru["result"]["lastanchors"].size() == 5 && ru["result"]["lastanchors"][0]["height"] == 44 &&
+                           !ru["result"].contains("name") &&
+                           !RpcOk(rn) && RpcError(rn).find("no pool with that id") != std::string::npos &&
+                           !RpcOk(rb) &&
+                           RpcOk(rz) && rz["result"]["status"] == "active" && rz["result"]["claims"] == nZeroWin &&
+                           rz["result"]["rules"]["spacing"] == 10,
+                           "poolinfo: an id nobody burned shows only its claims, an id nobody names is refused, "
+                           "pool zero shows its rules and claims") ? 0 : 1;
+
+            // poolcreate everpool: the record, the id and the fee shown,
+            // nothing sent without "send".
+            uint160 hNew;
+            memset(hNew.begin(), 0x22, 20);
+            const std::string strNewAddr = Hash160ToAddress(hNew);
+            json pNew = { { "name", "newpool" }, { "feebps", 100 }, { "feeaddress", strNewAddr } };
+            json rc = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew }), &strAll);
+            json rd = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "dryrun" }), &strAll);
+            bool fPreview = RpcOk(rc) && RpcOk(rd) && rc["result"] == rd["result"];
+            std::vector<unsigned char> recNew;
+            if (fPreview)
+            {
+                json j = rc["result"];
+                recNew = ParseHex(j["record"].get<std::string>());
+                poolreg::PoolRecord back;
+                std::string e;
+                fPreview = poolreg::Parse(recNew, back, e) && !back.fLocal && back.name == "newpool" &&
+                           back.nSpacing == 30 && back.nWindow == 2160 && back.nRetarget == 720 &&
+                           back.nUncleDepth == 3 && back.nUnclePct == 80 && back.nFeeBps == 100 &&
+                           back.nFeeType == poolreg::FEE_P2PKH && memcmp(back.feeHash, hNew.begin(), 20) == 0 &&
+                           j["id"] == PoolIndexTestId(recNew).GetHex() &&
+                           j["fingerprint"] == PoolIndexTestId(recNew).GetHex().substr(0, 8) &&
+                           j["fee"]["bps"] == 100 && j["fee"]["percent"] == "1.00%" && j["fee"]["address"] == strNewAddr &&
+                           j["burn"] == 1.0 && j["sent"] == false && !j.contains("txid") && j["recorded"].is_null() &&
+                           j["poolzero"] == false && j["index"]["synced"] == true;
+            }
+            nFail += Check(fPreview, "poolcreate everpool shows the record, the id and the fee, and sends nothing "
+                                     "without \"send\"") ? 0 : 1;
+
+            // "send" goes through every check to the wallet's burn path:
+            // here a locked wallet is the first thing to say no.
+            const bool fEncWas = fWalletEncrypted, fLockWas = fWalletLocked;
+            fWalletEncrypted = true;
+            fWalletLocked = true;
+            json rs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            fWalletEncrypted = fEncWas;
+            fWalletLocked = fLockWas;
+            nFail += Check(!RpcOk(rs) && RpcError(rs) == "wallet is locked",
+                           "poolcreate everpool \"send\" passes every check and reaches the wallet's burn path") ? 0 : 1;
+
+            // Refused before the wallet: a pool already recorded, the same
+            // burn already waiting to be mined, an index behind the tip, a
+            // record that breaks a rule, a third parameter that is not a word
+            // it knows.
+            json pFee = { { "name", "feepool" }, { "spacing", 30 }, { "window", 720 }, { "retarget", 360 },
+                          { "uncledepth", 2 }, { "unclepct", 80 }, { "feebps", 150 }, { "feeaddress", strFeeAddr } };
+            json rf = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pFee }), &strAll);
+            json rfs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pFee, "send" }), &strAll);
+            nFail += Check(RpcOk(rf) && rf["result"]["id"] == idFee.GetHex() &&
+                           rf["result"]["recorded"]["status"] == "active" && rf["result"]["recorded"]["firstheight"] == 5 &&
+                           !RpcOk(rfs) && RpcError(rfs).find("already recorded, first at block 5") != std::string::npos,
+                           "a pool already recorded is shown as such, and burning it again is refused") ? 0 : 1;
+
+            CTransaction txWait = PoolIndexTestBurn(CScript() << OP_RETURN << recNew, poolreg::MIN_BURN, 903);
+            CRITICAL_BLOCK(cs_mapTransactions)
+                mapTransactions[txWait.GetHash()] = txWait;
+            json rw = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            CRITICAL_BLOCK(cs_mapTransactions)
+                mapTransactions.erase(txWait.GetHash());
+            nFail += Check(!RpcOk(rw) && RpcError(rw).find("already waiting to be mined: " + txWait.GetHash().GetHex()) !=
+                                             std::string::npos,
+                           "the same burn waiting in the memory pool is refused") ? 0 : 1;
+
+            chain.SetMain(pTip->pprev);
+            json rl2 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            chain.SetMain(pTip);
+            json rbad = LocalNodeRpc(user, pass, "poolcreate",
+                                     json::array({ "everpool", json({ { "name", "x" }, { "spacing", 10 } }) }), &strAll);
+            json rword = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "yes" }), &strAll);
+            nFail += Check(!RpcOk(rl2) && RpcError(rl2).find("has not read up to the tip") != std::string::npos &&
+                           !RpcOk(rbad) && RpcError(rbad).find("not a valid pool") != std::string::npos &&
+                           !RpcOk(rword) && RpcError(rword).find("\"send\"") != std::string::npos,
+                           "refused: an index behind the tip, a record breaking a rule, an unknown third word") ? 0 : 1;
+
+            // Pool zero's own record can be burned once, as a public copy of
+            // its rules: shown as pool zero, never burned yet here.
+            json pZero = { { "name", "bitflash" }, { "spacing", 10 }, { "window", 2160 }, { "retarget", 720 },
+                           { "uncledepth", 3 }, { "unclepct", 80 } };
+            json rpz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero }), &strAll);
+            const std::vector<unsigned char> recZero = poolreg::PoolZero().Encode();
+            json rpzs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero, "send" }), &strAll);
+            json rnz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "publishzero" }), &strAll);
+            fWalletEncrypted = true;
+            fWalletLocked = true;
+            json rpzp = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero, "publishzero" }), &strAll);
+            fWalletEncrypted = fEncWas;
+            fWalletLocked = fLockWas;
+            nFail += Check(RpcOk(rpz) && rpz["result"]["poolzero"] == true && rpz["result"]["id"] == idZero.GetHex() &&
+                           rpz["result"]["record"] == HexStr(recZero.begin(), recZero.end(), false) &&
+                           rpz["result"]["recorded"].is_null() &&
+                           !RpcOk(rpzs) && RpcError(rpzs).find("\"publishzero\"") != std::string::npos &&
+                           !RpcOk(rnz) && RpcError(rnz).find("pool zero's own record only") != std::string::npos &&
+                           !RpcOk(rpzp) && RpcError(rpzp) == "wallet is locked",
+                           "pool zero's own record is recognised byte for byte; \"send\" refuses it, only "
+                           "\"publishzero\" reaches the burn, and only for pool zero") ? 0 : 1;
+
+            // The node's index back to empty for what follows.
+            CPoolIndex blank;
+            blank.SetPath(blankPath);
+            bool fBlank = blank.Save();
+            PoolIndex().SetPath(blankPath);
+            fBlank = fBlank && PoolIndex().Load() && PoolIndexHeight() == -1;
+            nFail += Check(fBlank, "the node's index is empty again") ? 0 : 1;
+            remove(rpcPath.c_str());
+            remove(blankPath.c_str());
         }
     }
     catch (std::exception& e)
