@@ -364,9 +364,14 @@ bool Sessions::OnHello(uint64_t conn, const std::vector<std::string>& vOwnOnions
         // same silence a non-member gets.
         if (Seen(hello.nonce))
             return false;
-        if (mapSession.count(conn) || mapPending.count(conn))
+        if (mapPending.count(conn))
             return false;
-        if (mapSession.size() + mapPending.size() >= MAX_SESSIONS)
+        // A fresh hello of a member on a connection that already holds a
+        // session: the other side no longer has it (its operator took this
+        // node off the pool's list and put it back). Its ack replaces the
+        // session, in the same place: refusing it left that side unable to
+        // open a session on the connection for as long as it lasted.
+        if (mapSession.size() - mapSession.count(conn) + mapPending.size() >= MAX_SESSIONS)
             return false;
         vSeen.push_back(std::vector<unsigned char>(hello.nonce, hello.nonce + NONCE_BYTES));
         while (vSeen.size() > SEEN_NONCES)
@@ -396,7 +401,8 @@ bool Sessions::OnAck(uint64_t conn, const unsigned char ack[ACK_BYTES], int64_t 
     AckTag(A, half.O, half.nA, half.nB, want);
     if (sodium_memcmp(want, ack, ACK_BYTES) != 0)
         return false;
-    if (mapSession.count(conn) || mapSession.size() >= MAX_SESSIONS)
+    // A session already on this connection is replaced (OnHello).
+    if (mapSession.size() - mapSession.count(conn) >= MAX_SESSIONS)
     {
         mapPending.erase(it);
         return false;

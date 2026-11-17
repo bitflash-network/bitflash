@@ -33,6 +33,9 @@
 #include <atomic>
 #include "poolrecord.h"
 
+// pool-registry.dat: a version, the registry, and the hash of both. Version
+// 2 added dropped anchors and the locator.
+static const int POOL_INDEX_FILE_VERSION = 2;
 // A pool counts once its first appearance has this many confirmations: the
 // block holding it and 29 on top.
 static const int POOL_ACTIVE_CONFIRMATIONS = 30;
@@ -313,6 +316,8 @@ public:
     int Height() const;
     uint256 TipHash() const;
     void Tip(int& nHeightOut, uint256& hashOut) const;
+    // Tip and Rebuilding under one hold of the lock.
+    void State(int& nHeightOut, uint256& hashOut, bool& fRebuildingOut) const;
     bool Lookup(const uint256& id, CPoolInfo& out) const;
     void List(std::vector<CPoolInfo>& out) const;
     int Status(const uint256& id) const;
@@ -341,15 +346,18 @@ private:
     void StartOverLocked(const unsigned char magic[4]);
 };
 
-// The node's index: started at the end of LoadBlockIndex, read by a thread
-// of its own, saved in GetAppDir()/pool-registry.dat.
+// The node's index, read by a thread of its own, saved in
+// GetAppDir()/pool-registry.dat. Started by the node once StartNode has
+// succeeded, so every path the thread runs on is a path that stops it:
+// LoadBlockIndex alone (the one-shot commands, the self-tests) never starts
+// it. Once per process.
 void PoolIndexStart();
-// Ends the thread (it saves first) and waits for it, at most 30 s.
+// Ends the thread (it saves first) and waits for it, best effort: at most
+// 30 s, then a line in the log. A no-op when it never started.
 void PoolIndexStop();
+// Whether the thread is running (the self-test).
+bool PoolIndexRunning();
 CPoolIndex& PoolIndex();
-// False keeps LoadBlockIndex from starting the thread: the self-tests load
-// block indexes of their own, and drive the index by hand.
-extern bool fPoolIndexAutoStart;
 
 // For later callers (RPCs, the pool chooser); all take only the index's lock.
 bool PoolIndexLookup(const uint256& id, CPoolInfo& out);
@@ -360,5 +368,12 @@ void PoolIndexAnchors(const uint256& id, std::vector<CPoolAnchor>& vRecent, int&
 int PoolIndexHeight();
 // Whether the index has read up to the active chain's tip.
 bool PoolIndexSynced();
+// Whether an output is an appearance of a pool (at least 1 BTF into
+// OP_RETURN <record>, the record valid): the test the fold makes, for anyone
+// who must find the same burns elsewhere (the memory pool, the wallet).
+bool PoolBurnedRecord(const CTxOut& out, std::vector<unsigned char>& recordOut, poolreg::PoolRecord& recOut);
+// The index's height, whether it is at the active chain's tip, and whether
+// it is reading the chain again from genesis, of one moment.
+void PoolIndexState(int& nHeightOut, bool& fSyncedOut, bool& fRebuildingOut);
 
 #endif

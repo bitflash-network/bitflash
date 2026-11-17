@@ -408,7 +408,8 @@ fuzz-p2plocal: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_p2plocal.o
 # The pool registry index: coinbase anchors, pool-registry.dat as read back,
 # and the fold under reorgs (fuzz_poolindex.cpp).
 fuzz-poolindex: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_poolindex.o
-	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) 	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
+	$(FUZZ_CXX) $(filter-out -fsanitize=fuzzer-no-link%,$(FUZZ_CXXFLAGS)) \
+	  $(FUZZ_LDFLAGS) -o $@ $^ $(NODE_LIBS)
 	@echo "Built: fuzz-poolindex"
 
 fuzz-light-peer: $(FUZZ_BASE_OBJS) obj-fuzz/fuzz_light_peer.o

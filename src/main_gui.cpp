@@ -915,9 +915,9 @@ static void FatalStartupError(bool fHeadless, const string& strWhat, const strin
     // finding tor.exe still running with the dead process's torrc on its command
     // line.
     BtfStopManagedTor();
-    // The pool index thread starts at the end of LoadBlockIndex, before most
-    // of the errors that land here; its last save is waited for (a no-op when
-    // it never started).
+    // The pool index thread starts only after StartNode, past every caller
+    // here; kept so a later caller after that point stays safe (a no-op when
+    // the thread never started).
     PoolIndexStop();
 
     printf("FATAL: %s\n", strWhat.c_str());
@@ -1707,6 +1707,12 @@ int main(int argc, char* argv[])
         return 1;
     }
     btcswap::StartLightClients();
+    // The pool registry is a reading of the active chain (poolindex.h): its
+    // own thread follows it from here on and never decides whether a block
+    // is valid. Started here, not in LoadBlockIndex: every one-shot command
+    // above returns without a stop, and from here on the only ways out (the
+    // headless loop, the window) stop it and wait for its last save.
+    PoolIndexStart();
 #endif
 
     if (nMineMode == MINE_OPERATOR || fP2PoolMode) {
