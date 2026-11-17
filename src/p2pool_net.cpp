@@ -538,8 +538,11 @@ static void WriteShares(const string& strFile, int nTipHeight, const vector<Shar
     string tmp = strFile + ".new";
     if (pRecord)
     {
-        // A registered pool's, its record in front. Nothing secret in it,
-        // but owner-only like every file this node writes for itself.
+        // A registered pool's, its record in front, in pools/ (made here: a
+        // pool mined from its first share never wrote a partial file, which
+        // made the directory before). Nothing secret in it, but owner-only
+        // like every file this node writes for itself.
+        _mkdir((GetAppDir() + "/pools").c_str());
         CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
         if (!file)
             return;

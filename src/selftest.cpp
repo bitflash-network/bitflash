@@ -9738,6 +9738,8 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(P2PoolRegFetchForTest(idA) == P2PoolRegStatusInfo::FETCH_COMPLETE && P2PoolMinedReady(why) &&
                        inv.size() == 1 && inv[0] == idA && CountSent(pOld, "poolinv") == 0,
                        "after its grace its line starts here, and it is announced to the peer that reads the registry only") ? 0 : 1;
+        nFail += Check(FileExists((tmp + "/pools/" + idA.GetHex() + ".dat").c_str()),
+                       "and its file is written in pools/, a directory nothing had made before") ? 0 : 1;
     }
 
     // ---- a line mined here, with an uncle and a side branch
