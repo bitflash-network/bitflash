@@ -57,7 +57,7 @@ extern bool (*g_pfnFuzzRpcAllow)(const char* pszMethod);   // jsonrpc.cpp, fuzz 
 // file, changes a setting, restarts Tor, or calls another chain's node.
 static const char* const kAllowed[] = {
     "getinfo", "getblockcount", "getblockhash", "getblock", "validateaddress",
-    "createmultisig", "decodescript", "getbalance", "getinvoice", "listinvoices",
+    "createmultisig", "decodescript", "getbalance", "getwalletinfo", "getinvoice", "listinvoices",
     "estimatefee", "gettreasuryinfo", "gettransaction", "listtransactions",
     "listsinceblock", "listunspent", "createrawtransaction", "decoderawtransaction",
     "getrawtransaction", "signrawtransaction", "swapauditcontract", "templatehash",
@@ -220,6 +220,7 @@ static void WriteSeeds(const std::string& d)
     WriteCall(d, "createmultisig", json::array({ 1, json::array({ pubHex, addr2 }) }));
     WriteCall(d, "decodescript", json::array({ spkHex }));
     WriteCall(d, "getbalance", json::array({ "*", 1 }));
+    WriteCall(d, "getwalletinfo", json::array());
     WriteCall(d, "getinvoice", json::array({ std::string(32, 'a') }));
     WriteCall(d, "listinvoices", json::array({ "paid" }));
     WriteCall(d, "estimatefee", json::array());
