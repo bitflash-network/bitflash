@@ -32,6 +32,8 @@
 #include "bip21.h"
 #include "btfchatwallet.h"
 #include "chatdir.h"
+#include "poolindex.h"
+#include <functional>
 #include "community.h"
 #include "explorer.h"
 #include "jsonrpc.h"
@@ -9076,8 +9078,9 @@ static int RunP2PoolLocalNodeSelfTest()
                        e0.find("local") != std::string::npos && e1 == e0,
                        "poolcreate with no mode is refused, naming everpool and local") ? 0 : 1;
         json r2 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", json({ { "name", "home" } }) }), &strAll);
-        nFail += Check(!RpcOk(r2) && RpcError(r2).find("not in this release") != std::string::npos,
-                       "poolcreate everpool says it is not in this release, and burns nothing") ? 0 : 1;
+        nFail += Check(RpcOk(r2) && r2["result"]["sent"] == false && !r2["result"].contains("txid") &&
+                           r2["result"]["burn"] == 1.0 && r2["result"]["name"] == "home",
+                       "poolcreate everpool without \"send\" shows the pool and burns nothing") ? 0 : 1;
         json r3 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "home" }, { "spacing", 10 } }) }), &strAll);
         json r4 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "home" }, { "colour", 1 } }) }), &strAll);
         json r5 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "local", json({ { "name", "a b" } }) }), &strAll);
@@ -9211,13 +9214,14 @@ static int RunP2PoolLocalNodeSelfTest()
     }
     {
         json rList = LocalNodeRpc(user, pass, "poollist", json::array(), &strAll);
-        bool fList = RpcOk(rList) && rList["result"].size() == 3 && rList["result"][0]["local"] == false &&
-                     rList["result"][1]["name"] == "home" && rList["result"][1]["local"] == true &&
-                     rList["result"][2]["name"] == "lan";
+        json lp = RpcOk(rList) && rList["result"].is_object() ? rList["result"].value("pools", json::array()) : json::array();
+        bool fList = lp.size() == 3 && lp[0]["local"] == false &&
+                     lp[1]["name"] == "home" && lp[1]["local"] == true &&
+                     lp[2]["name"] == "lan";
         json rInfo = LocalNodeRpc(user, pass, "poolinfo", json::array({ "local:home" }), &strAll);
         bool fInfo = RpcOk(rInfo) && rInfo["result"]["code"] == strCode && rInfo["result"]["rules"]["spacing"] == 30 &&
                      rInfo["result"]["local"] == true;
-        json rZero = LocalNodeRpc(user, pass, "poolinfo", json::array({ rList["result"][0]["id"] }), &strAll);
+        json rZero = LocalNodeRpc(user, pass, "poolinfo", json::array({ lp.size() ? lp[0]["id"] : json("") }), &strAll);
         nFail += Check(fList && fInfo && RpcOk(rZero) && rZero["result"]["rules"]["spacing"] == 10,
                        "poollist shows pool zero and the local pools marked local; poolinfo shows each") ? 0 : 1;
     }
@@ -14865,6 +14869,1400 @@ static int RunChainWorkSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- pool-index: the pool registry read off the active chain -------------
+// docs/pool-registry.md, sections 3, 4 and 7: appearances and the 30
+// confirmations, duplicates, a reorg on either side of 30, a record on both
+// branches, pool zero as entry zero, anchors as claims, and the file deleted,
+// damaged or naming a block this node does not know, read again to the same
+// registry.
+
+namespace {
+
+std::map<const CBlockIndex*, CBlock> g_poolIndexBlocks;
+// Ways to make a read go wrong: fail (or throw) at one height, and something
+// to do while a block is read (move the chain, ask for a stop).
+int g_poolIndexFailAt = -1;
+bool g_fPoolIndexThrow = false;
+std::function<void(const CBlockIndex*)> g_poolIndexReadHook;
+
+bool PoolIndexTestRead(const CBlockIndex* pindex, CBlock& block)
+{
+    if (pindex->nHeight == g_poolIndexFailAt)
+    {
+        if (g_fPoolIndexThrow)
+            throw std::runtime_error("CAutoFile::read : end of file");
+        return false;
+    }
+    std::map<const CBlockIndex*, CBlock>::const_iterator it = g_poolIndexBlocks.find(pindex);
+    if (it == g_poolIndexBlocks.end())
+        return false;
+    block = it->second;
+    if (g_poolIndexReadHook)
+        g_poolIndexReadHook(pindex);
+    return true;
+}
+
+// A pool-registry.dat as the index writes one: version, registry, any extra
+// bytes, and the hash of all of it. With nPatchAt >= 0 one 4-byte field of
+// the registry (counted from the start of the file) is overwritten first.
+bool PoolIndexTestWriteFile(const std::string& path, int nVersion, const CPoolRegistry& r,
+                            const std::string& extra, int nPatchAt = -1, int nPatch = 0)
+{
+    CDataStream ss(SER_DISK);
+    ss << nVersion << r;
+    std::string data(ss.begin(), ss.end());
+    data += extra;
+    if (nPatchAt >= 0 && nPatchAt + 4 <= (int)data.size())
+        memcpy(&data[nPatchAt], &nPatch, 4);
+    uint256 h = Hash(data.begin(), data.end());
+    data.append((const char*)h.begin(), 32);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool fOk = fwrite(data.data(), 1, data.size(), f) == data.size();
+    return fclose(f) == 0 && fOk;
+}
+
+bool PoolIndexTestWriteRaw(const std::string& path, const std::string& data)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool fOk = fwrite(data.data(), 1, data.size(), f) == data.size();
+    return fclose(f) == 0 && fOk;
+}
+
+std::vector<unsigned char> PoolIndexTestRecord(const std::string& name)
+{
+    poolreg::PoolRecord r;
+    r.nSpacing = 30;
+    r.nWindow = 720;
+    r.nRetarget = 360;
+    r.nFloor = poolreg::NETWORK_FLOOR;
+    r.nUncleDepth = 2;
+    r.nUnclePct = 80;
+    r.nFeeBps = 0;
+    r.nFeeType = poolreg::FEE_NONE;
+    r.name = name;
+    return r.Encode();
+}
+
+uint256 PoolIndexTestId(const std::vector<unsigned char>& record)
+{
+    uint256 id = 0;
+    poolreg::PoolId(record, (const unsigned char*)pchMessageStart, id.begin());
+    return id;
+}
+
+CTransaction PoolIndexTestBurn(const CScript& script, int64 nBurn, unsigned int nSalt)
+{
+    CTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout.hash = uint256(nSalt + 1);
+    tx.vin[0].prevout.n = 0;
+    tx.vout.push_back(CTxOut(nBurn, script));
+    return tx;
+}
+
+CScript PoolIndexTestRecordScript(const std::vector<unsigned char>& record)
+{
+    return CScript() << OP_RETURN << record;
+}
+
+std::vector<unsigned char> PoolIndexTestPush(const char* tag, const uint256* pId, const uint256& hash)
+{
+    // uint256's begin() is not const: copies.
+    std::vector<unsigned char> v(tag, tag + 3);
+    if (pId)
+    {
+        uint256 id = *pId;
+        v.insert(v.end(), id.begin(), id.end());
+    }
+    uint256 h = hash;
+    v.insert(v.end(), h.begin(), h.end());
+    return v;
+}
+
+// A block whose coinbase carries the height and these pushes, then txs.
+CBlock PoolIndexTestBlock(int nHeight, const std::vector<std::vector<unsigned char> >& vPush,
+                          const std::vector<CTransaction>& vTx = std::vector<CTransaction>())
+{
+    CTransaction cb;
+    cb.vin.resize(1);
+    cb.vin[0].scriptSig = CScript() << nHeight;
+    for (size_t i = 0; i < vPush.size(); i++)
+        cb.vin[0].scriptSig << vPush[i];
+    cb.vout.push_back(CTxOut(50 * COIN, CScript() << OP_TRUE));
+    CBlock block;
+    block.vtx.push_back(cb);
+    block.vtx.insert(block.vtx.end(), vTx.begin(), vTx.end());
+    return block;
+}
+
+CBlock PoolIndexTestPlain(int nHeight)
+{
+    return PoolIndexTestBlock(nHeight, std::vector<std::vector<unsigned char> >());
+}
+
+// A made-up block index whose blocks the reader above hands out.
+struct PoolIndexTestChain
+{
+    std::vector<CBlockIndex*> vMade;
+    unsigned int nNext;
+    CBlockIndex* pGenesis;
+
+    PoolIndexTestChain() : nNext(0x7a000000), pGenesis(NULL) {}
+
+    CBlockIndex* Add(CBlockIndex* pprev, const CBlock& block)
+    {
+        CBlockIndex* p = new CBlockIndex();
+        std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.insert(make_pair(uint256(nNext++), p)).first;
+        p->phashBlock = &((*mi).first);
+        p->pprev = pprev;
+        p->nHeight = pprev ? pprev->nHeight + 1 : 0;
+        vMade.push_back(p);
+        g_poolIndexBlocks[p] = block;
+        if (!pprev)
+            pGenesis = p;
+        return p;
+    }
+
+    // n more blocks on p; fill(height) gives each one.
+    CBlockIndex* Extend(CBlockIndex* p, int n, const std::function<CBlock(int)>& fill)
+    {
+        for (int i = 0; i < n; i++)
+            p = Add(p, fill(p->nHeight + 1));
+        return p;
+    }
+
+    // Make the branch ending at tip the active chain.
+    void SetMain(CBlockIndex* tip)
+    {
+        for (size_t i = 0; i < vMade.size(); i++)
+            vMade[i]->pnext = NULL;
+        for (CBlockIndex* p = tip; p->pprev; p = p->pprev)
+            p->pprev->pnext = p;
+        pindexGenesisBlock = pGenesis;
+        pindexBest = tip;
+        nBestHeight = tip->nHeight;
+        hashBestChain = tip->GetBlockHash();
+    }
+
+    void Forget(CBlockIndex* p)
+    {
+        mapBlockIndex.erase(p->GetBlockHash());
+        g_poolIndexBlocks.erase(p);
+        vMade.erase(std::find(vMade.begin(), vMade.end(), p));
+        delete p;
+    }
+
+    ~PoolIndexTestChain()
+    {
+        for (size_t i = 0; i < vMade.size(); i++)
+        {
+            mapBlockIndex.erase(vMade[i]->GetBlockHash());
+            g_poolIndexBlocks.erase(vMade[i]);
+            delete vMade[i];
+        }
+    }
+};
+
+// The registry read straight from genesis to tip, the way a node with no
+// file reads it.
+uint256 PoolIndexTestReference(CBlockIndex* tip)
+{
+    std::vector<CBlockIndex*> v;
+    for (CBlockIndex* p = tip; p; p = p->pprev)
+        v.push_back(p);
+    CPoolRegistry r;
+    r.Reset((const unsigned char*)pchMessageStart);
+    for (size_t i = v.size(); i-- > 0; )
+        r.ConnectBlock(g_poolIndexBlocks[v[i]], v[i]->nHeight, v[i]->GetBlockHash());
+    return r.Digest();
+}
+
+// Passes until the index is at the tip; false if it never gets there.
+bool PoolIndexTestSync(CPoolIndex& idx, unsigned int nMax)
+{
+    for (int i = 0; i < 100000; i++)
+    {
+        bool fSynced = false;
+        int n = idx.Step(nMax, fSynced);
+        if (fSynced)
+            return true;
+        if (n <= 0)
+            return false;
+    }
+    return false;
+}
+
+} // namespace
+
+static int RunPoolIndexSelfTest()
+{
+    fflush(stdout);
+    printf("pool-index self-test\n");
+
+    int nFail = 0;
+    const bool fTestNetSaved = IsTestNet();
+    CBlockIndex* pindexBestSaved = pindexBest;
+    CBlockIndex* pindexGenesisSaved = pindexGenesisBlock;
+    const int nBestHeightSaved = nBestHeight;
+    const uint256 hashBestSaved = hashBestChain;
+    const std::string path = GetAppDir() + "/pool-registry-selftest.dat";
+    remove(path.c_str());
+    try
+    {
+        // ---- pool zero: entry zero, its record and ids pinned (section 4)
+        nFail += Check(poolreg::PoolZero().Encode() ==
+                       ParseHex("4254465001010a007008d002ffff0f1f03500000000000000000000000000000000000000000000000626974666c617368"),
+                       "pool zero's record is the 49 bytes of the design") ? 0 : 1;
+        SelectChainParams(true);
+        {
+            CPoolRegistry r;
+            r.Reset((const unsigned char*)pchMessageStart);
+            nFail += Check(r.ZeroId().GetHex() == "a97d439cb065f828545a5b45f098297ca79adebba56a80a87cb0b095fddb2736",
+                           "pool zero's id on testnet") ? 0 : 1;
+        }
+        SelectChainParams(false);
+        CPoolRegistry r;
+        r.Reset((const unsigned char*)pchMessageStart);
+        const uint256 idZero = r.ZeroId();
+        nFail += Check(idZero.GetHex() == "d925f36f20d98092d034dc083e46040fcb292c5f5437bc834130da088b197c8a",
+                       "pool zero's id on mainnet") ? 0 : 1;
+        {
+            std::vector<CPoolInfo> v;
+            r.List(v);
+            nFail += Check(v.size() == 1 && v[0].fZero && v[0].id == idZero && v[0].nStatus == POOL_ACTIVE &&
+                           v[0].nAppearances == 0 && v[0].first.nHeight == -1 &&
+                           v[0].record == poolreg::PoolZero().Encode() && v[0].rec.nSpacing == 10,
+                           "before any block, the registry is pool zero alone, active, with no burn") ? 0 : 1;
+            CPoolInfo info;
+            nFail += Check(!r.Lookup(uint256(77), info) && r.Status(uint256(77)) == POOL_UNKNOWN,
+                           "an id nobody burned is unknown") ? 0 : 1;
+        }
+
+        // ---- appearances and the 30 confirmations (section 3)
+        const std::vector<unsigned char> recA = PoolIndexTestRecord("alpha");
+        const std::vector<unsigned char> recB = PoolIndexTestRecord("beta");
+        const std::vector<unsigned char> recC = PoolIndexTestRecord("gamma");
+        const uint256 idA = PoolIndexTestId(recA), idB = PoolIndexTestId(recB), idC = PoolIndexTestId(recC);
+        std::vector<std::vector<unsigned char> > none;
+        // Registry-only blocks: hash = salt * 2^20 + height.
+        int nSalt = 1;
+        std::function<bool(const CBlock&)> connect = [&](const CBlock& b) {
+            int h = r.Height() + 1;
+            return r.ConnectBlock(b, h, uint256((uint64)nSalt * 0x100000 + h));
+        };
+        for (int h = 0; h < 5; h++)
+            connect(PoolIndexTestPlain(h));
+        CTransaction txA = PoolIndexTestBurn(PoolIndexTestRecordScript(recA), poolreg::MIN_BURN, 1);
+        connect(PoolIndexTestBlock(5, none, std::vector<CTransaction>(1, txA)));
+        {
+            CPoolInfo info;
+            bool fFound = r.Lookup(idA, info);
+            nFail += Check(fFound && info.nStatus == POOL_PENDING && info.nConfirmations == 1 && info.nAppearances == 1 &&
+                           info.first.nHeight == 5 && info.first.nTx == 1 && info.first.nOut == 0 &&
+                           info.first.nBurn == poolreg::MIN_BURN && info.first.txid == txA.GetHash() &&
+                           info.first.hashBlock == uint256((uint64)0x100000 + 5) && info.record == recA &&
+                           info.rec.name == "alpha" && !info.fZero,
+                           "a record burning 1 BTF is an appearance: height, block, txid, output, burn") ? 0 : 1;
+        }
+        while (r.Height() < 33)
+            connect(PoolIndexTestPlain(r.Height() + 1));
+        {
+            CPoolInfo info;
+            r.Lookup(idA, info);
+            nFail += Check(info.nStatus == POOL_PENDING && info.nConfirmations == 29,
+                           "at 29 confirmations the pool is pending") ? 0 : 1;
+        }
+        connect(PoolIndexTestPlain(34));
+        {
+            CPoolInfo info;
+            r.Lookup(idA, info);
+            nFail += Check(info.nStatus == POOL_ACTIVE && info.nConfirmations == 30,
+                           "at 30 confirmations it is active") ? 0 : 1;
+        }
+        nFail += Check(!r.ConnectBlock(PoolIndexTestPlain(36), 36, uint256(36)) && r.Height() == 34,
+                       "a block that is not the next one is refused") ? 0 : 1;
+
+        // ---- what is not a registration
+        {
+            std::vector<CTransaction> vTx;
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(recC), poolreg::MIN_BURN - 1, 2));
+            std::vector<unsigned char> bad = recC;
+            bad[16] = 0;   // uncle depth 0
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(bad), poolreg::MIN_BURN, 3));
+            std::vector<unsigned char> local = recC;
+            local[3] = 'L';   // "BTFL": a local pool's record, never on the chain
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(local), poolreg::MIN_BURN, 4));
+            CScript pushdata1;
+            pushdata1.push_back(OP_RETURN);
+            pushdata1.push_back(OP_PUSHDATA1);
+            pushdata1.push_back((unsigned char)recC.size());
+            pushdata1.insert(pushdata1.end(), recC.begin(), recC.end());
+            vTx.push_back(PoolIndexTestBurn(pushdata1, poolreg::MIN_BURN, 5));
+            vTx.push_back(PoolIndexTestBurn(CScript() << OP_RETURN << recC << OP_0, poolreg::MIN_BURN, 6));
+            vTx.push_back(PoolIndexTestBurn(CScript() << recC, poolreg::MIN_BURN, 7));
+            connect(PoolIndexTestBlock(35, none, vTx));
+            nFail += Check(r.Status(idC) == POOL_UNKNOWN && r.PoolCount() == 1,
+                           "a burn under 1 BTF, a bad record, a local record, OP_PUSHDATA1, a trailing opcode "
+                           "and no OP_RETURN are no registration") ? 0 : 1;
+        }
+
+        // ---- duplicates (section 2: the same rules are the same pool)
+        CTransaction txA2 = PoolIndexTestBurn(PoolIndexTestRecordScript(recA), 2 * poolreg::MIN_BURN, 8);
+        connect(PoolIndexTestBlock(36, none, std::vector<CTransaction>(1, txA2)));
+        {
+            CTransaction twice = PoolIndexTestBurn(PoolIndexTestRecordScript(recA), poolreg::MIN_BURN, 9);
+            twice.vout.push_back(CTxOut(poolreg::MIN_BURN, PoolIndexTestRecordScript(recA)));
+            std::vector<CTransaction> vTx;
+            vTx.push_back(twice);
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(recB), poolreg::MIN_BURN, 10));
+            connect(PoolIndexTestBlock(37, none, vTx));
+        }
+        {
+            CPoolInfo info;
+            r.Lookup(idA, info);
+            std::vector<CPoolAppearance> v;
+            r.Appearances(idA, v);
+            nFail += Check(info.nAppearances == 4 && info.first.nHeight == 5 && info.nStatus == POOL_ACTIVE &&
+                           v.size() == 4 && v[1].nHeight == 36 && v[1].nBurn == 2 * poolreg::MIN_BURN &&
+                           v[2].nHeight == 37 && v[2].nTx == 1 && v[2].nOut == 0 && v[3].nOut == 1 &&
+                           r.PoolCount() == 2,
+                           "registering it again adds appearances; the first, and the pool's age, stay") ? 0 : 1;
+            std::vector<CPoolInfo> vList;
+            r.List(vList);
+            nFail += Check(vList.size() == 3 && vList[0].fZero && vList[1].id == idA && vList[2].id == idB &&
+                           vList[2].nStatus == POOL_PENDING,
+                           "the list is pool zero, then by first appearance") ? 0 : 1;
+        }
+        while (r.Height() < 50)
+            connect(PoolIndexTestPlain(r.Height() + 1));
+
+        // ---- a reorg before 30, and the record on both branches
+        nFail += Check(r.DisconnectAbove(36, uint256((uint64)0x100000 + 36)) && r.Height() == 36,
+                       "a reorg to block 36 is undone in place") ? 0 : 1;
+        {
+            CPoolInfo info;
+            r.Lookup(idA, info);
+            nFail += Check(r.Status(idB) == POOL_UNKNOWN && info.nAppearances == 2 && info.nStatus == POOL_ACTIVE,
+                           "an appearance reorged out before 30 goes; the earlier ones stay") ? 0 : 1;
+        }
+        nSalt = 2;
+        while (r.Height() < 39)
+            connect(PoolIndexTestPlain(r.Height() + 1));
+        connect(PoolIndexTestBlock(40, none,
+                                   std::vector<CTransaction>(1, PoolIndexTestBurn(PoolIndexTestRecordScript(recB), poolreg::MIN_BURN, 11))));
+        {
+            CPoolInfo info;
+            bool fFound = r.Lookup(idB, info);
+            nFail += Check(fFound && info.id == idB && info.nStatus == POOL_PENDING && info.first.nHeight == 40 &&
+                           info.first.hashBlock == uint256((uint64)2 * 0x100000 + 40),
+                           "the same record on the new branch: the same id, pending again from its new height") ? 0 : 1;
+        }
+        while (r.Height() < 68)
+            connect(PoolIndexTestPlain(r.Height() + 1));
+        nFail += Check(r.Status(idB) == POOL_PENDING, "29 confirmations on the new branch: pending") ? 0 : 1;
+        connect(PoolIndexTestPlain(69));
+        nFail += Check(r.Status(idB) == POOL_ACTIVE, "30: active") ? 0 : 1;
+
+        // ---- a reorg after 30
+        nFail += Check(r.DisconnectAbove(4, uint256((uint64)0x100000 + 4)), "a reorg to block 4 is undone in place") ? 0 : 1;
+        {
+            std::vector<CPoolInfo> v;
+            r.List(v);
+            nFail += Check(r.Status(idA) == POOL_UNKNOWN && r.Status(idB) == POOL_UNKNOWN && v.size() == 1 && v[0].fZero,
+                           "pools active for 30 and more go too: depth never makes a pool permanent") ? 0 : 1;
+        }
+
+        // ---- anchors as claims (section 7)
+        {
+            CPoolRegistry a;
+            a.Reset((const unsigned char*)pchMessageStart);
+            const uint256 idU = uint256(0xabcdef);
+            std::vector<uint256> h;
+            for (int i = 0; i < 20; i++)
+                h.push_back(uint256(0x5000 + i));
+            std::function<void(const CBlock&)> add = [&](const CBlock& b) {
+                int n = a.Height() + 1;
+                a.ConnectBlock(b, n, uint256((uint64)3 * 0x100000 + n));
+            };
+            add(PoolIndexTestPlain(0));
+            std::vector<std::vector<unsigned char> > p;
+            p.assign(1, PoolIndexTestPush("p2p", NULL, h[1]));
+            add(PoolIndexTestBlock(1, p));                                           // pool zero
+            p.assign(1, PoolIndexTestPush("p2x", &idA, h[2]));
+            add(PoolIndexTestBlock(2, p));                                           // A, not yet burned
+            p.assign(1, PoolIndexTestPush("p2x", &idA, h[3]));
+            p.push_back(PoolIndexTestPush("p2p", NULL, h[3]));
+            add(PoolIndexTestBlock(3, p));                                           // none
+            p.assign(1, PoolIndexTestPush("p2x", &idA, h[4]));
+            p.push_back(PoolIndexTestPush("p2x", &idB, h[4]));
+            add(PoolIndexTestBlock(4, p));                                           // none
+            p.assign(1, PoolIndexTestPush("p2x", &idA, h[5]));
+            p.push_back(PoolIndexTestPush("p2l", NULL, h[5]));
+            add(PoolIndexTestBlock(5, p));                                           // none
+            p.assign(1, PoolIndexTestPush("p2p", NULL, h[6]));
+            p.push_back(PoolIndexTestPush("p2l", NULL, h[6]));
+            add(PoolIndexTestBlock(6, p));                                           // pool zero
+            p.assign(1, PoolIndexTestPush("p2l", NULL, h[7]));
+            add(PoolIndexTestBlock(7, p));                                           // none
+            p.assign(1, PoolIndexTestPush("p2x", &idZero, h[8]));
+            add(PoolIndexTestBlock(8, p));                                           // none
+            p.assign(1, PoolIndexTestPush("p2p", NULL, h[9]));
+            p.push_back(PoolIndexTestPush("p2p", NULL, h[9]));
+            add(PoolIndexTestBlock(9, p));                                           // none
+            {
+                CBlock b = PoolIndexTestBlock(10, std::vector<std::vector<unsigned char> >(1, PoolIndexTestPush("p2p", NULL, h[10])));
+                b.vtx[0].vin[0].scriptSig.push_back(OP_PUSHDATA1);   // a push with no length: does not parse
+                add(b);                                                              // none
+            }
+            {
+                CBlock b = PoolIndexTestPlain(11);
+                std::vector<unsigned char> push = PoolIndexTestPush("p2p", NULL, h[11]);
+                b.vtx[0].vin[0].scriptSig.push_back(OP_PUSHDATA1);
+                b.vtx[0].vin[0].scriptSig.push_back((unsigned char)push.size());
+                b.vtx[0].vin[0].scriptSig.insert(b.vtx[0].vin[0].scriptSig.end(), push.begin(), push.end());
+                add(b);                                                              // pool zero
+            }
+            p.assign(1, PoolIndexTestPush("p2x", &idA, h[12]));
+            add(PoolIndexTestBlock(12, p, std::vector<CTransaction>(1, txA)));       // A, and its burn
+            p.assign(1, PoolIndexTestPush("p2x", &idU, h[13]));
+            add(PoolIndexTestBlock(13, p));                                          // an id nobody burned
+
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            a.Anchors(idZero, v, nWin);
+            nFail += Check(nWin == 3 && v.size() == 3 && v[0].nHeight == 11 && v[1].nHeight == 6 && v[2].nHeight == 1 &&
+                           v[0].hashShareData == h[11] && v[0].hashBlock == uint256((uint64)3 * 0x100000 + 11),
+                           "pool zero: one \"p2p\" and no \"p2x\", a \"p2l\" beside it or not, by any push opcode") ? 0 : 1;
+            CPoolInfo info;
+            a.Lookup(idA, info);
+            nFail += Check(info.nAnchorsInWindow == 2 && info.vRecentAnchors.size() == 2 &&
+                           info.vRecentAnchors[0].nHeight == 12 && info.vRecentAnchors[1].nHeight == 2 &&
+                           info.vRecentAnchors[1].hashShareData == h[2],
+                           "a registered pool: one \"p2x\" and nothing else; one made before its burn counts too") ? 0 : 1;
+            nFail += Check(a.Status(idU) == POOL_UNKNOWN && !a.Lookup(idU, info),
+                           "an anchor naming an id nobody burned registers nothing") ? 0 : 1;
+            a.Anchors(idU, v, nWin);
+            nFail += Check(nWin == 1 && v.size() == 1 && v[0].nHeight == 13, "but is kept as a claim on that id") ? 0 : 1;
+            a.Anchors(idB, v, nWin);
+            nFail += Check(nWin == 0 && v.empty(),
+                           "two \"p2x\", \"p2x\" with \"p2p\" or \"p2l\", two \"p2p\", pool zero's id in \"p2x\", "
+                           "and a scriptSig that does not parse count for no pool") ? 0 : 1;
+
+            // The window: 720 blocks ending at the tip.
+            while (a.Height() < 2 + 719)
+                add(PoolIndexTestPlain(a.Height() + 1));
+            a.Lookup(idA, info);
+            nFail += Check(info.nAnchorsInWindow == 2, "an anchor 719 blocks below the tip is in the window") ? 0 : 1;
+            add(PoolIndexTestPlain(a.Height() + 1));
+            a.Lookup(idA, info);
+            nFail += Check(info.nAnchorsInWindow == 1 && info.vRecentAnchors.size() == 2,
+                           "720 below, it is out of the count and still among the recent") ? 0 : 1;
+
+            // A serialized registry reads back to the same answers.
+            CDataStream ss(SER_DISK);
+            ss << a;
+            CPoolRegistry back;
+            ss >> back;
+            std::string why;
+            nFail += Check(back.Digest() == a.Digest() && back.CheckConsistent(why) && back.Height() == a.Height(),
+                           "a registry written and read back answers the same") ? 0 : 1;
+        }
+        {
+            CPoolRegistry a;
+            a.Reset((const unsigned char*)pchMessageStart);
+            for (int n = 0; n < 70; n++)
+                a.ConnectBlock(PoolIndexTestBlock(n, std::vector<std::vector<unsigned char> >(1, PoolIndexTestPush("p2p", NULL, uint256(n + 1)))),
+                               n, uint256((uint64)4 * 0x100000 + n));
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            a.Anchors(idZero, v, nWin);
+            nFail += Check(v.size() == 64 && v[0].nHeight == 69 && v[63].nHeight == 6 && nWin == 70,
+                           "the newest 64 anchors are kept for showing, newest first; the count is all 70") ? 0 : 1;
+            a.DisconnectAbove(59, uint256((uint64)4 * 0x100000 + 59));
+            a.Anchors(idZero, v, nWin);
+            nFail += Check(v.size() == 60 && v[0].nHeight == 59 && v[59].nHeight == 0 && nWin == 60,
+                           "a reorg takes its anchors with it") ? 0 : 1;
+        }
+
+        // ---- the index on a made-up chain: passes, reorgs and the file
+        PoolIndexTestChain chain;
+        CTransaction txB = PoolIndexTestBurn(PoolIndexTestRecordScript(recB), poolreg::MIN_BURN, 12);
+        std::function<CBlock(int)> fillMain = [&](int n) {
+            std::vector<std::vector<unsigned char> > p;
+            if (n >= 20 && n <= 25)
+                p.push_back(PoolIndexTestPush("p2x", &idA, uint256(n)));
+            else if (n % 10 == 0)
+                p.push_back(PoolIndexTestPush("p2p", NULL, uint256(n)));
+            std::vector<CTransaction> vTx;
+            if (n == 5)
+                vTx.push_back(txA);
+            if (n == 40)
+                vTx.push_back(txB);
+            return PoolIndexTestBlock(n, p, vTx);
+        };
+        std::function<CBlock(int)> fillPlain = [&](int n) { return PoolIndexTestPlain(n); };
+        CBlockIndex* pGen = chain.Add(NULL, PoolIndexTestPlain(0));
+        CBlockIndex* pTipM = chain.Extend(pGen, 60, fillMain);
+        CBlockIndex* pM[61];
+        for (CBlockIndex* q = pTipM; q; q = q->pprev)
+            pM[q->nHeight] = q;
+        chain.SetMain(pTipM);
+
+        CPoolIndex idx(PoolIndexTestRead);
+        idx.SetPath(path);
+        nFail += Check(!idx.Load(), "with no file the index starts from genesis") ? 0 : 1;
+        bool fSynced = PoolIndexTestSync(idx, 1000);
+        nFail += Check(fSynced && idx.Height() == 60 && idx.Status(idA) == POOL_ACTIVE && idx.Status(idB) == POOL_PENDING &&
+                       idx.Digest() == PoolIndexTestReference(pTipM),
+                       "the index reads the active chain to its tip: A active, B pending") ? 0 : 1;
+        {
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            idx.Anchors(idA, v, nWin);
+            nFail += Check(nWin == 6 && v.size() == 6 && v[0].nHeight == 25, "and A's six anchors") ? 0 : 1;
+        }
+
+        // A reorg before 30: a branch from block 35 without B's burn.
+        CBlockIndex* pTipX = chain.Extend(pM[35], 30, fillPlain);
+        chain.SetMain(pTipX);
+        fSynced = PoolIndexTestSync(idx, 7);
+        nFail += Check(fSynced && idx.Height() == 65 && idx.Status(idB) == POOL_UNKNOWN && idx.Status(idA) == POOL_ACTIVE &&
+                       idx.Digest() == PoolIndexTestReference(pTipX) && idx.Rebuilds() == 0,
+                       "a branch without B's burn: B is gone, A stays, undone in place") ? 0 : 1;
+        nFail += Check(PoolIndexTestReference(pTipX) != PoolIndexTestReference(pTipM) &&
+                       PoolIndexTestReference(pTipX) != PoolIndexTestReference(pM[64 - 30]),
+                       "and the digest tells registries apart: another branch, or the same one shorter") ? 0 : 1;
+
+        // The record on both branches: B burned again at 45 on a branch from 39.
+        CTransaction txB2 = PoolIndexTestBurn(PoolIndexTestRecordScript(recB), poolreg::MIN_BURN, 13);
+        CBlockIndex* pTipY = chain.Extend(pM[39], 31, [&](int n) {
+            return n == 45 ? PoolIndexTestBlock(n, std::vector<std::vector<unsigned char> >(), std::vector<CTransaction>(1, txB2))
+                           : PoolIndexTestPlain(n);
+        });
+        chain.SetMain(pTipY);
+        fSynced = PoolIndexTestSync(idx, 1000);
+        {
+            CPoolInfo info;
+            idx.Lookup(idB, info);
+            nFail += Check(fSynced && info.nStatus == POOL_PENDING && info.first.nHeight == 45 && info.nAppearances == 1 &&
+                           info.first.txid == txB2.GetHash() && idx.Digest() == PoolIndexTestReference(pTipY),
+                           "B on the other branch too: the same pool, from that branch's block") ? 0 : 1;
+        }
+
+        // A reorg after 30: a longer branch from block 3, before A's burn.
+        CBlockIndex* pTipZ = chain.Extend(pM[3], 72, fillPlain);
+        chain.SetMain(pTipZ);
+        fSynced = PoolIndexTestSync(idx, 1000);
+        nFail += Check(fSynced && idx.Status(idA) == POOL_UNKNOWN && idx.Status(idB) == POOL_UNKNOWN &&
+                       idx.Digest() == PoolIndexTestReference(pTipZ) && idx.Rebuilds() == 0,
+                       "a branch from before A's burn: A, active for 50 blocks, is gone") ? 0 : 1;
+
+        // And back: everything re-learned.
+        chain.SetMain(pTipM);
+        fSynced = PoolIndexTestSync(idx, 1000);
+        {
+            CPoolInfo info;
+            idx.Lookup(idA, info);
+            nFail += Check(fSynced && info.nStatus == POOL_ACTIVE && info.first.nHeight == 5 && idx.Status(idB) == POOL_PENDING &&
+                           idx.Digest() == PoolIndexTestReference(pTipM),
+                           "back on the first branch, A and B are learned again") ? 0 : 1;
+        }
+
+        // The file: read back, deleted, damaged.
+        nFail += Check(idx.Save(), "the index is saved") ? 0 : 1;
+        {
+            CPoolIndex again(PoolIndexTestRead);
+            again.SetPath(path);
+            bool fLoaded = again.Load();
+            bool fSyncedAgain = false;
+            int n = again.Step(1000, fSyncedAgain);
+            nFail += Check(fLoaded && again.Digest() == idx.Digest() && n == 0 && fSyncedAgain,
+                           "read back from the file it is the same registry, at the tip, with nothing to read") ? 0 : 1;
+        }
+        remove(path.c_str());
+        {
+            CPoolIndex fresh(PoolIndexTestRead);
+            fresh.SetPath(path);
+            bool fLoaded = fresh.Load();
+            bool fOk = PoolIndexTestSync(fresh, 13);
+            nFail += Check(!fLoaded && fOk && fresh.Digest() == idx.Digest(),
+                           "the file deleted, the chain read again gives the same registry") ? 0 : 1;
+        }
+        idx.Save();
+        {
+            FILE* f = fopen(path.c_str(), "r+b");
+            bool fFlipped = false;
+            if (f)
+            {
+                fseek(f, 0, SEEK_END);
+                long nSize = ftell(f);
+                fseek(f, nSize / 2, SEEK_SET);
+                int c = fgetc(f);
+                fseek(f, nSize / 2, SEEK_SET);
+                fFlipped = c != EOF && fputc(c ^ 0x5a, f) != EOF;
+                fclose(f);
+            }
+            CPoolIndex damaged(PoolIndexTestRead);
+            damaged.SetPath(path);
+            bool fLoaded = damaged.Load();
+            bool fOk = PoolIndexTestSync(damaged, 1000);
+            nFail += Check(fFlipped && !fLoaded && fOk && damaged.Digest() == idx.Digest(),
+                           "a damaged file is not used; the chain gives the same registry") ? 0 : 1;
+        }
+
+        // A file ending in blocks this node lost (an unclean stop that took
+        // the last blocks of its block index): it resumes from the newest
+        // block of its locator that the node still knows.
+        {
+            CBlockIndex* pTipS = chain.Extend(pM[50], 5, fillMain);
+            chain.SetMain(pTipS);
+            CPoolIndex side(PoolIndexTestRead);
+            side.SetPath(path);
+            bool fOk = PoolIndexTestSync(side, 1000) && side.Save();
+            chain.SetMain(pTipM);
+            while (pTipS != pM[50])
+            {
+                CBlockIndex* prev = pTipS->pprev;
+                chain.Forget(pTipS);
+                pTipS = prev;
+            }
+            CPoolIndex resumed(PoolIndexTestRead);
+            resumed.SetPath(path);
+            bool fLoaded = resumed.Load();
+            bool fSyncedS = PoolIndexTestSync(resumed, 1000);
+            nFail += Check(fOk && fLoaded && fSyncedS && resumed.Rebuilds() == 0 && resumed.Digest() == idx.Digest(),
+                           "a file ending in blocks this node lost resumes from its locator, not from genesis") ? 0 : 1;
+        }
+
+        // A file of a chain this node never had: read again from genesis,
+        // the old registry answering until the new one reaches the tip.
+        {
+            CPoolRegistry stray;
+            stray.Reset((const unsigned char*)pchMessageStart);
+            CTransaction txC = PoolIndexTestBurn(PoolIndexTestRecordScript(recC), poolreg::MIN_BURN, 14);
+            for (int n = 0; n <= 40; n++)
+                stray.ConnectBlock(n == 5 ? PoolIndexTestBlock(n, none, std::vector<CTransaction>(1, txC)) : PoolIndexTestPlain(n),
+                                   n, uint256((uint64)0xdead0000 + n));
+            bool fWritten = PoolIndexTestWriteFile(path, 2, stray, "");
+            CPoolIndex stranger(PoolIndexTestRead);
+            stranger.SetPath(path);
+            bool fLoaded = stranger.Load();
+            bool fSynced0 = false;
+            stranger.Step(1000, fSynced0);
+            stranger.Step(10, fSynced0);
+            bool fMidway = stranger.Rebuilding() && stranger.Status(idC) == POOL_ACTIVE && stranger.Height() == 40;
+            bool fOk = PoolIndexTestSync(stranger, 1000);
+            nFail += Check(fWritten && fLoaded && fMidway && fOk && !stranger.Rebuilding() && stranger.Rebuilds() == 1 &&
+                           stranger.Status(idC) == POOL_UNKNOWN && stranger.Digest() == idx.Digest(),
+                           "a file of a chain this node never had: read again beside it, its pools answered until then") ? 0 : 1;
+
+            // Files that are not used.
+            std::string body;
+            {
+                CDataStream ss(SER_DISK);
+                ss << stray;
+                body.assign(ss.begin(), ss.end());
+            }
+            CPoolRegistry other;
+            const unsigned char magicOther[4] = { 0xce, 0xe2, 0xc0, 0xff };
+            other.Reset(magicOther);
+            other.ConnectBlock(PoolIndexTestPlain(0), 0, uint256(1));
+            bool fRefused = true;
+            const char* vWhy[] = { "another version", "another network", "fewer than 36 bytes", "trailing bytes",
+                                   "contents that do not hold together" };
+            for (int k = 0; k < 5; k++)
+            {
+                bool fW = false;
+                if (k == 0)
+                    fW = PoolIndexTestWriteFile(path, 1, stray, "");
+                else if (k == 1)
+                    fW = PoolIndexTestWriteFile(path, 2, other, "");
+                else if (k == 2)
+                    fW = PoolIndexTestWriteRaw(path, std::string(35, 'x'));
+                else if (k == 3)
+                    fW = PoolIndexTestWriteFile(path, 2, stray, "xyz");
+                else
+                    fW = PoolIndexTestWriteFile(path, 2, stray, "", 8, 2);   // the tip at 2, an appearance at 5
+                CPoolIndex refused(PoolIndexTestRead);
+                refused.SetPath(path);
+                bool fL = refused.Load();
+                if (!fW || fL)
+                {
+                    printf("       (a file with %s was %s)\n", vWhy[k], fW ? "used" : "not written");
+                    fRefused = false;
+                }
+            }
+            nFail += Check(fRefused, "files of another version or network, too short, with trailing bytes, "
+                                     "or whose contents do not hold together are not used") ? 0 : 1;
+            bool fGood = PoolIndexTestWriteFile(path, 2, stray, "");
+            CPoolIndex good(PoolIndexTestRead);
+            good.SetPath(path);
+            nFail += Check(fGood && good.Load(), "and the same file, as written, is") ? 0 : 1;
+        }
+
+        // The network changes under the index.
+        {
+            CPoolIndex net(PoolIndexTestRead);
+            bool fOk = PoolIndexTestSync(net, 1000);
+            SelectChainParams(true);
+            bool fSyncedN = false;
+            int n = net.Step(1000, fSyncedN);
+            const unsigned char magicTest[4] = { 0xce, 0xe2, 0xc0, 0xff };
+            bool fReset = n == 1 && net.Rebuilds() == 1 && net.Height() == -1 && net.Snapshot().HasMagic(magicTest);
+            SelectChainParams(false);
+            fOk = fOk && PoolIndexTestSync(net, 1000);
+            nFail += Check(fReset && fOk && net.Rebuilds() == 2 && net.Digest() == idx.Digest(),
+                           "another network's registry is dropped at the next pass, and the chain read again") ? 0 : 1;
+        }
+
+        // The chain moves while a pass reads it.
+        {
+            CPoolIndex moving(PoolIndexTestRead);
+            g_poolIndexReadHook = [&](const CBlockIndex* p) {
+                if (p == pM[30])
+                    chain.SetMain(pTipZ);
+            };
+            bool fSyncedM = false;
+            moving.Step(1000, fSyncedM);
+            g_poolIndexReadHook = nullptr;
+            int nAfter = moving.Height();
+            bool fOk = PoolIndexTestSync(moving, 1000);
+            nFail += Check(nAfter == 29 && fOk && moving.Rebuilds() == 0 && moving.Digest() == PoolIndexTestReference(pTipZ),
+                           "a block no longer on the chain ends the pass; the next ones follow the new branch") ? 0 : 1;
+            chain.SetMain(pTipM);
+        }
+
+        // A block that cannot be read, and one whose read throws.
+        {
+            CPoolIndex flaky(PoolIndexTestRead);
+            bool fSyncedF = false;
+            g_poolIndexFailAt = 20;
+            int n1 = flaky.Step(1000, fSyncedF);
+            int n2 = flaky.Step(1000, fSyncedF);
+            nFail += Check(n1 == 20 && n2 == -1 && flaky.Height() == 19,
+                           "a block that cannot be read ends the pass, and the next pass says so") ? 0 : 1;
+            g_fPoolIndexThrow = true;
+            bool fEscaped = false;
+            int n3 = 0;
+            try
+            {
+                n3 = flaky.Step(1000, fSyncedF);
+            }
+            catch (...)
+            {
+                fEscaped = true;
+            }
+            g_poolIndexFailAt = -1;
+            g_fPoolIndexThrow = false;
+            int nAt = flaky.Height();
+            bool fOk = PoolIndexTestSync(flaky, 1000);
+            if (!Check(!fEscaped && n3 == -1 && nAt == 19 && fOk && flaky.Digest() == idx.Digest(),
+                       "a read that throws is the same: the pass ends, nothing escapes, the next pass goes on"))
+            {
+                printf("       (escaped %d, returned %d, at %d, synced %d, same %d)\n", (int)fEscaped, n3, nAt, (int)fOk,
+                       (int)(flaky.Digest() == idx.Digest()));
+                nFail++;
+            }
+        }
+
+        // A stop asked for in the middle of a pass.
+        {
+            CPoolIndex stopper(PoolIndexTestRead);
+            g_poolIndexReadHook = [&](const CBlockIndex* p) {
+                if (p->nHeight == 25)
+                    stopper.RequestStop();
+            };
+            bool fSyncedS = false;
+            int n = stopper.Step(1000, fSyncedS);
+            g_poolIndexReadHook = nullptr;
+            bool fStopped = n == 26 && stopper.Height() == 25 && stopper.Step(1000, fSyncedS) == 0 && stopper.Height() == 25;
+            stopper.ClearStop();
+            bool fOk = PoolIndexTestSync(stopper, 1000);
+            nFail += Check(fStopped && fOk && stopper.Digest() == idx.Digest(),
+                           "a stop ends the pass after the block being read, and reading resumes after it") ? 0 : 1;
+        }
+
+        // Anchors naming ids nobody burned: kept only for the last 2160
+        // blocks, so they cost the index a bounded amount, however many.
+        {
+            CPoolRegistry s;
+            s.Reset((const unsigned char*)pchMessageStart);
+            std::vector<std::vector<unsigned char> > vRec;
+            for (int n = 0; n < 4000; n++)
+                vRec.push_back(PoolIndexTestRecord(strprintf("s%d", n)));
+            size_t nMaxStored = 0, nMaxCounted = 0;
+            for (int n = 0; n < 4000; n++)
+            {
+                uint256 id = PoolIndexTestId(vRec[n]);
+                s.ConnectBlock(PoolIndexTestBlock(n, std::vector<std::vector<unsigned char> >(1, PoolIndexTestPush("p2x", &id, uint256(n)))),
+                               n, uint256((uint64)5 * 0x100000 + n));
+                nMaxStored = std::max(nMaxStored, s.AnchorsStored());
+                nMaxCounted = std::max(nMaxCounted, s.AnchorsCounted());
+            }
+            const size_t nBoundStored = POOL_UNREGISTERED_ANCHOR_BLOCKS + POOL_INDEX_REORG_MARGIN + 2 * POOL_ANCHOR_SWEEP_INTERVAL;
+            const size_t nBoundCounted = POOL_UNREGISTERED_ANCHOR_BLOCKS + POOL_ANCHOR_SWEEP_INTERVAL;
+            printf("       4000 blocks, each naming a new id: at most %u anchors kept, %u counting\n",
+                   (unsigned int)nMaxStored, (unsigned int)nMaxCounted);
+            nFail += Check(nMaxStored <= nBoundStored && nMaxCounted <= nBoundCounted && s.AnchorIds() == s.AnchorsStored(),
+                           "4000 blocks each naming a new id keep a bounded number of anchors") ? 0 : 1;
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            s.Anchors(PoolIndexTestId(vRec[100]), v, nWin);
+            bool fOldGone = v.empty();
+            s.Anchors(PoolIndexTestId(vRec[3990]), v, nWin);
+            nFail += Check(fOldGone && v.size() == 1 && nWin == 1,
+                           "an old claim of an id nobody burned is gone; a recent one counts") ? 0 : 1;
+            std::vector<CTransaction> vTx;
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(vRec[100]), poolreg::MIN_BURN, 15));
+            vTx.push_back(PoolIndexTestBurn(PoolIndexTestRecordScript(vRec[3990]), poolreg::MIN_BURN, 16));
+            s.ConnectBlock(PoolIndexTestBlock(4000, none, vTx), 4000, uint256((uint64)5 * 0x100000 + 4000));
+            CPoolInfo i100, i3990;
+            s.Lookup(PoolIndexTestId(vRec[100]), i100);
+            s.Lookup(PoolIndexTestId(vRec[3990]), i3990);
+            nFail += Check(i100.nStatus == POOL_PENDING && i100.vRecentAnchors.empty() &&
+                           i3990.nStatus == POOL_PENDING && i3990.vRecentAnchors.size() == 1,
+                           "burned later, a pool has the anchors of its last 2160 blocks before the burn, no older") ? 0 : 1;
+
+            // The same on a chain, with reorgs across the sweeps.
+            std::function<CBlock(int)> fillSpam = [&](int n) {
+                uint256 id = PoolIndexTestId(vRec[n % 4000]);
+                std::vector<std::vector<unsigned char> > p(1, PoolIndexTestPush("p2x", &id, uint256(n)));
+                return PoolIndexTestBlock(n, p);
+            };
+            // 4000 blocks: the first sweep that drops a claim is at 2304, the
+            // first that removes dropped ones for good at 3744.
+            CBlockIndex* pTipP = chain.Extend(pGen, 4000, fillSpam);
+            CBlockIndex* pP3800 = pTipP;
+            while (pP3800->nHeight > 3800)
+                pP3800 = pP3800->pprev;
+            CBlockIndex* pP2400 = pP3800;
+            while (pP2400->nHeight > 2400)
+                pP2400 = pP2400->pprev;
+            chain.SetMain(pTipP);
+            CPoolIndex spam(PoolIndexTestRead);
+            bool fOk = PoolIndexTestSync(spam, 1000);
+            nFail += Check(fOk && spam.Digest() == PoolIndexTestReference(pTipP) &&
+                           spam.Snapshot().AnchorsStored() <= nBoundStored,
+                           "read on a chain, the same bound, and the same registry as a straight read") ? 0 : 1;
+            CBlockIndex* pTipP1 = chain.Extend(pP3800, 250, fillPlain);
+            chain.SetMain(pTipP1);
+            fOk = PoolIndexTestSync(spam, 1000);
+            nFail += Check(fOk && spam.Rebuilds() == 0 && spam.Digest() == PoolIndexTestReference(pTipP1),
+                           "a reorg of 200 blocks across sweeps brings the swept claims back in place, exactly") ? 0 : 1;
+            CBlockIndex* pTipP2 = chain.Extend(pP2400, 1700, fillPlain);
+            chain.SetMain(pTipP2);
+            fOk = PoolIndexTestSync(spam, 1000);
+            if (!Check(fOk && spam.Rebuilds() == 1 && spam.Digest() == PoolIndexTestReference(pTipP2),
+                       "one below claims already removed for good reads the chain again, and is exact"))
+            {
+                printf("       (synced %d, rebuilds %d, same %d, height %d)\n", (int)fOk, spam.Rebuilds(),
+                       (int)(spam.Digest() == PoolIndexTestReference(pTipP2)), spam.Height());
+                nFail++;
+            }
+        }
+
+        // Reorgs and the margin: pool zero anchored in every block, so its
+        // oldest anchors are removed as the chain grows.
+        {
+            std::function<CBlock(int)> fillZero = [&](int n) {
+                std::vector<std::vector<unsigned char> > p(1, PoolIndexTestPush("p2p", NULL, uint256(n)));
+                return PoolIndexTestBlock(n, p, n == 100 ? std::vector<CTransaction>(1, txA) : std::vector<CTransaction>());
+            };
+            CBlockIndex* pTipL = chain.Extend(pGen, 2400, fillZero);
+            CBlockIndex* pL960 = pTipL;
+            while (pL960->nHeight > 960)
+                pL960 = pL960->pprev;
+            CBlockIndex* pL959 = pL960->pprev;
+            chain.SetMain(pTipL);
+            CPoolIndex deep(PoolIndexTestRead);
+            deep.SetPath(path);
+            bool fOk = PoolIndexTestSync(deep, 1000);
+            nFail += Check(fOk && deep.Digest() == PoolIndexTestReference(pTipL) && deep.Status(idA) == POOL_ACTIVE,
+                           "2400 blocks, each with an anchor: read to the tip") ? 0 : 1;
+
+            CBlockIndex* pTipL1 = chain.Extend(pL960, 1440, fillZero);
+            chain.SetMain(pTipL1);
+            fOk = PoolIndexTestSync(deep, 1000);
+            nFail += Check(fOk && deep.Rebuilds() == 0 && deep.Digest() == PoolIndexTestReference(pTipL1),
+                           "a reorg of exactly 1440 blocks, the margin, is undone in place and exact") ? 0 : 1;
+
+            CBlockIndex* pTipL2 = chain.Extend(pL959, 1443, fillZero);
+            chain.SetMain(pTipL2);
+            fOk = PoolIndexTestSync(deep, 1000);
+            std::vector<CPoolAnchor> v;
+            int nWin = 0;
+            deep.Anchors(idZero, v, nWin);
+            nFail += Check(fOk && deep.Rebuilds() == 1 && deep.Digest() == PoolIndexTestReference(pTipL2) &&
+                           nWin == POOL_ANCHOR_WINDOW && v.size() == POOL_RECENT_ANCHORS && v[0].nHeight == 2402,
+                           "one of 1441 reads the chain again, and is exact") ? 0 : 1;
+        }
+
+        // ---- the RPCs: poollist, poolinfo and poolcreate everpool answer
+        // from the node's index, here loaded with a made-up chain's registry
+        {
+            using nlohmann::json;
+            PoolIndexTestChain chain;
+            const std::string rpcPath = GetAppDir() + "/pool-registry-selftest-rpc.dat";
+            const std::string blankPath = GetAppDir() + "/pool-registry-selftest-blank.dat";
+            const std::string user = "selftest", pass = "selftest-password-0123456789";
+            JsonRpcConfigure(user, pass, "");
+            std::string strAll;
+            CBigNum bnFloor;
+            bnFloor.SetCompact(0x207fffff);
+            P2PoolResetForTest(bnFloor, false);
+
+            // A pool with a fee, burned at 5 (active at the tip, 60); one
+            // burned at 50 (pending); an id nobody burned, named by blocks
+            // 40 to 44; the fee pool named by 20 to 22; pool zero by the rest.
+            uint160 hFee;
+            memset(hFee.begin(), 0x11, 20);
+            const std::string strFeeAddr = Hash160ToAddress(hFee);
+            poolreg::PoolRecord fr;
+            fr.nSpacing = 30;
+            fr.nWindow = 720;
+            fr.nRetarget = 360;
+            fr.nFloor = poolreg::NETWORK_FLOOR;
+            fr.nUncleDepth = 2;
+            fr.nUnclePct = 80;
+            fr.nFeeBps = 150;
+            fr.nFeeType = poolreg::FEE_P2PKH;
+            memcpy(fr.feeHash, hFee.begin(), 20);
+            fr.name = "feepool";
+            std::string errFr;
+            const bool fFrOk = fr.Check(errFr);
+            const std::vector<unsigned char> recFee = fr.Encode();
+            const std::vector<unsigned char> recLate = PoolIndexTestRecord("late");
+            const uint256 idFee = PoolIndexTestId(recFee), idLate = PoolIndexTestId(recLate);
+            const uint256 idUnreg = PoolIndexTestId(PoolIndexTestRecord("nobody-burned-this"));
+            const CTransaction txFee = PoolIndexTestBurn(PoolIndexTestRecordScript(recFee), poolreg::MIN_BURN, 901);
+            const CTransaction txLate = PoolIndexTestBurn(PoolIndexTestRecordScript(recLate), poolreg::MIN_BURN, 902);
+            // Two pools named like others (section 12): "Bit-Flash" like pool
+            // zero's "bitflash", burned at 52; "Fee_Pool" like "feepool", at 54.
+            const std::vector<unsigned char> recClone = PoolIndexTestRecord("Bit-Flash");
+            const std::vector<unsigned char> recAlike = PoolIndexTestRecord("Fee_Pool");
+            const uint256 idClone = PoolIndexTestId(recClone), idAlike = PoolIndexTestId(recAlike);
+            const CTransaction txClone = PoolIndexTestBurn(PoolIndexTestRecordScript(recClone), poolreg::MIN_BURN, 904);
+            const CTransaction txAlike = PoolIndexTestBurn(PoolIndexTestRecordScript(recAlike), poolreg::MIN_BURN, 905);
+            std::function<CBlock(int)> fill = [&](int n) {
+                std::vector<std::vector<unsigned char> > vp;
+                uint256 h = uint256((uint64)0x5000 + n);
+                if (n >= 40 && n < 45)
+                    vp.push_back(PoolIndexTestPush("p2x", &idUnreg, h));
+                else if (n >= 20 && n < 23)
+                    vp.push_back(PoolIndexTestPush("p2x", &idFee, h));
+                else
+                    vp.push_back(PoolIndexTestPush("p2p", NULL, h));
+                std::vector<CTransaction> vTx;
+                if (n == 5)
+                    vTx.push_back(txFee);
+                if (n == 50)
+                    vTx.push_back(txLate);
+                if (n == 52)
+                    vTx.push_back(txClone);
+                if (n == 54)
+                    vTx.push_back(txAlike);
+                return PoolIndexTestBlock(n, vp, vTx);
+            };
+            CBlockIndex* pGen = chain.Add(NULL, PoolIndexTestPlain(0));
+            CBlockIndex* pTip = chain.Extend(pGen, 60, fill);
+            chain.SetMain(pTip);
+            CPoolIndex made(PoolIndexTestRead);
+            made.SetPath(rpcPath);
+            bool fOk = fFrOk && PoolIndexTestSync(made, 1000) && made.Save();
+            PoolIndex().SetPath(rpcPath);
+            fOk = fOk && PoolIndex().Load() && PoolIndexSynced() && PoolIndex().Digest() == made.Digest();
+            nFail += Check(fOk, "the node's index answers with a made-up chain's registry, at its tip") ? 0 : 1;
+            std::vector<CPoolAnchor> vZeroAnchors;
+            int nZeroWin = 0;
+            made.Anchors(idZero, vZeroAnchors, nZeroWin);
+
+            // poollist: pool zero first, then the recorded pools in the order
+            // of their first appearance; an id nobody burned is not a pool.
+            json rl = LocalNodeRpc(user, pass, "poollist", json::array(), &strAll);
+            bool fList = RpcOk(rl) && rl["result"].is_object() && rl["result"]["pools"].is_array() &&
+                         rl["result"]["pools"].size() >= 5;
+            bool fAlike = fList;
+            if (fList)
+            {
+                json a = rl["result"]["pools"];
+                json z = a[0], f = a[1], l = a[2], c = a[3], k = a[4];
+                // Each entry names the other pools called alike, with the
+                // full id beside every fingerprint.
+                fAlike = z["samename"].size() == 1 && z["samename"][0]["id"] == idClone.GetHex() &&
+                         z["samename"][0]["fingerprint"] == idClone.GetHex().substr(0, 8) &&
+                         z["samename"][0]["poolzero"] == false &&
+                         f["samename"].size() == 1 && f["samename"][0]["id"] == idAlike.GetHex() &&
+                         l["samename"].empty() &&
+                         c["id"] == idClone.GetHex() && c["name"] == "Bit-Flash" && c["samename"].size() == 1 &&
+                         c["samename"][0]["id"] == idZero.GetHex() && c["samename"][0]["poolzero"] == true &&
+                         c["samename"][0]["fingerprint"] == idZero.GetHex().substr(0, 8) &&
+                         c["fingerprint"] == idClone.GetHex().substr(0, 8) &&
+                         k["id"] == idAlike.GetHex() && k["samename"].size() == 1 &&
+                         k["samename"][0]["id"] == idFee.GetHex() && k["samename"][0]["poolzero"] == false;
+                fList = rl["result"]["index"]["height"] == 60 && rl["result"]["index"]["synced"] == true &&
+                        rl["result"]["index"]["rebuilding"] == false &&
+                        rl["result"]["note"].get<std::string>().find("names are not unique") != std::string::npos &&
+                        z["id"] == idZero.GetHex() && z["status"] == "active" && z["claims"] == nZeroWin &&
+
+                        z["firstheight"].is_null() && z["appearances"] == 0 &&
+                        f["id"] == idFee.GetHex() && f["name"] == "feepool" && f["local"] == false &&
+                        f["status"] == "active" && f["feebps"] == 150 && f["firstheight"] == 5 &&
+                        f["confirmations"] == 56 && f["appearances"] == 1 && f["claims"] == 3 &&
+                        f["rules"].is_string() && f["rules"].get<std::string>().find("fee 1.50%") != std::string::npos &&
+                        l["id"] == idLate.GetHex() && l["status"] == "pending" && l["firstheight"] == 50 &&
+                        l["confirmations"] == 11 && l["claims"] == 0;
+                for (size_t i = 0; i < a.size(); i++)
+                    fList = fList && a[i].value("id", std::string()) != idUnreg.GetHex();
+            }
+            nFail += Check(fList, "poollist: the index's height, synced and rebuilding, the note on names, pool zero "
+                                  "as entry zero, then each recorded pool with its status, fee, rules, first "
+                                  "appearance and claims; an id nobody burned is not listed") ? 0 : 1;
+            nFail += Check(fAlike, "poollist: every entry lists the other pools named alike (case, '-' and '_' set "
+                                   "aside) with id and fingerprint; a clone named like pool zero is listed on pool "
+                                   "zero's entry and lists pool zero on its own") ? 0 : 1;
+            json rci = LocalNodeRpc(user, pass, "poolinfo", json::array({ idClone.GetHex() }), &strAll);
+            json rzi = LocalNodeRpc(user, pass, "poolinfo", json::array({ idZero.GetHex() }), &strAll);
+            nFail += Check(RpcOk(rci) && rci["result"]["samename"].size() == 1 &&
+                           rci["result"]["samename"][0]["poolzero"] == true &&
+                           rci["result"]["note"].get<std::string>().find("names are not unique") != std::string::npos &&
+                           RpcOk(rzi) && rzi["result"]["samename"].size() == 1 &&
+                           rzi["result"]["samename"][0]["id"] == idClone.GetHex() &&
+                           rzi["result"]["note"].is_string(),
+                           "poolinfo: the same list and the note on names, for a clone and for pool zero") ? 0 : 1;
+
+            // poolinfo of a recorded pool: its record, every appearance and
+            // the last anchors, newest first.
+            json ri = LocalNodeRpc(user, pass, "poolinfo", json::array({ idFee.GetHex() }), &strAll);
+            bool fInfo = RpcOk(ri);
+            if (fInfo)
+            {
+                json j = ri["result"];
+                fInfo = j["status"] == "active" && j["record"] == HexStr(recFee.begin(), recFee.end(), false) &&
+                        j["rules"]["feebps"] == 150 && j["rules"]["feeaddress"] == strFeeAddr &&
+                        j["firstappearance"]["height"] == 5 && j["firstappearance"]["txid"] == txFee.GetHash().GetHex() &&
+                        j["firstappearance"]["burn"] == 1.0 && j["appearancelist"].size() == 1 &&
+                        j["lastanchors"].size() == 3 && j["lastanchors"][0]["height"] == 22 &&
+                        j["lastanchors"][2]["height"] == 20 && j["index"]["synced"] == true &&
+                        j["index"]["height"] == 60;
+            }
+            nFail += Check(fInfo, "poolinfo <id>: rules, record, first appearance, every appearance, last anchors, "
+                                  "and the index's height") ? 0 : 1;
+            json ru = LocalNodeRpc(user, pass, "poolinfo", json::array({ idUnreg.GetHex() }), &strAll);
+            json rn = LocalNodeRpc(user, pass, "poolinfo", json::array({ uint256(99).GetHex() }), &strAll);
+            json rb = LocalNodeRpc(user, pass, "poolinfo", json::array({ "not-an-id" }), &strAll);
+            json rz = LocalNodeRpc(user, pass, "poolinfo", json::array({ idZero.GetHex() }), &strAll);
+            nFail += Check(RpcOk(ru) && ru["result"]["status"] == "unknown" && ru["result"]["claims"] == 5 &&
+                           ru["result"]["lastanchors"].size() == 5 && ru["result"]["lastanchors"][0]["height"] == 44 &&
+                           !ru["result"].contains("name") &&
+                           !RpcOk(rn) && RpcError(rn).find("no pool with that id") != std::string::npos &&
+                           !RpcOk(rb) &&
+                           RpcOk(rz) && rz["result"]["status"] == "active" && rz["result"]["claims"] == nZeroWin &&
+                           rz["result"]["rules"]["spacing"] == 10,
+                           "poolinfo: an id nobody burned shows only its claims, an id nobody names is refused, "
+                           "pool zero shows its rules and claims") ? 0 : 1;
+
+            // poolcreate everpool: the record, the id and the fee shown,
+            // nothing sent without "send".
+            uint160 hNew;
+            memset(hNew.begin(), 0x22, 20);
+            const std::string strNewAddr = Hash160ToAddress(hNew);
+            json pNew = { { "name", "newpool" }, { "feebps", 100 }, { "feeaddress", strNewAddr } };
+            json rc = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew }), &strAll);
+            json rd = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "dryrun" }), &strAll);
+            bool fPreview = RpcOk(rc) && RpcOk(rd) && rc["result"] == rd["result"];
+            std::vector<unsigned char> recNew;
+            if (fPreview)
+            {
+                json j = rc["result"];
+                recNew = ParseHex(j["record"].get<std::string>());
+                poolreg::PoolRecord back;
+                std::string e;
+                fPreview = poolreg::Parse(recNew, back, e) && !back.fLocal && back.name == "newpool" &&
+                           back.nSpacing == 30 && back.nWindow == 2160 && back.nRetarget == 720 &&
+                           back.nUncleDepth == 3 && back.nUnclePct == 80 && back.nFeeBps == 100 &&
+                           back.nFeeType == poolreg::FEE_P2PKH && memcmp(back.feeHash, hNew.begin(), 20) == 0 &&
+                           j["id"] == PoolIndexTestId(recNew).GetHex() &&
+                           j["fingerprint"] == PoolIndexTestId(recNew).GetHex().substr(0, 8) &&
+                           j["fee"]["bps"] == 100 && j["fee"]["percent"] == "1.00%" && j["fee"]["address"] == strNewAddr &&
+                           j["burn"] == 1.0 && j["sent"] == false && !j.contains("txid") && j["recorded"].is_null() &&
+                           j["poolzero"] == false && j["index"]["synced"] == true &&
+                           j["samename"].is_array() && j["samename"].empty() && !j.contains("note");
+            }
+            nFail += Check(fPreview, "poolcreate everpool shows the record, the id and the fee, and sends nothing "
+                                     "without \"send\"") ? 0 : 1;
+
+            // "send" goes through every check to the wallet's burn path:
+            // here a locked wallet is the first thing to say no.
+            const bool fEncWas = fWalletEncrypted, fLockWas = fWalletLocked;
+            fWalletEncrypted = true;
+            fWalletLocked = true;
+            json rs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            fWalletEncrypted = fEncWas;
+            fWalletLocked = fLockWas;
+            nFail += Check(!RpcOk(rs) && RpcError(rs) == "wallet is locked",
+                           "poolcreate everpool \"send\" passes every check and reaches the wallet's burn path") ? 0 : 1;
+
+            // Refused before the wallet: a pool already recorded, the same
+            // burn already waiting to be mined, an index behind the tip, a
+            // record that breaks a rule, a third parameter that is not a word
+            // it knows.
+            json pFee = { { "name", "feepool" }, { "spacing", 30 }, { "window", 720 }, { "retarget", 360 },
+                          { "uncledepth", 2 }, { "unclepct", 80 }, { "feebps", 150 }, { "feeaddress", strFeeAddr } };
+            json rf = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pFee }), &strAll);
+            json rfs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pFee, "send" }), &strAll);
+            nFail += Check(RpcOk(rf) && rf["result"]["id"] == idFee.GetHex() &&
+                           rf["result"]["recorded"]["status"] == "active" && rf["result"]["recorded"]["firstheight"] == 5 &&
+                           !RpcOk(rfs) && RpcError(rfs).find("already recorded, first at block 5") != std::string::npos,
+                           "a pool already recorded is shown as such, and burning it again is refused") ? 0 : 1;
+
+            CTransaction txWait = PoolIndexTestBurn(CScript() << OP_RETURN << recNew, poolreg::MIN_BURN, 903);
+            CRITICAL_BLOCK(cs_mapTransactions)
+                mapTransactions[txWait.GetHash()] = txWait;
+            json rw = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            CRITICAL_BLOCK(cs_mapTransactions)
+                mapTransactions.erase(txWait.GetHash());
+            nFail += Check(!RpcOk(rw) && RpcError(rw).find("already waiting to be mined: " + txWait.GetHash().GetHex()) !=
+                                             std::string::npos,
+                           "the same burn waiting in the memory pool is refused") ? 0 : 1;
+
+            chain.SetMain(pTip->pprev);
+            json rl2 = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+            chain.SetMain(pTip);
+            json rbad = LocalNodeRpc(user, pass, "poolcreate",
+                                     json::array({ "everpool", json({ { "name", "x" }, { "spacing", 10 } }) }), &strAll);
+            json rword = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "yes" }), &strAll);
+            nFail += Check(!RpcOk(rl2) && RpcError(rl2).find("has not read up to the tip") != std::string::npos &&
+                           !RpcOk(rbad) && RpcError(rbad).find("not a valid pool") != std::string::npos &&
+                           !RpcOk(rword) && RpcError(rword).find("\"send\"") != std::string::npos,
+                           "refused: an index behind the tip, a record breaking a rule, an unknown third word") ? 0 : 1;
+            json rx = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send", "extra" }), &strAll);
+            nFail += Check(!RpcOk(rx) && RpcError(rx).find("three parameters at most") != std::string::npos,
+                           "a fourth parameter is refused") ? 0 : 1;
+
+            // "Synced" is to this node's tip: while peers say the chain is
+            // well past it, "send" is refused even with the index at the tip.
+            {
+                CNode* peerAhead = new CNode(INVALID_SOCKET, CAddress());
+                peerAhead->nStartingHeight = nBestHeight + 10;
+                CRITICAL_BLOCK(cs_vNodes)
+                    vNodes.push_back(peerAhead);
+                bool fIbd = IsInitialBlockDownload() && PoolIndexSynced();
+                json ribd = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+                CRITICAL_BLOCK(cs_vNodes)
+                    vNodes.erase(std::find(vNodes.begin(), vNodes.end(), peerAhead));
+                delete peerAhead;
+                nFail += Check(fIbd && !RpcOk(ribd) && RpcError(ribd).find("still catching up") != std::string::npos &&
+                               !IsInitialBlockDownload(),
+                               "\"send\" is refused while the node is catching up, the index at its tip or not") ? 0 : 1;
+            }
+
+            // The same burn in this wallet and not in a block (dropped from
+            // the memory pool, or out of a block in a reorg): the wallet
+            // sends it again until it is mined, so a second one is refused.
+            // A burn of the same record below 1 BTF is not an appearance.
+            {
+                CWalletTx wtxOld(PoolIndexTestBurn(CScript() << OP_RETURN << recNew, poolreg::MIN_BURN, 906));
+                CRITICAL_BLOCK(cs_mapWallet)
+                    mapWallet[wtxOld.GetHash()] = wtxOld;
+                json rww = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+                CRITICAL_BLOCK(cs_mapWallet)
+                    mapWallet.erase(wtxOld.GetHash());
+                nFail += Check(!RpcOk(rww) && RpcError(rww).find("this wallet already has a transaction recording this "
+                                                                 "pool") != std::string::npos &&
+                               RpcError(rww).find(wtxOld.GetHash().GetHex()) != std::string::npos,
+                               "the same burn unconfirmed in this wallet is refused, with its txid") ? 0 : 1;
+
+                CTransaction txSmall = PoolIndexTestBurn(CScript() << OP_RETURN << recNew, poolreg::MIN_BURN - 1, 907);
+                CWalletTx wtxSmall(PoolIndexTestBurn(CScript() << OP_RETURN << recNew, poolreg::MIN_BURN - 1, 908));
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    mapTransactions[txSmall.GetHash()] = txSmall;
+                CRITICAL_BLOCK(cs_mapWallet)
+                    mapWallet[wtxSmall.GetHash()] = wtxSmall;
+                fWalletEncrypted = true;
+                fWalletLocked = true;
+                json rsm = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "send" }), &strAll);
+                fWalletEncrypted = fEncWas;
+                fWalletLocked = fLockWas;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    mapTransactions.erase(txSmall.GetHash());
+                CRITICAL_BLOCK(cs_mapWallet)
+                    mapWallet.erase(wtxSmall.GetHash());
+                nFail += Check(!RpcOk(rsm) && RpcError(rsm) == "wallet is locked",
+                               "a burn of the same record below 1 BTF, waiting or in the wallet, does not block "
+                               "\"send\" (it records nothing)") ? 0 : 1;
+            }
+
+            // Pool zero's own record can be burned once, as a public copy of
+            // its rules: shown as pool zero, never burned yet here.
+            json pZero = { { "name", "bitflash" }, { "spacing", 10 }, { "window", 2160 }, { "retarget", 720 },
+                           { "uncledepth", 3 }, { "unclepct", 80 } };
+            json rpz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero }), &strAll);
+            const std::vector<unsigned char> recZero = poolreg::PoolZero().Encode();
+            json rpzs = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero, "send" }), &strAll);
+            json rnz = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pNew, "publishzero" }), &strAll);
+            fWalletEncrypted = true;
+            fWalletLocked = true;
+            json rpzp = LocalNodeRpc(user, pass, "poolcreate", json::array({ "everpool", pZero, "publishzero" }), &strAll);
+            fWalletEncrypted = fEncWas;
+            fWalletLocked = fLockWas;
+            nFail += Check(RpcOk(rpz) && rpz["result"]["poolzero"] == true && rpz["result"]["id"] == idZero.GetHex() &&
+                           rpz["result"]["record"] == HexStr(recZero.begin(), recZero.end(), false) &&
+                           rpz["result"]["recorded"].is_null() &&
+                           rpz["result"]["samename"].size() == 1 && rpz["result"]["samename"][0]["id"] == idClone.GetHex() &&
+                           rpz["result"]["note"].is_string() &&
+                           !RpcOk(rpzs) && RpcError(rpzs).find("\"publishzero\"") != std::string::npos &&
+                           !RpcOk(rnz) && RpcError(rnz).find("pool zero's own record only") != std::string::npos &&
+                           !RpcOk(rpzp) && RpcError(rpzp) == "wallet is locked",
+                           "pool zero's own record is recognised byte for byte; \"send\" refuses it, only "
+                           "\"publishzero\" reaches the burn, and only for pool zero") ? 0 : 1;
+
+            // The node's index back to empty for what follows.
+            CPoolIndex blank;
+            blank.SetPath(blankPath);
+            bool fBlank = blank.Save();
+            PoolIndex().SetPath(blankPath);
+            fBlank = fBlank && PoolIndex().Load() && PoolIndexHeight() == -1;
+            nFail += Check(fBlank, "the node's index is empty again") ? 0 : 1;
+            remove(rpcPath.c_str());
+            remove(blankPath.c_str());
+        }
+    }
+    catch (std::exception& e)
+    {
+        printf("  FAIL exception: %s\n", e.what());
+        nFail++;
+    }
+    catch (...)
+    {
+        printf("  FAIL unknown exception\n");
+        nFail++;
+    }
+
+    remove(path.c_str());
+    pindexBest = pindexBestSaved;
+    pindexGenesisBlock = pindexGenesisSaved;
+    nBestHeight = nBestHeightSaved;
+    hashBestChain = hashBestSaved;
+    SelectChainParams(fTestNetSaved);
+
+    // ---- the node's own thread, on a block index loaded the node's way: a
+    // fresh data directory (the genesis block alone), or with
+    // POOLINDEX_DATADIR a copy of a real one, read from its block files.
+    {
+        const char* pszDataDir = getenv("POOLINDEX_DATADIR");
+        std::string tmp;
+        bool fDir = true;
+        // POOLINDEX_TESTNET: the copy is a testnet one (its files under testnet/).
+        if (pszDataDir && getenv("POOLINDEX_TESTNET"))
+            SelectChainParams(true);
+        if (pszDataDir)
+            strSetDataDir = pszDataDir;
+        else if ((fDir = MakeTempDir(tmp)))
+            strSetDataDir = tmp;
+        try
+        {
+            if (!fDir)
+                throw std::runtime_error("no temporary data directory");
+            const std::string fileNode = GetAppDir() + "/pool-registry.dat";
+            const std::string fileCheck = GetAppDir() + "/pool-registry-check.dat";
+            remove(fileCheck.c_str());
+            int64 nStart = GetTime();
+            if (!LoadBlockIndex())
+                throw std::runtime_error("LoadBlockIndex failed");
+            // What every one-shot command runs (/newaddress, /rescan,
+            // /dumpwallet, -sendto, ...) before it returns without a stop:
+            // LoadBlockIndex alone leaves the thread unstarted.
+            bool fNoFileYet = true;
+            {
+                FILE* f = fopen(fileNode.c_str(), "rb");
+                if (f)
+                {
+                    fNoFileYet = false;
+                    fclose(f);
+                }
+            }
+            nFail += Check(!PoolIndexRunning() && (pszDataDir || fNoFileYet),
+                           "LoadBlockIndex alone (what a one-shot command runs) does not start the thread") ? 0 : 1;
+            PoolIndexStart();
+            nFail += Check(PoolIndexRunning(), "PoolIndexStart (the node's, after StartNode) starts it") ? 0 : 1;
+            int nTip = -1;
+            CRITICAL_BLOCK(cs_main)
+                nTip = nBestHeight;
+            while (!PoolIndexSynced() && GetTime() - nStart < 20 * 60)
+                Sleep(100);
+            int64 nRead = GetTime() - nStart;
+            nFail += Check(PoolIndexSynced() && PoolIndexHeight() == nTip,
+                           "and it reads the chain to the tip") ? 0 : 1;
+            std::vector<CPoolInfo> v;
+            PoolIndexList(v);
+            nFail += Check(!v.empty() && v[0].fZero && v[0].nStatus == POOL_ACTIVE && v[0].id == PoolIndex().Snapshot().ZeroId(),
+                           "and lists pool zero first") ? 0 : 1;
+
+            // Read again, apart, from the block files.
+            CPoolIndex apart;
+            apart.SetPath(fileCheck);
+            bool fApart = PoolIndexTestSync(apart, 1000);
+            nFail += Check(fApart && apart.Digest() == PoolIndex().Digest(),
+                           "a second reading of the same block files gives the same registry") ? 0 : 1;
+
+            // Stopped at once, before its first save (10 s after the tip),
+            // the thread saves on its way out.
+            bool fBeforeSave = !pszDataDir && GetTime() - nStart < 8;
+            bool fFileBefore = false;
+            {
+                FILE* f = fopen(fileNode.c_str(), "rb");
+                if (f)
+                {
+                    fFileBefore = true;
+                    fclose(f);
+                }
+            }
+            PoolIndexStop();
+            nFail += Check(!PoolIndexRunning(), "PoolIndexStop waits for the thread to end") ? 0 : 1;
+            CPoolIndex fromFile;
+            fromFile.SetPath(fileNode);
+            bool fLoaded = fromFile.Load();
+            nFail += Check(fLoaded && fromFile.Digest() == PoolIndex().Digest(),
+                           "stopped, it writes pool-registry.dat, which reads back to the same registry") ? 0 : 1;
+            if (!pszDataDir)
+                nFail += Check(fBeforeSave && !fFileBefore && fLoaded,
+                               "and that file came from the save on the way out, not an earlier one") ? 0 : 1;
+
+            if (pszDataDir)
+            {
+                std::vector<CPoolAnchor> vRecent;
+                int nInWindow = 0;
+                PoolIndexAnchors(v[0].id, vRecent, nInWindow);
+                printf("       chain read to block %d (%s) in about %d s: %u pool(s) besides pool zero; pool zero "
+                       "anchored in %d of the last %d blocks (newest at %d, %d shown)\n",
+                       nTip, PoolIndex().TipHash().GetHex().c_str(), (int)nRead, (unsigned int)(v.size() - 1),
+                       nInWindow, POOL_ANCHOR_WINDOW, vRecent.empty() ? -1 : vRecent[0].nHeight, (int)vRecent.size());
+                for (size_t i = 1; i < v.size(); i++)
+                    printf("       pool %s \"%s\": %s, first in block %d, %d appearance(s), %d anchor(s) in the window\n",
+                           v[i].id.GetHex().c_str(), v[i].rec.name.c_str(),
+                           v[i].nStatus == POOL_ACTIVE ? "active" : "pending", v[i].first.nHeight,
+                           v[i].nAppearances, v[i].nAnchorsInWindow);
+            }
+            remove(fileCheck.c_str());
+        }
+        catch (std::exception& e)
+        {
+            printf("  FAIL exception: %s\n", e.what());
+            nFail++;
+        }
+        PoolIndexStop();
+    }
+
+    printf("%s (%d failure%s)\n", nFail == 0 ? "pool-index: all passed" : "pool-index: FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail == 0 ? 0 : 1;
+}
+
 // ---- rules v5 (docs/rules-v5.md)
 
 // A block on pindexPrev for the rules-v5 bench chain: an anyone-can-spend
@@ -19738,6 +21136,9 @@ static int RunBlockIndexLoadSelfTest()
 
 int RunSelfTest(const std::string& name)
 {
+    // The self-tests load block indexes of their own; LoadBlockIndex never
+    // starts the pool index thread (the node does, after StartNode), so
+    // only a self-test that calls PoolIndexStart runs it (poolindex.h).
     AttachTerminal();
 
     if (name == "wallet-keypool")
@@ -19780,6 +21181,8 @@ int RunSelfTest(const std::string& name)
         return RunConsensusLimitsSelfTest();
     if (name == "chain-work")
         return RunChainWorkSelfTest();
+    if (name == "pool-index")
+        return RunPoolIndexSelfTest();
     if (name == "consensus-safety")
         return RunConsensusSafetySelfTest();
     if (name == "reorg-safety")

@@ -612,7 +612,9 @@ bool BumpFee(const uint256& txid, int64 nNewRatePerKB, uint256& newTxidOut,
 bool CommitTransactionSpent(const CWalletTx& wtxNew);
 // nFeeLimit: the most the caller agreed to pay in fees (the GUI shows the fee
 // first and passes what it showed); -1 means nMaxTxFee.
-bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit = -1);
+// pstrError, when given, gets why a send failed, in words for the caller.
+bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit = -1,
+               std::string* pstrError = NULL);
 // The fee a send would pay, from the transaction built (and signed) but not
 // sent; no change key is drawn. What the GUI shows before the user confirms.
 bool PreviewSendFee(const CScript& scriptPubKey, int64 nValue, int64& nFeeRet, string& strWhyRet);

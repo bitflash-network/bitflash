@@ -218,6 +218,31 @@ anchors that name it (section 7): the last 64 (height, block hash, share data
 hash) and the count over the last 720 blocks. All of it is undone by a reorg
 the same way.
 
+**Anchors that name no registered pool are kept only for a while.** A
+`"p2x"` push costs nothing to write, so a miner could name a new made-up id in
+every coinbase; kept forever, those claims would grow the index without any
+burn, against section 11. So at every height that is a multiple of 144, an id
+that is neither pool zero nor registered at that height loses its anchors
+older than 2160 blocks. A dropped anchor stays in the file for 1440 more
+blocks, so a reorg above the sweep restores it exactly; a reorg below an
+anchor dropped for good is detected and the chain is read again. The sweep is
+part of reading the chain, so a rebuild gives the same result. A pool whose
+record appears later starts with the anchors of its last 2160 blocks before
+the burn.
+
+**The file and restarts.** The index lives in `pool-registry.dat`, written
+atomically, with a checksum, and rebuildable from the block files: deleting
+it and starting again gives the same registry. It keeps the hashes of the
+last 64 blocks it read and one every 144 blocks, so a node whose block index
+lost its last blocks in an unclean stop resumes from the newest one it still
+has instead of reading from genesis. A rebuild from genesis (a damaged file,
+a reorg deeper than the kept anchors allow) is read into a second registry
+while the old one keeps answering, and takes over at the tip. The index has a
+thread of its own, started once the node's network is up (never by a
+one-shot command such as `-newaddress` or `-rescan`); on the way out the node
+waits for its last save, best effort, for at most 30 s, and a save cut short
+leaves the previous file.
+
 **Cost.** One parse per `OP_RETURN` output of at least 1 BTF, a few hundred
 bytes per pool on disk and in memory. There is no cap on the number of
 entries: a cap would let whoever fills it stop everybody else from creating a
@@ -418,7 +443,7 @@ how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
 a `"p2x"` push names its pool in full. The count reads a coinbase the way a
 share is read: the scriptSig must parse fully, and it counts for pool zero
 with exactly one `"p2p"` push and no `"p2x"` push, for a registered pool with
-exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). The index keeps these counts (section
+exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). A `"p2x"` push naming pool zero's own id also counts for no pool: pool zero's shares never carry its id (section 6), so such a push cannot come from its template. The index keeps these counts (section
 3). They are *claims*: anybody can put a `"p2x"` push in a solo block's
 coinbase. Only a node that carries the pool can tell a real one (the coinbase
 pays that pool's window, the share data is in its share chain) from a label,
@@ -637,10 +662,10 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
-| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, `dryrun` or not. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
+| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4 |
 | `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
-| `poollist [all]` | active pools (with `all`, pending ones too): id, fingerprint, name, rules, fee, first height, confirmations, anchors in the last 720 blocks, whether carried, and the share chain's height and work when carried. Ordered by recent share work for carried pools, then by anchors, never by name |
-| `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, its share chain if carried, its guardians this epoch (Phase C) |
+| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint; the answer carries the index's state and a note that names are not unique (section 12) |
+| `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
 
 ## 10. Rotating replication: guardians
 
@@ -1091,7 +1116,7 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | threat | what happens | defence |
 |---|---|---|
 | spam registrations | the index grows; guardians are drawn for junk | 1 BTF burned per pool; a few hundred bytes each; a never-mined pool costs a guardian one request per epoch; guard slots are ranked by line work, so junk with a few floor shares never displaces a mined pool |
-| a pool named like the default ("bitflash", "official") with a 3% fee | miners lured | wallets show the fingerprint, the age, the fee and the work, never the name alone; pool zero is marked as entry zero; the fee is capped and can never rise |
+| a pool named like the default ("bitflash", "official") with a 3% fee | miners lured | wallets show the fingerprint (with the full id), the age, the fee and the work, never the name alone; pool zero is marked as entry zero; `poollist` and `poolinfo` list, on each entry, the other pools named alike, pool zero included, and say that names are not unique; the fee is capped and can never rise |
 | fragmentation | a small network split into many small pools, each with more variance | pool zero stays the default; `poollist` orders by work; the choice is the miner's |
 | a frozen bug in a rules version | a pool cannot be fixed | the fix is a new version and new pools; releases may refuse to build templates for a broken version, never stop validating it |
 | a fake anchor (a solo block labelled `"p2x" + id`) | a pool looks more successful than it is | anchors are shown as claims; a node that carries the pool shows the blocks its share chain confirms, and orders by share work, not anchors |
@@ -1963,7 +1988,7 @@ over it; it goes with the pool's other files when the pool is left.
 
 | call | does |
 |---|---|
-| `poolcreate everpool {params} [dryrun]` | an Everpool pool: the record of section 1, burned on the chain (section 9) |
+| `poolcreate everpool {params} ["send"]` | an Everpool pool: the record of section 1, burned on the chain with `"send"` (or `"publishzero"` for pool zero's own record), shown without it (section 9) |
 | `poolcreate local {params} [password]` | a local pool: checks the record as section 1 does, with the defaults of section 9, derives the id, saves `pools/local/<id>.conf`, and returns the name, the pool code and the note below. A name already used by a local pool on this node is refused. Nothing is sent anywhere |
 | `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the name and the note. A name already used by a local pool on this node is refused (after joining with a mistyped password, `poolleave` and join again) |
 | `poolpeers local:<name> ["ADDR@HOST.onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows each and its state: connected with a session, this node at its session cap, or no proof (not a member, a wrong password, or the peer at its own cap, which answers with silence) |

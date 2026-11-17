@@ -55,6 +55,9 @@ jobs:
       - name: Run local pool messages fuzz smoke (hello, handle, shares, paced serves)
         run: make fuzz-p2plocal-smoke
 
+      - name: Run pool registry index fuzz smoke (anchors, pool-registry.dat, the fold under reorgs)
+        run: make fuzz-poolindex-smoke
+
       - name: Run light-client peer fuzz smoke (headers, blocks, filters, merkle differential)
         run: make fuzz-light-peer-smoke
 

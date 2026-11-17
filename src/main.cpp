@@ -14,6 +14,7 @@
 #include "treasury.h"
 #include "chatrelay.h"  // the chat's records: held, relayed and served here
 #include "p2pool_net.h"  // the P2Pool share chain: held, checked and relayed here
+#include "poolindex.h"   // the pool registry, read off the active chain
 #include "sha.h"
 #include "proxy.h"      // BtfConnectSocket: dial the pool over its Tor onion
 #include "sockcount.h"  // SOCK_ONION_PEER
@@ -7547,7 +7548,7 @@ bool PreviewSendFee(const CScript& scriptPubKey, int64 nValue, int64& nFeeRet, s
     return true;
 }
 
-bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit)
+bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFeeLimit, string* pstrError)
 {
     CRITICAL_BLOCK(cs_main)
     {
@@ -7561,10 +7562,23 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFee
                 strError = strprintf("Error: This is an oversized transaction that requires a transaction fee of %s ", FormatMoney(nFeeRequired).c_str());
             else
                 strError = "Error: Transaction creation failed ";
+            if (pstrError)
+            {
+                if (!LastCreateTransactionError().empty())
+                    *pstrError = LastCreateTransactionError();
+                else if (nValue + nFeeRequired > GetBalance())
+                    *pstrError = strprintf("insufficient balance: %s plus a fee of %s is more than the wallet's %s",
+                                           FormatMoney(nValue).c_str(), FormatMoney(nFeeRequired).c_str(),
+                                           FormatMoney(GetBalance()).c_str());
+                else
+                    *pstrError = "the transaction could not be made (see debug.log)";
+            }
             return error("SendMoney() : %s\n", strError.c_str());
         }
         if (!CommitTransactionSpent(wtxNew))
         {
+            if (pstrError)
+                *pstrError = "the wallet could not record the transaction";
             return error("SendMoney() : Error finalizing transaction");
         }
 
@@ -7578,6 +7592,9 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64 nFee
             // input already spent by another transaction). Unwind the
             // wallet state we just wrote instead of crashing the app.
             RollbackTransactionSpent(wtxNew);
+            if (pstrError)
+                *pstrError = "the transaction was refused by this node's memory pool (an input already spent, or a "
+                             "policy limit; see debug.log); nothing was sent";
             return error("SendMoney() : wtxNew.AcceptTransaction() failed");
         }
         wtxNew.RelayWalletTransaction();

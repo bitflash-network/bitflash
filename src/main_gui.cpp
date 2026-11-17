@@ -13,7 +13,8 @@
 #include "walletcmd.h"
 #include "jsonrpc.h"
 #include "p2pool_net.h"
-#include <thread>          // hardware_concurrency, to sanity-check /genproclimit
+#include "poolindex.h"
+#include <thread>         // hardware_concurrency, to sanity-check /genproclimit
 #ifndef _WIN32
 #include <csignal>
 #endif
@@ -914,6 +915,10 @@ static void FatalStartupError(bool fHeadless, const string& strWhat, const strin
     // finding tor.exe still running with the dead process's torrc on its command
     // line.
     BtfStopManagedTor();
+    // The pool index thread starts only after StartNode, past every caller
+    // here; kept so a later caller after that point stays safe (a no-op when
+    // the thread never started).
+    PoolIndexStop();
 
     printf("FATAL: %s\n", strWhat.c_str());
     if (!strDetail.empty())
@@ -1702,6 +1707,12 @@ int main(int argc, char* argv[])
         return 1;
     }
     btcswap::StartLightClients();
+    // The pool registry is a reading of the active chain (poolindex.h): its
+    // own thread follows it from here on and never decides whether a block
+    // is valid. Started here, not in LoadBlockIndex: every one-shot command
+    // above returns without a stop, and from here on the only ways out (the
+    // headless loop, the window) stop it and wait for its last save.
+    PoolIndexStart();
 #endif
 
     if (nMineMode == MINE_OPERATOR || fP2PoolMode) {
@@ -1777,6 +1788,9 @@ int main(int argc, char* argv[])
         printf("Running headless. Ctrl-C to stop.\n");
         while (!fShutdown) Sleep(500);
         StopNode();
+        // The pool index thread is not one of StopNode's slots: wait here
+        // for its last save of pool-registry.dat (poolindex.h).
+        PoolIndexStop();
         BtfStopManagedTor();
         // Checkpoints, releases wallet.dat from this directory's Berkeley DB
         // environment, and closes it. Declared since 2009 and never once
@@ -1812,6 +1826,7 @@ int main(int argc, char* argv[])
     int ret = RunGUI(argc, argv);
     fShutdown = true;
     StopNode();
+    PoolIndexStop();
     BtfStopManagedTor();
     DBFlush(true);
     WalletSQLiteRuntimeClose();

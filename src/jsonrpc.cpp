@@ -30,6 +30,7 @@
 #include "invoice.h"
 #include "btfaddr.h"
 #include "p2pool_net.h"
+#include "poolindex.h"
 #include "nostr.h"
 
 #ifndef _WIN32
@@ -735,6 +736,24 @@ static json rpc_sendtoaddress(const json& p)
 // sendburn <amount> <data hex>: burn `amount` into an OP_RETURN carrying the
 // data -- provably unspendable, gone from the supply. What a public community
 // listing is (community.h); 80 bytes of data at most, the relay limit.
+// The one burn path: an OP_RETURN with this data, through the wallet's
+// SendMoney. sendburn and poolcreate everpool both send with it.
+static uint256 SendBurn(const vector<unsigned char>& data, int64 nValue, const string& strComment)
+{
+    if (IsWalletLocked())
+        throw runtime_error("wallet is locked");
+    if (data.empty() || data.size() > MAX_OP_RETURN_RELAY)
+        throw runtime_error(strprintf("the data is 1 to %u bytes", MAX_OP_RETURN_RELAY));
+    CScript scriptPubKey;
+    scriptPubKey << OP_RETURN << data;
+    CWalletTx wtx;
+    wtx.mapValue["comment"] = strComment;
+    string strError;
+    if (!SendMoney(scriptPubKey, nValue, wtx, -1, &strError))
+        throw runtime_error("send failed: " + (strError.empty() ? string("see debug.log") : strError));
+    return wtx.GetHash();
+}
+
 static json rpc_sendburn(const json& p)
 {
     if (p.size() < 2 || !p[1].is_string() || !IsHex(p[1].get<string>()))
@@ -744,14 +763,8 @@ static json rpc_sendburn(const json& p)
     vector<unsigned char> data = ParseHex(p[1].get<string>());
     if (data.empty() || data.size() > MAX_OP_RETURN_RELAY)
         throw runtime_error(strprintf("the data is 1 to %u bytes", MAX_OP_RETURN_RELAY));
-    CScript scriptPubKey;
-    scriptPubKey << OP_RETURN << data;
     int64 nValue = AmountFromValue(p[0]);
-    CWalletTx wtx;
-    wtx.mapValue["comment"] = "Burned";
-    if (!SendMoney(scriptPubKey, nValue, wtx))
-        throw runtime_error("send failed: insufficient balance once the fee is counted");
-    return wtx.GetHash().GetHex();
+    return SendBurn(data, nValue, "Burned").GetHex();
 }
 
 // donate <amount>: pay the treasury. Exactly sendtoaddress treasury <amount>,
@@ -4697,7 +4710,300 @@ static void JoinLocalPool(const poolreg::PoolRecord& rec, string& strPassword)
         throw runtime_error(err);
 }
 
-// poolcreate everpool|local {params} [dryrun|password]
+// ---- Everpool pools, read from the registry index (poolindex.h) ----------
+
+static const char* PoolStatusName(int nStatus)
+{
+    switch (nStatus)
+    {
+    case POOL_ACTIVE:  return "active";
+    case POOL_PENDING: return "pending";
+    default:           return "unknown";
+    }
+}
+
+static string PoolFeePercent(unsigned int nBps)
+{
+    return strprintf("%u.%02u%%", nBps / 100, nBps % 100);
+}
+
+// One line for poollist: what a miner compares between pools.
+static string PoolRulesSummary(const poolreg::PoolRecord& rec)
+{
+    return strprintf("a share every %u s, PPLNS over %u shares, retarget over %u, uncles %u deep paid %u%%, fee %s",
+                     rec.nSpacing, rec.nWindow, rec.nRetarget, rec.nUncleDepth, rec.nUnclePct,
+                     PoolFeePercent(rec.nFeeBps).c_str());
+}
+
+static json PoolAppearanceJson(const CPoolAppearance& a)
+{
+    json j;
+    j["height"] = a.nHeight;
+    j["blockhash"] = a.hashBlock.GetHex();
+    j["txid"] = a.txid.GetHex();
+    j["vout"] = a.nOut;
+    j["burn"] = ValueFromAmount(a.nBurn);
+    return j;
+}
+
+static json PoolAnchorJson(const CPoolAnchor& a)
+{
+    json j;
+    j["height"] = a.nHeight;
+    j["blockhash"] = a.hashBlock.GetHex();
+    j["sharedata"] = a.hashShareData.GetHex();
+    return j;
+}
+
+// What the index says about a pool. Anchors are claims: anybody can name a
+// pool in a solo block's coinbase, so they are counted, never trusted.
+static void AddRegistryJson(json& j, const CPoolInfo& info, bool fFull)
+{
+    j["status"] = PoolStatusName(info.nStatus);
+    j["firstheight"] = info.first.nHeight >= 0 ? json(info.first.nHeight) : json(nullptr);
+    j["confirmations"] = info.nConfirmations;
+    j["appearances"] = info.nAppearances;
+    j["claims"] = info.nAnchorsInWindow;
+    if (!fFull)
+        return;
+    j["firstappearance"] = info.first.nHeight >= 0 ? PoolAppearanceJson(info.first) : json(nullptr);
+    json a = json::array();
+    for (size_t i = 0; i < info.vRecentAnchors.size(); i++)
+        a.push_back(PoolAnchorJson(info.vRecentAnchors[i]));
+    j["lastanchors"] = a;
+}
+
+// Section 12: a pool named like pool zero ("bitflash") with a fee is the
+// classic lure. Names are not unique and cost nothing to copy; every entry
+// lists the other pools whose names look the same, pool zero's included.
+static const char* POOL_NAME_NOTE =
+    "names are not unique: anyone can record a pool under any name, pool zero's (\"bitflash\") included; a pool "
+    "is its id (the fingerprint is only its first 8 hex digits), its age (first height), its fee and its work";
+
+// Names that look the same: equal once case, '-' and '_' are set aside.
+static string PoolNameKey(const string& s)
+{
+    string k;
+    for (size_t i = 0; i < s.size(); i++)
+        if (s[i] != '-' && s[i] != '_')
+            k += (char)tolower((unsigned char)s[i]);
+    return k;
+}
+
+static uint256 PoolZeroId()
+{
+    uint256 id = 0;
+    poolreg::PoolId(poolreg::PoolZero().Encode(), (const unsigned char*)pchMessageStart, id.begin());
+    return id;
+}
+
+// The other pools named like strName (by PoolNameKey): pool zero first,
+// then the recorded pools; never the pool itself.
+static json SameNameJson(const uint256& idSelf, const string& strName, const vector<CPoolInfo>& vReg)
+{
+    json a = json::array();
+    const string key = PoolNameKey(strName);
+    const uint256 idZero = PoolZeroId();
+    if (idSelf != idZero && PoolNameKey(poolreg::PoolZero().name) == key)
+    {
+        json z;
+        z["id"] = idZero.GetHex();
+        z["fingerprint"] = idZero.GetHex().substr(0, 8);
+        z["poolzero"] = true;
+        a.push_back(z);
+    }
+    for (size_t i = 0; i < vReg.size(); i++)
+    {
+        if (vReg[i].fZero || vReg[i].id == idSelf || PoolNameKey(vReg[i].rec.name) != key)
+            continue;
+        json o;
+        o["id"] = vReg[i].id.GetHex();
+        o["fingerprint"] = vReg[i].id.GetHex().substr(0, 8);
+        o["poolzero"] = false;
+        a.push_back(o);
+    }
+    return a;
+}
+
+static json RegisteredPoolJson(const CPoolInfo& info, bool fFull, const vector<CPoolInfo>& vReg)
+{
+    json j;
+    j["name"] = info.rec.name;
+    j["local"] = false;
+    j["id"] = info.id.GetHex();
+    j["fingerprint"] = info.id.GetHex().substr(0, 8);
+    j["samename"] = SameNameJson(info.id, info.rec.name, vReg);
+    j["feebps"] = info.rec.nFeeBps;
+    if (fFull)
+    {
+        j["rules"] = PoolRulesJson(info.rec);
+        j["record"] = HexStr(info.record.begin(), info.record.end(), false);
+    }
+    else
+        j["rules"] = PoolRulesSummary(info.rec);
+    AddRegistryJson(j, info, fFull);
+    return j;
+}
+
+static json PoolIndexStateJson()
+{
+    int nHeight = -1;
+    bool fSynced = false, fRebuilding = false;
+    PoolIndexState(nHeight, fSynced, fRebuilding);
+    json j;
+    j["height"] = nHeight;
+    j["synced"] = fSynced;
+    j["rebuilding"] = fRebuilding;
+    return j;
+}
+
+// poolcreate everpool {params} ["send"]
+//
+// Every rule of section 1 is checked before anything is sent: the record's
+// own check, the bytes read back as the same record, and the burn's script
+// read back as the same record by the same parser the index uses. Without
+// "send" nothing is sent: the answer shows the id, the fee and the burn.
+static json CreateEverpool(const json& p)
+{
+    if (p.size() < 2)
+        throw runtime_error("poolcreate everpool {\"name\", \"spacing\", \"window\", \"retarget\", \"floor\", "
+                            "\"uncledepth\", \"unclepct\", \"feebps\", \"feeaddress\"} [\"send\"]");
+    string strAct;
+    if (p.size() > 3)
+        throw runtime_error("poolcreate everpool takes three parameters at most: the mode, the pool and \"send\", "
+                            "\"dryrun\" or \"publishzero\"");
+    if (p.size() > 2)
+    {
+        string s = p[2].is_string() ? p[2].get<string>() : string();
+        if (s != "send" && s != "dryrun" && s != "publishzero")
+            throw runtime_error("the third parameter of poolcreate everpool is \"send\" (burn 1 BTF and record the "
+                                "pool) or \"dryrun\" (show what would be sent); without it nothing is sent");
+        strAct = s;
+    }
+    poolreg::PoolRecord rec = PoolRecordFromParams(p[1], false);
+    vector<unsigned char> record = rec.Encode();
+    poolreg::PoolRecord back;
+    string err;
+    if (!poolreg::Parse(record, back, err) || back.fLocal || back.Encode() != record)
+        throw runtime_error("not a valid pool: the record does not read back as itself (" + err + ")");
+    CScript script;
+    script << OP_RETURN << record;
+    vector<unsigned char> vScript(script.begin(), script.end());
+    if (!poolreg::ParseScript(vScript, back, err) || back.Encode() != record)
+        throw runtime_error("not a valid pool: the burn's script does not read back as the record (" + err + ")");
+    if (record.size() > MAX_OP_RETURN_RELAY)
+        throw runtime_error("not a valid pool: the record is larger than an OP_RETURN relays");
+
+    uint256 id = 0;
+    poolreg::PoolId(record, (const unsigned char*)pchMessageStart, id.begin());
+    CPoolInfo info;
+    bool fZero = PoolIndexLookup(id, info) && info.fZero;
+    bool fRecorded = info.nAppearances > 0;
+    vector<CPoolInfo> vReg;
+    PoolIndexList(vReg);
+
+    json j;
+    j["name"] = rec.name;
+    j["local"] = false;
+    j["id"] = id.GetHex();
+    j["fingerprint"] = id.GetHex().substr(0, 8);
+    j["samename"] = SameNameJson(id, rec.name, vReg);
+    if (!j["samename"].empty())
+        j["note"] = POOL_NAME_NOTE;
+    j["poolzero"] = fZero;
+    json fee;
+    fee["bps"] = rec.nFeeBps;
+    fee["percent"] = PoolFeePercent(rec.nFeeBps);
+    fee["address"] = PoolRulesJson(rec)["feeaddress"];
+    j["fee"] = fee;
+    j["rules"] = PoolRulesJson(rec);
+    j["burn"] = ValueFromAmount(poolreg::MIN_BURN);
+    j["record"] = HexStr(record.begin(), record.end(), false);
+    j["index"] = PoolIndexStateJson();
+    if (fRecorded)
+    {
+        json r;
+        AddRegistryJson(r, info, false);
+        j["recorded"] = r;
+    }
+    else
+        j["recorded"] = nullptr;
+
+    if (strAct != "send" && strAct != "publishzero")
+    {
+        j["sent"] = false;
+        j["send"] = fZero ? "this is pool zero, already in every node; the same call with \"publishzero\" as its "
+                            "third parameter burns 1 BTF to publish its record on the chain once (section 4)"
+                          : "the same call with \"send\" as its third parameter burns 1 BTF and records this pool; "
+                            "it is active once the burn has 30 confirmations";
+        return j;
+    }
+    // Pool zero is in every node without a burn: publishing its record is a
+    // deliberate act of its own word, never what "send" does by accident.
+    if (fZero && strAct != "publishzero")
+        throw runtime_error("this is pool zero's record, already in every node: \"send\" would burn 1 BTF for "
+                            "nothing; \"publishzero\" publishes it on the chain once (section 4)");
+    if (!fZero && strAct == "publishzero")
+        throw runtime_error("\"publishzero\" is for pool zero's own record only; this is another pool: \"send\"");
+
+    // Everything from here to the burn under cs_main: no block can be
+    // connected between "the index is at the tip and does not have this
+    // pool" and the send, so a burn mined in between cannot make one pool
+    // burn 1 BTF twice. cs_main is taken first and the index's lock only
+    // inside it (the index never takes cs_main while holding its own lock).
+    uint256 txid = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        // "At the tip" means this node's tip: while it is still catching up,
+        // the burn may be in a block it has not read yet.
+        if (IsInitialBlockDownload())
+            throw runtime_error("this node is still catching up with the network, so it cannot say whether this "
+                                "pool is already recorded; try again once it has the chain");
+        if (!PoolIndexSynced())
+            throw runtime_error("the pool index has not read up to the tip of the chain yet, so it cannot say "
+                                "whether this pool is already recorded; try again once it has");
+        // Burning a record that is already on the chain changes nothing
+        // (same id, same age): refused, rather than spending 1 BTF on
+        // nothing. Looked up again now that the chain cannot move.
+        CPoolInfo now;
+        if (PoolIndexLookup(id, now) && now.nAppearances > 0)
+            throw runtime_error(strprintf("this pool is already recorded, first at block %d: burning it again "
+                                          "changes nothing", now.first.nHeight));
+        // The same burn not in a block yet: in the memory pool, or in this
+        // wallet (which sends its unconfirmed transactions again until they
+        // are mined, even when the memory pool has dropped them).
+        vector<unsigned char> recOut;
+        poolreg::PoolRecord recSeen;
+        CRITICAL_BLOCK(cs_mapTransactions)
+        {
+            for (map<uint256, CTransaction>::const_iterator it = mapTransactions.begin(); it != mapTransactions.end(); ++it)
+                for (size_t i = 0; i < it->second.vout.size(); i++)
+                    if (PoolBurnedRecord(it->second.vout[i], recOut, recSeen) && recOut == record)
+                        throw runtime_error("a transaction recording this pool is already waiting to be mined: " +
+                                            it->first.GetHex());
+        }
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            {
+                if (it->second.GetDepthInMainChain() > 0)
+                    continue;
+                for (size_t i = 0; i < it->second.vout.size(); i++)
+                    if (PoolBurnedRecord(it->second.vout[i], recOut, recSeen) && recOut == record)
+                        throw runtime_error("this wallet already has a transaction recording this pool that is not "
+                                            "in a block yet, and sends it again until it is: " + it->first.GetHex());
+            }
+        }
+        txid = SendBurn(record, poolreg::MIN_BURN, "Everpool pool " + rec.name);
+    }
+    j["sent"] = true;
+    j["txid"] = txid.GetHex();
+    j["status"] = fZero ? "active: pool zero always is; the burn publishes its record"
+                        : "pending: active once the burn has 30 confirmations";
+    return j;
+}
+
+// poolcreate everpool|local {params} [send|dryrun|password]
 static json rpc_poolcreate(const json& p)
 {
     if (p.size() < 1 || !p[0].is_string() || (p[0].get<string>() != "everpool" && p[0].get<string>() != "local"))
@@ -4705,7 +5011,7 @@ static json rpc_poolcreate(const json& p)
                             "for 1 BTF) or \"local\" (a private pool of your own machines, nothing on the chain): "
                             "poolcreate local {\"name\": ...} [password]");
     if (p[0].get<string>() == "everpool")
-        throw runtime_error("Everpool pools are not in this release yet; poolcreate local makes a local pool");
+        return CreateEverpool(p);
     if (p.size() < 2)
         throw runtime_error("poolcreate local {\"name\", \"spacing\", \"window\", \"retarget\", \"floor\", "
                             "\"uncledepth\", \"unclepct\", \"feebps\", \"feeaddress\"} [password]");
@@ -4874,11 +5180,35 @@ static json PoolZeroJson()
     return j;
 }
 
-// poollist: pool zero and this node's local pools; never another node's.
+// poollist: the index's state, the note on names, and the pools: pool zero,
+// the pools recorded on the chain (from the registry index), and this node's
+// local pools; never another node's local pool.
 static json rpc_poollist(const json&)
 {
     json a = json::array();
-    a.push_back(PoolZeroJson());
+    json out;
+    out["index"] = PoolIndexStateJson();
+    out["note"] = POOL_NAME_NOTE;
+    vector<CPoolInfo> vReg;
+    PoolIndexList(vReg);
+    json z = PoolZeroJson();
+    z["rules"] = PoolRulesSummary(poolreg::PoolZero());
+    z["samename"] = SameNameJson(PoolZeroId(), poolreg::PoolZero().name, vReg);
+    if (!vReg.empty() && vReg[0].fZero)
+        AddRegistryJson(z, vReg[0], false);
+    a.push_back(z);
+    // Section 9: by recent share work for carried pools, then by anchors,
+    // never by name. Nothing is carried yet, so: by anchors in the last 720
+    // blocks, ties in the order of first appearance (PoolIndexList's).
+    vector<CPoolInfo> vRest;
+    for (size_t i = 0; i < vReg.size(); i++)
+        if (!vReg[i].fZero)
+            vRest.push_back(vReg[i]);
+    std::stable_sort(vRest.begin(), vRest.end(), [](const CPoolInfo& x, const CPoolInfo& y) {
+        return x.nAnchorsInWindow > y.nAnchorsInWindow;
+    });
+    for (size_t i = 0; i < vRest.size(); i++)
+        a.push_back(RegisteredPoolJson(vRest[i], false, vReg));
     vector<string> vNames;
     P2PoolLocalNames(vNames);
     for (size_t i = 0; i < vNames.size(); i++)
@@ -4887,10 +5217,11 @@ static json rpc_poollist(const json&)
         if (P2PoolLocalStatus(vNames[i], st))
             a.push_back(LocalPoolJson(vNames[i], st, false));
     }
-    return a;
+    out["pools"] = a;
+    return out;
 }
 
-// poolinfo local:<name> | <pool zero's id>
+// poolinfo local:<name> | <pool id>
 static json rpc_poolinfo(const json& p)
 {
     static const char* pszUsage = "poolinfo local:<name> | <pool id>";
@@ -4908,12 +5239,55 @@ static json rpc_poolinfo(const json& p)
     json z = PoolZeroJson();
     for (size_t i = 0; i < s.size(); i++)
         s[i] = (char)tolower((unsigned char)s[i]);
+    if (s.size() != 64 || !IsHex(s))
+        throw runtime_error(pszUsage);
+    uint256 id;
+    id.SetHex(s);
+    CPoolInfo info;
+    bool fKnown = PoolIndexLookup(id, info);
+    vector<CPoolInfo> vReg;
+    PoolIndexList(vReg);
     if (s == z["id"].get<string>())
     {
         z["rules"] = PoolRulesJson(poolreg::PoolZero());
+        z["samename"] = SameNameJson(id, poolreg::PoolZero().name, vReg);
+        z["note"] = POOL_NAME_NOTE;
+        if (fKnown && info.fZero)
+            AddRegistryJson(z, info, true);
+        z["index"] = PoolIndexStateJson();
         return z;
     }
-    throw runtime_error("no such pool on this node (Everpool pools are not in this release yet)");
+    if (fKnown)
+    {
+        json j = RegisteredPoolJson(info, true, vReg);
+        j["note"] = POOL_NAME_NOTE;
+        std::vector<CPoolAppearance> vAppear;
+        PoolIndexAppearances(id, vAppear);
+        json a = json::array();
+        for (size_t i = 0; i < vAppear.size(); i++)
+            a.push_back(PoolAppearanceJson(vAppear[i]));
+        j["appearancelist"] = a;
+        j["index"] = PoolIndexStateJson();
+        return j;
+    }
+    // Not recorded: what the chain says about the id is only claims, if any.
+    std::vector<CPoolAnchor> vAnchors;
+    int nInWindow = 0;
+    PoolIndexAnchors(id, vAnchors, nInWindow);
+    if (vAnchors.empty() && nInWindow == 0)
+        throw runtime_error("no pool with that id is recorded on the chain this node follows, and no block names it");
+    json j;
+    j["id"] = id.GetHex();
+    j["local"] = false;
+    j["status"] = PoolStatusName(POOL_UNKNOWN);
+    j["claims"] = nInWindow;
+    json a = json::array();
+    for (size_t i = 0; i < vAnchors.size(); i++)
+        a.push_back(PoolAnchorJson(vAnchors[i]));
+    j["lastanchors"] = a;
+    j["note"] = "no record of this pool is on the chain: blocks name it, but anybody can name an id";
+    j["index"] = PoolIndexStateJson();
+    return j;
 }
 
 // Calls that take their own locks, run without cs_main (Dispatch).
