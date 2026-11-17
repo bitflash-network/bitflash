@@ -614,6 +614,41 @@ static json rpc_getbalance(const json& p)
     return ValueFromAmount(nTotal);
 }
 
+// getwalletinfo: the wallet at a glance, read under the wallet's own lock the
+// way getbalance and listtransactions read it. Balances reuse rpc_getbalance
+// (minconf 1 and minconf 0), so the numbers cannot drift from it.
+static json rpc_getwalletinfo(const json&)
+{
+    json j;
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        int64 nTrusted = AmountFromValue(rpc_getbalance(json::array()));
+        int64 nAll = AmountFromValue(rpc_getbalance(json::array({ 0 })));
+        int64 nImmature = 0;
+        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx& wtx = it->second;
+            // The rule behind category "immature" in listtransactions. A
+            // coinbase that is not in the best chain will never mature, so it
+            // is not counted as coming.
+            if (wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0 && wtx.GetDepthInMainChain() > 0 &&
+                !wtx.fSpent)
+                nImmature += wtx.CTransaction::GetCredit();
+        }
+        j["balance"]             = ValueFromAmount(nTrusted);
+        j["unconfirmed_balance"] = ValueFromAmount(nAll > nTrusted ? nAll - nTrusted : (int64)0);
+        j["immature_balance"]    = ValueFromAmount(nImmature);
+        j["txcount"]             = (int)mapWallet.size();
+    }
+    CRITICAL_BLOCK(cs_keyPool)
+        j["keypoolsize"] = (int)mapKeyPool.size();
+    j["encrypted"] = IsWalletEncrypted();
+    j["locked"]    = IsWalletLocked();
+    j["hdseed"]    = WalletHasHDSeed();
+    j["backend"]   = WalletSQLiteRuntimeActive() ? "sqlite" : "bdb";
+    return j;
+}
+
 // ---- invoices (invoice.h): the shop's own payment gateway ----
 
 // createinvoice <amount> [description] [expiry seconds=3600] [order id]
@@ -5314,7 +5349,7 @@ static bool RunsWithoutMainLock(const string& method)
 static json rpc_help(const json&)
 {
     return "getinfo getblockcount getblockhash getblock getnewaddress validateaddress "
-           "getbalance walletlock sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
+           "getbalance getwalletinfo walletlock sendtoaddress estimatefee settxfee bumpfee createinvoice getinvoice listinvoices cancelinvoice "
            "gettransaction listtransactions listsinceblock "
            "createmultisig addmultisigaddress decodescript listunspent createrawtransaction "
            "decoderawtransaction getrawtransaction signrawtransaction sendrawtransaction "
@@ -5338,6 +5373,7 @@ static const RpcEntry kMethods[] = {
     { "getnewaddress",    rpc_getnewaddress },
     { "validateaddress",  rpc_validateaddress },
     { "getbalance",       rpc_getbalance },
+    { "getwalletinfo",    rpc_getwalletinfo },
     { "walletlock",       rpc_walletlock },
     { "sendtoaddress",    rpc_sendtoaddress },
     { "estimatefee",      rpc_estimatefee },
@@ -6200,6 +6236,25 @@ int WalletRpcV4SelfTest()
                           strprintf("minconf 1 counts our own change (9) but not somebody's unconfirmed payment (5); "
                                     "minconf 0 counts both (got %s and %s)",
                                     FormatMoney(n1).c_str(), FormatMoney(n0).c_str()).c_str());
+        // getwalletinfo reads the same wallet: balance is getbalance, the
+        // unconfirmed part is what minconf 0 adds, txcount is every entry
+        // listtransactions can return.
+        json wi = rpc_getwalletinfo(json::array());
+        json lt = rpc_listtransactions(json::array({ 1000000 }));
+        nFail += T::Check(AmountFromValue(wi["balance"]) == n1 &&
+                          AmountFromValue(wi["balance"]) == AmountFromValue(rpc_getbalance(json::array())) &&
+                          AmountFromValue(wi["unconfirmed_balance"]) == n0 - n1 &&
+                          AmountFromValue(wi["unconfirmed_balance"]) >= 0 &&
+                          wi["txcount"].get<int>() == (int)lt.size() &&
+                          wi["txcount"].get<int>() == (int)mapWallet.size(),
+                          "getwalletinfo: balance equals getbalance, unconfirmed is what minconf 0 adds, "
+                          "txcount equals listtransactions' full length");
+        nFail += T::Check(wi["immature_balance"].is_number() && wi["encrypted"].is_boolean() &&
+                          wi["locked"].is_boolean() && wi["hdseed"].is_boolean() &&
+                          wi["keypoolsize"].is_number_integer() && wi["backend"].is_string() &&
+                          wi["locked"].get<bool>() == IsWalletLocked() &&
+                          wi["encrypted"].get<bool>() == IsWalletEncrypted(),
+                          "getwalletinfo: lock, encryption, seed, key pool and backend fields have the right types");
     }
 
     return nFail;
