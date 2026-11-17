@@ -114,7 +114,7 @@ struct Reader
         unsigned int a = Byte();
         return a | ((unsigned int)Byte() << 8);
     }
-    uint64 U64()
+    uint64 Next64()
     {
         uint64 v = 0;
         for (int i = 0; i < 8; i++)
@@ -288,7 +288,7 @@ static void AppendTxOut(Reader& r, CTransaction& tx)
     else if (nValue == 2)
         nOut = 50 * COIN;
     else
-        nOut = (int64)(r.U64() % (uint64)(MAX_MONEY + 1));   // a valid block's outputs are in range
+        nOut = (int64)(r.Next64() % (uint64)(MAX_MONEY + 1));   // a valid block's outputs are in range
     unsigned char nScript = r.Byte() % 4;
     CScript script;
     if (nScript == 0 || nScript == 1)
