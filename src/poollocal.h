@@ -154,10 +154,13 @@ public:
     // Responder, step 2: a hello from 'conn', tried against each of this
     // node's own onions. True: replyOut is to be sent (nB is the caller's
     // fresh nonce). False: silence, whatever the reason (no match, a
-    // repeated nonce, the session cap, a reply already pending).
+    // repeated nonce, the session cap, a reply already pending). A hello on a
+    // connection that already holds a session is answered: the other side
+    // has lost it.
     bool OnHello(uint64_t conn, const std::vector<std::string>& vOwnOnions, const Hello& hello,
                  const unsigned char nB[32], int64_t nNow, Hello& replyOut);
-    // Responder, after step 3: the ack. True opens the session.
+    // Responder, after step 3: the ack. True opens the session, in place of
+    // one the connection held.
     bool OnAck(uint64_t conn, const unsigned char ack[ACK_BYTES], int64_t nNow,
                unsigned char hOut[HANDLE_BYTES]);
 

@@ -2120,14 +2120,21 @@ static void ConnectDiscoveredBtfPeers()
             delete ctx;
 
             CNode* pnode = ConnectNodeBtfResolved(addr, meeting, onion, enc_pub, desc);
-            CRITICAL_BLOCK(cs_btfPeerState)
-            {
-                if (pnode)
+            if (pnode)
+                CRITICAL_BLOCK(cs_vNodes)
                 {
                     if (!pnode->fNetworkNode)
                         pnode->fNetworkNode = true;
                     else
+                    {
+                        pnode->fLocalPoolPin = false;   // the pin is this code's too now
                         pnode->Release();
+                    }
+                }
+            CRITICAL_BLOCK(cs_btfPeerState)
+            {
+                if (pnode)
+                {
                     g_btfPeerBackoff.erase(addr);
                     g_btfPeerFails.erase(addr);
                     g_btfPeerEverConnected.insert(addr);

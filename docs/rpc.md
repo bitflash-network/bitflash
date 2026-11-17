@@ -164,6 +164,14 @@ key in `pools/local/<id>.conf` (owner-only) and never the password. No answer,
 error or log line holds the password, the key or the pool's id; the pool is
 named by its name everywhere (`-p2pool=local:NAME`, `poolinfo local:NAME`).
 
+Once a call is answered, the node overwrites the copies of the request it
+can reach: the bytes received, the headers and the decoded credential, the
+body, and every string of the parsed request and of the call's parameters.
+Some copies it cannot reach and does not overwrite: the JSON parser's own
+token buffer, and the old buffers left behind when the received request
+grew. Treat the password as possibly present in the node's memory until the
+process ends; the node itself never writes it to a file.
+
 ## The loop an exchange runs
 
 1. `getnewaddress` once per user, stored against the account.

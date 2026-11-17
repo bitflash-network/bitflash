@@ -65,8 +65,9 @@ public:
     bool Take(int64 nNow);
     int Tokens(int64 nNow);
     void Reset() { nTokens = nCapacity; nLast = 0; }
-    // Self-tests: empty, the next token nSecsPerToken from nNow.
-    void Drain(int64 nNow) { nTokens = 0; nLast = nNow; }
+    // Self-tests: nLeft tokens (none by default), the next one
+    // nSecsPerToken from nNow.
+    void Drain(int64 nNow, int nLeft = 0) { nTokens = nLeft; nLast = nNow; }
 private:
     void Refill(int64 nNow);
     int nCapacity;
@@ -194,6 +195,9 @@ bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out);
 void P2PoolLocalNames(vector<string>& out);
 // Every peer some local pool of this node lists, once each.
 void P2PoolLocalDialList(vector<string>& out);
+// Whether some local pool of this node (not one being left) still lists
+// that peer. Takes cs_p2pool: callers may hold cs_vNodes, not the other way.
+bool P2PoolLocalStillListed(const string& strPeer);
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.
@@ -211,14 +215,30 @@ size_t P2PoolRegQueuedForTest(CNode* pnode, size_t* pnSpans = NULL);
 // and the next share of each made to be one the chain no longer holds.
 size_t P2PoolRegServeHeldBytesForTest();
 void P2PoolRegServeLoseNextForTest();
-// Self-tests: the registered class's budgets for proven peers' shares (the
-// class's and each session's) emptied or refilled, and the connections the
+// Self-tests: the budgets for proven peers' shares in local pools (each
+// pool's and each session's) emptied or refilled, and the connections the
 // registered class holds a share or an ask for.
-void P2PoolDrainProvenWorkForTest(bool fClass, bool fSessions);
+void P2PoolDrainProvenWorkForTest(bool fPools, bool fSessions);
 void P2PoolRefillProvenWorkForTest();
 size_t P2PoolRegisteredDeferredCount();
+// Self-tests: a local pool's budget for its proven peers set to n tokens; a
+// session's count of wasted tokens set, and read (-1 with no session); a
+// session's own tokens (-1 with no session); the connections a local pool
+// keeps state for; whether this node asked a local pool's members for a
+// share lately.
+bool P2PoolLocalSetPoolTokensForTest(const string& strName, int n);
+bool P2PoolLocalSetWorkDebtForTest(const string& strName, CNode* pnode, int nDebt);
+int P2PoolLocalWorkDebtForTest(const string& strName, CNode* pnode);
+int P2PoolLocalSessionTokensForTest(const string& strName, CNode* pnode);
+size_t P2PoolLocalPeerEntriesForTest(const string& strName);
+bool P2PoolLocalAskedForTest(const string& strName, const uint256& id);
+bool P2PoolLocalNoteAskedForTest(const string& strName, const uint256& id);
+// Self-tests: the hellos sent and read on a connection made nSecs older.
+void P2PoolLocalAgeHelloForTest(CNode* pnode, int64 nSecs);
 // Self-tests: the message thread's check of one connection for a listed
-// peer reached at another onion than the one listed (true: dropped).
+// peer reached at another onion than the one listed (true: dropped), and
+// the drops made so far made nSecs older.
 bool P2PoolLocalDropWrongOnionForTest(CNode* pnode);
+void P2PoolLocalAgeWrongOnionDropsForTest(int64 nSecs);
 
 #endif
