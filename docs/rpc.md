@@ -112,6 +112,12 @@ null.
 | `inheritpackage` | `address` | the package for the heir: script, first transaction, heir address, period, network. No key is in it |
 | `inheritimport` | `package` (JSON object or string) | in the heir's wallet; refused unless the script is an inheritance script byte for byte and this wallet holds the heir key. Everything is read from the script, not from what the package says about it |
 | `inheritclaim` | `address`, `toaddress`, [`fee`=0.01] | the heir takes the coins, once the period has passed since the last renewal; before that, says how long is left |
+| `poolcreate` | `"local"`, `{"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"}`, [`password`] | a local pool (P2Pool local, `docs/pool-registry.md` section 18): a private pool of your own machines, nothing on the chain. The name is required; the rest default to window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee, and a spacing of 30 or `ceil(60 / depth)`, whichever is larger. Returns `name`, `code` (the pool code to hand the other members), `mine` (the option that mines it) and `note`. With no mode, or `"everpool"` (not in this release yet), it is refused, so nothing is ever burned by default |
+| `pooljoin` | `code`, [`password`] | joins the local pool of that code (and password, if it has one); returns `name`, `mine` and `note`. A mistyped password joins another, empty pool: `poolleave` it and join again |
+| `poolpeers` | `"local:NAME"`, [`["ADDRESS@HOST.onion[:PORT]", ...]`] | with a list (at most 16), the member nodes this one dials and says hello to; with none, each listed peer and its state (`in session`, `connected, no proof`, `not connected`, ...) and the sessions in all. Either way `self` is this node as the other members list it (`ADDRESS@HOST.onion:PORT`), null until Tor has published the onion |
+| `poolleave` | `"local:NAME"` | forgets the local pool and deletes its files; refused while this node mines it |
+| `poollist` | -- | pool zero and this node's local pools (`"local": true`), with sessions, shares and tip height |
+| `poolinfo` | `"local:NAME"` \| pool zero's id | one pool: its rules, and for a local pool its code, sessions and listed peers |
 
 `amount` and `balance` are BTF as JSON numbers. `sendtoaddress` accepts the
 amount as a number or as a string. The word `treasury` stands for the
@@ -125,6 +131,40 @@ it with one paying more -- or paying somebody else. Credit deposits on
 confirmations, never on the memory pool, and match a deposit by address and
 amount rather than by the txid first seen. `gettransaction` says
 `bip125-replaceable: yes` while that is possible.
+
+## Local pools and their password
+
+`poolcreate local` and `pooljoin` take the pool's password, if it has one, as
+their last parameter. It travels in the request body to 127.0.0.1 and nowhere
+else, and it must never be on a command line, where the process list and the
+shell history keep it: read it from a prompt and send the body on stdin.
+
+The RPC credential stays off the command line too: keep it in a netrc file
+only you can read, `~/.bitflash-rpc.netrc` (mode 600), holding the one line
+`machine 127.0.0.1 login exchange password SECRET`, and point curl at it.
+
+```bash
+read -rs -p 'Pool password: ' PW; echo
+printf '{"id":1,"method":"pooljoin","params":["btfl1:...","%s"]}' "$PW" |
+  curl -s --netrc-file ~/.bitflash-rpc.netrc -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:8432/
+unset PW
+```
+
+(`printf` is a shell builtin, so the password is in no process's arguments,
+and curl reads the RPC credential from the file, so it is in none either.
+A password with a `"` or a backslash in it has to be escaped for JSON.)
+The node stretches it with Argon2id (64 MiB) into the pool's key, keeps that
+key in `pools/local/<id>.conf` (owner-only) and never the password. No answer,
+error or log line holds the password, the key or the pool's id; the pool is
+named by its name everywhere (`-p2pool=local:NAME`, `poolinfo local:NAME`).
+
+Once a call is answered, the node overwrites the copies of the request it
+can reach: the bytes received, the headers and the decoded credential, the
+body, and every string of the parsed request and of the call's parameters.
+Some copies it cannot reach and does not overwrite: the JSON parser's own
+token buffer, and the old buffers left behind when the received request
+grew. Treat the password as possibly present in the node's memory until the
+process ends; the node itself never writes it to a file.
 
 ## The loop an exchange runs
 

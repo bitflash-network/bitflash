@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include "btfaddr.h"
 #include "proxy.h"
+#include "p2pool_net.h"
 #include "chatdir.h"
 #include "tor.h"
 
@@ -1635,16 +1636,127 @@ static int DialP2PoolPeers(int nBudget)
     return nConnected;
 }
 
+// The listed peers of this node's local pools (docs/pool-registry.md,
+// section 18): an ordinary outbound connection to each one that answers,
+// kept as /connectbtf keeps one. They come on top of the ordinary peers and
+// never in their place (they are not counted toward BTF_TARGET_PEERS), within
+// MAX_CONNECTIONS. Two dials a round; one that does not answer waits out the
+// same backoff as any peer. The hello goes out by itself once the version
+// handshake is done (P2PoolOnVersion, and the message thread's tick).
+static const int LOCAL_POOL_DIALS_PER_ROUND = 2;
+
+// The dial schedule's key for a listed peer: no address starts with it.
+static const string LISTED_DIAL_KEY = "listed ";
+
+void BtfNoteListedDialResult(const string& strPeer, bool fOk)
+{
+    BtfNoteDialResult(LISTED_DIAL_KEY + strPeer, fOk);
+}
+
+bool BtfListedDialFailed(const string& strPeer)
+{
+    bool f;
+    CRITICAL_BLOCK(cs_btfDialSched)
+        f = g_btfDialFails.count(LISTED_DIAL_KEY + strPeer) != 0;
+    return f;
+}
+
+bool BtfListedDialDue(const string& strPeer)
+{
+    return BtfDialDue(LISTED_DIAL_KEY + strPeer);
+}
+
+void BtfListedDialBackoffEndForTest(const string& strPeer)
+{
+    CRITICAL_BLOCK(cs_btfDialSched)
+        g_btfNextDial.erase(LISTED_DIAL_KEY + strPeer);
+}
+
+static int CountListedConnected(const set<string>& setAddr)
+{
+    int n = 0;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (!pnode->strBtfAddr.empty() && setAddr.count(pnode->strBtfAddr))
+                n++;
+    return n;
+}
+
+static int DialLocalPoolPeers(const vector<string>& vListed, int nBudget)
+{
+    int nTried = 0, nConnected = 0;
+    foreach(const string& strPeer, vListed)
+    {
+        if (fShutdown || nTried >= nBudget)
+            break;
+        size_t at = strPeer.find('@');
+        if (at == string::npos)
+            continue;
+        string strAddr = strPeer.substr(0, at), strOnion = strPeer.substr(at + 1);
+        // Its own backoff, apart from the address's: a listed onion that
+        // does not answer must not hold back the ordinary dials of that
+        // address, nor they the listed onion.
+        if (strAddr == BtfLocalAddress() || BtfAlreadyConnected(strAddr) || !BtfDialDue(LISTED_DIAL_KEY + strPeer))
+            continue;
+        size_t nNodes;
+        CRITICAL_BLOCK(cs_vNodes)
+            nNodes = vNodes.size();
+        if (nNodes >= MAX_CONNECTIONS)
+            break;
+        nTried++;
+        unsigned char noEnc[32] = {0};
+        CNode* pnode = ConnectNodeBtfResolved(strAddr, "", strOnion, noEnc);
+        BtfNoteListedDialResult(strPeer, pnode != NULL);
+        if (pnode)
+        {
+            nConnected++;
+            // Keep the ref, as ThreadBtfConnect does, and remember the pin
+            // is this code's: poolpeers releases only a pin it took. Not
+            // for a connection already gone from vNodes (nothing would
+            // release the pin), nor for a peer taken off every list since
+            // the list above was read. The check and the pin go together
+            // under cs_vNodes: a list changed after them is followed by the
+            // message thread's unpinning pass, which takes cs_vNodes too and
+            // finds the pin (p2pool_net.cpp, LocalUnpinUnlisted).
+            CRITICAL_BLOCK(cs_vNodes)
+            {
+                bool fLive = std::find(vNodes.begin(), vNodes.end(), pnode) != vNodes.end();
+                if (fLive && !pnode->fNetworkNode && P2PoolLocalStillListed(strPeer))
+                {
+                    pnode->fNetworkNode = true;
+                    pnode->fLocalPoolPin = true;
+                }
+                else
+                    pnode->Release();
+            }
+        }
+    }
+    if (nTried)
+        LogPrint("net", "btfpeers: dialled %d listed peer(s) of this node's local pools, %d answered\n",
+                 nTried, nConnected);
+    return nConnected;
+}
+
 void ThreadReconnectCachedBtfPeers(void* parg)
 {
     LogPrint("net", "btfpeers: connection scheduler started\n");
     while (!fShutdown)
     {
+        vector<string> vListed;
+        P2PoolLocalDialList(vListed);
+        set<string> setListed;
+        foreach(const string& strPeer, vListed)
+            setListed.insert(strPeer.substr(0, strPeer.find('@')));
+        // Not in isolated mode, which dials nobody but /connectbtf peers.
+        if (!vListed.empty() && !fBtfIsolated)
+            DialLocalPoolPeers(vListed, LOCAL_POOL_DIALS_PER_ROUND);
+        int nListed = setListed.empty() ? 0 : CountListedConnected(setListed);
+
         if (fP2PoolMode && !fBtfIsolated && CountP2PoolPeersConnected() < P2POOL_TARGET_PEERS &&
-            CountBtfPeersConnected() < BTF_TARGET_PEERS + P2POOL_EXTRA_PEERS)
+            CountBtfPeersConnected() - nListed < BTF_TARGET_PEERS + P2POOL_EXTRA_PEERS)
             DialP2PoolPeers(P2POOL_DIALS_PER_ROUND);
 
-        int nHave = CountBtfPeersConnected();
+        int nHave = CountBtfPeersConnected() - nListed;
         if (nHave < BTF_TARGET_PEERS)
         {
             int nBudget = BTF_DIALS_PER_ROUND;
@@ -2049,12 +2161,16 @@ void ThreadBtfConnect(void* parg)
             CNode* pnode = strOnion.empty() ? ConnectNodeBtf(strAddr)
                                             : ConnectNodeBtfResolved(strAddr, "", strOnion, noEnc);
             if (pnode)
-            {
-                if (!pnode->fNetworkNode)
-                    pnode->fNetworkNode = true; // keep the ref from ConnectNodeBtf
-                else
-                    pnode->Release(); // already pinned; drop the extra ref
-            }
+                CRITICAL_BLOCK(cs_vNodes)
+                {
+                    if (!pnode->fNetworkNode)
+                        pnode->fNetworkNode = true; // keep the ref from ConnectNodeBtf
+                    else
+                    {
+                        pnode->fLocalPoolPin = false; // the pin is ours too now
+                        pnode->Release(); // already pinned; drop the extra ref
+                    }
+                }
         }
         CATCH_PRINT_EXCEPTION("ThreadBtfConnect")
         for (int i = 0; i < 30 && !fShutdown; i++)
@@ -2220,6 +2336,7 @@ void ThreadSocketHandler2(void* parg)
                         {
                             pnode->AddRef();
                             swap(pnodeExtra->fNetworkNode, pnode->fNetworkNode);
+                            swap(pnodeExtra->fLocalPoolPin, pnode->fLocalPoolPin);
                             pnodeExtra->Release();
                         }
                         pnodeExtra->fDisconnect = true;
@@ -2598,6 +2715,7 @@ void ThreadSocketHandler2(void* parg)
                         if (nBytes > 0)
                         {
                             vSend.erase(vSend.begin(), vSend.begin() + nBytes);
+                            pnode->nSendDrained += nBytes;
                             pnode->nLastSend = GetTime();
                         }
                         else if (nBytes == 0)
