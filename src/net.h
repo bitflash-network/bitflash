@@ -57,6 +57,13 @@ bool BtfCachedPeerOnion(const string& strBtfAddr, string& strOnionOut);
 void BtfNoteP2PoolPeer(const string& strBtfAddr, bool fP2Pool);
 void BtfNoteP2PoolHints(const vector<string>& vBtfAddr);
 void BtfKnownP2PoolPeers(vector<string>& vOut, size_t nMax);
+// A listed peer of a local pool (ADDR@HOST.onion[:PORT]): dials of it are
+// scheduled apart from the address's ordinary dials, whether its last dial
+// failed, and whether its backoff has run out (self-tests: end it now).
+void BtfNoteListedDialResult(const string& strPeer, bool fOk);
+bool BtfListedDialFailed(const string& strPeer);
+bool BtfListedDialDue(const string& strPeer);
+void BtfListedDialBackoffEndForTest(const string& strPeer);
 // The pinned onion seeds of the active network. The chat app starts from these
 // the same way a node does: no server to ask first.
 void BtfSeedOnions(vector<string>& vOut);
@@ -814,6 +821,10 @@ public:
     bool fClient;
     bool fInbound;
     bool fNetworkNode;
+    // The fNetworkNode pin is the local pools' own (net.cpp,
+    // DialLocalPoolPeers): set only when that code pinned a connection
+    // nothing else had, cleared when anything else wants it kept too.
+    bool fLocalPoolPin;
     bool fDisconnect;
     // P2Pool history (p2pool_net.cpp): when we last sent this peer ours, when
     // we asked it for its own (0: not asked, or the answer is over), and how
@@ -825,6 +836,12 @@ public:
     // has named its P2Pool peers to us yet (once per connection).
     int64 nP2PoolLastGood;
     bool fP2PoolPeersRecv;
+    // Bytes this connection has sent in its life, and the stretches of the
+    // send stream that hold messages of pools other than pool zero, as stream
+    // positions (docs/pool-registry.md, section 8): pool zero's queue caps
+    // count vSend less those. Both under cs_vSend.
+    uint64 nSendDrained;
+    std::deque<std::pair<uint64, uint64> > vRegSpans;
 protected:
     int nRefCount;
 public:
@@ -974,12 +991,14 @@ public:
         fClient = false; // set by version message
         fInbound = fInboundIn;
         fNetworkNode = false;
+        fLocalPoolPin = false;
         fDisconnect = false;
         nP2PoolSyncServed = 0;
         nP2PoolSyncAskedAt = 0;
         nP2PoolHistoryRecv = 0;
         nP2PoolLastGood = 0;
         fP2PoolPeersRecv = false;
+        nSendDrained = 0;
         nRefCount = 0;
         nReleaseTime = 0;
         nDisconnectSince = 0;

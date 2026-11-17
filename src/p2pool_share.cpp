@@ -3,11 +3,14 @@
 
 #include "headers.h"
 #include "p2pool_share.h"
+#include "poollocal.h"
 
 namespace p2pool
 {
 
 static const unsigned char TAG[3] = { 'p', '2', 'p' };
+static const unsigned char TAG_X[3] = { 'p', '2', 'x' };
+static const unsigned char TAG_L[3] = { 'p', '2', 'l' };
 
 static bool Fail(string& errOut, const char* why)
 {
@@ -45,6 +48,136 @@ bool FindCommitment(const CTransaction& coinbase, uint256& hashOut)
     }
     // Two commitments would let one PoW count on two share chains.
     return nFound == 1;
+}
+
+PoolRules::PoolRules()
+    : nSpacing(0), nWindow(0), nRetarget(0), bnFloor(0), nUncleDepth(0), nUnclePct(0), nFeeBps(0),
+      nAnchor(ANCHOR_P2P), poolId(0)
+{
+    memset(anchorKey, 0, sizeof(anchorKey));
+}
+
+PoolRules::~PoolRules()
+{
+    OPENSSL_cleanse(anchorKey, sizeof(anchorKey));
+}
+
+uint64_t UnclePaid(uint64_t work, unsigned int nPct)
+{
+    return work / 100 * nPct + (work % 100) * nPct / 100;
+}
+
+vector<unsigned char> AnchorPush(const PoolRules& rules, const ShareData& d)
+{
+    uint256 h = d.GetHash();
+    if (rules.nAnchor == ANCHOR_P2L)
+        return poollocal::AnchorData(rules.anchorKey, h.begin());
+    if (rules.nAnchor == ANCHOR_P2X)
+    {
+        uint256 id = rules.poolId;
+        vector<unsigned char> v(TAG_X, TAG_X + 3);
+        v.insert(v.end(), id.begin(), id.end());
+        v.insert(v.end(), h.begin(), h.end());
+        return v;
+    }
+    return CommitmentPush(h);
+}
+
+// Sections 6 and 18: the whole scriptSig parses, it carries exactly one
+// commitment of this pool to this share data, and no commitment of any other
+// kind. A push is known by its data alone, whatever opcode carried it.
+static bool CheckAnchorX(const PoolRules& rules, const CTransaction& coinbase, const ShareData& d)
+{
+    if (!coinbase.IsCoinBase())
+        return false;
+    const CScript& s = coinbase.vin[0].scriptSig;
+    CScript::const_iterator pc = s.begin();
+    opcodetype op;
+    vector<unsigned char> push;
+    int nOwn = 0;
+    uint256 h = d.GetHash();
+    uint256 id = rules.poolId;
+    while (pc < s.end())
+    {
+        if (!s.GetOp(pc, op, push))
+            return false;
+        bool fP2P = push.size() == 35 && memcmp(&push[0], TAG, 3) == 0;
+        bool fP2L = push.size() == 35 && memcmp(&push[0], TAG_L, 3) == 0;
+        bool fP2X = push.size() == 67 && memcmp(&push[0], TAG_X, 3) == 0;
+        if (fP2P)
+            return false;
+        if (rules.nAnchor == ANCHOR_P2L)
+        {
+            if (fP2X)
+                return false;
+            if (fP2L)
+            {
+                if (!poollocal::AnchorMatches(push, rules.anchorKey, h.begin()))
+                    return false;
+                nOwn++;
+            }
+        }
+        else
+        {
+            if (fP2L)
+                return false;
+            if (fP2X)
+            {
+                if (memcmp(&push[3], id.begin(), 32) != 0 || memcmp(&push[35], h.begin(), 32) != 0)
+                    return false;
+                nOwn++;
+            }
+        }
+    }
+    return nOwn == 1;
+}
+
+bool CheckAnchor(const PoolRules& rules, const CTransaction& coinbase, const ShareData& d)
+{
+    if (rules.IsZero())
+    {
+        // Pool zero's rule, frozen: exactly one "p2p" push, whatever else.
+        uint256 hashCommit;
+        return !d.fX && !d.fSalt && FindCommitment(coinbase, hashCommit) && hashCommit == d.GetHash();
+    }
+    // A share of another pool names that pool, and never pool zero's form; a
+    // local pool's carries its salt, a registered pool's none.
+    if (!d.fX || d.poolId != rules.poolId || rules.poolId == 0)
+        return false;
+    if (d.fSalt != (rules.nAnchor == ANCHOR_P2L))
+        return false;
+    return CheckAnchorX(rules, coinbase, d);
+}
+
+bool ComputePoolPayouts(const PoolRules& rules, const vector<WindowShare>& window, int64 nTotal,
+                        vector<Payout>& out, string& errOut)
+{
+    if (rules.nFeeBps == 0)
+        return ComputePayouts(window, nTotal, out, errOut);
+    if (nTotal < 0 || !MoneyRange(nTotal) || rules.nFeeBps > 10000 || !IsPayoutScript(rules.feeScript))
+        return Fail(errOut, "a creator fee that cannot be paid");
+    // floor(nTotal * bps / 10000), split so the product cannot overflow.
+    int64 nFee = nTotal / 10000 * (int64)rules.nFeeBps + (nTotal % 10000) * (int64)rules.nFeeBps / 10000;
+    if (!ComputePayouts(window, nTotal - nFee, out, errOut))
+        return false;
+    if (nFee == 0)
+        return true;
+    for (size_t i = 0; i < out.size(); i++)
+    {
+        if (out[i].script == rules.feeScript)
+        {
+            out[i].value += nFee;
+            return true;
+        }
+    }
+    Payout fee;
+    fee.script = rules.feeScript;
+    fee.value = nFee;
+    size_t nAt = 0;
+    while (nAt < out.size() && out[nAt].script < rules.feeScript)
+        nAt++;
+    out.insert(out.begin() + nAt, fee);
+    return true;
 }
 
 CBlock Share::Header() const
@@ -93,7 +226,7 @@ static bool CheckShareHash(const Share& share, bool& fBlockOut, string& errOut, 
 }
 
 // Everything CheckShareWork looks at but the hash.
-static bool CheckShareCheap(const Share& share, const CBigNum& bnFloor, string& errOut)
+static bool CheckShareCheap(const Share& share, const PoolRules& rules, string& errOut)
 {
     const ShareData& d = share.data;
 
@@ -125,15 +258,14 @@ static bool CheckShareCheap(const Share& share, const CBigNum& bnFloor, string& 
     // a window of shares with two uncles each. Checked here, on the share
     // alone, so it also bounds a share taken on its work alone, whose
     // payouts are never checked against a window.
-    if (share.coinbase.vout.size() > 3 * WINDOW_SHARES)
+    if (share.coinbase.vout.size() > rules.MaxOutputs())
         return Fail(errOut, "a coinbase paying more addresses than a window holds");
     foreach(const CTxOut& o, share.coinbase.vout)
         if (!IsPayoutScript(vector<unsigned char>(o.scriptPubKey.begin(), o.scriptPubKey.end())))
             return Fail(errOut, "a coinbase paying something other than an address");
 
     // The coinbase commits to this share's chain data, and only to it.
-    uint256 hashCommit;
-    if (!FindCommitment(share.coinbase, hashCommit) || hashCommit != d.GetHash())
+    if (!CheckAnchor(rules, share.coinbase, d))
         return Fail(errOut, "the coinbase does not commit to this share");
 
     // The coinbase is the first transaction of the block it claims.
@@ -147,7 +279,7 @@ static bool CheckShareCheap(const Share& share, const CBigNum& bnFloor, string& 
     // without, parted ways for good.
     CBigNum bnShare;
     bnShare.SetCompact(d.nShareBits);
-    if (bnShare <= 0 || bnShare > bnFloor)
+    if (bnShare <= 0 || bnShare > rules.bnFloor)
         return Fail(errOut, "share target easier than the floor");
     return true;
 }
@@ -155,9 +287,21 @@ static bool CheckShareCheap(const Share& share, const CBigNum& bnFloor, string& 
 bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
                     bool fCheckPoW, WorkGate* pGate)
 {
+    return CheckShareWork(share, PoolRules::Zero(bnFloor), fBlockOut, errOut, fCheckPoW, pGate);
+}
+
+bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
+                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW, WorkGate* pGate)
+{
+    return CheckShare(share, window, nBlockHeight, PoolRules::Zero(bnFloor), fBlockOut, errOut, fCheckPoW, pGate);
+}
+
+bool CheckShareWork(const Share& share, const PoolRules& rules, bool& fBlockOut, string& errOut,
+                    bool fCheckPoW, WorkGate* pGate)
+{
     fBlockOut = false;
     errOut.clear();
-    if (!CheckShareCheap(share, bnFloor, errOut))
+    if (!CheckShareCheap(share, rules, errOut))
         return false;
     return !fCheckPoW || CheckShareHash(share, fBlockOut, errOut, pGate);
 }
@@ -175,13 +319,13 @@ bool IsPayoutScript(const vector<unsigned char>& s)
 }
 
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
-                const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW, WorkGate* pGate)
+                const PoolRules& rules, bool& fBlockOut, string& errOut, bool fCheckPoW, WorkGate* pGate)
 {
     // The hash last: a share that does not pay its window is refused before
     // anything is spent on its work.
     fBlockOut = false;
     errOut.clear();
-    if (!CheckShareCheap(share, bnFloor, errOut))
+    if (!CheckShareCheap(share, rules, errOut))
         return false;
     if (nBlockHeight < 1 || nBlockHeight > MAX_BLOCK_HEIGHT)
         return Fail(errOut, "block height out of range");
@@ -198,7 +342,7 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
         return Fail(errOut, "the coinbase pays less than the subsidy");
 
     vector<Payout> want;
-    if (!ComputePayouts(window, nTotal, want, errOut))
+    if (!ComputePoolPayouts(rules, window, nTotal, want, errOut))
         return false;
     if (want.size() != share.coinbase.vout.size())
         return Fail(errOut, "the coinbase does not pay the window");

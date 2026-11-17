@@ -218,6 +218,31 @@ anchors that name it (section 7): the last 64 (height, block hash, share data
 hash) and the count over the last 720 blocks. All of it is undone by a reorg
 the same way.
 
+**Anchors that name no registered pool are kept only for a while.** A
+`"p2x"` push costs nothing to write, so a miner could name a new made-up id in
+every coinbase; kept forever, those claims would grow the index without any
+burn, against section 11. So at every height that is a multiple of 144, an id
+that is neither pool zero nor registered at that height loses its anchors
+older than 2160 blocks. A dropped anchor stays in the file for 1440 more
+blocks, so a reorg above the sweep restores it exactly; a reorg below an
+anchor dropped for good is detected and the chain is read again. The sweep is
+part of reading the chain, so a rebuild gives the same result. A pool whose
+record appears later starts with the anchors of its last 2160 blocks before
+the burn.
+
+**The file and restarts.** The index lives in `pool-registry.dat`, written
+atomically, with a checksum, and rebuildable from the block files: deleting
+it and starting again gives the same registry. It keeps the hashes of the
+last 64 blocks it read and one every 144 blocks, so a node whose block index
+lost its last blocks in an unclean stop resumes from the newest one it still
+has instead of reading from genesis. A rebuild from genesis (a damaged file,
+a reorg deeper than the kept anchors allow) is read into a second registry
+while the old one keeps answering, and takes over at the tip. The index has a
+thread of its own, started once the node's network is up (never by a
+one-shot command such as `-newaddress` or `-rescan`); on the way out the node
+waits for its last save, best effort, for at most 30 s, and a save cut short
+leaves the previous file.
+
 **Cost.** One parse per `OP_RETURN` output of at least 1 BTF, a few hundred
 bytes per pool on disk and in memory. There is no cap on the number of
 entries: a cap would let whoever fills it stop everybody else from creating a
@@ -369,6 +394,10 @@ with `SerializeHash`. A format 1 share (`ShareX`) is a pool zero `Share` with
 `ShareDataX` in place of `ShareData`: the same header fields, coinbase and
 merkle branch.
 
+A local pool's share (section 18) adds one field to this, a random salt
+after `poolId` that never goes on the chain; a registered pool's share has
+none.
+
 On top of the v1 rules, a format 1 share is valid only if:
 
 - its `poolId` is the pool whose rules it is checked against, and is not pool
@@ -414,7 +443,7 @@ how many blocks each pool's template produced**: a `"p2p"` push is pool zero,
 a `"p2x"` push names its pool in full. The count reads a coinbase the way a
 share is read: the scriptSig must parse fully, and it counts for pool zero
 with exactly one `"p2p"` push and no `"p2x"` push, for a registered pool with
-exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). The index keeps these counts (section
+exactly one `"p2x"` push and no `"p2p"` or `"p2l"` push; anything else counts for no pool (a `"p2l"` push is a local pool's, and counts for none, section 18). A `"p2x"` push naming pool zero's own id also counts for no pool: pool zero's shares never carry its id (section 6), so such a push cannot come from its template. The index keeps these counts (section
 3). They are *claims*: anybody can put a `"p2x"` push in a solo block's
 coinbase. Only a node that carries the pool can tell a real one (the coinbase
 pays that pool's window, the share data is in its share chain) from a label,
@@ -633,10 +662,10 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
-| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} [dryrun]` | builds the record, checks it canonically, returns its hex and its id; without `dryrun`, burns 1 BTF into it (`sendburn`) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, `dryrun` or not. A record equal to pool zero's is refused without `dryrun` (it would burn 1 BTF to register what is already there), except with an explicit `"publishzero": true` for the one-time publication of section 4 |
+| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4 |
 | `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
-| `poollist [all]` | active pools (with `all`, pending ones too): id, fingerprint, name, rules, fee, first height, confirmations, anchors in the last 720 blocks, whether carried, and the share chain's height and work when carried. Ordered by recent share work for carried pools, then by anchors, never by name |
-| `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, its share chain if carried, its guardians this epoch (Phase C) |
+| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint; the answer carries the index's state and a note that names are not unique (section 12) |
+| `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
 
 ## 10. Rotating replication: guardians
 
@@ -1087,7 +1116,7 @@ against a hashrate majority (unchanged, as in `docs/p2pool.md`).
 | threat | what happens | defence |
 |---|---|---|
 | spam registrations | the index grows; guardians are drawn for junk | 1 BTF burned per pool; a few hundred bytes each; a never-mined pool costs a guardian one request per epoch; guard slots are ranked by line work, so junk with a few floor shares never displaces a mined pool |
-| a pool named like the default ("bitflash", "official") with a 3% fee | miners lured | wallets show the fingerprint, the age, the fee and the work, never the name alone; pool zero is marked as entry zero; the fee is capped and can never rise |
+| a pool named like the default ("bitflash", "official") with a 3% fee | miners lured | wallets show the fingerprint (with the full id), the age, the fee and the work, never the name alone; pool zero is marked as entry zero; `poollist` and `poolinfo` list, on each entry, the other pools named alike, pool zero included, and say that names are not unique; the fee is capped and can never rise |
 | fragmentation | a small network split into many small pools, each with more variance | pool zero stays the default; `poollist` orders by work; the choice is the miner's |
 | a frozen bug in a rules version | a pool cannot be fixed | the fix is a new version and new pools; releases may refuse to build templates for a broken version, never stop validating it |
 | a fake anchor (a solo block labelled `"p2x" + id`) | a pool looks more successful than it is | anchors are shown as claims; a node that carries the pool shows the blocks its share chain confirms, and orders by share work, not anchors |
@@ -1683,9 +1712,9 @@ Pool zero, the default P2Pool, stays as it is for whoever picks neither.
 
 A local pool has the same parameters as an Everpool pool and obeys the same
 share rules v1 (section 5), and its shares have the `ShareX`/`ShareDataX`
-structure of section 6, with the anchor rule below in place of section 6's
-`"p2x"` rule: it is the same code with a different identity and a different
-reach. A share whose `ShareDataX.poolId` is not the session's pool is
+structure of section 6 plus a salt, with the anchor rule below in place of
+section 6's `"p2x"` rule: it is the same code with a different identity and
+a different reach. A share whose `ShareDataX.poolId` is not the session's pool is
 invalid, and its sender scored, as in section 8. Its parameters are a record
 in the format of section 1, with three differences:
 
@@ -1733,21 +1762,64 @@ has the code and the password can: membership is the only thing it protects.
 **What a password buys.** Without one, the pool is private only as long as
 its code is: anyone who has the code, or guesses it (a default record with a
 common name is easy to guess), computes the same id and key. With one, the
-code can be shared openly and the pool is still closed. Nothing seen by
-anyone a member did not list lets it test a password offline: the anchor is keyed with `C` (below),
-and a hello is bound to the onion it was sent to, so only that listed peer
-can check it, at one Argon2id run per guess. The operator's own copies of the
-id and password are kept out of argv and logs (above, and *Using it*).
+code can be shared openly and the pool is still closed. Precisely: someone
+who holds the code but not the password can test a password guess offline
+only against a hello sent to it, which a member sends only to a peer it
+listed. Everything on the chain, and everything sent to anyone else, gives
+it nothing to test against: the id and the shares go only to members in
+session; the coinbase anchor (below) hashes a 256-bit random salt that never
+goes on the chain, so checking a guess against it means guessing the salt as
+well; and a hello is bound to the onion it was sent to, so only the listed
+peer that receives it can check it, at one Argon2id run per guess. The salt
+does this for the anchor, not the key `C`: whoever holds the code derives
+`C` from each guess as easily as the id. Members can test guesses (they hold
+shares, which carry the id and the salt), but they already hold `K`. The
+operator's own copies of the id and password are kept out of argv and logs
+(above, and *Using it*).
 
 ### The coinbase anchor
 
-A local pool's coinbase carries a **35-byte push**: `"p2l"` and
-`HMAC-SHA256(C, SerializeHash(ShareDataX))` (the share data, `poolId`
-included). The hash is keyed because share data is partly public: a share's
-parent may be a block (its hash is on the chain), its payout script is among
-the coinbase outputs, and its height and bits can be searched; an unkeyed
-hash would let anyone holding the code test passwords against the chain.
-Members check it the same way, with `C`. It carries no pool id, so:
+A local pool's share data is section 6's `ShareDataX` with one more field,
+a **salt**, right after `poolId`:
+
+```
+ShareDataL {
+    uint256 poolId;               // as ShareDataX
+    uint256 salt;                 // 32 random bytes, fresh for every template
+    uint256 hashPrevShare;        // and the rest as ShareDataX
+    vector<uint256> vUncles;
+    unsigned int nShareHeight;
+    unsigned int nShareBits;
+    vector<unsigned char> payoutScript;
+}
+```
+
+serialized in that order, so a local share (`ShareL`) is a `ShareX` with 32
+more bytes after the pool id. The node that builds a template draws the salt
+from its strong random source; the share carries it to the members, in
+`p2lshare` and `p2lshares` and in each member's `pools/local/<id>.dat`, and
+nothing puts it on the chain. Pool zero's share bytes do not change, and a
+registered pool's share has no salt.
+
+The coinbase carries a **35-byte push**: `"p2l"` and `HMAC-SHA256(C,
+SerializeHash(ShareDataL))` (the share data, `poolId` and `salt` included).
+Members check it with `C`.
+
+Why the salt. Everything else in the share data is often public or
+guessable: `poolId` follows from the code and a guessed password,
+`hashPrevShare` is 0 or the hash of a block on the chain, `vUncles` is often
+empty, the height is small, `nShareBits` is the record's floor for the first
+retarget window, and `payoutScript` is one of the coinbase outputs. The first
+share of a chain, mined into a block, is all of that: `(id, 0, [], 0, floor,
+the one output)`. Keying the hash with `C` adds nothing against someone who
+holds the code, since `C` follows from the guess as the id does. Without the
+salt, such a block would let them run a dictionary offline, one Argon2id run
+per guess. With it, a guess can only be checked by also guessing 256 random
+bits, so the block tells them nothing about the password (section *What a
+password buys*). A restart from the same code and password, or a block whose
+parent share was also a block, gets a fresh salt like any other.
+
+It carries no pool id, so:
 
 - each block of the pool shows a different hash, and nothing in the anchors
   ties one block of the pool to another;
@@ -1761,10 +1833,11 @@ Members check it the same way, with `C`. It carries no pool id, so:
 The share rules of section 6 extend to it, so that one PoW counts on at most
 one share chain:
 
-- a local share is valid only if its coinbase parses fully and carries
-  exactly one `"p2l"` push, whose 32 bytes are `HMAC-SHA256(C,
-  SerializeHash(ShareDataX))` with `poolId` equal to this local pool's id,
-  and no `"p2p"` push and no `"p2x"` push;
+- a local share is valid only if it carries a salt, its coinbase parses
+  fully and carries exactly one `"p2l"` push, whose 32 bytes are
+  `HMAC-SHA256(C, SerializeHash(ShareDataL))` with `poolId` equal to this
+  local pool's id, and no `"p2p"` push and no `"p2x"` push (the salt's value
+  is not checked: it protects the members' own password);
 - a registered pool's share (format 1) also refuses any `"p2l"` push (added
   to section 6's list);
 - pool zero's frozen rule counts only `"p2p"` pushes, so a pool zero coinbase
@@ -1825,7 +1898,10 @@ nodes that accept connections.
   receiver checks at most one `p2lhello` per connection per minute and 8 in
   the life of a connection, and keeps the last 256 `nA` of each pool to drop
   a repeated one; a reply not acked within 30 s is forgotten and holds no
-  session. At most 16 sessions per local pool, inbound and outbound
+  session. A member's hello on a connection that already holds a session
+  of that pool is answered, and its ack replaces that session: the other
+  side has lost it (its operator took this node off the list and put it
+  back). At most 16 sessions per local pool, inbound and outbound
   together; a hello beyond that gets the same silence as no match. Hellos
   over these limits are dropped unread, and nobody is scored for a hello that
   matches nothing (a non-member listing this node by mistake is not an
@@ -1847,13 +1923,53 @@ nodes that accept connections.
 ### Limits
 
 A local pool spends from the registered class of section 8, never from pool
-zero's: its shares are checked through the registered RandomX budget, its
+zero's: its shares are checked through the registered RandomX budget (a
+member in session is proven, and its shares still draw on budgets of their
+own: one per session, twice the pool's share rate with a small burst, and
+one per local pool for all its sessions together, one share every 8 s with
+a burst of 16, so the members of one pool cannot spend another's; a share
+over them is held, not hashed and not scored). Within a
+pool the sessions take turns for the pool's budget: the session that wasted
+fewer of its tokens lately goes first, then the one that had a token longer
+ago, and a share that comes in live waits behind one held for a session
+ahead of it. A token is wasted when the share it paid for is a side share:
+it did not become this node's tip (judged after the orphans it lets in are
+connected), it did not build on this node's tip when it came, and this node
+did not ask for it in the last 10 minutes. A share whose line becomes the
+tip pays one back; a share that built on the tip when it came (it lost a
+race, or waited in this node's queue while the tip moved on) and a parent
+or uncle this node asked for change nothing. A new session, a member's
+reconnect among them, starts with as many wasted tokens as the session of
+its pool that has the most, and its last token now: at the back. So a member
+flooding side shares from many sessions falls behind every member whose
+shares extend the pool's line; sessions it keeps idle get one turn each
+ahead of such a member, no more, and the member loses no place for having
+waited behind them. Its
 orphans wait in the registered queue, its serves take the 8 registered slots
 and the per-(connection, pool) limits of sections 8 and 17, with the session
 in place of the pool. On top of that: at most 4 local pools per node, at most
 16 listed peers and 16 sessions each (above), and the byte caps pool zero has
 (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`) for each.
 A peer that sends an invalid share in a session is scored, as for any pool.
+
+Sessions that are not proven yet (inbound ones whose peer has not sent a
+share this node took) have no budgets of their own: they share the
+registered class's pieces with the unproven peers of every local pool on
+the node, and of every pool of that class later: the RandomX budget for
+unproven peers (32 hashes, one more every 2 s), the orphan queue of 256
+shares, and the 64 held slots (one share and one history ask per
+connection). A member flooding from unproven sessions so delays the other
+pools' unproven sessions too, never pool zero and never a proven session.
+Only members hold such sessions (a message needs a session's handle), at
+most 16 a pool, so the 64 held slots are always enough for one each. What
+it costs an honest member: the first share of a member that has just
+reconnected inbound (and is not proven again until a share of it is taken)
+may wait behind the held shares of a flooding member's other sessions, at
+most 15, served one every 2 s once the budget's burst is spent: up to about
+32 s. An orphan of it may also lose its place in the queue of 256 to the
+flooder's orphans (each of which cost the flooder a hash on the same
+budget). Once one of its shares is taken, it is proven, and its own budgets
+apply.
 
 ### When the members go away
 
@@ -1862,17 +1978,21 @@ The share chain lives in `pools/local/<id>.dat` (and a fetch in progress in
 member stops, the pool stops; when one comes back with its file, the pool
 goes on from there, and when none has the file any more, starting again from
 the same code and password gives the same id and a fresh chain. Nothing is
-left anywhere else to clean up.
+left anywhere else to clean up. The file starts with a format byte (1 in
+this release); a node reads its own format only, and starts a pool whose
+file has another one from its peers, saying so in its log. That file is set
+aside first, as `pools/local/<id>.dat.other`, so nothing saved later writes
+over it; it goes with the pool's other files when the pool is left.
 
 ### Using it
 
 | call | does |
 |---|---|
-| `poolcreate everpool {params} [dryrun]` | an Everpool pool: the record of section 1, burned on the chain (section 9) |
+| `poolcreate everpool {params} ["send"]` | an Everpool pool: the record of section 1, burned on the chain with `"send"` (or `"publishzero"` for pool zero's own record), shown without it (section 9) |
 | `poolcreate local {params} [password]` | a local pool: checks the record as section 1 does, with the defaults of section 9, derives the id, saves `pools/local/<id>.conf`, and returns the name, the pool code and the note below. A name already used by a local pool on this node is refused. Nothing is sent anywhere |
 | `pooljoin "<pool code>" [password]` | joins a local pool from its code: checks the checksum and the record, derives the id, saves the file, returns the name and the note. A name already used by a local pool on this node is refused (after joining with a mistyped password, `poolleave` and join again) |
 | `poolpeers local:<name> ["ADDR@HOST.onion", ...]` | sets the listed peers of a local pool (at most 16); with no list, shows each and its state: connected with a session, this node at its session cap, or no proof (not a member, a wrong password, or the peer at its own cap, which answers with silence) |
-| `poolleave local:<name>` | forgets a local pool: deletes its files after the node stops mining it |
+| `poolleave local:<name>` | forgets a local pool: closes its sessions and deletes its files. Refused while this node mines it: restart the node without `-p2pool=local:<name>` first |
 | `poollist`, `poolinfo` | show this node's local pools too, marked `"local": true`, with their sessions; never any other node's |
 
 `poolcreate` with no mode is refused with a message that names the two, so
@@ -1896,7 +2016,11 @@ notes carry the same informative note, without alarm:
   password; `-p2pool=local:<name>` with an unknown name refusing to start;
   the anchor rules (`"p2l"` with the wrong hash, an unkeyed hash, two of
   them, alongside a `"p2p"` or a `"p2x"`; a format 1 share refusing
-  `"p2l"`); the hello (a match, no match answered by silence, a hello
+  `"p2l"`; a local share with another salt or none refused); a block's
+  anchor that cannot be checked from the code, the right password and the
+  whole block without the salt, for the first share of a chain, and can be
+  with the salt a member holds; the salt in no byte of the block, and fresh
+  in each template; the hello (a match, no match answered by silence, a hello
   replayed to a third node and a handshake relayed between two members both
   failing, a repeated `nA` dropped, an unacked reply expiring, the session
   cap answered by silence, the rate limit, an unknown `h` dropped); the id
@@ -1907,6 +2031,8 @@ notes carry the same informative note, without alarm:
   node lists one of them with the wrong password and gets nothing; both mine
   until a block is found, its coinbase pays both to the satoshi, the coins
   mature and are spent; the block's anchor is a `"p2l"` push and nothing on
-  the chain or in any other node's `poollist` names the pool; one node goes
+  the chain or in any other node's `poollist` names the pool; the code, the
+  right password and the block do not check the anchor, and the salt from a
+  member's share file does; one node goes
   away and comes back from its file; then both go away, and the pool is
   gone. One of the two runs behind Snowflake for the whole step.

@@ -14,9 +14,26 @@
 namespace p2pool
 {
 
-// What the coinbase commits to: the share chain side of a share.
+// What the coinbase commits to: the share chain side of a share. Pool zero's
+// shares have the first form, frozen; every other pool's (a registered or a
+// local pool, docs/pool-registry.md sections 6 and 18) carry the pool's id in
+// front, "ShareDataX", and a local pool's also a salt after the id. One
+// struct holds all three: fX and fSalt say which, are set before a share is
+// read and are not themselves on the wire, so a pool zero share is the bytes
+// it always was.
+//
+// The salt: 32 random bytes, fresh for every template, that members receive
+// with the share and that never go on the chain. A local pool's coinbase
+// anchor is keyed with C, which anybody holding the pool code derives from a
+// guessed password; the rest of the share data is often guessable from the
+// chain (a first share is the pool id, 0, no uncles, height 0, the floor and
+// the one output). The salt is what keeps the anchor from testing a guess.
 struct ShareData
 {
+    bool fX;                          // format 1: poolId is part of the data
+    bool fSalt;                       // a local pool's share: salt follows poolId
+    uint256 poolId;                   // the pool this share belongs to (fX)
+    uint256 salt;                     // (fSalt) random, never on the chain
     uint256 hashPrevShare;            // 0 for the first share of a chain
     vector<uint256> vUncles;          // at most MAX_UNCLES
     unsigned int nShareHeight;
@@ -24,10 +41,14 @@ struct ShareData
     vector<unsigned char> payoutScript;
 
     // uint256 does not zero itself: a default ShareData starts a chain.
-    ShareData() : hashPrevShare(0), nShareHeight(0), nShareBits(0) {}
+    ShareData() : fX(false), fSalt(false), poolId(0), salt(0), hashPrevShare(0), nShareHeight(0), nShareBits(0) {}
 
     IMPLEMENT_SERIALIZE
     (
+        if (fX)
+            READWRITE(poolId);
+        if (fSalt)
+            READWRITE(salt);
         READWRITE(hashPrevShare);
         READWRITE(vUncles);
         READWRITE(nShareHeight);
@@ -89,6 +110,85 @@ struct Share
     uint256 GetId() const { return Header().GetHash(); }
 };
 
+// A format 1 share: a Share whose data is read and written with the pool id.
+// Only the constructor differs, so a vector of these reads the p2x and p2l
+// messages while a vector of Share reads pool zero's.
+struct ShareX : public Share
+{
+    ShareX() { data.fX = true; data.fSalt = false; }
+    ShareX(const Share& s) : Share(s) { data.fX = true; data.fSalt = false; }
+};
+
+// A local pool's share (section 18): format 1 with the salt after the pool
+// id. What the p2l messages and a local pool's file carry.
+struct ShareL : public Share
+{
+    ShareL() { data.fX = true; data.fSalt = true; }
+    ShareL(const Share& s) : Share(s) { data.fX = true; data.fSalt = true; }
+};
+
+// Which commitment a pool's coinbase carries.
+enum Anchor
+{
+    ANCHOR_P2P = 0,     // pool zero: "p2p" and the hash of ShareData
+    ANCHOR_P2X = 1,     // a registered pool: "p2x", the pool id, the hash
+    ANCHOR_P2L = 2,     // a local pool: "p2l" and the hash (salt included) keyed with C
+};
+
+// Share rules v1 (docs/pool-registry.md, section 5): the code of 1.2.34 with
+// its constants made parameters, plus the creator fee. Zero() is pool zero,
+// which is 1.2.34 exactly.
+struct PoolRules
+{
+    unsigned int nSpacing;            // seconds per share
+    unsigned int nWindow;             // PPLNS window, shares
+    unsigned int nRetarget;           // retarget window, shares
+    CBigNum bnFloor;                  // no share target easier than this
+    int nUncleDepth;                  // an uncle is at most this many shares older
+    unsigned int nUnclePct;           // what an uncle is paid of its work
+    unsigned int nFeeBps;             // creator fee, basis points
+    vector<unsigned char> feeScript;  // where it is paid; empty with no fee
+    int nAnchor;                      // Anchor
+    uint256 poolId;                   // ANCHOR_P2X, ANCHOR_P2L
+    unsigned char anchorKey[32];      // ANCHOR_P2L: the pool's key C
+
+    PoolRules();
+    // C is wiped wherever a copy of the rules goes.
+    ~PoolRules();
+    PoolRules(const PoolRules&) = default;
+    PoolRules& operator=(const PoolRules&) = default;
+    static PoolRules Zero(const CBigNum& bnFloorIn);
+
+    bool IsZero() const { return nAnchor == ANCHOR_P2P; }
+    unsigned int HistoryShares() const { return nWindow + nRetarget + 2 * nUncleDepth + 10; }
+    size_t MaxChainShares() const { return 4 * (size_t)HistoryShares(); }
+    int NearTipShares() const { return 2 * nUncleDepth + 10; }
+    int64 TipMaxAge() const { return 180 * (int64)nSpacing; }
+    // Coinbase outputs at most: a window of shares with two uncles each, and
+    // one more for the fee.
+    size_t MaxOutputs() const { return 3 * (size_t)nWindow + (nFeeBps ? 1 : 0); }
+};
+
+// What an uncle is paid of its work, floor(work * pct / 100), exact without
+// overflow. For 80 it is pool zero's work / 5 * 4 + (work % 5) * 4 / 5.
+uint64_t UnclePaid(uint64_t work, unsigned int nPct);
+
+// The payouts a share's coinbase must carry: the creator fee, floor(nTotal *
+// bps / 10000), to the fee script, and the rest over the window with
+// ComputePayouts; if the fee script is also in the window its two amounts are
+// one output, otherwise the fee output takes its place in the order by
+// script bytes, and a fee that rounds to 0 is no output. With no fee this is
+// ComputePayouts.
+bool ComputePoolPayouts(const PoolRules& rules, const vector<WindowShare>& window, int64 nTotal,
+                        vector<Payout>& out, string& errOut);
+
+// The push a pool's coinbase carries for this share data: 35 bytes for pool
+// zero and a local pool, 67 for a registered pool.
+vector<unsigned char> AnchorPush(const PoolRules& rules, const ShareData& d);
+// Whether a coinbase carries this pool's commitment to this share data, and
+// nothing that would let the same work count on another share chain.
+bool CheckAnchor(const PoolRules& rules, const CTransaction& coinbase, const ShareData& d);
+
 // Asked once per share, right before its RandomX hash and after every cheap
 // check has passed: false refuses the share with an error that starts
 // "here:", so nobody is blamed for it (a budget this node keeps on hashes it
@@ -121,9 +221,17 @@ extern bool fFuzzShareWorkStandIn;
 // The checks that need no window: share data bounds, the payout script, the
 // coinbase's own rules, the commitment, the merkle branch, the target and the
 // RandomX work (unless !fCheckPoW).
-bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
+bool CheckShareWork(const Share& share, const PoolRules& rules, bool& fBlockOut, string& errOut,
                     bool fCheckPoW = true, WorkGate* pGate = NULL);
 
+bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
+                const PoolRules& rules, bool& fBlockOut, string& errOut, bool fCheckPoW = true,
+                WorkGate* pGate = NULL);
+
+// Pool zero's rules with this floor: what every caller meant before pools
+// had parameters.
+bool CheckShareWork(const Share& share, const CBigNum& bnFloor, bool& fBlockOut, string& errOut,
+                    bool fCheckPoW = true, WorkGate* pGate = NULL);
 bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBlockHeight,
                 const CBigNum& bnFloor, bool& fBlockOut, string& errOut, bool fCheckPoW = true,
                 WorkGate* pGate = NULL);

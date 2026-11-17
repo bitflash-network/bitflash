@@ -139,9 +139,16 @@ static std::vector<unsigned char> P2PoolPayoutScript()
 
 // Room a P2Pool template keeps for its coinbase, which is written after the
 // transactions are chosen: an output and a signature operation per address,
-// for a window of 2160 shares each naming up to two uncles.
-static const unsigned int P2POOL_COINBASE_SIGOPS = 3 * p2pool::WINDOW_SHARES;
-static const unsigned int P2POOL_COINBASE_BYTES = 3 * p2pool::WINDOW_SHARES * 34 + 1000;
+// for a window of shares each naming up to two uncles, and the fee output
+// (PoolRules::MaxOutputs). For pool zero, 2160 shares and no fee: 6480.
+static unsigned int P2PoolCoinbaseSigOps(const p2pool::PoolRules& rules)
+{
+    return (unsigned int)rules.MaxOutputs();
+}
+static unsigned int P2PoolCoinbaseBytes(const p2pool::PoolRules& rules)
+{
+    return (unsigned int)rules.MaxOutputs() * 34 + 1000;
+}
 
 // The coinbase of a P2Pool template: height, bits, extranonce and the share
 // commitment in, the share window paid out. False when this node cannot know
@@ -152,6 +159,7 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
 {
     p2pool::ShareData d;
     vector<p2pool::Payout> pay;
+    vector<unsigned char> vAnchor;
     string err;
     CRITICAL_BLOCK(cs_p2pool)
     {
@@ -160,7 +168,26 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
             LogPrint("pool", "[p2pool] no template yet: waiting for the share chain from peers\n");
             return false;
         }
-        p2pool::ShareChain& c = P2PoolChain();
+        // The pool this node mines: pool zero, or the local pool of
+        // -p2pool=local:<name>, whose shares carry its id and whose coinbase
+        // carries its keyed "p2l" anchor (docs/pool-registry.md, section 18).
+        p2pool::ShareChain& c = P2PoolMinedChain();
+        const p2pool::PoolRules& rules = c.Rules();
+        if (!rules.IsZero())
+        {
+            d.fX = true;
+            d.poolId = rules.poolId;
+        }
+        // A local pool's share data carries a fresh random salt, which the
+        // members get with the share and the chain never sees: without it,
+        // whoever holds the pool code could rebuild the share data of a
+        // block (the first share of a chain is all public) and test
+        // passwords against its anchor offline.
+        if (rules.nAnchor == p2pool::ANCHOR_P2L)
+        {
+            d.fSalt = true;
+            GetStrongRandBytes(d.salt.begin(), 32);
+        }
         d.hashPrevShare = c.Tip();
         d.nShareHeight = d.hashPrevShare == 0 ? 0 : c.Height(d.hashPrevShare) + 1;
         d.nShareBits = c.NextShareBits(d.hashPrevShare);
@@ -170,7 +197,7 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
         vector<p2pool::WindowShare> window;
         if (d.payoutScript.empty() ||
             !c.WindowFor(d, p2pool::WorkOf(d.nShareBits), window, err) ||
-            !p2pool::ComputePayouts(window, block.GetBlockValue(nHeight, nFees), pay, err))
+            !p2pool::ComputePoolPayouts(rules, window, block.GetBlockValue(nHeight, nFees), pay, err))
         {
             LogPrint("pool", "[p2pool] no template: %s\n",
                      d.payoutScript.empty()
@@ -179,10 +206,10 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
                          : err.c_str());
             return false;
         }
+        vAnchor = p2pool::AnchorPush(rules, d);
     }
     CTransaction& cb = block.vtx[0];
-    cb.vin[0].scriptSig = CScript() << nHeight << nBits << (CBigNum)extraNonce
-                                    << p2pool::CommitmentPush(d.GetHash());
+    cb.vin[0].scriptSig = CScript() << nHeight << nBits << (CBigNum)extraNonce << vAnchor;
     cb.vout.clear();
     for (size_t i = 0; i < pay.size(); i++)
         cb.vout.push_back(CTxOut(pay[i].value, CScript(pay[i].script.begin(), pay[i].script.end())));
@@ -190,6 +217,22 @@ static bool P2PoolCoinbase(CBlock& block, int nHeight, unsigned int nBits, uint3
     shareTargetOut = CBigNum().SetCompact(d.nShareBits).getuint256();
     return true;
 }
+
+// Self-tests (p2pool-local-node): the coinbase a template of the pool this
+// node mines carries, and the room the template keeps for it.
+bool P2PoolCoinbaseForTest(CBlock& block, int nHeight, unsigned int nBits, int64 nFees, p2pool::ShareData& dataOut,
+                           unsigned int& nSigOpsRoomOut, unsigned int& nBytesRoomOut)
+{
+    p2pool::PoolRules rules;
+    CRITICAL_BLOCK(cs_p2pool)
+        rules = P2PoolMinedChain().Rules();
+    nSigOpsRoomOut = P2PoolCoinbaseSigOps(rules);
+    nBytesRoomOut = P2PoolCoinbaseBytes(rules);
+    uint256 shareTarget;
+    unsigned int nMinTime = 0;
+    return P2PoolCoinbase(block, nHeight, nBits, 1, nFees, dataOut, shareTarget, nMinTime);
+}
+
 static StratumJob gCurrentJob;
 // The last jobs sent, newest first: a miner may answer any of them while its
 // block still builds on the tip.
@@ -309,6 +352,11 @@ static bool RebuildJob()
         bool fSelectedV4 = false;   // the rules the transactions were chosen under
         int nSelectedRules = 0;     // all of them (RuleSetAt): v3 changes P2SH and finality
         int64 nFees = 0;
+        // The rules of the pool mined, read before cs_mapTransactions.
+        p2pool::PoolRules minedRules;
+        if (fP2PoolMode)
+            CRITICAL_BLOCK(cs_p2pool)
+                minedRules = P2PoolMinedChain().Rules();
         {
             CTxDB txdb("r");
             CRITICAL_BLOCK(cs_mapTransactions)
@@ -341,9 +389,9 @@ static bool RebuildJob()
                 {
                     // Room for the coinbase P2PoolCoinbase writes later: an
                     // output, and a signature operation, per address of the
-                    // window, its uncles included.
-                    nBlockSigOps = P2POOL_COINBASE_SIGOPS;
-                    nSizeLimit = MAX_BLOCK_SIZE - P2POOL_COINBASE_BYTES;
+                    // window, its uncles included, for the pool mined.
+                    nBlockSigOps = P2PoolCoinbaseSigOps(minedRules);
+                    nSizeLimit = MAX_BLOCK_SIZE - P2PoolCoinbaseBytes(minedRules);
                 }
                 while (fFoundSomething && sz < nSizeLimit)
                 {
@@ -2570,13 +2618,44 @@ static void PoolEventLoop()
         // 1.5. P2Pool: a new share tip, ours or a peer's, is new work. A
         // template still on the old tip would pay a window the next share no
         // longer has.
+        // The tip of the pool this node mines: pool zero's, or the local
+        // pool's of -p2pool=local:<name>.
+        //
+        // A late share is named as soon as it arrives (docs/pool-registry.md,
+        // section 9): a share that joined the chain marks the job for a
+        // check, and the check -- whether the uncles the next share on the
+        // tip could name are still those of the job -- runs at most once
+        // every 2 s. A mark inside the 2 s waits for the next check; it is
+        // never dropped. The new job goes out without asking miners to drop
+        // their work: the old one stays valid.
         if (fP2PoolMode && gHaveJob) {
+            static const int64 UNCLE_CHECK_MS = 2000;
+            static uint64 nCheckedSeq = 0;
+            static int64 nLastUncleCheck = 0;
+            const int64 nNowMs = (int64)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             uint256 tip;
+            uint64 nSeq;
             CRITICAL_BLOCK(cs_p2pool)
-                tip = P2PoolChain().Tip();
-            if (tip != gCurrentJob.shareData.hashPrevShare && RebuildJob()) {
-                BroadcastJob(true);
-                lastRefresh = GetTime();
+                tip = P2PoolMinedChain().Tip();
+            nSeq = P2PoolMinedChainSeq();
+            if (tip != gCurrentJob.shareData.hashPrevShare) {
+                if (RebuildJob()) {
+                    BroadcastJob(true);
+                    lastRefresh = GetTime();
+                    nCheckedSeq = nSeq;
+                }
+            } else if (nSeq != nCheckedSeq && nNowMs - nLastUncleCheck >= UNCLE_CHECK_MS) {
+                nLastUncleCheck = nNowMs;
+                nCheckedSeq = nSeq;
+                vector<uint256> vUncles;
+                CRITICAL_BLOCK(cs_p2pool)
+                    vUncles = P2PoolMinedChain().UncleCandidates(tip);
+                if (vUncles != gCurrentJob.shareData.vUncles && RebuildJob()) {
+                    LogPrint("pool", "[p2pool] job %s names %u uncle(s) now\n",
+                             gCurrentJob.jobId.c_str(), (unsigned)gCurrentJob.shareData.vUncles.size());
+                    BroadcastJob(false);
+                }
             }
         }
 

@@ -56,7 +56,7 @@ bin=$SRC/src/$t
 # ones); they join the corpus (a kept one too,
 # so seeds added later reach it) without replacing anything. The others
 # start from one byte.
-case " fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap " in *" $t "*)
+case " fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-p2plocal fuzz-poolindex fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap " in *" $t "*)
     sd=$OUT/seeds-$t
     rm -rf "$sd"; mkdir -p "$sd"
     BITFLASH_FUZZ_WRITE_SEEDS="$sd" "$bin" -runs=0 > "$OUT/seeds-$t.log" 2>&1 || true

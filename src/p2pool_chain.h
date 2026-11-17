@@ -10,6 +10,7 @@
 
 // Include headers.h (or headers_core.h) first: they have no include guard.
 #include "p2pool_share.h"
+#include "poollocal.h"
 
 namespace p2pool
 {
@@ -69,6 +70,10 @@ public:
     virtual int64 Now() const = 0;
 };
 
+// Share rules v1 for a local pool (docs/pool-registry.md, section 18): its
+// record's parameters, its id, and its key C for the "p2l" anchor.
+bool RulesForLocal(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, PoolRules& out, string& errOut);
+
 // Expected hashes to meet a target, capped at 2^64-1: a share's weight.
 uint64_t WorkOf(unsigned int nBits);
 
@@ -83,7 +88,13 @@ public:
     // hashTip spelled out: uint256 does not zero itself, and a chain with no
     // shares must answer 0 for its tip, not whatever the memory held.
     explicit ShareChain(const CBigNum& bnFloorIn, bool fCheckPoWIn = true)
-        : hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+        : rules(PoolRules::Zero(bnFloorIn)), hashTip(0), bnFloor(bnFloorIn), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+    // Any pool's share chain: share rules v1 with that pool's parameters
+    // (docs/pool-registry.md, section 5). The one above is pool zero's.
+    explicit ShareChain(const PoolRules& rulesIn, bool fCheckPoWIn = true)
+        : rules(rulesIn), hashTip(0), bnFloor(rulesIn.bnFloor), fCheckPoW(fCheckPoWIn), nLastPruneCut(-10), nTrustedBytes(0), nBytes(0), nMaxBytes(MAX_CHAIN_BYTES) {}
+
+    const PoolRules& Rules() const { return rules; }
 
     // Verify a share in context and keep it. A share whose parent or uncles
     // are not here is refused with their ids in *pvMissing, so the caller
@@ -115,6 +126,9 @@ public:
     // The line behind the tip, HISTORY_SHARES deep, with the uncles it names,
     // oldest first: what a starting peer is sent.
     void History(vector<Share>& out) const;
+    // The same line's share ids and heights, in the same order: what a paced
+    // serve keeps, fetching each share as its part goes out.
+    void HistoryIds(vector<uint256>& idsOut, vector<int>& heightsOut) const;
 
     bool Has(const uint256& id) const { return mapShares.count(id) != 0; }
     uint256 Tip() const { return hashTip; }
@@ -167,6 +181,7 @@ private:
         bool fTrusted;         // taken on its work alone (AddTrusted)
         size_t nSize;          // serialized bytes of the share
     };
+    PoolRules rules;
     map<uint256, Entry> mapShares;
     uint256 hashTip;
     CBigNum bnFloor;
@@ -187,6 +202,8 @@ private:
     size_t ByteCap(const set<uint256>& keep) const;
 
     const Entry* Get(const uint256& id) const;
+    // The entries History returns, in its order.
+    void HistoryEntries(vector<const Entry*>& v) const;
     bool OnLine(const uint256& id, const uint256& from, int nDepth) const;
     bool UncleTaken(const uint256& uncle, const uint256& from, int nDepth) const;
     // Why 'u' may not be an uncle of a child of 'parent' at nHeight; NULL if it may.
