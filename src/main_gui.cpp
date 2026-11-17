@@ -1164,7 +1164,13 @@ int main(int argc, char* argv[])
     {
         if (!LoadBlockIndex())
         {
-            FatalStartupError(fHeadlessStartup, "Cannot load the block index.", "");
+            if (RandomXSetupFailed())
+                FatalStartupError(fHeadlessStartup,
+                                  "RandomX could not be set up, so this node cannot check proof of work and will not start.",
+                                  "It needs about 256 MB of free memory for its cache. Close other programs, "
+                                  "or run the node on a machine with more memory.");
+            else
+                FatalStartupError(fHeadlessStartup, "Cannot load the block index.", "");
             return 1;
         }
     }

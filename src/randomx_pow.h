@@ -61,9 +61,23 @@ size_t PoWInputFromHeader(const unsigned char* pHeader80, unsigned char* pOut, i
 const unsigned char* PoWSeedV2();
 std::string PoWSeedV2Hex();
 
+// A hash that could not be computed. Every hash function below returns it
+// when RandomX could not be set up on this machine: all ones, above every
+// target, so code that only compares a hash with a target treats such work
+// as not done. It used to be zero, which is below every target: a node whose
+// 256 MB cache could not be allocated took any block's proof of work as met.
+// Code that has to tell "not met" from "not known" uses the Checked forms.
+#define POW_HASH_UNAVAILABLE (~uint256(0))
+
 // PoW hash of an 80-byte header, version chosen by its nTime, on the shared
 // verification VM (thread-safe). This is what consensus checks.
+// POW_HASH_UNAVAILABLE when RandomX is not available.
 uint256 PoWHashHeader(const unsigned char* pHeader80);
+
+// Same, but false when the hash could not be computed here: the work is
+// unknown, which is neither valid nor invalid. A caller must not accept what
+// it could not check, and must not blame the sender for this node's failure.
+bool PoWHashHeaderChecked(const unsigned char* pHeader80, uint256& hashOut);
 
 // Same, on an owned mining VM created for the header's version.
 uint256 PoWHashHeaderWithVM(void* vm, const unsigned char* pHeader80);
@@ -83,9 +97,25 @@ bool RandomXInitDataset(int nVersion, int nThreads);
 // PoWHashHeader; this is for tests and for the pool, which builds its own
 // inputs.
 uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize);
+bool RandomXPoWHashChecked(int nVersion, const void* pData, size_t nSize, uint256& hashOut);
 // Self-test only: hold (or let go of) the first verification VM from the
 // calling thread.
 void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold);
+
+// Set up the cache and verification VM of one version now. False when that
+// cannot be done (not enough memory for the 256 MB cache, or the VM could not
+// be created). Startup asks for the current version and refuses to run
+// without it: a node that cannot check proof of work must not follow any
+// chain. Once set up, a version's verifier is never released.
+bool RandomXVerifierReady(int nVersion);
+
+// True when the last attempt to set up a verifier failed (for the message a
+// failed startup gives).
+bool RandomXSetupFailed();
+
+// Self-test only: while set, every verifier behaves as if RandomX could not
+// be set up, whatever was set up before, and no new miner VM can be made.
+void RandomXForceUnavailableForTest(bool fUnavailable);
 
 // Create a VM for a mining thread (own VM, not shared) keyed for one version.
 // Uses that version's dataset (fast) if ready, otherwise its cache (light).
@@ -93,7 +123,8 @@ void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold);
 void* RandomXCreateMinerVM(int nVersion);
 void  RandomXDestroyMinerVM(void* vm);
 
-// Compute a hash on an owned mining VM (not guarded).
+// Compute a hash on an owned mining VM (not guarded). POW_HASH_UNAVAILABLE
+// for a NULL VM, so a miner without one can never "find" a block.
 uint256 RandomXHashWithVM(void* vm, const void* pData, size_t nSize);
 
 // True when the 2 GB dataset of that version is ready (fast mode active).

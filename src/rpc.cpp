@@ -1903,7 +1903,16 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         memcpy(hdr+72, &b.nBits,          4);
         memcpy(hdr+76, &b.nNonce,         4);
 
-        uint256 powHash = PoWHashHeader(hdr);
+        uint256 powHash;
+        if (!PoWHashHeaderChecked(hdr, powHash)) {
+            // This node could not compute the hash (RandomX not available
+            // here): the work is unknown, so it is not credited, and the
+            // miner is not told its work was bad.
+            LogPrintAlways("worker", "[worker->pool] submit from %s not checked: RandomX is not available on this node\n",
+                           m->address.c_str());
+            reply(false, "the pool cannot check work right now (RandomX unavailable on the pool node)");
+            return true;
+        }
 
         // A RandomX miner sends the hash it computed. If it differs from ours
         // the miner is keyed or laid out wrong, and "Low difficulty share"
@@ -2289,8 +2298,24 @@ int RunPoolStratumSelfTest()
           && submitReply["error"].value("message", "").find("does not match") != std::string::npos,
           "the mismatch is reported as such, not as low difficulty");
 
+    // A pool node that cannot compute the hash credits nothing: the same
+    // submit that was credited above is refused while RandomX is unavailable,
+    // and the refusal says why instead of calling the work bad.
     captured.clear();
-    json keep = {{"id", 4}, {"jsonrpc", "2.0"}, {"method", "keepalived"}, {"params", json{{"id", "00"}}}};
+    cnsubmit["params"]["result"] = ToHex((const unsigned char*)&want, 32);
+    cnsubmit["id"] = 5;
+    RandomXForceUnavailableForTest(true);
+    HandleLine(&cn, cnsubmit.dump(), roundShareCount, roundShareTotal, blocksFound);
+    RandomXForceUnavailableForTest(false);
+    try { submitReply = json::parse(captured); } catch (...) {}
+    check(roundShareTotal == before + 1 && roundShareCount["selftest-cn-address"] == 1,
+          "while RandomX is unavailable a submit is not credited");
+    check(submitReply.is_object() && submitReply["error"].is_object()
+          && submitReply["error"].value("message", "").find("cannot check") != std::string::npos,
+          "and the refusal says the pool cannot check work, not that the share is bad");
+
+    captured.clear();
+    json keep ={{"id", 4}, {"jsonrpc", "2.0"}, {"method", "keepalived"}, {"params", json{{"id", "00"}}}};
     HandleLine(&cn, keep.dump(), roundShareCount, roundShareTotal, blocksFound);
     try { submitReply = json::parse(captured); } catch (...) {}
     check(submitReply.is_object() && submitReply["result"].value("status", "") == "KEEPALIVED",

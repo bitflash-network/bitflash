@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 // v1 key. The v2 key is SHA-256 of this string, computed once at init: 32
 // bytes, which is the one size a RandomX miner accepts as seed_hash.
@@ -180,6 +181,7 @@ struct RxKeyState
     bool             fLargeCache   = false;
     bool             fLargeDataset = false;
     bool             fLargeVerify  = false;
+    int64            nRetryAfter   = 0;   // after a failed set-up (EnsureKey)
 };
 static RxKeyState g_key[2];   // index = version - 1
 
@@ -258,13 +260,28 @@ bool RandomXInit()
     return true;
 }
 
+// Self-test hook (RandomXForceUnavailableForTest).
+static std::atomic<bool> g_fForceUnavailable(false);
+// Whether the last attempt to set up a verifier failed.
+static std::atomic<bool> g_fSetupFailed(false);
+// After a failed set-up, how long until the next attempt. A failed attempt can
+// get as far as filling the 256 MB cache (about a second of CPU) before the VM
+// fails, and every block or share that asks for that version would otherwise
+// pay for one; the work it asked to have checked is refused either way.
+static const int64 RANDOMX_SETUP_RETRY_SECONDS = 60;
+
 // Cache + verification VM of one version, allocated the first time that
 // version is asked for. 256 MB each; a node that runs only after the switch
 // and never has to check a v1 block allocates only v2.
+//
+// NULL means this node cannot compute that version's hash. Every caller
+// treats that as "not known", never as a hash: see POW_HASH_UNAVAILABLE.
 static RxKeyState* EnsureKey(int nVersion)
 {
     RxKeyState* k = KeyState(nVersion);
     if (!k)
+        return NULL;
+    if (g_fForceUnavailable)
         return NULL;
     if (k->vmVerify)
         return k;
@@ -274,6 +291,11 @@ static RxKeyState* EnsureKey(int nVersion)
     std::lock_guard<std::mutex> lock(g_csInit);
     if (k->vmVerify)
         return k;
+    int64 nNow = GetTime();
+    if (k->nRetryAfter != 0 && nNow < k->nRetryAfter)
+        return NULL;
+    k->nRetryAfter = nNow + RANDOMX_SETUP_RETRY_SECONDS;
+    g_fSetupFailed = true;
 
     randomx_flags flags = g_flags;
     randomx_cache* cache = AllocCache(flags, k->fLargeCache);
@@ -284,7 +306,8 @@ static RxKeyState* EnsureKey(int nVersion)
         cache = AllocCache(flags, k->fLargeCache);
         if (!cache)
         {
-            error("RandomX: failed to allocate the v%d cache (256 MB)", nVersion);
+            error("RandomX: failed to allocate the v%d cache (256 MB): this node cannot check "
+                  "v%d proof of work, and accepts no block or share that needs it", nVersion, nVersion);
             return NULL;
         }
         g_flags = flags;
@@ -305,12 +328,15 @@ static RxKeyState* EnsureKey(int nVersion)
     if (!vm)
     {
         randomx_release_cache(cache);
-        error("RandomX: failed to create the v%d verification VM", nVersion);
+        error("RandomX: failed to create the v%d verification VM: this node cannot check "
+              "v%d proof of work, and accepts no block or share that needs it", nVersion, nVersion);
         return NULL;
     }
     k->cache = cache;
     k->flagsVerify = flags;
     k->vmVerify = vm;
+    k->nRetryAfter = 0;
+    g_fSetupFailed = false;
     printf("RandomX: v%d cache ready (256 MB, large pages: %s)\n",
            nVersion, RandomXLargePagesStatus());
     if (fRandomXLargePages && !k->fLargeCache)
@@ -432,12 +458,35 @@ void RandomXHoldPrimaryVerifyForTest(int nVersion, bool fHold)
         k->csVerify.Leave();
 }
 
+bool RandomXVerifierReady(int nVersion)
+{
+    return EnsureKey(nVersion) != NULL;
+}
+
+bool RandomXSetupFailed()
+{
+    return g_fSetupFailed;
+}
+
+void RandomXForceUnavailableForTest(bool fUnavailable)
+{
+    g_fForceUnavailable = fUnavailable;
+}
+
 uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize)
 {
-    uint256 result = 0;
+    uint256 result;
+    if (!RandomXPoWHashChecked(nVersion, pData, nSize, result))
+        return POW_HASH_UNAVAILABLE;
+    return result;
+}
+
+bool RandomXPoWHashChecked(int nVersion, const void* pData, size_t nSize, uint256& result)
+{
+    result = POW_HASH_UNAVAILABLE;
     RxKeyState* k = EnsureKey(nVersion);
     if (!k)
-        return result;
+        return false;
     unsigned char hash[RANDOMX_HASH_SIZE];
 
     // The first VM if it is free, else one of the extras (made on first use;
@@ -447,7 +496,7 @@ uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize)
     {
         randomx_calculate_hash(k->vmVerify, pData, nSize, hash);
         memcpy(&result, hash, RANDOMX_HASH_SIZE);
-        return result;
+        return true;
     }
     for (int i = 0; i < 2; i++)
     {
@@ -459,7 +508,7 @@ uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize)
             {
                 randomx_calculate_hash(k->vmExtra[i], pData, nSize, hash);
                 memcpy(&result, hash, RANDOMX_HASH_SIZE);
-                return result;
+                return true;
             }
         }
     }
@@ -468,7 +517,7 @@ uint256 RandomXPoWHash(int nVersion, const void* pData, size_t nSize)
         randomx_calculate_hash(k->vmVerify, pData, nSize, hash);
         memcpy(&result, hash, RANDOMX_HASH_SIZE);
     }
-    return result;
+    return true;
 }
 
 
@@ -478,6 +527,15 @@ uint256 PoWHashHeader(const unsigned char* pHeader80)
     int v = 1;
     size_t n = PoWInputFromHeader(pHeader80, input, &v);
     return RandomXPoWHash(v, input, n);
+}
+
+
+bool PoWHashHeaderChecked(const unsigned char* pHeader80, uint256& hashOut)
+{
+    unsigned char input[POW_INPUT_MAX];
+    int v = 1;
+    size_t n = PoWInputFromHeader(pHeader80, input, &v);
+    return RandomXPoWHashChecked(v, input, n, hashOut);
 }
 
 
@@ -526,9 +584,9 @@ void RandomXDestroyMinerVM(void* vm)
 
 uint256 RandomXHashWithVM(void* vm, const void* pData, size_t nSize)
 {
-    uint256 result = 0;
     if (!vm)
-        return result;
+        return POW_HASH_UNAVAILABLE;
+    uint256 result = 0;
     unsigned char hash[RANDOMX_HASH_SIZE];
     randomx_calculate_hash((randomx_vm*)vm, pData, nSize, hash);
     memcpy(&result, hash, RANDOMX_HASH_SIZE);

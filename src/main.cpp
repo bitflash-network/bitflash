@@ -3799,10 +3799,12 @@ bool fFuzzSkipPoW = false;
 static thread_local bool tl_fPoWBudgetGate = false;
 static thread_local bool tl_fPoWBudgetRefused = false;
 
-bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
+bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime, bool* pfUnverified) const
 {
     if (pnDoS)
         *pnDoS = 0;
+    if (pfUnverified)
+        *pfUnverified = false;
     // These are checks that are independent of context
     // that can be verified before saving an orphan block.
 
@@ -3876,8 +3878,24 @@ bool CBlock::CheckBlock(int* pnDoS, bool fCheckTime) const
 #ifdef BITFLASH_FUZZ
     if (!fFuzzSkipPoW)
 #endif
-    if (GetPoWHash() > CBigNum().SetCompact(nBits).getuint256())
-        return DoS(pnDoS, 50, error("CheckBlock() : RandomX proof-of-work does not match nBits"));
+    {
+        // A hash this node could not compute (RandomX could not be set up
+        // here) is neither a pass nor a fail. The block is not taken, since
+        // its work is unknown, and nothing is held against it or its sender:
+        // no score, nothing recorded, so it can be fetched again once the
+        // node can check it. Every node that can check it decides as before.
+        uint256 hashPoW;
+        if (!GetPoWHashChecked(hashPoW))
+        {
+            if (pfUnverified)
+                *pfUnverified = true;
+            return error("CheckBlock() : RandomX is not available on this node; the proof of work of block %s "
+                         "cannot be checked, so the block is not accepted",
+                         GetHash().ToString().substr(0,14).c_str());
+        }
+        if (hashPoW > CBigNum().SetCompact(nBits).getuint256())
+            return DoS(pnDoS, 50, error("CheckBlock() : RandomX proof-of-work does not match nBits"));
+    }
 
     // Check merkleroot
     if (hashMerkleRoot != BuildMerkleTree())
@@ -4230,10 +4248,12 @@ void SyncPeerResetForTest(int64 nProgressAge)
     nSyncLastProgress = GetTime() - nProgressAge;
 }
 
-bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
+bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS, bool* pfUnverified)
 {
     if (pnDoS)
         *pnDoS = 0;
+    if (pfUnverified)
+        *pfUnverified = false;
     // Counted before any check, so the ratio below is against everything that
     // arrived rather than everything that was any good.
     if (pfrom)
@@ -4275,7 +4295,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS)
     }
 
     // Preliminary checks
-    if (!pblock->CheckBlock(pnDoS))
+    if (!pblock->CheckBlock(pnDoS, true, pfUnverified))
     {
         delete pblock;
         return error("ProcessBlock() : CheckBlock FAILED");
@@ -4518,6 +4538,15 @@ bool LoadBlockIndex(bool fAllowNew)
     // and verification depend on it).
     if (!RandomXInit())
         return error("LoadBlockIndex() : RandomXInit failed");
+    // A node that cannot check proof of work must not follow any chain, so it
+    // does not start: the verifier of the version in force now is set up
+    // here, not on the first block. Once set up it is never released.
+    {
+        int nPoWVersion = PoWVersionAt((unsigned int)GetAdjustedTime());
+        if (!RandomXVerifierReady(nPoWVersion))
+            return error("LoadBlockIndex() : RandomX v%d could not be set up (it needs about 256 MB of free memory); "
+                         "this node cannot check proof of work and will not start", nPoWVersion);
+    }
 
     //
     // Load block index
@@ -4649,8 +4678,13 @@ bool LoadBlockIndex(bool fAllowNew)
         {
             printf("Mining Bitflash genesis block (RandomX)...\n");
             uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
-            while (block.GetPoWHash() > hashTarget)
+            uint256 hashPoW;
+            loop
             {
+                if (!block.GetPoWHashChecked(hashPoW))
+                    return error("LoadBlockIndex() : RandomX is not available, cannot mine the genesis block");
+                if (hashPoW <= hashTarget)
+                    break;
                 if ((block.nNonce & 0x3ff) == 0)
                     printf("nonce %u\r", block.nNonce);
                 block.nNonce++;
@@ -5575,11 +5609,22 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             ~PoWBudgetGate() { tl_fPoWBudgetGate = false; tl_fPoWBudgetRefused = false; }
         };
         int nDoS = 0;
-        bool fOk = false, fRefused = false;
+        bool fOk = false, fRefused = false, fUnverified = false;
         {
             PoWBudgetGate gate(PeerNeedsBlockBudget(pfrom));
-            fOk = ProcessBlock(pfrom, pblock.release(), &nDoS);
+            fOk = ProcessBlock(pfrom, pblock.release(), &nDoS, &fUnverified);
             fRefused = tl_fPoWBudgetRefused;
+        }
+        if (fUnverified)
+        {
+            // This node could not compute the block's proof of work: the
+            // fault is here, not the sender's. Not taken, not scored, and not
+            // remembered as asked for, so it is fetched again once this node
+            // can check it.
+            LogPrintAlways("net", "block %s from %s not accepted: RandomX is not available on this node to check its proof of work\n",
+                           inv.hash.ToString().substr(0,14).c_str(), pfrom->addr.ToString().c_str());
+            mapAlreadyAskedFor.erase(inv);
+            return true;
         }
         if (fRefused)
         {

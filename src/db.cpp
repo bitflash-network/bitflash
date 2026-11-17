@@ -891,8 +891,15 @@ bool CTxDB::LoadBlockIndex()
         // Not the "too far in the future" test: it is against the local
         // clock, and with no peers yet a machine that booted with a slow
         // clock would roll back, and mark failed, a good tail.
-        if (!block.CheckBlock(NULL, false))
+        bool fUnverified = false;
+        if (!block.CheckBlock(NULL, false, &fUnverified))
         {
+            // Not known to be bad: this node could not compute its proof of
+            // work. Rolling the chain back for that would throw away good
+            // blocks for a local fault, so the load stops instead.
+            if (fUnverified)
+                return error("LoadBlockIndex() : RandomX is not available, the block at height %d cannot be checked; "
+                             "not starting rather than treating it as bad", pindex->nHeight);
             printf("LoadBlockIndex() : *** bad block at height %d, hash=%s\n",
                    pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
             // Keep going: an older bad block further back wins, because

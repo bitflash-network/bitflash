@@ -498,7 +498,7 @@ bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmine
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
 // Takes ownership of pblock on every path (kept as an orphan or deleted).
-bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL);
+bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL, bool* pfUnverified=NULL);
 bool SelectCoins(int64 nTargetValue, std::set<CWalletTx*>& setCoinsRet);
 bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock);
 // True while this node is catching up: peers say the chain is well past us.
@@ -1577,6 +1577,13 @@ public:
         return PoWHashHeader((const unsigned char*)BEGIN(nVersion));
     }
 
+    // False when this node could not compute it (RandomX not available here):
+    // the work is unknown, neither met nor missed.
+    bool GetPoWHashChecked(uint256& hashOut) const
+    {
+        return PoWHashHeaderChecked((const unsigned char*)BEGIN(nVersion), hashOut);
+    }
+
     bool CheckSizeLimits() const
     {
         // The middle test compares a transaction *count* against a *byte*
@@ -1745,7 +1752,10 @@ public:
     // fCheckTime false skips the "too far in the future" test, which depends
     // on the local clock: the check at load, with no peers yet, uses it so a
     // machine that boots with a slow clock does not throw its tail away.
-    bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true) const;
+    // pfUnverified, when given, is set when the block was refused only because
+    // this node could not compute its proof of work: nothing is known against
+    // the block, and no score is given for it.
+    bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true, bool* pfUnverified=NULL) const;
     bool AcceptBlock(int* pnDoS=NULL);
 };
 

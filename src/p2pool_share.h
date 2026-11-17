@@ -131,6 +131,11 @@ bool CheckShare(const Share& share, const vector<WindowShare>& window, int nBloc
 // The refusal a closed WorkGate gives.
 static const char* const WORK_GATE_CLOSED = "here: too many shares to hash from unproven peers just now";
 
+// The refusal when this node could not compute the RandomX hash (RandomX not
+// available here). A "here:" refusal: nothing is known against the share, and
+// its sender is not blamed.
+static const char* const WORK_UNVERIFIABLE = "here: RandomX is not available on this node to check the work";
+
 } // namespace p2pool
 
 #endif
