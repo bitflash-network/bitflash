@@ -1931,9 +1931,16 @@ bool BtfStartManagedTor(const std::string& torPathOpt, std::string& errOut)
     unsigned short p2pPort = ntohs(nListenPort);
 #endif
     KillStaleManagedTor(torrcPath);
+    std::vector<std::string> bridges;
+    std::map<std::string, std::string> ptExec;
+    CRITICAL_BLOCK(cs_managedTor)
+    {
+        bridges = g_torBridges;
+        ptExec = g_torPtExec;
+    }
     std::string torrc = BtfBuildManagedTorrcForTest(dataDir, hsDir, socksPort,
                                                    controlPort, p2pPort,
-                                                   g_torBridges, g_torPtExec,
+                                                   bridges, ptExec,
                                                    chatHsDir, chatPort);
     if (!WriteTextFile(torrcPath, torrc, errOut))
         return false;
