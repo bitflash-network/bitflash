@@ -10699,7 +10699,70 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fInv, "pool zero's share chain holds its five shares and its invariants after all that") ? 0 : 1;
     }
 
-    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil };
+    // ---- poolwho answered: the carrier named is dialled (found while
+    // preparing the phase D testnet proof: the names went only into pool
+    // zero's peer cache, which marks addresses it already holds and is
+    // dialled from only while fewer than 3 pool zero peers are connected, so
+    // a node reached a carrier a peer named only if it dialled it anyway, and
+    // with no registry peer yet the first poolwho waited 10 minutes)
+    P2PoolResetForTest(bnFloor, false);
+    CNode* pW1 = NewRegTestNode(false, "BF1who-a");
+    CNode* pW2 = NewRegTestNode(true, "BF1who-b");
+    {
+        poolreg::PoolRecord recH = recA;
+        recH.name = "regtest-h";
+        p2pool::PoolRules rulesH;
+        p2pool::RulesForRegistered(recH, magic, rulesH, err);
+        const uint256 idH = rulesH.poolId;
+        uint256 idHc = idH;   // begin() is not const
+        nFail += Check(P2PoolRegAddForTest(recH, true, false, false, err), "a pool to mine joins, nothing of it here, no peer") ? 0 : 1;
+        P2PoolRegTickForTest();
+        P2PoolOnVersion(pW1);
+        P2PoolOnVersion(pW2);
+        // A poolat before any poolwho went out: nobody asked, it names nobody.
+        CDataStream s0(SER_NETWORK, VERSION);
+        s0 << idH << vector<string>(1, "BF1who-liar");
+        SendP2PoolTest(pW2, "poolat", s0);
+        P2PoolRegTickForTest();
+        vector<unsigned char> w1, w2;
+        bool fAsk1 = LastSent(pW1, "poolwho", w1) && w1.size() == 32 && memcmp(&w1[0], idHc.begin(), 32) == 0;
+        bool fAsk2 = LastSent(pW2, "poolwho", w2) && w2.size() == 32 && memcmp(&w2[0], idHc.begin(), 32) == 0;
+        nFail += Check(fAsk1 && fAsk2,
+                       "the first peers that read the registry are asked who carries it as soon as they connect, "
+                       "not an interval after a pass that found nobody to ask") ? 0 : 1;
+        CDataStream s1(SER_NETWORK, VERSION);
+        s1 << idH << vector<string>(1, "BF1who-carrier");
+        SendP2PoolTest(pW1, "poolat", s1);
+        vector<string> vDial;
+        P2PoolGuardDialList(vDial);
+        bool fDial = vDial.size() == 1 && vDial[0] == "BF1who-carrier";
+        P2PoolGuardSetOptions(false, 0, 0);
+        vector<string> vOff;
+        P2PoolGuardDialList(vOff);
+        bool fOff = vOff.size() == 1 && vOff[0] == "BF1who-carrier";
+        P2PoolGuardSetOptions(true, 0, 0);
+        nFail += Check(fDial && fOff && pW1->nMisbehavior == 0 && pW2->nMisbehavior == 0,
+                       "the carrier a peer names in answer is dialled for the pool looked for, with -poolguard=0 too; "
+                       "a poolat nobody asked for names nobody") ? 0 : 1;
+        if (!fDial || !fOff)
+            printf("       dial list: %u then %u name(s)\n", (unsigned)vDial.size(), (unsigned)vOff.size());
+        // While the named carrier is dialled the mined pool waits past its
+        // 2-minute grace, as for an announcer; at 10 minutes it starts here
+        // whatever, and the name is forgotten.
+        P2PoolRegAgeForTest(121);
+        P2PoolRegTickForTest();
+        bool fWaits = P2PoolRegFetchForTest(idH) != P2PoolRegStatusInfo::FETCH_COMPLETE;
+        P2PoolRegAgeForTest(480);
+        P2PoolRegTickForTest();
+        vector<string> vLate;
+        P2PoolGuardDialList(vLate);
+        bool fStarted = P2PoolRegFetchForTest(idH) == P2PoolRegStatusInfo::FETCH_COMPLETE;
+        nFail += Check(fWaits && fStarted && vLate.empty(),
+                       "a carrier being dialled holds the start past the grace, never past 10 minutes, and its name "
+                       "goes after 10 minutes") ? 0 : 1;
+    }
+
+    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil, pW1, pW2 };
     for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
     {
         P2PoolForgetDeferred(vAll[i]);

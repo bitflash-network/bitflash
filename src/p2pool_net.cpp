@@ -3909,6 +3909,11 @@ struct RegPool
     // Since when the pool is active and wanted here (0: it is not).
     int64 nWantedSince;
     int64 nWhoAt;                   // when peers were last asked poolwho for it
+    // Carriers a peer named in answer to this node's poolwho (poolat), each
+    // with when it was named: dialled with the guardians for POOLAT_HINT_TTL
+    // (P2PoolGuardDialList), whether or not the line has started here since,
+    // since an answer that comes after that is still taken.
+    vector<std::pair<string, int64> > vHintAt;
 
     RegPool(const uint256& idIn, const poolreg::PoolRecord& recIn, const vector<unsigned char>& recordIn,
             ShareChain* chainIn, const string& strFileIn, const string& strPartIn)
@@ -4033,6 +4038,16 @@ static const int64 REG_STATUS_SECS = 10;
 static const int64 POOLWHO_INTERVAL = 10 * 60;
 static const size_t POOLWHO_PEERS = 4;
 static const int64 POOLAT_WINDOW = 5 * 60;
+// A carrier named in a poolat answer is dialled for this long, then
+// forgotten (poolwho goes out again every POOLWHO_INTERVAL while the line is
+// not here); a pool keeps the newest POOLAT_HINTS_KEPT names.
+static const int64 POOLAT_HINT_TTL = 10 * 60;
+static const size_t POOLAT_HINTS_KEPT = 8;
+
+static bool HintNewer(const std::pair<string, int64>& a, const std::pair<string, int64>& b)
+{
+    return a.second > b.second;
+}
 // A paced serve older than this that averages under REG_SLOW_SERVE_RATE ends
 // when an ask waits for a slot.
 static const int64 REG_SLOW_SERVE_AGE = 15 * 60;
@@ -4837,6 +4852,10 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
     bool fAnnounced = false;
     for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && !fAnnounced; ++it)
         fAnnounced = !it->first->fDisconnect && it->second.setInv.count(rp->id) != 0;
+    // A carrier a peer named in answer to poolwho, being dialled, counts as
+    // an announcer for the grace (one hop away); REG_START_LONGEST holds.
+    for (size_t i = 0; i < rp->vHintAt.size() && !fAnnounced; i++)
+        fAnnounced = nNow - rp->vHintAt[i].second <= POOLAT_HINT_TTL;
     if (rp->fMined && rp->nFetch != FETCH_CATCHUP && rp->state.chain->Size() == 0 && rp->hashResume == 0 &&
         ((!fAnnounced && nNow - rp->nWantedSince >= REG_START_GRACE) || nNow - rp->nWantedSince >= REG_START_LONGEST))
     {
@@ -4913,10 +4932,11 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
         AskHistory(rp->state, pAsk);
         return false;
     }
-    // Nobody to ask: peers are asked who carries it.
+    // Nobody to ask: peers are asked who carries it. With no peer that reads
+    // the registry connected yet, the first one is asked as soon as it is,
+    // not an interval later.
     if (nNow - rp->nWhoAt >= POOLWHO_INTERVAL)
     {
-        rp->nWhoAt = nNow;
         size_t nAsked = 0;
         for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && nAsked < POOLWHO_PEERS; ++it)
         {
@@ -4926,6 +4946,12 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
             it->second.mapWhoAsked[rp->id] = nNow;
             PushReg(p, "poolwho", rp->id);
             nAsked++;
+        }
+        if (nAsked)
+        {
+            rp->nWhoAt = nNow;
+            LogPrint("p2pool", "p2pool: registered pool %s: nobody to ask for its line; asked %u peer(s) who carries it\n",
+                     rp->id.GetHex().c_str(), (unsigned)nAsked);
         }
     }
     return false;
@@ -7205,7 +7231,43 @@ static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStrea
         }
     }
     if (fAsked && !vAddr.empty())
+    {
         BtfNoteP2PoolHints(vAddr);
+        // The carriers named go to the dialler for the pool this node looks
+        // for (P2PoolGuardDialList), as its guardians do: the peer cache
+        // above only marks addresses it already holds, and is dialled from
+        // only while fewer than 3 pool zero peers are connected, so a fresh
+        // node, or one with -poolguard=0, never reached a carrier named here.
+        size_t nNoted = 0;
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            RegPool* rp = RegById(id);
+            if (rp && RegActive(*rp))
+                foreach(const string& a, vAddr)
+                {
+                    if (a.empty() || a.size() > 128)
+                        continue;
+                    bool fHave = false;
+                    for (size_t i = 0; i < rp->vHintAt.size() && !fHave; i++)
+                        if (rp->vHintAt[i].first == a)
+                        {
+                            rp->vHintAt[i].second = nNow;
+                            fHave = true;
+                        }
+                    if (!fHave)
+                        rp->vHintAt.push_back(std::make_pair(a, nNow));
+                    nNoted++;
+                }
+            if (rp && rp->vHintAt.size() > POOLAT_HINTS_KEPT)
+            {
+                std::stable_sort(rp->vHintAt.begin(), rp->vHintAt.end(), HintNewer);
+                rp->vHintAt.resize(POOLAT_HINTS_KEPT);
+            }
+        }
+        if (nNoted)
+            LogPrint("p2pool", "p2pool: registered pool %s: a peer named %u carrier(s) of it; dialling them\n",
+                     id.GetHex().c_str(), (unsigned)nNoted);
+    }
     return true;
 }
 
@@ -7464,6 +7526,8 @@ void P2PoolRegAgeForTest(int64 nSecs)
             if (rp->nLastNewShare) rp->nLastNewShare -= nSecs;
             if (rp->nWantedSince) rp->nWantedSince -= nSecs;
             if (rp->nWhoAt) rp->nWhoAt -= nSecs;
+            for (size_t i = 0; i < rp->vHintAt.size(); i++)
+                rp->vHintAt[i].second -= nSecs;
             for (map<CNode*, PeerPool>::iterator it = rp->state.mapPeer.begin(); it != rp->state.mapPeer.end(); ++it)
             {
                 PeerPool& pp = it->second;
@@ -7619,11 +7683,27 @@ void P2PoolTicketsStop()
 void P2PoolGuardDialList(vector<string>& out)
 {
     out.clear();
+    int64 nNow = GetTime();
     CRITICAL_BLOCK(cs_p2pool)
     {
+        set<string> setSeen;
+        // Carriers a peer named in answer to poolwho first, newest first, for
+        // every pool this node wants and is live, whether or not it guards (a
+        // node with -poolguard=0 finds the pool it mines through announcing
+        // peers and poolwho only, section 10): each was seen announcing the
+        // pool, where a guardian may hold nothing of it.
+        foreach(RegPool* rp, vRegPools)
+        {
+            if (!RegActive(*rp))
+                continue;
+            vector<std::pair<string, int64> > v = rp->vHintAt;
+            std::stable_sort(v.begin(), v.end(), HintNewer);
+            for (size_t i = 0; i < v.size() && out.size() < GUARD_DIAL_MAX; i++)
+                if (nNow - v[i].second <= POOLAT_HINT_TTL && setSeen.insert(v[i].first).second)
+                    out.push_back(v[i].first);
+        }
         if (!TktActive())
             return;
-        set<string> setSeen;
         foreach(const uint256& id, vGuardSeek)
         {
             map<uint256, vector<string> >::const_iterator it = mapGuardSeekAddr.find(id);
