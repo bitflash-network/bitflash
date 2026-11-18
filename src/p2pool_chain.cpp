@@ -634,10 +634,12 @@ bool ShareChain::CheckInvariants(string& errOut) const
 }
 
 bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut,
-                            bool* pfWhole)
+                            bool* pfWhole, vector<uint256>* pvAdded)
 {
     if (pfWhole)
         *pfWhole = false;
+    if (pvAdded)
+        pvAdded->clear();
     // Oldest first, as History() sends it. A part out of order let a child
     // come before its parent and be taken on trust, then sit on the parent
     // once that was checked in full.
@@ -659,6 +661,8 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
         bool fTrust = (int64)s.data.nShareHeight < (int64)nTipHeight - (int64)rules.nRetarget &&
                       (!parent || parent->fTrusted);
         bool fOk = fTrust ? AddTrusted(s, err) : Add(s, main, err);
+        if (fOk && pvAdded)
+            pvAdded->push_back(s.GetId());
         if (fOk || err == "already have this share")
             continue;
         // Nothing wrong with the sender; what follows builds on this one.
@@ -669,6 +673,24 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
     }
     if (pfWhole)
         *pfWhole = true;
+    return true;
+}
+
+bool ShareChain::GetHeld(const uint256& id, Share& out) const
+{
+    const Entry* e = Get(id);
+    if (!e)
+        return false;
+    out = e->share;
+    return true;
+}
+
+bool ShareChain::ParentOf(const uint256& id, uint256& parentOut) const
+{
+    const Entry* e = Get(id);
+    if (!e)
+        return false;
+    parentOut = e->share.data.hashPrevShare;
     return true;
 }
 
