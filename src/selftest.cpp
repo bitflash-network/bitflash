@@ -18339,6 +18339,66 @@ static int RunP2PoolGuardiansSelfTest()
            "a peer that carries it, no guardian, gives the line; the old window is mined on");
     }
 
+    // ---- a line taken partly on its work alone is served whole
+    {
+        poolreg::PoolRecord rec6 = GuardRecord(101);
+        const uint256 id6 = GuardInfo(rec6).id;
+        ok(P2PoolRegAddForTest(rec6, false, true, false, err), "a pool carried with nothing of it here");
+        p2pool::PoolRules rules6;
+        p2pool::RulesForRegistered(rec6, (const unsigned char*)pchMessageStart, rules6, err);
+        p2pool::ShareChain mirror6(rules6, false);
+        vector<p2pool::Share> line6 = RegLine(mirror6, main, 200, 6);
+        CNode* pX = NewRegTestNode(false, "BF1guard-x");
+        CNode* pY = NewRegTestNode(false, "BF1guard-y");
+        vNodes2Free.push_back(pX);
+        vNodes2Free.push_back(pY);
+        P2PoolOnVersion(pX);
+        P2PoolOnVersion(pY);
+        SendPoolInv(pX, vector<uint256>(1, id6));
+        P2PoolRegTickForTest();
+        SendRegPart(pX, id6, 199, 0, vector<p2pool::Share>(line6.begin(), line6.begin() + 100));
+        SendRegPart(pX, id6, 199, 1, vector<p2pool::Share>(line6.begin() + 100, line6.end()));
+        P2PoolRegAgeForTest(301);
+        P2PoolRegTickForTest();
+        bool fHave = RegShares(id6) == 200;
+        CRITICAL_BLOCK(pY->cs_vSend)
+        {
+            pY->nSendDrained += pY->vSend.size();
+            pY->vSend.clear();
+        }
+        SendRegItem(pY, "p2xsync", id6, uint256(0));
+        size_t nGot = 0;
+        bool fEarly = false, fEnd = false;
+        for (int i = 0; i < 40 && !fEnd && !fEarly; i++)
+        {
+            foreach(const SentMessage& m, SentTo(pY))
+            {
+                if (m.strCommand != "p2xshares" || m.payload.empty())
+                    continue;
+                CDataStream ss((const char*)&m.payload[0], (const char*)&m.payload[0] + m.payload.size(), SER_NETWORK, VERSION);
+                uint256 id;
+                int nTip;
+                unsigned char nFlag;
+                vector<p2pool::ShareX> vx;
+                ss >> id >> nTip >> nFlag >> vx;
+                nGot += vx.size();
+                fEarly = fEarly || nFlag == 2;
+                fEnd = fEnd || nFlag == 1;
+            }
+            CRITICAL_BLOCK(pY->cs_vSend)
+            {
+                pY->nSendDrained += pY->vSend.size();
+                pY->vSend.clear();
+            }
+            P2PoolRegAgeServeStartsForTest(60);
+            P2PoolRegTickForTest();
+        }
+        ok(fHave && fEnd && !fEarly && nGot == 200,
+           "a line whose deep shares were taken on their work alone is served whole, not ended early");
+        if (!(fHave && fEnd && !fEarly && nGot == 200))
+            printf("       have %d end %d early %d got %u\n", fHave, fEnd, fEarly, (unsigned)nGot);
+    }
+
     // ---- a redraw mid-handoff
     {
         P2PoolTicketKeyForTest(skOwn);

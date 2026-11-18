@@ -2580,10 +2580,17 @@ static void PumpRegServes()
             vector<Share> part;
             size_t nPartBytes = 0;
             bool fGone = false;
+            // A registered pool's history holds the deep shares a line read
+            // back from its file keeps on their work alone, as pool zero's
+            // History() does: the asker takes them on their work alone too.
+            // GetShare refuses those, so a node that restarted served nothing
+            // but "ended early" (found on testnet with a guardian pulling
+            // from a miner that had restarted). Local pools keep GetShare.
+            const bool fReg = RegOf(*r.pool) != NULL;
             while (r.i < r.vIds.size())
             {
                 Share sh;
-                if (!r.pool->chain->GetShare(r.vIds[r.i], sh))
+                if (!(fReg ? r.pool->chain->GetHeld(r.vIds[r.i], sh) : r.pool->chain->GetShare(r.vIds[r.i], sh)))
                 {
                     // Pruned since the snapshot: the line from here is not
                     // what the asker would get, so the serve ends early
