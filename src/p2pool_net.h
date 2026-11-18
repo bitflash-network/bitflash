@@ -385,6 +385,14 @@ struct P2PoolGuardEntryInfo
 void P2PoolGuardEntriesForTest(vector<P2PoolGuardEntryInfo>& out);
 void P2PoolGuardSaveForTest();
 size_t P2PoolGuardLoadForTest();
+// Self-tests: guard-only pools out of memory and nothing drawn, as at a
+// start (P2PoolGuardLoadForTest then reads pool-guards.dat); one entry's
+// place and linger end set and kept, as a redraw this run cannot see would
+// have left them; the node taken as behind (initial block download, or a
+// tip a day old) or caught up.
+void P2PoolGuardRestartForTest();
+void P2PoolGuardSetEntryForTest(const uint256& id, int nRank, int64 nUntil);
+void P2PoolTicketBehindForTest(bool fBehind);
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.

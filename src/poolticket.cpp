@@ -645,8 +645,10 @@ int CTicketBook::AddOwn(const CTicketChainView& view, const CGuardTicket& ticket
 }
 
 int CTicketBook::AddOwnVerified(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
-                                const uint256& hashWork)
+                                const uint256& hashWork, const unsigned char workKey[32])
 {
+    if (memcmp(ticket.PubKey(), workKey, 32) != 0)
+        return TICKET_BAD_WORK;
     const std::vector<unsigned char> b = ticket.Bytes();
     CGuardTicket t;
     int v = Precheck(view, &b[0], b.size(), ticket.Epoch(), hashSeed, true, t);
@@ -1084,9 +1086,9 @@ bool WriteTicketFileData(const std::string& strPath, const std::string& data)
     return true;
 }
 
-std::string TicketFileData(const CTicketBook& book)
+void TicketFileEpochs(const CTicketBook& book, std::vector<CTicketFileEpoch>& vEpochs)
 {
-    std::vector<CTicketFileEpoch> vEpochs;
+    vEpochs.clear();
     const std::map<unsigned int, CTicketEpoch>& all = book.All();
     for (std::map<unsigned int, CTicketEpoch>::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -1101,12 +1103,25 @@ std::string TicketFileData(const CTicketBook& book)
             fe.vTickets.push_back(vHeld[i].ticket);
         vEpochs.push_back(fe);
     }
+}
+
+std::string TicketFileBytes(const unsigned char magic[4], const std::vector<CTicketFileEpoch>& vEpochs)
+{
+    unsigned char m[4];
+    memcpy(m, magic, 4);
     CDataStream ss(SER_DISK);
-    ss << TICKET_FILE_VERSION << FLATDATA(book.Params().magic) << vEpochs;
+    ss << TICKET_FILE_VERSION << FLATDATA(m) << vEpochs;
     uint256 h = Hash(ss.begin(), ss.end());
     std::string data(ss.begin(), ss.end());
     data.append((const char*)h.begin(), 32);
     return data;
+}
+
+std::string TicketFileData(const CTicketBook& book)
+{
+    std::vector<CTicketFileEpoch> vEpochs;
+    TicketFileEpochs(book, vEpochs);
+    return TicketFileBytes(book.Params().magic, vEpochs);
 }
 
 bool LoadTicketFile(const std::string& strPath, const CTicketParams& params,

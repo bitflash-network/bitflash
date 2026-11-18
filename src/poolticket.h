@@ -390,9 +390,12 @@ public:
     // The same for a ticket whose work hash the caller computed (its own
     // grind, or Verify run with no lock held): steps 1 and 2, the signature,
     // then Add with that hash. Hashes nothing, so it runs under the caller's
-    // lock.
+    // lock. workKey is the key the work was ground with (this node's): a
+    // ticket whose body names another key is refused (TICKET_BAD_WORK, the
+    // hash is not this body's) before anything is added, remembered or
+    // marked as this node's own, a body already checked included.
     int AddOwnVerified(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
-                       const uint256& hashWork);
+                       const uint256& hashWork, const unsigned char workKey[32]);
     bool Own(unsigned int nEpoch, CGuardTicket& ticketOut, uint256& hashWorkOut) const;
 
     // Follow the chain: forget epochs before the previous one (and the
@@ -573,8 +576,12 @@ namespace pooltkt
 // The file: a version, the network's magic, up to three epochs, and the hash
 // of all of it; written to a temporary name and renamed into place.
 bool SaveTicketFile(const std::string& strPath, const CTicketBook& book);
-// The same in two steps, so the book's lock is held only while its bytes are
-// made: the bytes SaveTicketFile writes, and their write.
+// The same in steps, so the book's lock is held only for a copy: what the
+// file holds of each epoch (TicketFileEpochs, the copy), the bytes made of it
+// with no lock (TicketFileBytes), and their write. TicketFileData is the
+// first two together.
+void TicketFileEpochs(const CTicketBook& book, std::vector<CTicketFileEpoch>& vOut);
+std::string TicketFileBytes(const unsigned char magic[4], const std::vector<CTicketFileEpoch>& vEpochs);
 std::string TicketFileData(const CTicketBook& book);
 bool WriteTicketFileData(const std::string& strPath, const std::string& data);
 // Reads it. False, with the reason, when there is none or it is not this

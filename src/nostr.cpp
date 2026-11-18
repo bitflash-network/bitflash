@@ -446,8 +446,11 @@ bool BtfSignGuardTicket(CGuardTicket& t)
 {
     if (!EnsureNostrKey())
         return false;
-    // Sign fills the body's key from the secret key's, so a ticket ground
-    // for another key could not come out signed by this one.
+    // Sign writes this key into the body, so the key the work was ground
+    // with is compared before signing: a ticket ground for another key would
+    // otherwise come out signed by this one, with work that is not its own.
+    if (memcmp(t.PubKey(), g_nostrKey.xonly, 32) != 0)
+        return false;
     return t.Sign(g_nostrKey.seckey) && memcmp(t.PubKey(), g_nostrKey.xonly, 32) == 0 && t.VerifySig();
 }
 
