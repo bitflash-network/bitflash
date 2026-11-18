@@ -35,7 +35,6 @@
 // ---------------------------------------------------------------------------
 extern int64         nTransactionFee;
 extern int           nBestHeight;
-extern std::string   strParticipantPool;
 extern CAddress      addrLocalHost;
 
 void   MainFrameRepaint();
@@ -444,7 +443,15 @@ static void DrawMainWindow()
     ImGui::Spacing();
     ImGui::TextDisabled("Address:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-80.0f);
+    // Room for the two buttons after the field, measured from their labels
+    // and the style (a fixed 80 px cut "Request" off at the window's edge),
+    // so it holds under any font size.
+    {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float wBtns = ImGui::CalcTextSize("Copy").x + ImGui::CalcTextSize("Request").x +
+                      4.0f * st.FramePadding.x + 2.0f * st.ItemSpacing.x;
+        ImGui::SetNextItemWidth(-wBtns);
+    }
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f, 0.14f, 0.14f, 1.0f));
     ImGui::InputText("##addr", (char*)g_myAddress.c_str(), g_myAddress.size()+1,
                      ImGuiInputTextFlags_ReadOnly);
@@ -640,6 +647,7 @@ static void DrawMainWindow()
         ImGui::Spacing();
         ImGui::SeparatorText("Participant Mining");
 
+        const std::string strParticipantPool = GetParticipantPool();
         ImGui::TextDisabled("Selected pool:");
         ImGui::SameLine();
         if (strParticipantPool.empty())
@@ -697,8 +705,8 @@ static void DrawMainWindow()
                     if (ImGui::SmallButton(btnId.c_str())) {
                         strncpy(g_participantPool, ann.btfAddress.c_str(),
                                 sizeof(g_participantPool)-1);
-                        strParticipantPool = ann.btfAddress;
-                        CWalletDB().WriteSetting("strParticipantPool", strParticipantPool);
+                        SetParticipantPool(ann.btfAddress);
+                        CWalletDB().WriteSetting("strParticipantPool", ann.btfAddress);
                         g_needRefresh = true;
                     }
                 }
@@ -994,12 +1002,13 @@ static void DrawOptionsDialog()
     static bool wasOpen = false;
     if (!wasOpen) {
         g_mineRadio = nMineMode;
-        strncpy(g_participantPool, strParticipantPool.c_str(), sizeof(g_participantPool)-1);
-        strncpy(g_poolName, strPoolName.c_str(), sizeof(g_poolName)-1);
-        snprintf(g_poolFee, sizeof(g_poolFee), "%.2f", dPoolFeePercent);
-        strncpy(g_poolDash, strPoolDashboardUrl.c_str(), sizeof(g_poolDash)-1);
-        g_treasuryShare = nTreasurySharePercent;
-        g_poolFeeToTreasury = fPoolFeeToTreasury;
+        const CPoolSettings poolSet = GetPoolSettings();
+        strncpy(g_participantPool, poolSet.strParticipantPool.c_str(), sizeof(g_participantPool)-1);
+        strncpy(g_poolName, poolSet.strPoolName.c_str(), sizeof(g_poolName)-1);
+        snprintf(g_poolFee, sizeof(g_poolFee), "%.2f", poolSet.dPoolFeePercent);
+        strncpy(g_poolDash, poolSet.strPoolDashboardUrl.c_str(), sizeof(g_poolDash)-1);
+        g_treasuryShare = poolSet.nTreasurySharePercent;
+        g_poolFeeToTreasury = poolSet.fPoolFeeToTreasury;
         g_torAutoBridges = nTorBridgeFallbackSecs > 0;
         {
             std::vector<std::string> lines = BtfLoadUserBridges();
@@ -1189,19 +1198,23 @@ static void DrawOptionsDialog()
                 CWalletDB().WriteSetting("nPayTxFeePerKB", nPayTxFeePerKB);
             }
 
+            // The miner and pool threads read these: replaced whole, under
+            // the settings lock (SetPoolSettings, main.h).
+            CPoolSettings poolSet = GetPoolSettings();
             bool poolChanged =
                 nMineMode != g_mineRadio ||
-                strPoolName != (g_poolName[0] ? g_poolName : "Bitflash Pool") ||
-                strPoolDashboardUrl != g_poolDash ||
-                dPoolFeePercent != atof(g_poolFee);
+                poolSet.strPoolName != (g_poolName[0] ? g_poolName : "Bitflash Pool") ||
+                poolSet.strPoolDashboardUrl != g_poolDash ||
+                poolSet.dPoolFeePercent != atof(g_poolFee);
 
-            nMineMode            = g_mineRadio;
-            strParticipantPool   = g_participantPool;
-            strPoolName          = g_poolName[0] ? g_poolName : "Bitflash Pool";
-            strPoolDashboardUrl  = g_poolDash;
-            dPoolFeePercent      = atof(g_poolFee);
-            nTreasurySharePercent = g_treasuryShare;
-            fPoolFeeToTreasury    = g_poolFeeToTreasury;
+            nMineMode                     = g_mineRadio;
+            poolSet.strParticipantPool    = g_participantPool;
+            poolSet.strPoolName           = g_poolName[0] ? g_poolName : "Bitflash Pool";
+            poolSet.strPoolDashboardUrl   = g_poolDash;
+            poolSet.dPoolFeePercent       = atof(g_poolFee);
+            poolSet.nTreasurySharePercent = g_treasuryShare;
+            poolSet.fPoolFeeToTreasury    = g_poolFeeToTreasury;
+            SetPoolSettings(poolSet);
 
             if (nMineMode == MINE_OPERATOR && poolChanged) gAnnounceNow = true;
 
@@ -1223,7 +1236,7 @@ static void DrawOptionsDialog()
             // days looked identical to one that had never been asked to.
             CWalletDB().WriteSetting("nMineMode", nMineMode.load());
             CWalletDB().WriteSetting("fGenerateBitcoins", fGenerateBitcoins.load());
-            CWalletDB().WriteSetting("strParticipantPool", strParticipantPool);
+            CWalletDB().WriteSetting("strParticipantPool", poolSet.strParticipantPool);
 
             if (nMineMode == MINE_OPERATOR) {
                 if (!gPoolServerRunning) {
@@ -2002,7 +2015,7 @@ int RunGUI(int argc, char* argv[])
     ImGui_ImplOpenGL3_Init("#version 330");
 
     g_mineRadio = nMineMode;
-    strncpy(g_participantPool, strParticipantPool.c_str(), sizeof(g_participantPool)-1);
+    strncpy(g_participantPool, GetParticipantPool().c_str(), sizeof(g_participantPool)-1);
 
     // Kept for the wizard's "Restart Now": relaunch with the same command line.
     g_restartArgc = argc;

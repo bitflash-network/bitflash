@@ -376,4 +376,19 @@ bool PoolBurnedRecord(const CTxOut& out, std::vector<unsigned char>& recordOut, 
 // it is reading the chain again from genesis, of one moment.
 void PoolIndexState(int& nHeightOut, bool& fSyncedOut, bool& fRebuildingOut);
 
+// Registered pools on mainnet (docs/pool-registry.md, section 9). Until the
+// release that carries and mines them there (the p2x messages of section 8
+// and the guardians of section 10), a burn on mainnet would cost 1 BTF for a
+// pool nobody can mine, so `poolcreate everpool` refuses "send" and
+// "publishzero" on mainnet and shows its preview only. The release that opens
+// registered pools on mainnet sets this to true, and changes nothing else.
+// Testnet is always open.
+static const bool POOL_REGISTRY_MAINNET_OPEN = false;
+// Whether this node may burn a pool record now: testnet, or mainnet once
+// POOL_REGISTRY_MAINNET_OPEN is true.
+bool PoolBurnsOpen();
+// The self-test only: opens mainnet in this process, so the checks behind
+// the gate can run with the made-up mainnet registry.
+void PoolBurnsOpenForTest(bool fOpen);
+
 #endif

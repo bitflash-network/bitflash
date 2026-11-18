@@ -48,12 +48,12 @@ long long ShareOf(long long nBlockValue, int nPercent);
 
 } // namespace treasury
 
-// Solo mining: percent of every block mined here paid to the treasury in the
-// coinbase itself (0 = none; at most treasury::SHARE_MAX_PERCENT). Ignored in
-// operator (pool) mode, where -poolfeeto=treasury does the same job.
-extern int nTreasurySharePercent;
-
-// Operator: the pool fee is paid to the treasury instead of kept.
-extern bool fPoolFeeToTreasury;
+// The two mining settings that use the treasury live with the other pool
+// settings, behind their lock (CPoolSettings in main.h):
+// nTreasurySharePercent, solo mining's percent of every block paid to the
+// treasury in the coinbase itself (0 = none; at most SHARE_MAX_PERCENT;
+// ignored in operator mode, where -poolfeeto=treasury does the same job), and
+// fPoolFeeToTreasury, an operator's pool fee paid to the treasury instead of
+// kept.
 
 #endif

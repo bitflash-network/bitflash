@@ -187,12 +187,28 @@ extern std::atomic<int> nMineMode;
 // stored mode alone when this is true, so a flag is never silently overruled by
 // something a previous session wrote.
 extern bool   fMineModeFromCommandLine;
-extern string strParticipantPool; // participant: pool .btf address
-extern string strPoolName;        // operator: announced pool name
-extern string strPoolDashboardUrl; // operator: optional dashboard URL
+// The pool settings the GUI's save button changes while the miner, pool,
+// stratum bridge and announcement threads read them. They live behind
+// cs_poolSettings (a leaf lock: nothing else is taken while it is held), and
+// are only reached through these calls: readers get a copy, writers replace
+// them whole (or the participant pool alone).
+struct CPoolSettings
+{
+    string strParticipantPool;  // participant: pool .btf address
+    string strPoolName;         // operator: announced pool name
+    string strPoolDashboardUrl; // operator: optional dashboard URL
+    double dPoolFeePercent;     // operator: announced fee percent
+    int nTreasurySharePercent;  // solo: percent of each block to the treasury (treasury.h)
+    bool fPoolFeeToTreasury;    // operator: the pool fee goes to the treasury
+    CPoolSettings() : strPoolName("Bitflash Pool"), dPoolFeePercent(0.0), nTreasurySharePercent(0),
+                      fPoolFeeToTreasury(false) {}
+};
+CPoolSettings GetPoolSettings();
+void SetPoolSettings(const CPoolSettings& settings);
+string GetParticipantPool();
+void SetParticipantPool(const string& strPool);
 extern string strPoolStatusFile;   // operator: optional JSON status output path
 extern string strPoolRoundsFile;   // operator: optional public round proof path
-extern double dPoolFeePercent;     // operator: announced fee percent
 extern bool   fStratumBridge;      // participant helper: local Stratum bridge
 extern int    nStratumBridgePort;  // local bridge listen port, default 3333
 extern string strStratumBridgeBind; // bridge listen address, default 127.0.0.1
@@ -498,7 +514,23 @@ bool SequenceLockPasses(const CTxIn& txin, const CTxIndex& txindex, bool fUnmine
 // a block that is merely useless (old, orphan, early), up to 100 for one that
 // no honest node could have sent (bad proof of work, bad merkle root).
 // Takes ownership of pblock on every path (kept as an orphan or deleted).
-bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL);
+// pfUnverified, when given, is set when the block was refused only because
+// this node could not compute its proof of work (RandomX not available here).
+bool ProcessBlock(CNode* pfrom, CBlock* pblock, int* pnDoS=NULL, bool* pfUnverified=NULL);
+// Blocks of that kind: a peer that sends more than this many in a window is
+// disconnected, never scored or banned (the fault is this node's).
+static const int MAX_UNVERIFIED_BLOCKS_PER_PEER = 8;
+static const int64 UNVERIFIED_BLOCKS_PEER_WINDOW = 60;
+// Every block refused that way; of those, the ones refused before any hash
+// because their parent already rules them out (CheckBlock); peers disconnected
+// for them; and the log lines written about them (one a minute at most).
+extern int64 nBlocksUnverified;
+extern int64 nBlocksUnverifiedByContext;
+extern int64 nUnverifiedPeersDropped;
+extern int64 nUnverifiedLogLines;
+// Self-test only: make the last of those lines nAge seconds old (negative:
+// none written yet), so the next one is written.
+void UnverifiedLogAgeForTest(int64 nAge);
 bool SelectCoins(int64 nTargetValue, std::set<CWalletTx*>& setCoinsRet);
 bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock);
 // True while this node is catching up: peers say the chain is well past us.
@@ -1579,6 +1611,13 @@ public:
         return PoWHashHeader((const unsigned char*)BEGIN(nVersion));
     }
 
+    // False when this node could not compute it (RandomX not available here):
+    // the work is unknown, neither met nor missed.
+    bool GetPoWHashChecked(uint256& hashOut) const
+    {
+        return PoWHashHeaderChecked((const unsigned char*)BEGIN(nVersion), hashOut);
+    }
+
     bool CheckSizeLimits() const
     {
         // The middle test compares a transaction *count* against a *byte*
@@ -1747,7 +1786,12 @@ public:
     // fCheckTime false skips the "too far in the future" test, which depends
     // on the local clock: the check at load, with no peers yet, uses it so a
     // machine that boots with a slow clock does not throw its tail away.
-    bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true) const;
+    // pfUnverified, when given, is set when the block was refused only because
+    // this node could not compute its proof of work: nothing is known against
+    // the block, and no score is given for it. A caller that gives it holds
+    // cs_main (or is the load at startup): with it, a v1-era block is looked
+    // up against its parent in mapBlockIndex when v1 has failed to set up.
+    bool CheckBlock(int* pnDoS=NULL, bool fCheckTime=true, bool* pfUnverified=NULL) const;
     bool AcceptBlock(int* pnDoS=NULL);
 };
 

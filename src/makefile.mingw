@@ -380,6 +380,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=pool-stratum
 	./bitflash.exe -selftest=debug-log-buffer
 	./bitflash.exe -selftest=pow-v2
+	./bitflash.exe -selftest=pow-unavailable
 	./bitflash.exe -selftest=dgb-pow
 	./bitflash.exe -selftest=rvn-kawpow
 	./bitflash.exe -selftest=sigpipe
@@ -438,6 +439,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=reply-parsers
 	./bitflash.exe -selftest=managed-tor
 	./bitflash.exe -selftest=treasury
+	./bitflash.exe -selftest=pool-settings
 	./bitflash.exe -selftest=chat-link
 	./bitflash.exe -selftest=chat-identity
 	./bitflash.exe -selftest=chat-relay

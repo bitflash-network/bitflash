@@ -875,6 +875,11 @@ static void QueuePayouts(int blockHeight,
                          const std::map<std::string, uint64>& shareCount,
                          uint64 total)
 {
+    // One copy of the fee settings for the whole round, so the fee recorded
+    // is the fee applied even if the GUI saves new settings meanwhile.
+    const CPoolSettings poolSet = GetPoolSettings();
+    const double dPoolFeePercent = poolSet.dPoolFeePercent;
+    const bool fPoolFeeToTreasury = poolSet.fPoolFeeToTreasury;
     PoolRoundProof round;
     round.id = PayoutIdForBlock(blockHeight);
     round.blockHeight = blockHeight;
@@ -1173,12 +1178,13 @@ static void WritePoolStatusJsonLocked()
     j["network"] = IsTestNet() ? "bitflash-testnet" : "bitflash";
     j["updatedAt"] = GetTime();
 
+    const CPoolSettings poolSet = GetPoolSettings();
     j["operator"] = {
-        {"name", strPoolName},
+        {"name", poolSet.strPoolName},
         {"btfAddress", BtfLocalAddress()},
-        {"feePercent", dPoolFeePercent},
-        {"feeTo", fPoolFeeToTreasury && treasury::Configured() ? "treasury" : "operator"},
-        {"dashboardUrl", strPoolDashboardUrl},
+        {"feePercent", poolSet.dPoolFeePercent},
+        {"feeTo", poolSet.fPoolFeeToTreasury && treasury::Configured() ? "treasury" : "operator"},
+        {"dashboardUrl", poolSet.strPoolDashboardUrl},
         {"roundsFile", "pool_rounds.json"}
     };
 
@@ -1962,7 +1968,16 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         memcpy(hdr+72, &b.nBits,          4);
         memcpy(hdr+76, &b.nNonce,         4);
 
-        uint256 powHash = PoWHashHeader(hdr);
+        uint256 powHash;
+        if (!PoWHashHeaderChecked(hdr, powHash)) {
+            // This node could not compute the hash (RandomX not available
+            // here): the work is unknown, so it is not credited, and the
+            // miner is not told its work was bad.
+            LogPrintAlways("worker", "[worker->pool] submit from %s not checked: RandomX is not available on this node\n",
+                           m->address.c_str());
+            reply(false, "the pool cannot check work right now (RandomX unavailable on the pool node)");
+            return true;
+        }
 
         // A RandomX miner sends the hash it computed. If it differs from ours
         // the miner is keyed or laid out wrong, and "Low difficulty share"
@@ -2347,6 +2362,22 @@ int RunPoolStratumSelfTest()
     check(submitReply.is_object() && submitReply["error"].is_object()
           && submitReply["error"].value("message", "").find("does not match") != std::string::npos,
           "the mismatch is reported as such, not as low difficulty");
+
+    // A pool node that cannot compute the hash credits nothing: the same
+    // submit that was credited above is refused while RandomX is unavailable,
+    // and the refusal says why instead of calling the work bad.
+    captured.clear();
+    cnsubmit["params"]["result"] = ToHex((const unsigned char*)&want, 32);
+    cnsubmit["id"] = 5;
+    RandomXForceUnavailableForTest(true);
+    HandleLine(&cn, cnsubmit.dump(), roundShareCount, roundShareTotal, blocksFound);
+    RandomXForceUnavailableForTest(false);
+    try { submitReply = json::parse(captured); } catch (...) {}
+    check(roundShareTotal == before + 1 && roundShareCount["selftest-cn-address"] == 1,
+          "while RandomX is unavailable a submit is not credited");
+    check(submitReply.is_object() && submitReply["error"].is_object()
+          && submitReply["error"].value("message", "").find("cannot check") != std::string::npos,
+          "and the refusal says the pool cannot check work, not that the share is bad");
 
     captured.clear();
     json keep = {{"id", 4}, {"jsonrpc", "2.0"}, {"method", "keepalived"}, {"params", json{{"id", "00"}}}};
@@ -3287,7 +3318,7 @@ void ThreadRPCServer(void*)
     LogPrint("pool", "[pool] ============================================\n");
     LogPrint("pool", "[pool] Pool server starting\n");
     LogPrint("pool", "[pool] .btf address: %s\n", BtfLocalAddress().c_str());
-    LogPrint("pool", "[pool] fee: %.2f%%\n", dPoolFeePercent);
+    LogPrint("pool", "[pool] fee: %.2f%%\n", GetPoolSettings().dPoolFeePercent);
 
     if (RebuildJob()) {
         LogPrint("pool", "[pool] initial job %s seeded at height %d\n",

@@ -1852,10 +1852,11 @@ void ThreadBtfPoolAnnouncer(void*)
         if (nMineMode == MINE_OPERATOR && gPoolRunning)
         {
             BtfPoolAnnouncement ann;
+            const CPoolSettings poolSet = GetPoolSettings();
             ann.btfAddress = BtfLocalAddress();
-            ann.poolName = NostrClampUtf8(strPoolName, NOSTR_MAX_POOL_NAME);
-            ann.dashboardUrl = NostrClampUtf8(strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
-            ann.feePercent = dPoolFeePercent;
+            ann.poolName = NostrClampUtf8(poolSet.strPoolName, NOSTR_MAX_POOL_NAME);
+            ann.dashboardUrl = NostrClampUtf8(poolSet.strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
+            ann.feePercent = poolSet.dPoolFeePercent;
             uint64 roundShares = 0;
             double totalHashRate = 0.0;
             GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares, totalHashRate);
@@ -2249,10 +2250,11 @@ void ThreadNostrSeed(void* parg)
         if (nMineMode == MINE_OPERATOR && gPoolRunning)
         {
             BtfPoolAnnouncement ann;
+            const CPoolSettings poolSet = GetPoolSettings();
             ann.btfAddress = BtfLocalAddress();
-            ann.poolName = NostrClampUtf8(strPoolName, NOSTR_MAX_POOL_NAME);
-            ann.dashboardUrl = NostrClampUtf8(strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
-            ann.feePercent = dPoolFeePercent;
+            ann.poolName = NostrClampUtf8(poolSet.strPoolName, NOSTR_MAX_POOL_NAME);
+            ann.dashboardUrl = NostrClampUtf8(poolSet.strPoolDashboardUrl, NOSTR_MAX_DASHBOARD_URL);
+            ann.feePercent = poolSet.dPoolFeePercent;
             uint64 roundShares = 0;
             double totalHashRate = 0.0;
             GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares, totalHashRate);
