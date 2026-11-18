@@ -62,7 +62,11 @@ Tor: last time only the obfs4 bridges reached the network; starting on them (del
 
 Where to see it: *Options* in the desktop app shows the transport in use and
 Tor's bootstrap line; the diagnostics dump (`managed Tor` line) and the
-`gettorinfo` RPC show the same for a headless node.
+`gettorinfo` RPC show the same for a headless node. `gettorinfo` also lists
+`transports`, the kinds of bridge Tor was given (`snowflake`, `obfs4`,
+`webtunnel`, `meek`, ...), which tells an operator's own `obfs4` line apart
+from a bundled rung even though `transport` says `user`; with an external Tor
+it is `null`, because the node cannot tell.
 
 ## Bridges of your own
 

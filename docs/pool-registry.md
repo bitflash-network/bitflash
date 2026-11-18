@@ -1584,7 +1584,7 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 | A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
 | B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
 | B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) merged (#91) |
-| C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | part 1 (tickets, the draw, the guard budget, no network) merged (#89); part 2 (`pooltkt`/`poolgettkt`, the ticket thread, guarded pools, handoff and revival, `-poolguard*`, `poolinfo` guardians, self-test `p2pool-guardians`, `fuzz-pooltkt`) in progress; the `transports` field still to do |
+| C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | part 1 (tickets, the draw, the guard budget, no network) merged (#89); part 2 (`pooltkt`/`poolgettkt`, the ticket thread, guarded pools, handoff and revival, `-poolguard*`, `poolinfo` guardians, self-test `p2pool-guardians`, `fuzz-pooltkt`) merged (#95); the `transports` field of section 17 done (`gettorinfo`, self-test `managed-tor`) |
 | D | the testnet proof of section 15 | after C |
 
 ## 17. Networks where Tor is blocked
@@ -1747,7 +1747,8 @@ under `cs_managedTor`, which `BtfSetTorBridges` then takes to write it too): `sn
 reported as `meek`, and any other kind passed through as written.
 `gettorinfo` gains a field **`transports`**: the sorted list of the kinds in
 the lines Tor has now, empty when Tor runs without bridges; with an external
-Tor the node cannot tell, and says so. The field is for the operator and for
+Tor the node cannot tell, and says so: `transports` is `null` and a
+`transportsnote` explains why. The field is for the operator and for
 Phase D, and is redone each time Tor is restarted on new lines (the ladder
 climbs, the operator calls `settorbridges`). **Nothing in the pool protocol
 depends on it**: every choice below is the same on every transport.

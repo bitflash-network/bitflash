@@ -75,7 +75,7 @@ null.
 | `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
 | `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
-| `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
+| `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), `transports` (sorted kinds in the bridge lines Tor has now, e.g. `["obfs4"]`; `[]` without bridges; `null` plus `transportsnote` with an external Tor), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
 | `gettreasuryinfo` | — | `configured`, `network`, `page`; when configured: `required`, `keys`, the `script` decoded, `howToPay`, this node's `treasuryShare` and `poolFeeTo` |
 | `donate` | `amount` | txid of a transaction paying the treasury; the same as `sendtoaddress treasury <amount>` |

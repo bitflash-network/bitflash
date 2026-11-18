@@ -1362,6 +1362,23 @@ static json rpc_gettorinfo(const json&)
     j["managed"]   = BtfManagedTorEnabled();
     j["status"]    = BtfManagedTorStatus();
     j["transport"] = BtfTorTransportMode();
+    {
+        // The kinds of bridge the managed Tor was given; null when Tor is
+        // external and the node cannot tell. Informational only.
+        std::vector<std::string> kinds;
+        if (BtfTorTransports(kinds))
+        {
+            json t = json::array();
+            for (size_t i = 0; i < kinds.size(); i++)
+                t.push_back(kinds[i]);
+            j["transports"] = t;
+        }
+        else
+        {
+            j["transports"] = json(nullptr);
+            j["transportsnote"] = "external Tor: the node cannot tell which transports it uses";
+        }
+    }
     int pct = BtfManagedTorBootstrapPercent();
     j["bootstrap"] = pct < 0 ? json(nullptr) : json(pct);
     j["bootstrapline"] = BtfManagedTorBootstrapLine();
