@@ -231,10 +231,19 @@ bool P2PoolLocalStillListed(const string& strPeer);
 // is carried, mined and announced; never whether a share of it is valid.
 
 static const size_t MAX_POOL_CARRY = 8;
+// Registered pools are open on testnet, and on mainnet once the release that
+// carries and mines them there sets POOL_REGISTRY_MAINNET_OPEN (poolindex.h,
+// docs/pool-registry.md section 9). Until then, on mainnet, no registered
+// pool is mined, carried, announced, relayed or served, every registry
+// message is dropped unread, and -p2pool=<pool id> and -poolcarry are
+// refused with this.
+static const char* const P2POOL_REG_CLOSED =
+    "Everpool pools are not open on mainnet in this release: -p2pool=<pool id> and -poolcarry work on testnet only";
 // The pool mined (fMine) or one more carried. Before P2PoolInit, which reads
 // back their files (pools/<id>.dat, or pools/<id>.part for a fetch in
 // progress); a pool with no file here joins once the registry index names
-// it. False for pool zero's id, or a ninth -poolcarry pool.
+// it. False for pool zero's id, a ninth -poolcarry pool, or any pool where
+// registered pools are not open (P2POOL_REG_CLOSED).
 bool P2PoolRegWant(const uint256& id, bool fMine, string& errOut);
 // The pools wanted: the mined one first, then those carried.
 void P2PoolRegWanted(vector<uint256>& out);
@@ -273,7 +282,16 @@ void P2PoolRegAgeForTest(int64 nSecs);
 // Self-tests: the paced serves in flight made nSecs older, their last part
 // left as recent as it was (slow, not stalled).
 void P2PoolRegAgeServeStartsForTest(int64 nSecs);
-bool P2PoolRegReloadForTest(const uint256& id);
+// fForceActive false: the pool comes back as at a real start, its status not
+// known until the index says (P2PoolRegIndexForTest).
+bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive = true);
+// Self-tests: statuses read from a made-up registry index from now on,
+// ready (loaded, at its tip, not rebuilding) or not, naming these pools with
+// these statuses; or from the node's own index; and the cap on a registered
+// pool's partial file made smaller (0: the pool's byte cap).
+void P2PoolRegIndexForTest(bool fReady, const vector<std::pair<uint256, int> >& vStatus);
+void P2PoolRegUseNodeIndexForTest();
+void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n);
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.

@@ -9637,6 +9637,36 @@ static size_t RegShares(const uint256& id)
     return P2PoolRegStatus(id, st) ? st.nShares : 0;
 }
 
+static long RegFileSize(const std::string& strPath)
+{
+    FILE* f = fopen(strPath.c_str(), "rb");
+    if (!f)
+        return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+// A line of n shares of a pool, from nothing, its last share 30 s ago.
+static vector<p2pool::Share> RegLine(p2pool::ShareChain& mirror, const TestMainView& main, int n, unsigned char cPay)
+{
+    vector<p2pool::Share> v;
+    uint256 prev = 0;
+    unsigned int t0 = (unsigned int)main.nNow - 30 * (n + 1);
+    for (int i = 0; i < n; i++)
+    {
+        CScript s;
+        s << OP_DUP << OP_HASH160 << uint160(cPay) << OP_EQUALVERIFY << OP_CHECKSIG;
+        string err;
+        p2pool::Share sh = RulesShare(mirror, main, prev, vector<unsigned char>(s.begin(), s.end()), t0 + 30 * i);
+        mirror.Add(sh, main, err);
+        prev = sh.GetId();
+        v.push_back(sh);
+    }
+    return v;
+}
+
 static int RunP2PoolRegisteredSelfTest()
 {
     printf("p2pool-registered self-test\n");
@@ -9667,6 +9697,9 @@ static int RunP2PoolRegisteredSelfTest()
     const unsigned char* magic = (const unsigned char*)pchMessageStart;
     uint256 idZero = 0;
     poolreg::PoolId(poolreg::PoolZero().Encode(), magic, idZero.begin());
+    // Mainnet's parameters, with registered pools opened in this process;
+    // the gate itself is checked closed further down.
+    PoolBurnsOpenForTest(true);
 
     poolreg::PoolRecord recA = poolreg::PoolZero();
     recA.nSpacing = 30; recA.nWindow = 360; recA.nRetarget = 120; recA.nUncleDepth = 2;
@@ -10114,7 +10147,10 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fClosed && fResumed,
                        "a part more than 5 minutes after the last is not taken; the fetch resumes from its newest share") ? 0 : 1;
 
-        // A restart: the partial file read back, the fetch resumed.
+        // A restart: the partial file read back, the fetch resumed. (After
+        // the interval: the peer was asked twice for this pool in it, and is
+        // asked no more than it answers, 3 a pool an interval.)
+        P2PoolRegAgeForTest(331);
         bool fReload = P2PoolRegReloadForTest(idB);
         bool fBack = fReload && RegShares(idB) == 100 && P2PoolRegFetchForTest(idB) == P2PoolRegStatusInfo::FETCH_RUNNING;
         size_t nSyncs = CountSent(pF, "p2xsync");
@@ -10286,6 +10322,288 @@ static int RunP2PoolRegisteredSelfTest()
         delete pW;
     }
 
+    // ---- a partial file grows with the line only, within the pool's cap
+    poolreg::PoolRecord recE = recB;
+    recE.name = "regtest-e";
+    p2pool::PoolRules rulesE;
+    p2pool::RulesForRegistered(recE, magic, rulesE, err);
+    const uint256 idE = rulesE.poolId;
+    const string strPartE = tmp + "/pools/" + idE.GetHex() + ".part";
+    const string strDatE = tmp + "/pools/" + idE.GetHex() + ".dat";
+    p2pool::ShareChain mirrorE(rulesE, false);
+    vector<p2pool::Share> lineE = RegLine(mirrorE, main, 80, 40);
+    CNode* pE = NewRegTestNode(false, "BF1epeer");
+    {
+        nFail += Check(P2PoolRegAddForTest(recE, false, true, true, err), "another pool given with -poolcarry joins") ? 0 : 1;
+        P2PoolOnVersion(pE);
+        SendPoolInv(pE, vector<uint256>(1, idE));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        SendRegPart(pE, idE, 79, 0, vector<p2pool::Share>(lineE.begin(), lineE.begin() + 40));
+        long nSize1 = RegFileSize(strPartE);
+        // The same ids again, each padded to 120 KB: shares already held,
+        // whatever their bytes, write nothing.
+        vector<p2pool::Share> vPad(lineE.begin(), lineE.begin() + 2);
+        vector<unsigned char> vJunk(120 * 1024, OP_NOP);
+        for (size_t i = 0; i < vPad.size(); i++)
+            vPad[i].coinbase.vout[0].scriptPubKey = CScript(vJunk.begin(), vJunk.end());
+        bool fSameIds = vPad[0].GetId() == lineE[0].GetId();
+        for (int k = 0; k < 5; k++)
+            SendRegPart(pE, idE, 79, 0, vPad);
+        bool fNoGrowth = nSize1 > 0 && RegFileSize(strPartE) == nSize1 && RegShares(idE) == 40;
+        // Held and new together: the new ones only, as the chain keeps them.
+        vector<p2pool::Share> vMixed(1, lineE[38]);
+        vMixed[0].coinbase.vout[0].scriptPubKey = CScript(vJunk.begin(), vJunk.end());
+        vMixed.insert(vMixed.end(), lineE.begin() + 39, lineE.begin() + 50);
+        SendRegPart(pE, idE, 79, 0, vMixed);
+        long nSize2 = RegFileSize(strPartE);
+        nFail += Check(fSameIds && fNoGrowth && RegShares(idE) == 50 && nSize2 > nSize1 && nSize2 - nSize1 < 32 * 1024 &&
+                       pE->nMisbehavior == 0,
+                       "a partial file takes only the shares the chain took, as the chain keeps them: held ids sent "
+                       "again padded add nothing") ? 0 : 1;
+        if (!fNoGrowth || nSize2 - nSize1 >= 32 * 1024)
+            printf("       sizes %ld, %ld; shares %u\n", nSize1, nSize2, (unsigned)RegShares(idE));
+
+        // Parts of held shares only do not keep the file alive: a day after
+        // the last new share it goes.
+        P2PoolRegAgeForTest(86000);
+        P2PoolRefillBudgetsForTest();
+        size_t nSyncs = CountSent(pE, "p2xsync");
+        P2PoolRegTickForTest();
+        bool fReasked = CountSent(pE, "p2xsync") == nSyncs + 1;
+        SendRegPart(pE, idE, 79, 0, vPad);
+        bool fKept = FileExists(strPartE.c_str());
+        P2PoolRegAgeForTest(401);
+        P2PoolRegTickForTest();
+        nFail += Check(fReasked && fKept && !FileExists(strPartE.c_str()) && RegShares(idE) == 0,
+                       "only a new share keeps a partial file: one fed held shares goes a day after its last new one") ? 0 : 1;
+
+        // The cap: a part that would pass it is not written; the fetch goes
+        // on in memory, and a restart resumes from what the file holds.
+        SendRegPart(pE, idE, 79, 0, vector<p2pool::Share>(lineE.begin(), lineE.begin() + 40));
+        bool fAgain = RegFileSize(strPartE) == nSize1;
+        P2PoolRegSetPartCapForTest(idE, (uint64)nSize1 + 64);
+        SendRegPart(pE, idE, 79, 0, vector<p2pool::Share>(lineE.begin() + 40, lineE.begin() + 50));
+        bool fCapped = RegFileSize(strPartE) == nSize1 && RegShares(idE) == 50;
+        P2PoolRegSetPartCapForTest(idE, 0);
+        SendRegPart(pE, idE, 79, 0, vector<p2pool::Share>(lineE.begin() + 50, lineE.begin() + 55));
+        bool fMemory = RegFileSize(strPartE) == nSize1 && RegShares(idE) == 55;
+        bool fBack = P2PoolRegReloadForTest(idE) && RegShares(idE) == 40 &&
+                     P2PoolRegFetchForTest(idE) == P2PoolRegStatusInfo::FETCH_RUNNING;
+        nFail += Check(fAgain && fCapped && fMemory && fBack,
+                       "a part that would take the partial file past the pool's cap is not written; the fetch goes on "
+                       "in memory, and a restart resumes from the file") ? 0 : 1;
+
+        // ---- a part cut short in the file (a stop while writing it)
+        vector<p2pool::ShareX> vx(lineE.begin() + 40, lineE.begin() + 45);
+        CDataStream ss(SER_DISK, VERSION);
+        ss << (int)79 << vx;
+        FILE* f = fopen(strPartE.c_str(), "ab");
+        if (f)
+        {
+            fwrite(&ss[0], 1, ss.size() / 2, f);
+            fclose(f);
+        }
+        bool fTorn = RegFileSize(strPartE) > nSize1;
+        bool fCut = P2PoolRegReloadForTest(idE) && RegShares(idE) == 40 && RegFileSize(strPartE) == nSize1;
+        P2PoolRegAgeForTest(631);
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        uint256 idSync, resume;
+        bool fResumed = LastRegSync(pE, idSync, resume) && idSync == idE && resume == lineE[39].GetId();
+        SendRegPart(pE, idE, 79, 0, vector<p2pool::Share>(lineE.begin() + 37, lineE.begin() + 60));
+        bool fAfter = P2PoolRegReloadForTest(idE) && RegShares(idE) == 60;
+        nFail += Check(fTorn && fCut && fResumed && fAfter,
+                       "a part cut short at the end of a partial file is cut off at start, and the next part is "
+                       "written and read back after the last whole one") ? 0 : 1;
+
+        // ---- a .dat that cannot be written keeps the partial file
+        MakeDirLocal(strDatE + ".new");
+        P2PoolRegTickForTest();
+        SendRegPart(pE, idE, 79, 1, vector<p2pool::Share>(lineE.begin() + 57, lineE.end()));
+        SendRegPart(pE, idE, 79, 1, vector<p2pool::Share>(1, lineE[79]));
+        bool fKeep = P2PoolRegFetchForTest(idE) == P2PoolRegStatusInfo::FETCH_COMPLETE && RegShares(idE) == 80 &&
+                     FileExists(strPartE.c_str()) && !FileExists(strDatE.c_str());
+        RemoveTree(strDatE + ".new");
+        nFail += Check(fKeep, "a line complete whose .dat could not be written keeps its partial file") ? 0 : 1;
+    }
+
+    // ---- at a start the index has not loaded yet: the partial file stays
+    poolreg::PoolRecord recG = recB;
+    recG.name = "regtest-g";
+    p2pool::PoolRules rulesG;
+    p2pool::RulesForRegistered(recG, magic, rulesG, err);
+    const uint256 idG = rulesG.poolId;
+    const string strPartG = tmp + "/pools/" + idG.GetHex() + ".part";
+    p2pool::ShareChain mirrorG(rulesG, false);
+    vector<p2pool::Share> lineG = RegLine(mirrorG, main, 30, 41);
+    CNode* pGn = NewRegTestNode(false);
+    {
+        P2PoolRegAddForTest(recG, false, true, true, err);
+        P2PoolOnVersion(pGn);
+        SendPoolInv(pGn, vector<uint256>(1, idG));
+        P2PoolRegTickForTest();
+        SendRegPart(pGn, idG, 29, 0, vector<p2pool::Share>(lineG.begin(), lineG.begin() + 20));
+        bool fPart = RegShares(idG) == 20 && FileExists(strPartG.c_str());
+        // As at a real start: nothing known of its status yet.
+        bool fReload = P2PoolRegReloadForTest(idG, false) && RegShares(idG) == 20 &&
+                       P2PoolRegFetchForTest(idG) == P2PoolRegStatusInfo::FETCH_RUNNING;
+        size_t nSyncs = CountSent(pGn, "p2xsync");
+        P2PoolRegStatusInfo st;
+        // The node's own index: a self-test never starts its thread, so it
+        // has not loaded, as at every start until it has.
+        P2PoolRegUseNodeIndexForTest();
+        P2PoolRegTickForTest();
+        bool fNode = PoolIndexHeight() >= 0 ||
+                     (FileExists(strPartG.c_str()) && RegShares(idG) == 20 &&
+                      P2PoolRegFetchForTest(idG) == P2PoolRegStatusInfo::FETCH_RUNNING &&
+                      CountSent(pGn, "p2xsync") == nSyncs && P2PoolRegStatus(idG, st) && !st.fCarried);
+        // An index loaded but behind its tip, or reading the chain again,
+        // that does not name it yet: the same.
+        P2PoolRegIndexForTest(false, vector<std::pair<uint256, int> >());
+        P2PoolRegTickForTest();
+        bool fNotReady = FileExists(strPartG.c_str()) && RegShares(idG) == 20 && CountSent(pGn, "p2xsync") == nSyncs;
+        nFail += Check(fPart && fReload && fNode && fNotReady,
+                       "a fetch read back at start keeps its partial file while the index has not loaded, is behind "
+                       "or is reading the chain again; nothing carried meanwhile") ? 0 : 1;
+        vector<std::pair<uint256, int> > vAll;
+        const uint256 vIds[] = { idA, idB, idE, idG };
+        for (size_t i = 0; i < sizeof(vIds) / sizeof(vIds[0]); i++)
+            vAll.push_back(std::make_pair(vIds[i], (int)POOL_ACTIVE));
+        P2PoolRegIndexForTest(true, vAll);
+        P2PoolRegTickForTest();
+        uint256 idSync, resume;
+        bool fResumed = CountSent(pGn, "p2xsync") == nSyncs + 1 && LastRegSync(pGn, idSync, resume) && idSync == idG &&
+                        resume == lineG[19].GetId();
+        vAll.pop_back();
+        P2PoolRegIndexForTest(true, vAll);
+        P2PoolRegTickForTest();
+        bool fGone = !FileExists(strPartG.c_str()) && RegShares(idG) == 0;
+        nFail += Check(fResumed && fGone,
+                       "once the index is ready and names it active the fetch resumes from its file; ready and not "
+                       "naming it, the fetch and its file go") ? 0 : 1;
+    }
+
+    // ---- a silent announcer: the fetch moves on, asks stay within what a
+    // peer answers
+    poolreg::PoolRecord recH = recA;
+    recH.name = "regtest-h";
+    p2pool::PoolRules rulesH;
+    p2pool::RulesForRegistered(recH, magic, rulesH, err);
+    const uint256 idH = rulesH.poolId;
+    CNode* pS = NewRegTestNode(false);
+    CNode* pT = NewRegTestNode(true);
+    {
+        P2PoolRegAddForTest(recH, false, true, true, err);
+        P2PoolOnVersion(pS);
+        P2PoolOnVersion(pT);
+        SendPoolInv(pS, vector<uint256>(1, idH));
+        SendPoolInv(pT, vector<uint256>(1, idH));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        bool fFirst = CountSent(pS, "p2xsync") == 1 && CountSent(pT, "p2xsync") == 0;
+        P2PoolRegAgeForTest(120);
+        P2PoolRegTickForTest();
+        bool fWaits = CountSent(pT, "p2xsync") == 0;
+        P2PoolRegAgeForTest(61);
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        bool fMoved = CountSent(pT, "p2xsync") == 1;
+        nFail += Check(fFirst && fWaits && fMoved,
+                       "an announcer whose first part has not come in 3 minutes is left alone, and another is asked") ? 0 : 1;
+        // One silent, one answering p2xnone, for 7 minutes more: each is
+        // asked again, never more than 3 times in the interval.
+        for (int k = 0; k < 7; k++)
+        {
+            SendRegItem(pT, "p2xnone", idH, 0);
+            P2PoolRegAgeForTest(61);
+            P2PoolRefillBudgetsForTest();
+            P2PoolRegTickForTest();
+        }
+        size_t nS = CountSent(pS, "p2xsync"), nT = CountSent(pT, "p2xsync");
+        nFail += Check(nS >= 2 && nS <= 3 && nT >= 2 && nT <= 3 && pS->nMisbehavior == 0 && pT->nMisbehavior == 0,
+                       "asks again, but never more than a peer answers: 3 a pool an interval") ? 0 : 1;
+        if (nS < 2 || nS > 3 || nT < 2 || nT > 3)
+            printf("       asks: silent %u, p2xnone %u\n", (unsigned)nS, (unsigned)nT);
+    }
+
+    // ---- registered pools closed (mainnet before the release that opens them)
+    CNode* pX = NewRegTestNode(true, "BF1closed");
+    PoolBurnsOpenForTest(false);
+    if (PoolBurnsOpen())
+    {
+        // Testnet, or a release that opened mainnet: nothing closed to check.
+        printf("  (registered pools are open on this network: the closed gate is not checked here)\n");
+        PoolBurnsOpenForTest(true);
+    }
+    else
+    {
+        string why, errW;
+        P2PoolRegStatusInfo st;
+        bool fWant = !P2PoolRegWant(uint256(4242), false, errW) && errW == P2POOL_REG_CLOSED;
+        bool fMine = !P2PoolRegWant(uint256(4243), true, errW) && errW == P2POOL_REG_CLOSED;
+        bool fNoTemplate = !P2PoolMinedReady(why) && why == P2POOL_REG_CLOSED;
+        p2pool::Share sa = RulesShare(mirrorA, main, lineA.back(), payTo(1), (unsigned int)main.nNow - 30 * 3);
+        bool fNoSubmit = !P2PoolSubmitShare(sa, err);
+        nFail += Check(fWant && fMine && fNoTemplate && fNoSubmit && P2PoolRegStatus(idA, st) && !st.fCarried &&
+                       !st.fAnnounced,
+                       "closed: -p2pool=<pool id> and -poolcarry refused, no template, no share, the mined pool "
+                       "neither carried nor announced") ? 0 : 1;
+        size_t nA = RegShares(idA), nPush = CountSent(pNew, "p2xshare");
+        P2PoolOnVersion(pX);
+        SendRegItem(pX, "p2xshare", idA, p2pool::ShareX(sa));
+        SendRegItem(pX, "p2xsync", idA, uint256(0));
+        SendRegItem(pX, "p2xsync", uint256(777), uint256(0));
+        SendRegItem(pX, "p2xgetsh", idA, vector<uint256>(1, lineA[0]));
+        CDataStream ssw(SER_NETWORK, VERSION);
+        ssw << idA;
+        SendP2PoolTest(pX, "poolwho", ssw);
+        SendPoolInv(pX, vector<uint256>(1, idA));
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        nFail += Check(RegShares(idA) == nA && CountSent(pNew, "p2xshare") == nPush && !SentRegMessage(pX) &&
+                       pX->nMisbehavior == 0 && LastPoolInv(pNew).empty(),
+                       "closed: a share is not taken or relayed, nothing is served or answered, nobody is scored, "
+                       "and no pool is announced") ? 0 : 1;
+        PoolBurnsOpenForTest(true);
+        P2PoolRegTickForTest();
+        nFail += Check(P2PoolRegStatus(idA, st) && st.fCarried && P2PoolMinedReady(why),
+                       "open again: the pool mined is carried and mined as before") ? 0 : 1;
+    }
+
+    // ---- a mined pool whose only announcer never answers starts its line
+    // 10 minutes after it became active, whatever was asked meanwhile
+    poolreg::PoolRecord recM = recA;
+    recM.name = "regtest-m";
+    p2pool::PoolRules rulesM;
+    p2pool::RulesForRegistered(recM, magic, rulesM, err);
+    const uint256 idM = rulesM.poolId;
+    CNode* pSil = NewRegTestNode(false);
+    {
+        P2PoolRegAddForTest(recM, true, false, true, err);
+        P2PoolOnVersion(pSil);
+        SendPoolInv(pSil, vector<uint256>(1, idM));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        for (int k = 0; k < 2; k++)
+        {
+            P2PoolRegAgeForTest(181);
+            P2PoolRegTickForTest();
+            P2PoolRegAgeForTest(61);
+            P2PoolRefillBudgetsForTest();
+            P2PoolRegTickForTest();
+        }
+        bool fWaiting = P2PoolRegFetchForTest(idM) != P2PoolRegStatusInfo::FETCH_COMPLETE;
+        P2PoolRegAgeForTest(181);
+        P2PoolRegTickForTest();
+        nFail += Check(fWaiting && P2PoolRegFetchForTest(idM) == P2PoolRegStatusInfo::FETCH_COMPLETE &&
+                       CountSent(pSil, "p2xsync") == 3,
+                       "a mined pool whose announcer never answers starts its line 10 minutes after it became active; "
+                       "the announcer asked 3 times meanwhile") ? 0 : 1;
+        if (CountSent(pSil, "p2xsync") != 3)
+            printf("       asks: %u\n", (unsigned)CountSent(pSil, "p2xsync"));
+    }
+
     // ---- a 1.2.34 node was sent nothing of any of it
     {
         bool fClean = true;
@@ -10300,13 +10618,14 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fInv, "pool zero's share chain holds its five shares and its invariants after all that") ? 0 : 1;
     }
 
-    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF };
+    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil };
     for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
     {
         P2PoolForgetDeferred(vAll[i]);
         delete vAll[i];
     }
     P2PoolResetForTest(bnProofOfWorkLimit, true);
+    PoolBurnsOpenForTest(false);
     SetCurrentDir(cwd);
     RemoveTree(tmp);
     printf("%s (%d failure%s)\n", nFail == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
@@ -22675,6 +22994,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, p2pool-registered, pool-index\n");
     return 1;
 }

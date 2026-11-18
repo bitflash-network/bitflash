@@ -6,7 +6,10 @@
 #include "poolindex.h"
 #include "nostr.h"
 #include <list>
-#ifndef WIN32
+#ifdef WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -461,6 +464,11 @@ static RegPool* RegOf(PoolState& ps);
 static uint256 RegZeroId();
 static const vector<unsigned char>* RegRecordOf(PoolState& ps);
 static bool RegSaveAllowed(PoolState& ps);
+// Under cs_p2pool: whether a registered pool's p2xsync to this peer stays
+// within what the peer answers (3 per pool, 8 in all, an interval), and the
+// count of one sent. True, and nothing counted, for any other pool.
+static bool RegAskRoomLocked(PoolState& ps, CNode* pnode);
+static void RegNoteAskLocked(CNode* pnode, const uint256& id);
 // A registered pool's share files (pools/<id>.dat and .part) start with this
 // byte, then the pool's record: a build reads its own format only, and a
 // file of another pool is never read as this one's.
@@ -532,7 +540,9 @@ static void LoadShares(PoolState& ps)
 
 // fPrivate: owner-only, for a local pool's file, whose shares carry the pool
 // id (with the code, a password oracle; section 18).
-static void WriteShares(const string& strFile, int nTipHeight, const vector<Share>& v, bool fPrivate,
+// True once the file is in place. A registered pool's that could not be
+// written is left as it was (RegComplete keeps the partial file then).
+static bool WriteShares(const string& strFile, int nTipHeight, const vector<Share>& v, bool fPrivate,
                         const vector<unsigned char>* pRecord = NULL)
 {
     string tmp = strFile + ".new";
@@ -543,28 +553,43 @@ static void WriteShares(const string& strFile, int nTipHeight, const vector<Shar
         // made the directory before). Nothing secret in it, but owner-only
         // like every file this node writes for itself.
         _mkdir((GetAppDir() + "/pools").c_str());
-        CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
-        if (!file)
-            return;
-        file << REG_SHARES_FORMAT << *pRecord << nTipHeight << v;
+        bool fWritten = false;
+        try
+        {
+            CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
+            if (file)
+            {
+                file << REG_SHARES_FORMAT << *pRecord << nTipHeight << v;
+                fWritten = fflush(file) == 0;
+            }
+        }
+        catch (std::exception& e)
+        {
+            printf("p2pool: %s not written (%s)\n", tmp.c_str(), e.what());
+        }
+        if (!fWritten)
+        {
+            remove(tmp.c_str());
+            return false;
+        }
     }
     else if (fPrivate)
     {
         CAutoFile file(OpenPrivateFile(tmp.c_str(), false));
         if (!file)
-            return;
+            return false;
         file << LOCAL_SHARES_FORMAT << nTipHeight << v;
     }
     else
     {
         CAutoFile file(fopen(tmp.c_str(), "wb"));
         if (!file)
-            return;
+            return false;
         file << nTipHeight << v;
     }
     // Windows will not rename over an existing file.
     remove(strFile.c_str());
-    rename(tmp.c_str(), strFile.c_str());
+    return rename(tmp.c_str(), strFile.c_str()) == 0;
 }
 
 void P2PoolBudget::Refill(int64 nNow)
@@ -816,7 +841,8 @@ void P2PoolInit()
 
 // Not under cs_p2pool: the line is copied under it, and written after, so
 // the few MB of a history do not go to disk with the share chain locked.
-static void MaybeSaveShares(PoolState& ps, bool fNow = false)
+// True when the file was written now, or the pool keeps none (memory only).
+static bool MaybeSaveShares(PoolState& ps, bool fNow = false)
 {
     vector<Share> v;
     int nTipHeight;
@@ -827,11 +853,11 @@ static void MaybeSaveShares(PoolState& ps, bool fNow = false)
     CRITICAL_BLOCK(cs_p2pool)
     {
         if (!fNow && GetTime() - ps.nLastSave < 120)
-            return;
+            return false;
         // A registered pool's line goes to pools/<id>.dat only once it is
         // complete; a fetch in progress has its own file (section 17).
         if (!RegSaveAllowed(ps))
-            return;
+            return false;
         ps.nLastSave = GetTime();
         ps.chain->History(v);
         nTipHeight = ps.chain->Height(ps.chain->Tip());
@@ -844,8 +870,9 @@ static void MaybeSaveShares(PoolState& ps, bool fNow = false)
             fReg = true;
         }
     }
-    if (!strFile.empty())
-        WriteShares(strFile, nTipHeight, v, fPrivate, fReg ? &vRecord : NULL);
+    if (strFile.empty())
+        return true;
+    return WriteShares(strFile, nTipHeight, v, fPrivate, fReg ? &vRecord : NULL);
 }
 
 // A share that is also a block: what its coinbase pays, so every node -- not
@@ -921,9 +948,18 @@ static void AskHistory(PoolState& ps, CNode* pfrom)
 // Whether this node may ask that peer for its history now: always one it
 // dialled or one that sent a share it took; an unproven peer only while the
 // shared budget lasts. Each ask is up to three histories of shares to hash.
-static bool HistoryAskAllowed(PoolState& ps, CNode* pfrom)
+// A registered pool's ask also stays within what the peer answers; and the
+// same peer asked again for the same fetch (fRepeat) spends from the budget
+// whoever it is, so a peer this node dialled cannot have a fetch ask it over
+// and over by ending each answer early.
+static bool HistoryAskAllowed(PoolState& ps, CNode* pfrom, bool fRepeat = false)
 {
-    if (PeerProven(ps, pfrom))
+    bool fRoom;
+    CRITICAL_BLOCK(cs_p2pool)
+        fRoom = RegAskRoomLocked(ps, pfrom);
+    if (!fRoom)
+        return false;
+    if (!fRepeat && PeerProven(ps, pfrom))
         return true;
     bool f;
     CRITICAL_BLOCK(cs_p2pool)
@@ -2391,7 +2427,10 @@ static void PushSync(PoolState& ps, CNode* pnode)
     {
         uint256 hashResume;
         CRITICAL_BLOCK(cs_p2pool)
+        {
             hashResume = RegResumeLocked(ps);
+            RegNoteAskLocked(pnode, id);
+        }
         PushReg(pnode, "p2xsync", id, hashResume);
     }
 }
@@ -2586,8 +2625,9 @@ static void StartRegServe(PoolState& ps, CNode* pfrom)
             map<uint256, size_t> mapAt;
             for (size_t i = 0; i < r.vIds.size(); i++)
                 mapAt[r.vIds[i]] = i;
+            // Walked by parent id: a copy of each share on the way, under
+            // cs_p2pool, cost up to a line of them for nothing.
             uint256 cur = hashResume;
-            Share sh;
             for (size_t n = 0; cur != 0 && n <= ps.chain->Size(); n++)
             {
                 map<uint256, size_t>::iterator itAt = mapAt.find(cur);
@@ -2598,9 +2638,10 @@ static void StartRegServe(PoolState& ps, CNode* pfrom)
                         r.i++;
                     break;
                 }
-                if (!ps.chain->GetShare(cur, sh))
+                uint256 prev;
+                if (!ps.chain->ParentOf(cur, prev))
                     break;
-                cur = sh.data.hashPrevShare;
+                cur = prev;
             }
         }
         r.nStart = GetTime();
@@ -3795,6 +3836,10 @@ struct RegPool
     bool fMined;                    // -p2pool=<id>
     bool fCarry;                    // -poolcarry=<id>
     int nStatus;                    // PoolStatus, from the registry index
+    // Whether nStatus is the index's word yet: until the index is loaded,
+    // at its tip and not reading the chain again, a pool it does not name
+    // keeps what it has here (a restart's partial file among it).
+    bool fStatusKnown;
     int nFetch;
     // The fetch: the peer asked (held by mapRegConn while it is there), when
     // the ask in flight went (0: none), when its last part came, when the
@@ -3808,6 +3853,13 @@ struct RegPool
     uint256 hashResume;
     // When the fetch last took a share: a partial file this old goes.
     int64 nLastNewShare;
+    // The partial file's length up to its last whole part, where the next
+    // part is written (a part cut short by a stop or a failed write is
+    // written over); and whether it reached the pool's byte cap, after which
+    // the fetch goes on in memory only.
+    uint64 nPartBytes;
+    bool fPartFull;
+    uint64 nPartCapForTest;         // self-tests: a smaller cap (0: none)
     // Since when the pool is active and wanted here (0: it is not).
     int64 nWantedSince;
     int64 nWhoAt;                   // when peers were last asked poolwho for it
@@ -3815,9 +3867,9 @@ struct RegPool
     RegPool(const uint256& idIn, const poolreg::PoolRecord& recIn, const vector<unsigned char>& recordIn,
             ShareChain* chainIn, const string& strFileIn, const string& strPartIn)
         : id(idIn), rec(recIn), record(recordIn), state(&classReg, chainIn, strFileIn), strPart(strPartIn),
-          fMined(false), fCarry(false), nStatus(POOL_UNKNOWN), nFetch(FETCH_IDLE), pFetchPeer(NULL),
-          nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
-          nWantedSince(0), nWhoAt(0) {}
+          fMined(false), fCarry(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
+          pFetchPeer(NULL), nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
+          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0) {}
 };
 
 // What this node keeps for a connection to a peer that reads the registry.
@@ -3839,8 +3891,13 @@ struct RegConn
     int nWho;
     map<uint256, int64> mapWhoAsked;    // poolwho this node sent it, by pool
     map<uint256, int64> mapNoneAt;      // pools it said it holds nothing of
+    // The p2xsync this node sent it: since when and how many, in all and by
+    // pool, so no ask goes past what it answers (RegAskRoomLocked).
+    int64 nAskedSince;
+    int nAsked;
+    map<uint256, std::pair<int64, int> > mapAskedPool;
     RegConn() : fInvPending(false), nInvAppliedAt(0), nInvSentAt(0), nNoneSince(0), nNone(0),
-                nWhoSince(0), nWho(0) {}
+                nWhoSince(0), nWho(0), nAskedSince(0), nAsked(0) {}
 };
 
 static const size_t MAX_POOL_INV = 32;
@@ -3861,6 +3918,20 @@ static const int64 REG_PART_EXPIRY = 24 * 60 * 60;
 // pool's start, and it has shares a spacing or two later. Each ask costs it
 // a p2xnone, 8 an interval at most.
 static const int64 REG_NONE_FORGET = 60;
+// An ask whose first part has not come this long after it: the fetch asks
+// another announcer, and this one is left alone as if it had said p2xnone.
+// Its answer is still taken if it comes within the receiving window
+// (REG_SYNC_ANSWER_WINDOW); a server whose slots are all taken holds an ask
+// that long, which a fetch with another announcer need not wait out.
+static const int64 REG_FIRST_PART_WAIT = 3 * 60;
+// What a server answers one connection (section 8): 3 p2xsync a pool an
+// interval, and 8 p2xnone an interval for pools it does not announce or
+// holds nothing of. This node asks no more often, counted over an interval
+// a little longer than the server's, so the server's own count, which
+// starts when the first ask arrives, has always started over too.
+static const int REG_ASKS_PER_POOL = 3;
+static const int REG_ASKS_PER_CONN = 8;
+static const int64 REG_ASK_INTERVAL = SYNC_SERVE_INTERVAL + 30;
 static const int64 REG_RETRY_SECS = 30;
 static const int64 REG_STATUS_SECS = 10;
 static const int64 POOLWHO_INTERVAL = 10 * 60;
@@ -3919,10 +3990,29 @@ static bool RegWanted(const RegPool& rp)
     return rp.fMined || rp.fCarry;
 }
 
-// Wanted and active: a fetch runs, answers to it are taken.
+// Registered pools on the network and in mining at all: testnet, and mainnet
+// once a release opens them there (POOL_REGISTRY_MAINNET_OPEN, section 9).
+// Until then anybody could burn a record on mainnet and the index would mark
+// it active, so this is the one gate every use below passes: a pool is never
+// live on a closed network, whatever its status, so nothing of it is fetched,
+// mined, carried, announced, relayed or served. Pool zero and local pools
+// are not registered pools, and never pass here.
+static bool RegOpen()
+{
+    return PoolBurnsOpen();
+}
+
+// Its record active on this node's chain, on a network where registered
+// pools are open.
+static bool RegLive(const RegPool& rp)
+{
+    return RegOpen() && rp.nStatus == POOL_ACTIVE;
+}
+
+// Wanted and live: a fetch runs, answers to it are taken.
 static bool RegActive(const RegPool& rp)
 {
-    return RegWanted(rp) && rp.nStatus == POOL_ACTIVE;
+    return RegWanted(rp) && RegLive(rp);
 }
 
 // Carried: its shares taken, relayed and served, its line mined on.
@@ -3989,6 +4079,50 @@ static RegConn& RegConnOf(CNode* pnode)
         return it->second;
     pnode->AddRef();
     return mapRegConn.insert(make_pair(pnode, RegConn())).first->second;
+}
+
+// Under cs_p2pool. The asks a connection was sent within the interval: in
+// all (nAllOut) and for one pool (nPoolOut); counts of an interval that has
+// run out are not counted.
+static void RegAskedLocked(const RegConn& c, const uint256& id, int64 nNow, int& nAllOut, int& nPoolOut)
+{
+    nAllOut = nNow - c.nAskedSince < REG_ASK_INTERVAL ? c.nAsked : 0;
+    nPoolOut = 0;
+    map<uint256, std::pair<int64, int> >::const_iterator it = c.mapAskedPool.find(id);
+    if (it != c.mapAskedPool.end() && nNow - it->second.first < REG_ASK_INTERVAL)
+        nPoolOut = it->second.second;
+}
+
+static bool RegAskRoomLocked(PoolState& ps, CNode* pnode)
+{
+    RegPool* rp = RegOf(ps);
+    if (!rp)
+        return true;
+    map<CNode*, RegConn>::const_iterator it = mapRegConn.find(pnode);
+    if (it == mapRegConn.end())
+        return true;
+    int nAll, nPool;
+    RegAskedLocked(it->second, rp->id, GetTime(), nAll, nPool);
+    return nAll < REG_ASKS_PER_CONN && nPool < REG_ASKS_PER_POOL;
+}
+
+static void RegNoteAskLocked(CNode* pnode, const uint256& id)
+{
+    int64 nNow = GetTime();
+    RegConn& c = RegConnOf(pnode);
+    if (nNow - c.nAskedSince >= REG_ASK_INTERVAL)
+    {
+        c.nAskedSince = nNow;
+        c.nAsked = 0;
+    }
+    c.nAsked++;
+    std::pair<int64, int>& p = c.mapAskedPool[id];
+    if (nNow - p.first >= REG_ASK_INTERVAL)
+    {
+        p.first = nNow;
+        p.second = 0;
+    }
+    p.second++;
 }
 
 // Under cs_p2pool, on the message thread: what a connection has done in a
@@ -4065,29 +4199,66 @@ static RegPool* RegNew(const uint256& id, const vector<unsigned char>& record, s
 
 typedef vector<std::pair<int, vector<ShareX> > > RegChunks;
 
+// A partial file holds at most the pool's byte cap (section 11): what a fetch
+// writes stops there, and what is read back stops there too.
+static const uint64 REG_PART_MAX_BYTES = MAX_CHAIN_BYTES;
+
+// A file cut back to n bytes, never through a link left in its place.
+static bool RegTruncate(const string& strPath, uint64 n)
+{
+#ifdef WIN32
+    int fd = _open(strPath.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0)
+        return false;
+    bool f = _chsize_s(fd, (__int64)n) == 0;
+    _close(fd);
+#else
+    int fd = open(strPath.c_str(), O_WRONLY | O_NOFOLLOW);
+    if (fd < 0)
+        return false;
+    bool f = ftruncate(fd, (off_t)n) == 0;
+    close(fd);
+#endif
+    return f;
+}
+
 // A registered pool's file read back: pools/<id>.dat (one part: the line as
 // History() gave it) or pools/<id>.part (the parts of a fetch, each with the
-// tip height it came with; a part cut short by a stop is left out). False
-// for a file of another format.
-static bool RegReadFile(const string& strPath, vector<unsigned char>& recordOut, RegChunks& vOut, bool fPart)
+// tip height it came with). False for a file of another format.
+// A partial file is read up to its last whole part, and no further than
+// REG_PART_MAX_BYTES; whatever follows (a part cut short by a stop) is cut
+// off the file, so the next part is written where the last whole one ends
+// and is read back after it (*pnGoodOut, the length kept). One whose start
+// is not readable goes.
+static bool RegReadFile(const string& strPath, vector<unsigned char>& recordOut, RegChunks& vOut, bool fPart,
+                        uint64* pnGoodOut = NULL)
 {
+    uint64 nGood = 0, nSize = 0;
+    bool fHead = false;
     try
     {
         CAutoFile file(fopen(strPath.c_str(), "rb"));
         if (!file)
             return false;
+        fseek(file, 0, SEEK_END);
+        nSize = (uint64)std::max(0L, ftell(file));
+        fseek(file, 0, SEEK_SET);
         unsigned char nFormat = 0;
         file >> nFormat;
         if (nFormat != REG_SHARES_FORMAT)
         {
             printf("p2pool: %s is in format %u, this build reads format %u only; not read\n",
                    strPath.c_str(), (unsigned)nFormat, (unsigned)REG_SHARES_FORMAT);
-            return false;
+            if (!fPart)
+                return false;
         }
-        file >> recordOut;
-        if (recordOut.size() > poolreg::MAX_RECORD_BYTES)
-            return false;
-        do
+        else
+        {
+            file >> recordOut;
+            fHead = recordOut.size() <= poolreg::MAX_RECORD_BYTES;
+            nGood = (uint64)std::max(0L, ftell(file));
+        }
+        while (fHead)
         {
             int nTip = 0;
             vector<ShareX> v;
@@ -4099,14 +4270,42 @@ static bool RegReadFile(const string& strPath, vector<unsigned char>& recordOut,
             {
                 break;
             }
+            uint64 nAt = (uint64)std::max(0L, ftell(file));
+            if (fPart && nAt > REG_PART_MAX_BYTES)
+                break;
             vOut.push_back(std::make_pair(nTip, v));
-        } while (fPart);
+            nGood = nAt;
+            if (!fPart)
+                break;
+        }
     }
     catch (std::exception& e)
     {
         printf("p2pool: %s unreadable (%s)\n", strPath.c_str(), e.what());
+    }
+    if (!fHead)
+    {
+        // A partial file nothing can be appended to (its start cut short, or
+        // of another format) would keep every later part unread: it goes.
+        if (fPart)
+            remove(strPath.c_str());
         return false;
     }
+    // A line file whose line is not readable is no line.
+    if (!fPart && vOut.empty())
+        return false;
+    if (fPart && nSize > nGood)
+    {
+        printf("p2pool: %s: %u bytes after its last whole part cut off\n", strPath.c_str(), (unsigned)(nSize - nGood));
+        if (!RegTruncate(strPath, nGood))
+        {
+            // Not cut back: nothing more may be appended after it.
+            remove(strPath.c_str());
+            return false;
+        }
+    }
+    if (pnGoodOut)
+        *pnGoodOut = nGood;
     return true;
 }
 
@@ -4141,6 +4340,8 @@ static void RegLoadChunks(RegPool* rp, const RegChunks& v, bool fPart)
 // line from pools/<id>.dat, a fetch in progress from pools/<id>.part.
 static void RegPoolsInit()
 {
+    if (!RegOpen())
+        return;
     vector<uint256> vWant;
     if (idMinedReg != 0)
         vWant.push_back(idMinedReg);
@@ -4154,11 +4355,12 @@ static void RegPoolsInit()
         RegChunks v;
         bool fDat = RegReadFile(strBase + ".dat", record, v, false);
         bool fPart = false;
+        uint64 nPartBytes = 0;
         if (!fDat)
         {
             record.clear();
             v.clear();
-            fPart = RegReadFile(strBase + ".part", record, v, true);
+            fPart = RegReadFile(strBase + ".part", record, v, true, &nPartBytes);
         }
         if (!fDat && !fPart)
             continue;
@@ -4179,6 +4381,7 @@ static void RegPoolsInit()
         {
             rp->nFetch = FETCH_RUNNING;
             rp->nLastNewShare = GetTime();
+            rp->nPartBytes = nPartBytes;
         }
         printf("p2pool: registered pool %s: %u shares read from its %s, tip at height %d\n", id.GetHex().c_str(),
                (unsigned)rp->state.chain->Size(), fDat ? "file" : "partial file (a fetch in progress)",
@@ -4186,34 +4389,60 @@ static void RegPoolsInit()
     }
 }
 
-// Not under cs_p2pool: a part of a fetch, appended to pools/<id>.part and
-// flushed before the next is asked for.
-static void RegAppendPart(const string& strPart, const vector<unsigned char>& record, int nTipHeight,
-                          const vector<Share>& part)
+// The outcome of writing a part to a partial file.
+enum
 {
-    if (strPart.empty())
-        return;
+    REG_PART_WRITTEN = 0,
+    REG_PART_FULL,      // it would pass REG_PART_MAX_BYTES (or the pool's cap): not written
+    REG_PART_FAILED,    // not written; the file is as long as it was
+};
+
+// Not under cs_p2pool, on the message thread: the shares a part of a fetch
+// brought, written to pools/<id>.part at nAt (the end of its last whole
+// part; 0 for a new file, which gets the format and the record first) and
+// flushed before the next part is asked for. Only shares the chain took, as
+// it keeps them, so the file grows only with the line, and never past nCap.
+// *pnSizeOut: the file's length after it.
+static int RegAppendPart(const string& strPart, const vector<unsigned char>& record, int nTipHeight,
+                         const vector<Share>& vNew, uint64 nAt, uint64 nCap, uint64* pnSizeOut)
+{
+    *pnSizeOut = nAt;
+    if (strPart.empty() || vNew.empty())
+        return REG_PART_WRITTEN;
+    CDataStream ss(SER_DISK, VERSION);
+    if (nAt == 0)
+        ss << REG_SHARES_FORMAT << record;
+    vector<ShareX> vx(vNew.begin(), vNew.end());
+    ss << nTipHeight << vx;
+    if (nAt + ss.size() > std::min(nCap, REG_PART_MAX_BYTES))
+        return REG_PART_FULL;
     _mkdir(RegDir().c_str());
 #ifdef WIN32
     // The data directory's ACL already keeps other accounts out.
-    FILE* f = fopen(strPart.c_str(), "ab");
+    FILE* f = fopen(strPart.c_str(), nAt == 0 ? "wb" : "r+b");
 #else
     // Owner-only, and never through a link someone left in its place.
-    int fd = open(strPart.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, S_IRUSR | S_IWUSR);
-    FILE* f = fd < 0 ? NULL : fdopen(fd, "ab");
+    int fd = open(strPart.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+    FILE* f = fd < 0 ? NULL : fdopen(fd, "r+b");
     if (fd >= 0 && !f)
         close(fd);
 #endif
     if (!f)
-        return;
-    fseek(f, 0, SEEK_END);
-    bool fNew = ftell(f) == 0;
-    CAutoFile file(f);
-    if (fNew)
-        file << REG_SHARES_FORMAT << record;
-    vector<ShareX> vx(part.begin(), part.end());
-    file << nTipHeight << vx;
-    fflush(f);
+        return REG_PART_FAILED;
+    // Written where the last whole part ends: a part a failed write left
+    // half there is written over, and the file never ends in one.
+    bool fOk = fseek(f, (long)nAt, SEEK_SET) == 0 && fwrite(&ss[0], 1, ss.size(), f) == ss.size() && fflush(f) == 0;
+    fclose(f);
+    if (!fOk)
+    {
+        RegTruncate(strPart, nAt);
+        return REG_PART_FAILED;
+    }
+    // Whatever an older write left past it goes (and if it cannot, the next
+    // start cuts it off: RegReadFile).
+    RegTruncate(strPart, nAt + ss.size());
+    *pnSizeOut = nAt + ss.size();
+    return REG_PART_WRITTEN;
 }
 
 // Under cs_p2pool: a fetch in progress is given up (the pool is no longer
@@ -4233,6 +4462,8 @@ static void RegDropFetch(RegPool* rp)
     rp->nAskAt = rp->nLastPartAt = rp->nCatchupAt = rp->nRetryAt = 0;
     rp->hashResume = 0;
     rp->nLastNewShare = 0;
+    rp->nPartBytes = 0;
+    rp->fPartFull = false;
 }
 
 // Not under cs_p2pool: the line is complete. It goes to pools/<id>.dat, the
@@ -4254,11 +4485,21 @@ static void RegComplete(RegPool* rp)
         nTip = rp->state.chain->Height(rp->state.chain->Tip());
         NoteChainGrew(rp->state);
     }
-    MaybeSaveShares(rp->state, true);
-    if (!strPart.empty())
+    // The partial file goes only once the line is in its .dat: a .dat that
+    // could not be written leaves the fetch to resume from it at the next
+    // start (and the next save tries the .dat again).
+    bool fSaved = MaybeSaveShares(rp->state, true);
+    if (fSaved && !strPart.empty())
         remove(strPart.c_str());
-    printf("p2pool: registered pool %s: its line is complete here (%u shares, tip at height %d)\n",
-           rp->id.GetHex().c_str(), (unsigned)nShares, nTip);
+    CRITICAL_BLOCK(cs_p2pool)
+        if (fSaved)
+        {
+            rp->nPartBytes = 0;
+            rp->fPartFull = false;
+        }
+    printf("p2pool: registered pool %s: its line is complete here (%u shares, tip at height %d)%s\n",
+           rp->id.GetHex().c_str(), (unsigned)nShares, nTip,
+           fSaved ? "" : "; its file could not be written, its partial file is kept");
 }
 
 static bool RegPartInWindow(PoolState& ps, CNode* pfrom)
@@ -4279,69 +4520,115 @@ static bool RegPartInWindow(PoolState& ps, CNode* pfrom)
     return f;
 }
 
-// After a part of a registered pool's history was read (OnShares). Only the
-// peer the fetch asked moves the fetch on; any other answer was asked for by
-// a complete pool (its line brought up to date) and is simply taken.
-static void RegOnPart(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<Share>& part, int nFlag, bool fOk,
-                      bool fWhole)
+// After a part of a registered pool's history was read (OnShares). The
+// shares it brought that the chain did not have (vNew, the chain's own
+// copies) go to the partial file whoever sent them; only the peer the fetch
+// asked moves the fetch on. Any other answer was asked for by a complete
+// pool (its line brought up to date), or by the fetch of an announcer it
+// has since moved on from, and is simply taken.
+static void RegOnPart(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<Share>& part,
+                      const vector<Share>& vNew, int nFlag, bool fOk, bool fWhole)
 {
     RegPool* rp = NULL;
     string strPart;
     vector<unsigned char> record;
+    uint64 nAt = 0, nCap = 0;
     bool fAppend = false, fCatchup = false, fComplete = false;
     CRITICAL_BLOCK(cs_p2pool)
     {
         rp = RegOf(ps);
-        if (!rp || rp->pFetchPeer != pfrom || (rp->nFetch != FETCH_RUNNING && rp->nFetch != FETCH_CATCHUP))
+        if (!rp || (rp->nFetch != FETCH_RUNNING && rp->nFetch != FETCH_CATCHUP))
             return;
         int64 nNow = GetTime();
-        rp->nLastPartAt = nNow;
-        if (!fOk)
+        // Only new shares keep a partial file alive (REG_PART_EXPIRY), and
+        // only they are written: shares sent again, whatever their bytes,
+        // cost the file nothing.
+        if (!vNew.empty())
         {
-            // Scored already; another announcer is asked.
-            RegConnOf(pfrom).mapNoneAt[rp->id] = nNow;
-            rp->nAskAt = 0;
-            rp->nRetryAt = nNow;
-            return;
-        }
-        if (fWhole && !part.empty() && rp->nFetch == FETCH_RUNNING)
-        {
-            fAppend = true;
-            strPart = rp->strPart;
-            record = rp->record;
-            rp->hashResume = part.back().GetId();
             rp->nLastNewShare = nNow;
+            if (!rp->fPartFull && !rp->strPart.empty())
+            {
+                fAppend = true;
+                strPart = rp->strPart;
+                record = rp->record;
+                nAt = rp->nPartBytes;
+                nCap = rp->nPartCapForTest ? rp->nPartCapForTest : (uint64)rp->state.chain->MaxBytes();
+            }
         }
-        if (nFlag == PART_END && fWhole)
+        if (rp->pFetchPeer == pfrom)
         {
-            if (rp->nFetch == FETCH_RUNNING)
-                fCatchup = true;
+            rp->nLastPartAt = nNow;
+            if (!fOk)
+            {
+                // Scored already; another announcer is asked.
+                RegConnOf(pfrom).mapNoneAt[rp->id] = nNow;
+                rp->nAskAt = 0;
+                rp->nRetryAt = nNow;
+            }
             else
-                fComplete = true;
-        }
-        else if (nFlag != PART_MORE || !fWhole)
-        {
-            // Ended early by the server, or a share of it waits on others
-            // here: asked again shortly, from where the fetch is.
-            rp->nAskAt = 0;
-            rp->nRetryAt = nNow + REG_RETRY_SECS;
+            {
+                // Its answer is coming: no new ask while it does, even if its
+                // first part was so late that the fetch had stopped waiting.
+                if (nFlag == PART_MORE && !rp->nAskAt)
+                    rp->nAskAt = nNow;
+                if (fWhole && !part.empty() && rp->nFetch == FETCH_RUNNING)
+                    rp->hashResume = part.back().GetId();
+                if (nFlag == PART_END && fWhole)
+                {
+                    if (rp->nFetch == FETCH_RUNNING)
+                        fCatchup = true;
+                    else
+                        fComplete = true;
+                }
+                else if (nFlag != PART_MORE || !fWhole)
+                {
+                    // Ended early by the server, or a share of it waits on
+                    // others here: asked again shortly, from where the fetch
+                    // is (within what the peer answers, RegCanAsk).
+                    rp->nAskAt = 0;
+                    rp->nRetryAt = nNow + REG_RETRY_SECS;
+                }
+            }
         }
     }
     if (fAppend)
-        RegAppendPart(strPart, record, nTipHeight, part);
+    {
+        uint64 nSize = nAt;
+        int nWrote = RegAppendPart(strPart, record, nTipHeight, vNew, nAt, nCap, &nSize);
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            // Unless the fetch was given up or completed meanwhile.
+            if (rp->nFetch == FETCH_RUNNING || rp->nFetch == FETCH_CATCHUP)
+            {
+                rp->nPartBytes = nSize;
+                if (nWrote == REG_PART_FULL)
+                {
+                    rp->fPartFull = true;
+                    printf("p2pool: registered pool %s: its partial file is at the pool's byte cap; the fetch goes on "
+                           "in memory only\n", rp->id.GetHex().c_str());
+                }
+            }
+        }
+    }
     if (fCatchup)
     {
         // The snapshot is here; what was found while it was sent comes with
-        // one more ask of the same peer, from this node's tip.
+        // one more ask of the same peer, from this node's tip, if the peer
+        // answers one more now; if not, the catch-up counts as unanswered
+        // and the line is complete after its 5 minutes.
+        bool fAsk;
         CRITICAL_BLOCK(cs_p2pool)
         {
+            fAsk = RegAskRoomLocked(ps, pfrom);
             rp->nFetch = FETCH_CATCHUP;
-            rp->nCatchupAt = rp->nAskAt = GetTime();
+            rp->nCatchupAt = GetTime();
+            rp->nAskAt = fAsk ? rp->nCatchupAt : 0;
             rp->nLastPartAt = 0;
         }
-        LogPrint("p2pool", "p2pool: registered pool %s: history taken; asking for what came meanwhile\n",
-                 rp->id.GetHex().c_str());
-        AskHistory(ps, pfrom);
+        LogPrint("p2pool", "p2pool: registered pool %s: history taken; %s\n", rp->id.GetHex().c_str(),
+                 fAsk ? "asking for what came meanwhile" : "that peer is asked nothing more this interval");
+        if (fAsk)
+            AskHistory(ps, pfrom);
     }
     if (fComplete)
         RegComplete(rp);
@@ -4359,11 +4646,16 @@ static vector<uint256> RegAnnouncedIdsLocked()
 }
 
 // Under cs_p2pool. Whether a connection may be asked for a pool's line:
-// it reads the registry, it announced the pool, and it has not said lately
-// that it holds nothing of it.
+// it reads the registry, it announced the pool, it has not said lately that
+// it holds nothing of it (nor left an ask unanswered lately), and one more
+// ask stays within what it answers (REG_ASKS_PER_POOL, REG_ASKS_PER_CONN).
 static bool RegCanAsk(const RegPool& rp, CNode* pnode, const RegConn& c, int64 nNow)
 {
     if (pnode->fDisconnect || pnode->nVersion == 0 || !(pnode->nServices & NODE_POOLREG) || !c.setInv.count(rp.id))
+        return false;
+    int nAll, nPool;
+    RegAskedLocked(c, rp.id, nNow, nAll, nPool);
+    if (nAll >= REG_ASKS_PER_CONN || nPool >= REG_ASKS_PER_POOL)
         return false;
     map<uint256, int64>::const_iterator it = c.mapNoneAt.find(rp.id);
     return it == c.mapNoneAt.end() || nNow - it->second >= REG_NONE_FORGET;
@@ -4407,15 +4699,45 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
     // gets (section 17).
     if (rp->nFetch == FETCH_CATCHUP && rp->nLastPartAt == 0 && nNow - rp->nCatchupAt >= REG_CATCHUP_WAIT)
         return true;
+    // A mined pool nothing of which has come yet starts its line on this
+    // node after a grace, unless a peer announces it (it mines it and has no
+    // share yet: its line is a spacing or two away), and in any case
+    // REG_START_LONGEST after it became active here, whatever was asked
+    // meanwhile: an announcer that never answers holds nothing up. An answer
+    // that comes later is still taken, and the line with more work wins.
+    bool fAnnounced = false;
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && !fAnnounced; ++it)
+        fAnnounced = !it->first->fDisconnect && it->second.setInv.count(rp->id) != 0;
+    if (rp->fMined && rp->nFetch != FETCH_CATCHUP && rp->state.chain->Size() == 0 && rp->hashResume == 0 &&
+        ((!fAnnounced && nNow - rp->nWantedSince >= REG_START_GRACE) || nNow - rp->nWantedSince >= REG_START_LONGEST))
+    {
+        printf("p2pool: registered pool %s: no peer has given its line; it starts here\n", rp->id.GetHex().c_str());
+        return true;
+    }
     if (rp->nAskAt)
     {
         bool fOpen = false;
-        if (rp->pFetchPeer && !rp->pFetchPeer->fDisconnect)
+        CNode* pPeer = rp->pFetchPeer;
+        if (pPeer && !pPeer->fDisconnect)
         {
-            map<CNode*, PeerPool>::iterator it = rp->state.mapPeer.find(rp->pFetchPeer);
-            fOpen = it != rp->state.mapPeer.end() && it->second.nSyncAskedAt != 0 &&
-                    nNow - it->second.nSyncAskedAt <= REG_SYNC_ANSWER_WINDOW &&
-                    (rp->nLastPartAt == 0 || nNow - rp->nLastPartAt <= REG_PART_WAIT);
+            map<CNode*, PeerPool>::iterator it = rp->state.mapPeer.find(pPeer);
+            if (it != rp->state.mapPeer.end() && it->second.nSyncAskedAt != 0 &&
+                nNow - it->second.nSyncAskedAt <= REG_SYNC_ANSWER_WINDOW)
+            {
+                if (rp->nLastPartAt == 0 && nNow - rp->nAskAt > REG_FIRST_PART_WAIT)
+                {
+                    // Nothing yet: left alone a while, as if it had said
+                    // p2xnone, and another announcer is asked. What it sends
+                    // within its window is still taken.
+                    map<CNode*, RegConn>::iterator itC = mapRegConn.find(pPeer);
+                    if (itC != mapRegConn.end())
+                        itC->second.mapNoneAt[rp->id] = nNow;
+                    LogPrint("p2pool", "p2pool: registered pool %s: no answer in %d s; asking another announcer\n",
+                             rp->id.GetHex().c_str(), (int)REG_FIRST_PART_WAIT);
+                }
+                else
+                    fOpen = rp->nLastPartAt == 0 || nNow - rp->nLastPartAt <= REG_PART_WAIT;
+            }
         }
         if (fOpen)
             return false;
@@ -4443,7 +4765,9 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
     }
     if (pAsk)
     {
-        if (!HistoryAskAllowed(rp->state, pAsk))
+        // The same peer again for this fetch spends from the ask budget
+        // whoever it is (HistoryAskAllowed).
+        if (!HistoryAskAllowed(rp->state, pAsk, pAsk == rp->pFetchPeer))
             return false;
         RegPeerOf(*rp, pAsk);
         rp->pFetchPeer = pAsk;
@@ -4460,19 +4784,7 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
         AskHistory(rp->state, pAsk);
         return false;
     }
-    // Nobody to ask. A mined pool with nothing of it here starts its line on
-    // this node after a grace, unless a peer announces it (it mines it and
-    // has no share yet: its line is a spacing or two away), and in any case
-    // after REG_START_LONGEST; and peers are asked who carries it.
-    bool fAnnounced = false;
-    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && !fAnnounced; ++it)
-        fAnnounced = !it->first->fDisconnect && it->second.setInv.count(rp->id) != 0;
-    if (rp->fMined && rp->nFetch == FETCH_IDLE && rp->state.chain->Empty() &&
-        ((!fAnnounced && nNow - rp->nWantedSince >= REG_START_GRACE) || nNow - rp->nWantedSince >= REG_START_LONGEST))
-    {
-        printf("p2pool: registered pool %s: no peer has its line; it starts here\n", rp->id.GetHex().c_str());
-        return true;
-    }
+    // Nobody to ask: peers are asked who carries it.
     if (nNow - rp->nWhoAt >= POOLWHO_INTERVAL)
     {
         rp->nWhoAt = nNow;
@@ -4492,6 +4804,52 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
 
 // Not under cs_p2pool: what the index says of each wanted pool. A pool it
 // names that this node has no file of joins from the record it reports.
+// Self-tests: the registry index as RegRefreshStatus sees it, instead of the
+// node's (fRegIndexForTest): whether it is ready, and the pools it names.
+static bool fRegIndexForTest = false;
+static bool fRegIndexReadyForTest = false;
+static map<uint256, CPoolInfo> mapRegIndexForTest;
+
+// Not under cs_p2pool or cs_main. Whether the index's word on a pool is
+// final: it has been loaded or read from the chain, it is at the active
+// chain's tip, and it is not reading the chain again from genesis. Before
+// that (at every start, the index loads after the node does) a pool it does
+// not name may simply not be read yet. cs_main only if free: busy, the
+// answer is "not yet", and the next look comes 10 s later.
+static bool RegIndexReady()
+{
+    if (fRegIndexForTest)
+        return fRegIndexReadyForTest;
+    int nHeight = -1;
+    uint256 hash = 0;
+    bool fRebuilding = false;
+    PoolIndex().State(nHeight, hash, fRebuilding);
+    if (nHeight < 0 || fRebuilding)
+        return false;
+    bool fSynced = false;
+    TRY_CRITICAL_BLOCK(cs_main)
+        fSynced = pindexBest && pindexBest->GetBlockHash() == hash;
+    return fSynced;
+}
+
+static bool RegIndexLookup(const uint256& id, CPoolInfo& out)
+{
+    if (!fRegIndexForTest)
+        return PoolIndexLookup(id, out);
+    map<uint256, CPoolInfo>::const_iterator it = mapRegIndexForTest.find(id);
+    if (it == mapRegIndexForTest.end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+// Not under cs_p2pool: what the index says of each wanted pool. A pool it
+// names that this node has no file of joins from the record it reports.
+// "Active" is taken whenever the index says it (it read that far); a pool
+// it calls pending or does not name is taken as such only once the index is
+// ready (RegIndexReady). Until then the pool keeps what it had: at a start
+// that is "not known yet", which carries nothing and drops nothing, so the
+// partial file read back at start is still there when the index has loaded.
 static void RegRefreshStatus()
 {
     vector<uint256> vWant;
@@ -4503,10 +4861,13 @@ static void RegRefreshStatus()
             vWant.push_back(idMinedReg);
         vWant.insert(vWant.end(), vCarryReg.begin(), vCarryReg.end());
     }
+    if (vWant.empty())
+        return;
+    bool fReady = RegIndexReady();
     vector<CPoolInfo> vInfo(vWant.size());
     vector<bool> vKnown(vWant.size(), false);
     for (size_t i = 0; i < vWant.size(); i++)
-        vKnown[i] = PoolIndexLookup(vWant[i], vInfo[i]);
+        vKnown[i] = RegIndexLookup(vWant[i], vInfo[i]);
     CRITICAL_BLOCK(cs_p2pool)
         for (size_t i = 0; i < vWant.size(); i++)
         {
@@ -4521,10 +4882,13 @@ static void RegRefreshStatus()
             if (!rp)
                 continue;
             int nStatus = vKnown[i] ? vInfo[i].nStatus : POOL_UNKNOWN;
-            if (nStatus != rp->nStatus)
+            if (nStatus != POOL_ACTIVE && !fReady)
+                continue;
+            if (nStatus != rp->nStatus || !rp->fStatusKnown)
                 printf("p2pool: registered pool %s is %s on this node's chain\n", rp->id.GetHex().c_str(),
                        nStatus == POOL_ACTIVE ? "active" : nStatus == POOL_PENDING ? "pending" : "not recorded");
             rp->nStatus = nStatus;
+            rp->fStatusKnown = true;
         }
 }
 
@@ -4552,7 +4916,7 @@ static void RegTick()
         foreach(CNode* pnode, vGone)
             RegForgetNode(pnode);
     }
-    if (nNow - nLastStatus >= REG_STATUS_SECS)
+    if (nNow - nLastStatus >= REG_STATUS_SECS || fRegTickForce)
     {
         nLastStatus = nNow;
         RegRefreshStatus();
@@ -4564,16 +4928,17 @@ static void RegTick()
         {
             if (!RegWanted(*rp))
                 continue;
-            if (rp->nStatus != POOL_ACTIVE)
+            if (!RegLive(*rp))
             {
                 // Not carried, not mined, not announced; a complete line
                 // stays on disk in case the record comes back, a fetch in
-                // progress goes.
+                // progress goes once the index says the pool is not active
+                // (not while it has not said yet: RegRefreshStatus).
                 if (rp->nWantedSince)
                     printf("p2pool: registered pool %s is not active on this node's chain: not carried\n",
                            rp->id.GetHex().c_str());
                 rp->nWantedSince = 0;
-                if (rp->nFetch == FETCH_RUNNING || rp->nFetch == FETCH_CATCHUP)
+                if ((rp->nFetch == FETCH_RUNNING || rp->nFetch == FETCH_CATCHUP) && (rp->fStatusKnown || !RegOpen()))
                     RegDropFetch(rp);
                 continue;
             }
@@ -4616,7 +4981,7 @@ static void RegTick()
 
 static void RegOnVersion(CNode* pfrom)
 {
-    if (!(pfrom->nServices & NODE_POOLREG) || pfrom->nVersion == 0)
+    if (!(pfrom->nServices & NODE_POOLREG) || pfrom->nVersion == 0 || !RegOpen())
         return;
     CRITICAL_BLOCK(cs_p2pool)
     {
@@ -4728,8 +5093,10 @@ static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStrea
     if (strCommand != "poolinv" && strCommand != "poolwho" && strCommand != "poolat" && strCommand != "p2xshare" &&
         strCommand != "p2xgetsh" && strCommand != "p2xsync" && strCommand != "p2xshares" && strCommand != "p2xnone")
         return false;
-    // Only between peers that read the registry.
-    if (!(pfrom->nServices & NODE_POOLREG))
+    // Only between peers that read the registry, and only where registered
+    // pools are open (RegOpen): elsewhere every one is dropped unread, and
+    // nobody is scored, answered or told who carries what.
+    if (!(pfrom->nServices & NODE_POOLREG) || !RegOpen())
         return true;
     int64 nNow = GetTime();
 
@@ -4947,6 +5314,9 @@ static void RegResetForTest(bool fCheckPoW)
     fRegFiles = true;
     fRegStatusForTest = false;
     fRegTickForce = false;
+    fRegIndexForTest = false;
+    fRegIndexReadyForTest = false;
+    mapRegIndexForTest.clear();
     foreach(RegPool* rp, vRegPools)
     {
         delete rp->state.chain;
@@ -4963,6 +5333,11 @@ bool P2PoolRegWant(const uint256& id, bool fMine, string& errOut)
     if (id == 0 || id == RegZeroId())
     {
         errOut = "pool zero is always carried, and -p2pool alone mines it";
+        return false;
+    }
+    if (!RegOpen())
+    {
+        errOut = P2POOL_REG_CLOSED;
         return false;
     }
     CRITICAL_BLOCK(cs_p2pool)
@@ -5012,7 +5387,12 @@ bool P2PoolMinedReady(string& whyOut)
         if (idMinedReg == 0)
             return true;
         RegPool* rp = RegById(idMinedReg);
-        if (!rp)
+        if (!RegOpen())
+        {
+            whyOut = P2POOL_REG_CLOSED;
+            f = false;
+        }
+        else if (!rp)
         {
             whyOut = "the pool this node mines is not recorded on the chain this node follows, "
                      "or the registry index has not read that far yet";
@@ -5085,6 +5465,7 @@ bool P2PoolRegAddForTest(const poolreg::PoolRecord& rec, bool fMine, bool fCarry
         if (!rp)
             return false;
         rp->nStatus = POOL_ACTIVE;
+        rp->fStatusKnown = true;
     }
     return true;
 }
@@ -5095,7 +5476,52 @@ void P2PoolRegSetStatusForTest(const uint256& id, int nStatus)
     {
         RegPool* rp = RegById(id);
         if (rp)
+        {
             rp->nStatus = nStatus;
+            rp->fStatusKnown = true;
+        }
+    }
+}
+
+void P2PoolRegIndexForTest(bool fReady, const vector<std::pair<uint256, int> >& vStatus)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fRegStatusForTest = false;
+        fRegIndexForTest = true;
+        fRegIndexReadyForTest = fReady;
+        mapRegIndexForTest.clear();
+        for (size_t i = 0; i < vStatus.size(); i++)
+        {
+            CPoolInfo& info = mapRegIndexForTest[vStatus[i].first];
+            info.id = vStatus[i].first;
+            info.nStatus = vStatus[i].second;
+            RegPool* rp = RegById(vStatus[i].first);
+            if (rp)
+            {
+                info.record = rp->record;
+                info.rec = rp->rec;
+            }
+        }
+    }
+}
+
+void P2PoolRegUseNodeIndexForTest()
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fRegStatusForTest = false;
+        fRegIndexForTest = false;
+    }
+}
+
+void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        RegPool* rp = RegById(id);
+        if (rp)
+            rp->nPartCapForTest = n;
     }
 }
 
@@ -5147,6 +5573,9 @@ void P2PoolRegAgeForTest(int64 nSecs)
             if (c.nInvSentAt) c.nInvSentAt -= nSecs;
             if (c.nNoneSince) c.nNoneSince -= nSecs;
             if (c.nWhoSince) c.nWhoSince -= nSecs;
+            if (c.nAskedSince) c.nAskedSince -= nSecs;
+            for (map<uint256, std::pair<int64, int> >::iterator itA = c.mapAskedPool.begin(); itA != c.mapAskedPool.end(); ++itA)
+                itA->second.first -= nSecs;
             for (map<uint256, int64>::iterator itW = c.mapWhoAsked.begin(); itW != c.mapWhoAsked.end(); ++itW)
                 itW->second -= nSecs;
             for (map<uint256, int64>::iterator itN = c.mapNoneAt.begin(); itN != c.mapNoneAt.end(); ++itN)
@@ -5167,7 +5596,7 @@ void P2PoolRegAgeServeStartsForTest(int64 nSecs)
             r.nStart -= nSecs;
 }
 
-bool P2PoolRegReloadForTest(const uint256& id)
+bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive)
 {
     bool fWanted = false;
     CRITICAL_BLOCK(cs_main)
@@ -5194,7 +5623,13 @@ bool P2PoolRegReloadForTest(const uint256& id)
             RegPool* rp = RegById(id);
             if (rp)
             {
-                rp->nStatus = POOL_ACTIVE;
+                // Without fForceActive, as at a real start: nothing known of
+                // its status until the index says.
+                if (fForceActive)
+                {
+                    rp->nStatus = POOL_ACTIVE;
+                    rp->fStatusKnown = true;
+                }
                 fWanted = true;
             }
         }
@@ -5322,10 +5757,22 @@ static void OnShares(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<S
     NodeMainView main;
     string err;
     bool fOk = true, fWhole = false;
+    // What this part brought that was not here, as the chain keeps it: a
+    // fetch writes these to its partial file, never the bytes as received.
+    vector<Share> vNew;
     CRITICAL_BLOCK(cs_p2pool)
     {
-        fOk = ps.fZero ? ps.chain->AddHistory(part, nTipHeight, main, err)
-                       : ps.chain->AddHistory(part, nTipHeight, main, err, &fWhole);
+        if (ps.fZero)
+            fOk = ps.chain->AddHistory(part, nTipHeight, main, err);
+        else
+        {
+            vector<uint256> vAdded;
+            fOk = ps.chain->AddHistory(part, nTipHeight, main, err, &fWhole, RegOf(ps) ? &vAdded : NULL);
+            Share sh;
+            foreach(const uint256& id, vAdded)
+                if (ps.chain->GetHeld(id, sh))
+                    vNew.push_back(sh);
+        }
         NoteChainGrew(ps);
     }
     if (!fOk)
@@ -5339,7 +5786,7 @@ static void OnShares(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<S
     // A registered pool's fetch: the part kept in its partial file, the
     // catch-up asked after the snapshot, the line complete after that.
     if (!ps.fZero)
-        RegOnPart(ps, pfrom, nTipHeight, part, nFlag, fOk, fWhole);
+        RegOnPart(ps, pfrom, nTipHeight, part, vNew, nFlag, fOk, fWhole);
     if (fOk && !ps.fZero)
         MaybeSaveShares(ps);
 }

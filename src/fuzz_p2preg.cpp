@@ -54,6 +54,7 @@
 
 #include "headers_core.h"
 #include "p2pool_net.h"
+#include "poolindex.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -572,6 +573,9 @@ static void WriteSeeds(const string& strDir)
 static void FuzzP2PRegInit()
 {
     SelectChainParams(false);
+    // Mainnet's parameters, with registered pools opened in this process
+    // (closed, every registry message is dropped unread: nothing to fuzz).
+    PoolBurnsOpenForTest(true);
     fFuzzShareWorkStandIn = true;
     poolreg::PoolRecord recA = poolreg::PoolZero();
     recA.nSpacing = 30;
