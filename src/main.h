@@ -69,9 +69,10 @@ static const unsigned int MAX_REPLACED_TXS = 100;
 
 // Bitflash difficulty floor. The PoW is RandomX (memory-hard), ~1000x slower
 // per hash than SHA-256d, so the target is much easier than Bitcoin's to let a
-// CPU network start with little hashrate. Difficulty rises on its own (retarget
-// toward 10-min blocks) as miners join. This does NOT affect emission
-// (21 million, halving every 210,000 blocks). Tunable.
+// CPU network start with little hashrate. Difficulty rises on its own as miners
+// join (retarget every 30 blocks toward 2-minute blocks, nTargetSpacing in
+// main.cpp). This does NOT affect emission (21 million, halving every 210,000
+// blocks). Consensus: changing it splits the chain.
 static const CBigNum bnProofOfWorkLimit(~uint256(0) >> 12);
 
 // Which chain is the best one.
