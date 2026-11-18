@@ -1125,7 +1125,90 @@ at most 64 KB/s serving them, and the ticket traffic of section 11 (about
 when it asks peers for a set, 5.8 MB at start).
 
 `-poolguard=0`: no tickets, never drawn, carries only pool zero, the pool it
-mines and `-poolcarry` pools. Mining is unaffected.
+mines and `-poolcarry` pools. Mining is unaffected. Such a node also takes
+no part in ticket traffic: it drops `pooltkt` and `poolgettkt` unread, as a
+node where registered pools are closed does, and a pool it mines is found
+through announcing peers and `poolwho` only. `-poolguardmb` sets the guard
+budget in MB (default 128); `-poolguardkbps` sets the pace of each registered
+history serve in KB/s (default 64, section 17).
+
+### In the node (Phase C)
+
+What the rules above leave to each node, as Phase C does it. None of it is a
+rule another node checks; two nodes doing it differently disagree at most
+about who keeps a copy.
+
+- **Where the work is done.** Messages are read on the message thread with
+  no hash: the stated epoch and seed of a `pooltkt` are judged before any
+  ticket is read (an epoch not taken, a seed not buried here or another one,
+  an unasked relay past the deadline: the whole message dropped, nobody
+  scored), each ticket then goes through steps 1 and 2 (`Precheck`), and
+  what passes waits in a queue. A thread of its own, at idle priority and
+  with a RandomX light VM of its own (never the verification VM that blocks
+  and shares wait on), takes one ticket per budget token, runs steps 1 and 2
+  again on the chain of that moment, checks the signature and the work with
+  no lock held, and adds the ticket to the set under the pools' lock. A work
+  hash that could not be computed here drops the ticket unscored and pauses
+  all checks for 60 s; an answer waits to be tried again, a relay is gone.
+- **The ticket budget**: 4 hashes a second with a burst of 256, one budget
+  for every peer and every pool. Three epochs of 4096 then fit in 51 minutes.
+  The order: relays of connections in good standing, older connections
+  first; then the answer queues in turn, one ticket from each (the node's own
+  file among them); then relays of connections whose relays keep coming back
+  outranked or past the cap (8 or more such in an interval, and more than
+  twice those held). A relay that finds the budget empty is dropped, and
+  every relay waiting with it; answers wait. Relays wait at most 512 per
+  connection and 4096 in all; past that they are dropped, unscored.
+- **Scoring**: 20 points, once per message. A relay is read up to its first
+  ticket the sender is at fault for; when a later check finds a bad
+  signature or failed work, the sender is scored once for that message and
+  the rest of that message is dropped. An answer with one bad ticket loses
+  its whole queue.
+- **Asking for sets**: an epoch whose seed is buried is asked for when the
+  node starts, when its seed is newly buried, after its seed was reorged out,
+  and once an interval while fewer than 64 of its tickets are held. Peers
+  that dialled out from this node come first, at most 4 answers wait per
+  epoch, and a peer is asked an epoch once an interval. A set is served from
+  a budget of its own (one every 30 s, 8 at once).
+- **This node's own ticket**: made for the current epoch and the next as soon
+  as each seed is buried, 16 nonces at a time between checks, only on a node
+  that listens on an onion; the .btf key signs it where the key is kept. A
+  ticket made after its epoch's deadline (a node started late, a seed
+  reorged out) travels only in answers.
+- **The draw** is made again at most every 30 s when the tickets or the tip
+  changed, and at least every 10 minutes for the index's new pools, over a
+  copy of the tickets with no lock held. The draws in force are the previous
+  epoch's until its linger end, the current epoch's, the next epoch's once
+  settled (its guardians pull early), and each seed a redraw replaced, until
+  its own linger end. A pool takes from them this node's best place and the
+  latest linger end among them; a pool the draw no longer names (its tickets
+  gone with a reorged ticket seed, or this node's place moved past 16 as
+  tickets came in) keeps what it had and lingers to its end.
+- **Pulls**: a drawn pool whose line is not known is pulled, at most 4 at
+  once beside those kept, those a peer announces first; it is asked of
+  announcing peers (`p2xsync`, through the fetch of section 17), and peers
+  are asked `poolwho`. A pull with nothing fetched and nobody announcing the
+  pool after 10 minutes takes the pool as having no shares (no slot), until a
+  peer announces it. A pool let go for want of room keeps the size and work
+  its line had, so it is not pulled again only to be let go again.
+- **Letting go**: a guarded pool this node neither mines nor carries by
+  `-poolcarry`, once no longer kept, gives back its line in memory and on
+  disk (`pools/<id>.dat`), so a guardian holds what the guard budget allows
+  and nothing more however many pools the draws name over the epochs. A
+  pool this node mines or carries is carried at pool zero's caps and takes
+  nothing of the guard budget.
+- **Dialling guardians**: for the pool this node mines while its line is not
+  here, and for pulls nobody announces, the draws in force name up to 16
+  .btf addresses (this node aside); the dialler resolves them from its peer
+  cache, through Nostr on a miss, and keeps up to 3 connections to them past
+  its usual peers, 2 dials a round.
+- **Files**: `pool-tickets.dat` is written when the sets changed, at most
+  once a minute, and at exit; it is read at start and queued as an answer,
+  never hashed where it stands. `pool-guards.dat` keeps the pools kept, each
+  with its place, its linger end and its record, so a restart does not
+  forget a pool held under a seed a redraw replaced.
+- **`poolinfo`** lists a pool's 16 in this node's view and this node's own
+  place, what it does with the pool and until when.
 
 ## 11. Storage and bandwidth bounds
 
@@ -1477,8 +1560,8 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 |---|---|---|
 | A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
 | B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
-| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) in progress |
-| C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | after B2 |
+| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) merged (#91) |
+| C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | part 1 (tickets, the draw, the guard budget, no network) merged (#89); part 2 (`pooltkt`/`poolgettkt`, the ticket thread, guarded pools, handoff and revival, `-poolguard*`, `poolinfo` guardians, self-test `p2pool-guardians`, `fuzz-pooltkt`) in progress; the `transports` field still to do |
 | D | the testnet proof of section 15 | after C |
 
 ## 17. Networks where Tor is blocked
