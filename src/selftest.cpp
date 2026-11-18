@@ -13554,6 +13554,59 @@ static int RunManagedTorSelfTest()
             nFail += Check(BtfTorTransportMode() == "direct",
                            "no bridges means direct") ? 0 : 1;
 
+            // Kinds for gettorinfo "transports".
+            {
+                std::vector<std::string> bl, k;
+                nFail += Check(BtfBridgeKinds(bl).empty(), "no lines, no kinds") ? 0 : 1;
+                bl.push_back("snowflake 192.0.2.3:80 A");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "snowflake", "snowflake line") ? 0 : 1;
+                bl.assign(1, "obfs4 1.2.3.4:1 A cert=x");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "obfs4", "obfs4 line") ? 0 : 1;
+                bl.assign(1, "webtunnel [::1]:443 C url=https://x/");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "webtunnel", "webtunnel line") ? 0 : 1;
+                bl.assign(1, "meek_lite 192.0.2.2:2 url=https://x/");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "meek", "meek_lite is reported as meek") ? 0 : 1;
+                bl.assign(1, "conjure 192.0.2.5:80 F");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "conjure", "unknown kind passes through as written") ? 0 : 1;
+                bl.assign(1, "ScrambleSuit 192.0.2.5:80 F");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "ScrambleSuit", "kind keeps its case") ? 0 : 1;
+                bl.assign(1, std::string(100, 'x') + " 1.2.3.4:1");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0].size() == 32, "kind is cut to 32 bytes") ? 0 : 1;
+                bl.assign(1, std::string("a\x01\x7f\xc3\xa9z 1.2.3.4:1"));
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 1 && k[0] == "az", "kind keeps printable ASCII only") ? 0 : 1;
+                bl.clear();
+                bl.push_back("");
+                bl.push_back("   ");
+                bl.push_back("# obfs4 1.2.3.4:1");
+                bl.push_back("  snowflake 1.2.3.4:1");
+                nFail += Check(BtfBridgeKinds(bl).size() == 1 && BtfBridgeKinds(bl)[0] == "snowflake",
+                               "blank and comment lines count for nothing") ? 0 : 1;
+                bl.clear();
+                bl.push_back("webtunnel a");
+                bl.push_back("obfs4 b");
+                bl.push_back("snowflake c");
+                bl.push_back("obfs4 d");
+                bl.push_back("meek_lite e");
+                bl.push_back("meek_lite f");
+                k = BtfBridgeKinds(bl);
+                nFail += Check(k.size() == 4 && k[0] == "meek" && k[1] == "obfs4" &&
+                               k[2] == "snowflake" && k[3] == "webtunnel",
+                               "kinds are sorted and de-duplicated") ? 0 : 1;
+                // With an external Tor (managed Tor off) the node cannot tell.
+                BtfSetTorBridges(bl, std::map<std::string, std::string>());
+                nFail += Check(!BtfTorTransports(k) && k.empty(),
+                               "external Tor: transports unknown, even with lines set") ? 0 : 1;
+                BtfSetTorBridges(std::vector<std::string>(), std::map<std::string, std::string>());
+            }
+
             BtfSetManagedTorPath("");
             remove(ptFile.c_str());
             rmdir(ptDir.c_str());

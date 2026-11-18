@@ -812,13 +812,67 @@ bool BtfBundledTorPath(std::string& torPathOut)
 void BtfSetTorBridges(const std::vector<std::string>& bridges,
                       const std::map<std::string, std::string>& ptExecByTransport)
 {
-    g_torBridges = bridges;
-    g_torPtExec = ptExecByTransport;
+    CRITICAL_BLOCK(cs_managedTor)
+    {
+        g_torBridges = bridges;
+        g_torPtExec = ptExecByTransport;
+    }
 }
 
 bool BtfTorBridgesConfigured()
 {
-    return !g_torBridges.empty();
+    CRITICAL_BLOCK(cs_managedTor)
+        return !g_torBridges.empty();
+    return false;
+}
+
+// One kind per bridge line, as the operator sees it: the first word, with
+// meek_lite reported as meek, kept as written otherwise but cut to 32 bytes
+// and to printable ASCII so it cannot bend RPC output.
+static std::string BridgeKindForReport(const std::string& line)
+{
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+        i++;
+    if (i >= line.size() || line[i] == '#')
+        return "";
+    std::string rest = line.substr(i);
+    std::string kind = BtfBridgeTransport(rest);
+    if (kind == "meek_lite")
+        return "meek";
+    std::string out;
+    for (size_t k = 0; k < kind.size() && out.size() < 32; k++)
+    {
+        unsigned char c = (unsigned char)kind[k];
+        if (c > 0x20 && c < 0x7f)
+            out += (char)c;
+    }
+    return out;
+}
+
+std::vector<std::string> BtfBridgeKinds(const std::vector<std::string>& lines)
+{
+    std::set<std::string> kinds;
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        std::string k = BridgeKindForReport(lines[i]);
+        if (!k.empty())
+            kinds.insert(k);
+    }
+    return std::vector<std::string>(kinds.begin(), kinds.end());
+}
+
+bool BtfTorTransports(std::vector<std::string>& kindsOut)
+{
+    kindsOut.clear();
+    CRITICAL_BLOCK(cs_managedTor)
+    {
+        if (!g_fManagedTor)
+            return false;
+        kindsOut = BtfBridgeKinds(g_torBridges);
+        return true;
+    }
+    return false;
 }
 
 void BtfSetManagedTorPath(const std::string& torPath)

@@ -69,6 +69,13 @@ bool BtfConfigureBridges(const std::vector<std::string>& lines, const std::strin
                          std::string& errOut);
 // What Tor goes through now: "direct", "your bridges", or a rung name.
 std::string BtfTorTransportMode();
+// The kinds in a set of bridge lines, for gettorinfo: sorted, de-duplicated,
+// first word of each line, meek_lite as "meek", others as written (printable
+// ASCII, at most 32 bytes). Blank and comment lines count for nothing.
+std::vector<std::string> BtfBridgeKinds(const std::vector<std::string>& lines);
+// The kinds in the bridge lines the managed Tor has now (empty: Tor runs
+// without bridges). False with an external Tor, which the node cannot read.
+bool BtfTorTransports(std::vector<std::string>& kindsOut);
 // The mode that reached the network last time, remembered in the data
 // directory ("" when nothing is remembered). Cleared when direct works.
 std::string BtfLastWorkingTransport();
