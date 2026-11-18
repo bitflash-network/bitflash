@@ -64,6 +64,35 @@ bool RulesForLocal(const poolreg::PoolRecord& rec, const poollocal::Keys& keys, 
     return true;
 }
 
+bool RulesForRegistered(const poolreg::PoolRecord& rec, const unsigned char magic[4], PoolRules& out, string& errOut)
+{
+    std::string err;
+    if (rec.fLocal || !rec.Check(err))
+    {
+        errOut = rec.fLocal ? "a local pool's record" : err;
+        return false;
+    }
+    vector<unsigned char> record = rec.Encode();
+    if (record == poolreg::PoolZero().Encode())
+    {
+        errOut = "pool zero's own record";
+        return false;
+    }
+    PoolRules r;
+    r.nSpacing = rec.nSpacing;
+    r.nWindow = rec.nWindow;
+    r.nRetarget = rec.nRetarget;
+    r.bnFloor.SetCompact(rec.nFloor);
+    r.nUncleDepth = (int)rec.nUncleDepth;
+    r.nUnclePct = rec.nUnclePct;
+    r.nFeeBps = rec.nFeeBps;
+    r.feeScript = rec.FeeScript();
+    r.nAnchor = ANCHOR_P2X;
+    poolreg::PoolId(record, magic, r.poolId.begin());
+    out = r;
+    return true;
+}
+
 uint64_t WorkOf(unsigned int nBits)
 {
     CBigNum bnTarget;
@@ -604,8 +633,13 @@ bool ShareChain::CheckInvariants(string& errOut) const
     return true;
 }
 
-bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut)
+bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const MainView& main, string& errOut,
+                            bool* pfWhole, vector<uint256>* pvAdded)
 {
+    if (pfWhole)
+        *pfWhole = false;
+    if (pvAdded)
+        pvAdded->clear();
     // Oldest first, as History() sends it. A part out of order let a child
     // come before its parent and be taken on trust, then sit on the parent
     // once that was checked in full.
@@ -627,6 +661,8 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
         bool fTrust = (int64)s.data.nShareHeight < (int64)nTipHeight - (int64)rules.nRetarget &&
                       (!parent || parent->fTrusted);
         bool fOk = fTrust ? AddTrusted(s, err) : Add(s, main, err);
+        if (fOk && pvAdded)
+            pvAdded->push_back(s.GetId());
         if (fOk || err == "already have this share")
             continue;
         // Nothing wrong with the sender; what follows builds on this one.
@@ -635,7 +671,33 @@ bool ShareChain::AddHistory(const vector<Share>& part, int nTipHeight, const Mai
         errOut = strprintf("share at height %u: %s", s.data.nShareHeight, err.c_str());
         return false;
     }
+    if (pfWhole)
+        *pfWhole = true;
     return true;
+}
+
+bool ShareChain::GetHeld(const uint256& id, Share& out) const
+{
+    const Entry* e = Get(id);
+    if (!e)
+        return false;
+    out = e->share;
+    return true;
+}
+
+bool ShareChain::ParentOf(const uint256& id, uint256& parentOut) const
+{
+    const Entry* e = Get(id);
+    if (!e)
+        return false;
+    parentOut = e->share.data.hashPrevShare;
+    return true;
+}
+
+uint256 ShareChain::TipLineWork() const
+{
+    CBigNum bn = LineWork(Get(hashTip));
+    return bn.getuint256();
 }
 
 // Do the lines ending at a and b share a share held here? If so, the work

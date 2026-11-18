@@ -333,6 +333,9 @@ fuzz-p2pool-smoke: deps-linux
 fuzz-p2plocal-smoke: deps-linux
 	$(MAKE) -C src -f Makefile fuzz-p2plocal-smoke
 
+fuzz-p2preg-smoke: deps-linux
+	$(MAKE) -C src -f Makefile fuzz-p2preg-smoke
+
 fuzz-poolindex-smoke: deps-linux
 	$(MAKE) -C src -f Makefile fuzz-poolindex-smoke
 
@@ -364,5 +367,5 @@ verify-release:
 	./scripts/verify-release.sh $(if $(TAG),$(TAG),latest)
 
 .PHONY: linux windows windows-tor clean gui appimage appimage-tor appimage-tools \
-        tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-chat-frame-smoke fuzz-chat-relay-smoke fuzz-nostr-smoke fuzz-swap-smoke fuzz-p2pool-smoke fuzz-p2plocal-smoke fuzz-poolindex-smoke fuzz-light-peer-smoke fuzz-io-smoke checksums sign-checksums verify-release \
+        tests fuzz-net-message-smoke fuzz-script-smoke fuzz-sigcheck-smoke fuzz-p2p-payload-smoke fuzz-deserialize-smoke fuzz-decoders-smoke fuzz-v4-templates-smoke fuzz-chat-frame-smoke fuzz-chat-relay-smoke fuzz-nostr-smoke fuzz-swap-smoke fuzz-p2pool-smoke fuzz-p2plocal-smoke fuzz-p2preg-smoke fuzz-poolindex-smoke fuzz-light-peer-smoke fuzz-io-smoke checksums sign-checksums verify-release \
         deps-linux deps-windows deps-apt deps-secp256k1 deps-randomx

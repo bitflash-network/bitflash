@@ -61,7 +61,7 @@ bool fClient = false;
 // no chat records, and must not tell anybody it does.
 uint64 nLocalServices = 0;
 #else
-uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT | NODE_P2POOL));
+uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT | NODE_P2POOL | NODE_POOLREG));
 #endif
 CAddress addrLocalHost(0, GetDefaultPort(), nLocalServices);
 unsigned short nListenPort = GetDefaultPort(); // local P2P port (tunable via /port)
