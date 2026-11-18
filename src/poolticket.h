@@ -222,6 +222,15 @@ bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned i
                 uint64 nNonceStart, uint64 nMaxTries,
                 CGuardTicket& ticketOut, uint256& hashWorkOut, uint64& nTriesOut,
                 const volatile bool* pfStop = NULL);
+// The work of MakeTicket alone, for a caller that signs elsewhere (the node
+// keeps its .btf secret key to itself): the body with this x-only key and a
+// nonce whose work meets the target, unsigned. The same rules for nTriesOut,
+// a hash that could not be computed and pfStop.
+bool MakeTicketWork(const CTicketParams& params, const uint256& hashSeed, unsigned int nEpoch,
+                    const unsigned char pubkey[32], unsigned short nCapacityMB,
+                    uint64 nNonceStart, uint64 nMaxTries,
+                    CGuardTicket& ticketOut, uint256& hashWorkOut, uint64& nTriesOut,
+                    const volatile bool* pfStop = NULL);
 
 } // namespace pooltkt
 
@@ -378,6 +387,12 @@ public:
     // answer: a node may make its ticket after its own deadline), held if it
     // ranks, and remembered as its own either way.
     int AddOwn(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed);
+    // The same for a ticket whose work hash the caller computed (its own
+    // grind, or Verify run with no lock held): steps 1 and 2, the signature,
+    // then Add with that hash. Hashes nothing, so it runs under the caller's
+    // lock.
+    int AddOwnVerified(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
+                       const uint256& hashWork);
     bool Own(unsigned int nEpoch, CGuardTicket& ticketOut, uint256& hashWorkOut) const;
 
     // Follow the chain: forget epochs before the previous one (and the
@@ -414,6 +429,10 @@ public:
     // Costs pools times tickets SHA256d.
     bool OwnRanks(const CTicketChainView& view, unsigned int nEpoch, const std::vector<uint256>& vPools,
                   std::vector<int>& vRankOut, bool& fSettledOut);
+    // The draw seed of an epoch on this view, remembered once settled as the
+    // seed drawn with (what Draw and OwnRanks do), for a caller that draws
+    // over a copy of the tickets with no lock held.
+    bool NoteDrawSeed(const CTicketChainView& view, unsigned int nEpoch, uint256& hashDrawOut, bool& fSettledOut);
     // The same under a draw seed the caller names (one of OldDrawSeeds): the
     // pools this node was drawn for before a redraw, while it still holds the
     // tickets of that epoch.
@@ -423,6 +442,8 @@ public:
     // not over: nodes drawn by any of them, or by the present seed, hold the
     // pool. Not saved in the file.
     void OldDrawSeeds(unsigned int nEpoch, std::vector<uint256>& out) const;
+    // The same with the height each one's linger ends at.
+    void OldDrawSeedsUntil(unsigned int nEpoch, std::vector<std::pair<uint256, int64> >& out) const;
 
     // Forget everything (the self-test, and a change of network).
     void Clear();
@@ -441,6 +462,7 @@ private:
     size_t nMaxGone;
 
     uint64 GoneTag(const uint256& hashBody) const;
+    void MarkOwn(const CGuardTicket& ticket, const uint256& hashSeed);
     void RememberChecked(CTicketEpoch& ep, const uint256& hashBody, const uint256& hashWork, bool fHeld);
     void Unhold(CTicketEpoch& ep, const std::vector<unsigned char>& key);
 };
@@ -551,6 +573,10 @@ namespace pooltkt
 // The file: a version, the network's magic, up to three epochs, and the hash
 // of all of it; written to a temporary name and renamed into place.
 bool SaveTicketFile(const std::string& strPath, const CTicketBook& book);
+// The same in two steps, so the book's lock is held only while its bytes are
+// made: the bytes SaveTicketFile writes, and their write.
+std::string TicketFileData(const CTicketBook& book);
+bool WriteTicketFileData(const std::string& strPath, const std::string& data);
 // Reads it. False, with the reason, when there is none or it is not this
 // version's, this network's, whole and consistent: the node then starts with
 // no tickets and asks its peers. What is read is not trusted: the caller
