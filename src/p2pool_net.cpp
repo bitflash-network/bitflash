@@ -7379,6 +7379,10 @@ bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out)
             static const char* const vChoice[] = { "not drawn", "guarded", "drawn, no shares", "pulling its line",
                                                    "drawn, no room" };
             out.strOwn = vChoice[std::max(0, std::min(4, it->second.nChoice))];
+            // A pool mined or carried here never enters the guard budget.
+            RegPool* rp = RegById(id);
+            if (rp && (rp->fMined || rp->fCarry))
+                out.strOwn = "drawn; mined or carried here, outside the guard budget";
         }
     }
     vector<CDrawPlace> places;
