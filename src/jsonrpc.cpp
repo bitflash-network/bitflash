@@ -4875,6 +4875,7 @@ static void AddCarriedJson(json& j, const uint256& id)
     j["carried"] = st.fCarried;
     j["mined"] = st.fMined;
     j["poolcarry"] = st.fCarry;
+    j["guarded"] = st.fGuard;
     json c;
     static const char* const vFetch[] = { "nothing yet", "fetching its line", "catching up", "complete" };
     c["state"] = vFetch[std::max(0, std::min(3, st.nFetch))];
@@ -4885,6 +4886,44 @@ static void AddCarriedJson(json& j, const uint256& id)
     c["announcers"] = (uint64_t)st.nAnnouncers;
     c["serves"] = (uint64_t)st.nServes;
     j["sharechain"] = c;
+}
+
+// A registered pool's guardians this epoch, in this node's view of the
+// tickets (docs/pool-registry.md, section 10): availability, never trust.
+static json GuardiansJson(const uint256& id)
+{
+    json g;
+    P2PoolGuardInfo gi;
+    P2PoolGuardians(id, gi);
+    g["enabled"] = gi.fGuarding;
+    if (!gi.fGuarding)
+    {
+        g["note"] = "guardian tickets are off on this node (registered pools not open here, or -poolguard=0)";
+        return g;
+    }
+    g["epoch"] = gi.nEpoch;
+    g["settled"] = gi.fSettled;
+    g["tickets"] = (uint64_t)gi.nTickets;
+    json a = json::array();
+    for (size_t i = 0; i < gi.vGuardians.size(); i++)
+    {
+        json o;
+        o["btf"] = gi.vGuardians[i].strBtf;
+        o["place"] = gi.vGuardians[i].nRank + 1;
+        o["role"] = gi.vGuardians[i].nRank < 8 ? "guardian" : "reserve";
+        o["capacitymb"] = gi.vGuardians[i].nCapacityMB;
+        if (gi.vGuardians[i].fSelf)
+            o["self"] = true;
+        a.push_back(o);
+    }
+    g["list"] = a;
+    json own;
+    own["place"] = gi.nOwnRank < 0 ? json(nullptr) : json(gi.nOwnRank + 1);
+    own["state"] = gi.strOwn.empty() ? string("not drawn") : gi.strOwn;
+    if (gi.nOwnRank >= 0)
+        own["until"] = gi.nOwnUntil;
+    g["thisnode"] = own;
+    return g;
 }
 
 static json RegisteredPoolJson(const CPoolInfo& info, bool fFull, const vector<CPoolInfo>& vReg)
@@ -5357,6 +5396,7 @@ static json rpc_poolinfo(const json& p)
             a.push_back(PoolAppearanceJson(vAppear[i]));
         j["appearancelist"] = a;
         j["index"] = PoolIndexStateJson();
+        j["guardians"] = GuardiansJson(id);
         return j;
     }
     // Not recorded: what the chain says about the id is only claims, if any.

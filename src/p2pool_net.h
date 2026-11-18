@@ -256,11 +256,13 @@ struct P2PoolRegStatusInfo
     enum { FETCH_IDLE = 0, FETCH_RUNNING, FETCH_CATCHUP, FETCH_COMPLETE };
     bool fMined;
     bool fCarry;
+    bool fGuard;            // guarded here (section 10), or its line pulled for the draw
     bool fCarried;          // its shares taken, relayed and served
     bool fAnnounced;
     int nStatus;            // PoolStatus, as this node last read it
     int nFetch;
     size_t nShares;
+    size_t nBytes;          // of every share held, as the guard budget counts them
     int nTipHeight;
     uint256 work;           // the tip line's work over the last window
     size_t nAnnouncers;     // peers whose latest poolinv names it
@@ -292,6 +294,97 @@ bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive = true);
 void P2PoolRegIndexForTest(bool fReady, const vector<std::pair<uint256, int> >& vStatus);
 void P2PoolRegUseNodeIndexForTest();
 void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n);
+
+// ---- Guardians (docs/pool-registry.md, sections 10 to 12)
+//
+// Between NODE_POOLREG peers, where registered pools are open and the node
+// guards (-poolguard, on by default):
+//   pooltkt     uint32 epoch, uint256 ticket seed, vector of 118-byte
+//               guardian tickets (at most 512): relayed when held, or in
+//               answer to poolgettkt
+//   poolgettkt  uint32 epoch: send me the tickets you hold for it (at most
+//               4096, in parts of 512)
+// Tickets are checked on a thread of their own with its own RandomX VM and
+// budget; the draw over them decides which registered pools this node
+// guards (carries like a -poolcarry pool, within -poolguardmb) and which
+// nodes a seeker of a pool dials. Nothing of it decides a share's validity.
+
+// -poolguard (false: no tickets made, relayed, served or asked for; never
+// drawn), -poolguardmb (the guard budget in MB; 0 keeps 128) and
+// -poolguardkbps (each registered history serve's pace in KB/s; 0 keeps 64).
+// At startup, before P2PoolTicketsStart.
+void P2PoolGuardSetOptions(bool fGuard, int64 nMB, int64 nKBps);
+// Whether this node takes part: registered pools open here, -poolguard on.
+bool P2PoolGuarding();
+// The ticket thread: started after StartNode (pool-tickets.dat is read and
+// queued to be checked again, never hashed at start), stopped at exit with a
+// last save of pool-tickets.dat and pool-guards.dat.
+void P2PoolTicketsStart();
+void P2PoolTicketsStop();
+// The .btf addresses of the guardians (this epoch's and the previous one's
+// 16) of the pools this node looks for: the one it mines while its line is
+// not here, and drawn pools nobody announces. At most 16; the dialler adds
+// up to 3 connections for them.
+void P2PoolGuardDialList(vector<string>& out);
+struct P2PoolGuardianInfo
+{
+    string strBtf;
+    int nRank;              // 0 to 7 guardian, 8 to 15 reserve
+    bool fSelf;
+    unsigned short nCapacityMB;
+};
+struct P2PoolGuardInfo
+{
+    bool fGuarding;         // false: tickets are off here (mainnet closed, or -poolguard=0)
+    int nEpoch;
+    bool fSettled;
+    size_t nTickets;        // held for the epoch
+    vector<P2PoolGuardianInfo> vGuardians;  // the pool's 16 in this node's view, lowest score first
+    int nOwnRank;           // this node's place for it, -1 when not drawn
+    int64 nOwnUntil;        // until which height that place holds
+    string strOwn;          // what this node does with it
+    P2PoolGuardInfo() : fGuarding(false), nEpoch(-1), fSettled(false), nTickets(0), nOwnRank(-1), nOwnUntil(0) {}
+};
+// A pool's guardians this epoch, as poolinfo shows them.
+bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out);
+
+// Self-tests: the ticket book's parameters (a cheap work hash), the chain
+// the tickets see (the hash of every height up to the tip), the key this
+// node's own ticket is signed with, the active pools the draw reads, one
+// pass of the ticket thread (returns the tickets it hashed), the ticket
+// state's clocks made older, the ticket budget set, what is held, own and
+// queued (pnode NULL: this node's file), pool-tickets.dat written and read
+// back as at a start, the guard budget, what the guard decided, and
+// pool-guards.dat written and read back.
+class CTicketParams;
+class CGuardTicket;
+class CPoolInfo;
+void P2PoolTicketParamsForTest(const CTicketParams& params);
+void P2PoolTicketViewForTest(const vector<uint256>& vHashes);
+void P2PoolTicketKeyForTest(const unsigned char seckey[32]);
+void P2PoolTicketPoolsForTest(const vector<CPoolInfo>& v);
+int P2PoolTicketStepForTest(int nMaxVerify, bool fMake);
+void P2PoolTicketAgeForTest(int64 nSecs);
+void P2PoolTicketBudgetForTest(int nTokens);
+size_t P2PoolTicketHeldForTest(unsigned int nEpoch);
+bool P2PoolTicketIsHeldForTest(unsigned int nEpoch, const CGuardTicket& t);
+bool P2PoolTicketOwnForTest(unsigned int nEpoch, CGuardTicket& out);
+void P2PoolTicketQueuedForTest(CNode* pnode, unsigned int nEpoch, size_t& nRelayOut, size_t& nAnswerOut);
+bool P2PoolTicketSaveForTest();
+size_t P2PoolTicketLoadForTest();
+void P2PoolGuardLimitsForTest(int64 nBudget, int64 nMaxPoolBytes, unsigned int nMaxPools);
+struct P2PoolGuardEntryInfo
+{
+    uint256 id;
+    int nRank;
+    int64 nUntil;
+    int nChoice;            // GuardChoice
+    bool fEmpty;
+    bool fGuard;            // its RegPool is flagged guarded now
+};
+void P2PoolGuardEntriesForTest(vector<P2PoolGuardEntryInfo>& out);
+void P2PoolGuardSaveForTest();
+size_t P2PoolGuardLoadForTest();
 
 // Self-tests: the onions this node answers hellos for, the registered
 // class's counters, and its budgets emptied.

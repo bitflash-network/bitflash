@@ -90,6 +90,12 @@ bool BtfGetIdentity(unsigned char pubkey[32], unsigned char enc_sk[32]);
 // This node's printable .btf address, or "" if the identity failed to load.
 std::string BtfLocalAddress();
 
+// Sign a guardian ticket (poolticket.h) with this node's .btf key, which
+// never leaves this file: the body gets this node's key, and false if the
+// identity failed to load or the signature does not verify.
+class CGuardTicket;
+bool BtfSignGuardTicket(CGuardTicket& t);
+
 // This node's own signed descriptor, ready to hand to a peer over the wire.
 // "" until ThreadBtfAccept has registered at a rendezvous.
 std::string BtfLocalDescriptor();

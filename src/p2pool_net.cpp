@@ -4,6 +4,8 @@
 #include "headers.h"
 #include "p2pool_net.h"
 #include "poolindex.h"
+#include "poolticket.h"
+#include "btfaddr.h"
 #include "nostr.h"
 #include <list>
 #ifdef WIN32
@@ -13,6 +15,10 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #endif
 
 using namespace p2pool;
@@ -439,6 +445,17 @@ static void PushReg(CNode* pnode, const char* pszCommand, const T1& a1, const T2
     }
 }
 
+template <typename T1, typename T2, typename T3>
+static void PushReg(CNode* pnode, const char* pszCommand, const T1& a1, const T2& a2, const T3& a3)
+{
+    CRITICAL_BLOCK(pnode->cs_vSend)
+    {
+        uint64 nFrom = pnode->nSendDrained + pnode->vSend.size();
+        pnode->PushMessage(pszCommand, a1, a2, a3);
+        NoteRegSpan(pnode, nFrom);
+    }
+}
+
 template <typename T1, typename T2, typename T3, typename T4>
 static void PushReg(CNode* pnode, const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4)
 {
@@ -469,6 +486,16 @@ static bool RegSaveAllowed(PoolState& ps);
 // count of one sent. True, and nothing counted, for any other pool.
 static bool RegAskRoomLocked(PoolState& ps, CNode* pnode);
 static void RegNoteAskLocked(CNode* pnode, const uint256& id);
+// Guardians and tickets (further down, docs/pool-registry.md section 10).
+static bool TktActive();
+static void TktTick(int64 nNow);
+static void TktFlush();
+static void TktResetForTest();
+static void GuardApply(int64 nNow);
+static void GuardNoteAnnouncedLocked(const uint256& id);
+static bool TktProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv);
+// Bytes a second each registered history serve is paced to (-poolguardkbps).
+static int64 nRegServeRate = 64 * 1000;
 // A registered pool's share files (pools/<id>.dat and .part) start with this
 // byte, then the pool's record: a build reads its own format only, and a
 // file of another pool is never read as this one's.
@@ -2496,7 +2523,8 @@ struct RegServe
 static std::list<RegServe> lRegServes;      // under cs_p2pool
 static const size_t MAX_REG_SERVES = 8;
 static const size_t MAX_REG_SERVES_UNPROVEN = 4;
-static const int64 REG_SERVE_RATE = 64 * 1000;     // bytes a second, whatever the transport
+// Bytes a second, whatever the transport: nRegServeRate, -poolguardkbps
+// (64 by default, section 11).
 static const int64 REG_SERVE_STALL = 5 * 60;
 
 static bool RegServeSlotFree(PoolState& ps, CNode* pfrom, bool fProven)
@@ -2544,7 +2572,7 @@ static void PumpRegServes()
                     ++it;
                 continue;
             }
-            if (r.nSent > (uint64)((nNow - r.nStart) * REG_SERVE_RATE))
+            if (r.nSent > (uint64)((nNow - r.nStart) * nRegServeRate))
             {
                 ++it;
                 continue;
@@ -3835,6 +3863,9 @@ struct RegPool
     string strPart;                 // pools/<id>.part; empty: memory only
     bool fMined;                    // -p2pool=<id>
     bool fCarry;                    // -poolcarry=<id>
+    // Guarded (section 10): the draw gave this node a place in it and the
+    // guard budget keeps it, or its line is being pulled to learn its work.
+    bool fGuard;
     int nStatus;                    // PoolStatus, from the registry index
     // Whether nStatus is the index's word yet: until the index is loaded,
     // at its tip and not reading the chain again, a pool it does not name
@@ -3867,9 +3898,40 @@ struct RegPool
     RegPool(const uint256& idIn, const poolreg::PoolRecord& recIn, const vector<unsigned char>& recordIn,
             ShareChain* chainIn, const string& strFileIn, const string& strPartIn)
         : id(idIn), rec(recIn), record(recordIn), state(&classReg, chainIn, strFileIn), strPart(strPartIn),
-          fMined(false), fCarry(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
+          fMined(false), fCarry(false), fGuard(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
           pFetchPeer(NULL), nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
           nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0) {}
+};
+
+// A guardian ticket waiting for the ticket budget (section 10): checked
+// against hashSeed, the seed its message named (Precheck made sure it was
+// this node's), and as an answer (no deadline) or a relay.
+struct TktItem
+{
+    CGuardTicket t;
+    unsigned int nEpoch;
+    uint256 hashSeed;
+    bool fOwn;          // this node's own, from pool-tickets.dat
+    uint64 nMsg;        // the message it came in: a relay is scored once per message
+};
+
+// The tickets one source sent that wait for the ticket budget: its relays,
+// and its answers to this node's poolgettkt, one queue per epoch, each
+// deduplicated within itself only (another peer's copy of a body waits in
+// that peer's queue, and whichever is checked second is dropped by Precheck
+// for free).
+struct TktQueues
+{
+    std::deque<TktItem> qRelay;
+    map<unsigned int, std::deque<TktItem> > mapAnswer;
+    map<unsigned int, set<uint256> > mapAnswerBodies;
+    size_t Answers() const
+    {
+        size_t n = 0;
+        for (map<unsigned int, std::deque<TktItem> >::const_iterator it = mapAnswer.begin(); it != mapAnswer.end(); ++it)
+            n += it->second.size();
+        return n;
+    }
 };
 
 // What this node keeps for a connection to a peer that reads the registry.
@@ -3877,6 +3939,24 @@ struct RegPool
 // closed (RegTick), on the message thread only.
 struct RegConn
 {
+    // Tickets (section 10). A serial no other connection had, so the ticket
+    // thread can tell this one from a later one at the same address.
+    uint64 nTktSerial;
+    TktQueues tq;
+    uint64 nTktMsg;                         // pooltkt messages read from it
+    uint64 nTktScoredMsg;                   // the last of them scored
+    int nTktScore;                          // scored by the ticket thread, applied on this thread
+    map<unsigned int, int64> mapTktAskedAt;     // poolgettkt sent it, by epoch
+    map<unsigned int, size_t> mapTktAnswered;   // tickets taken as that answer
+    map<unsigned int, int64> mapTktServedAt;    // poolgettkt it was answered
+    // Its relays that passed and were not held, and those held, since
+    // nTktTallySince: a connection whose relays keep coming back outranked
+    // or past the cap is checked after the answers (unscored).
+    int nTktWasted;
+    int nTktHeld;
+    int64 nTktTallySince;
+    // Held tickets to relay to it, by epoch, sent from the message thread.
+    map<unsigned int, vector<CGuardTicket> > mapTktOut;
     set<uint256> setInv;            // the peer's latest poolinv this node acted on
     vector<uint256> vInvPending;    // one that came within a minute of the last
     bool fInvPending;
@@ -3896,7 +3976,8 @@ struct RegConn
     int64 nAskedSince;
     int nAsked;
     map<uint256, std::pair<int64, int> > mapAskedPool;
-    RegConn() : fInvPending(false), nInvAppliedAt(0), nInvSentAt(0), nNoneSince(0), nNone(0),
+    RegConn() : nTktSerial(0), nTktMsg(0), nTktScoredMsg(0), nTktScore(0), nTktWasted(0), nTktHeld(0),
+                nTktTallySince(0), fInvPending(false), nInvAppliedAt(0), nInvSentAt(0), nNoneSince(0), nNone(0),
                 nWhoSince(0), nWho(0), nAskedSince(0), nAsked(0) {}
 };
 
@@ -3971,12 +4052,36 @@ static RegPool* RegOf(PoolState& ps)
     return NULL;
 }
 
+// The same pools by id: guarded pools come and go by the draw, and the guard
+// pass looks every drawn pool up once a second.
+static map<uint256, RegPool*> mapRegById;
+
 static RegPool* RegById(const uint256& id)
 {
-    foreach(RegPool* rp, vRegPools)
-        if (rp->id == id)
-            return rp;
-    return NULL;
+    map<uint256, RegPool*>::const_iterator it = mapRegById.find(id);
+    return it == mapRegById.end() ? NULL : it->second;
+}
+
+// Under cs_p2pool, on the message thread between messages (no message holds
+// it then): a pool that is neither mined nor carried leaves memory. What
+// points at its state goes first: orphans and held entries (ForgetPool), its
+// paced serves.
+static void RegFree(RegPool* rp)
+{
+    classReg.ForgetPool(&rp->state);
+    for (std::list<RegServe>::iterator it = lRegServes.begin(); it != lRegServes.end();)
+        if (it->pool == &rp->state)
+            it = lRegServes.erase(it);
+        else
+            ++it;
+    if (pPoolMined == &rp->state)
+        pPoolMined = NULL;
+    vector<RegPool*>::iterator it = std::find(vRegPools.begin(), vRegPools.end(), rp);
+    if (it != vRegPools.end())
+        vRegPools.erase(it);
+    mapRegById.erase(rp->id);
+    delete rp->state.chain;
+    delete rp;
 }
 
 static const vector<unsigned char>* RegRecordOf(PoolState& ps)
@@ -3987,7 +4092,7 @@ static const vector<unsigned char>* RegRecordOf(PoolState& ps)
 
 static bool RegWanted(const RegPool& rp)
 {
-    return rp.fMined || rp.fCarry;
+    return rp.fMined || rp.fCarry || rp.fGuard;
 }
 
 // Registered pools on the network and in mining at all: testnet, and mainnet
@@ -4078,7 +4183,11 @@ static RegConn& RegConnOf(CNode* pnode)
     if (it != mapRegConn.end())
         return it->second;
     pnode->AddRef();
-    return mapRegConn.insert(make_pair(pnode, RegConn())).first->second;
+    static uint64 nSerial = 0;
+    RegConn c;
+    c.nTktSerial = ++nSerial;
+    c.nTktTallySince = GetTime();
+    return mapRegConn.insert(make_pair(pnode, c)).first->second;
 }
 
 // Under cs_p2pool. The asks a connection was sent within the interval: in
@@ -4192,6 +4301,7 @@ static RegPool* RegNew(const uint256& id, const vector<unsigned char>& record, s
     rp->fMined = id == idMinedReg;
     rp->fCarry = std::find(vCarryReg.begin(), vCarryReg.end(), id) != vCarryReg.end();
     vRegPools.push_back(rp);
+    mapRegById[id] = rp;
     if (rp->fMined)
         pPoolMined = &rp->state;
     return rp;
@@ -4678,6 +4788,10 @@ static void RegApplyInvLocked(CNode* pnode, RegConn& c, int64 nNow)
     {
         if (setOld.count(id))
             continue;
+        // A pool this node is drawn for and holds no line of, announced now:
+        // pulled from that announcer (section 10, a pool that starts
+        // mid-epoch).
+        GuardNoteAnnouncedLocked(id);
         RegPool* rp = RegById(id);
         if (!rp || !RegCarried(*rp) || !RegCanAsk(*rp, pnode, c, nNow))
             continue;
@@ -4860,6 +4974,10 @@ static void RegRefreshStatus()
         if (idMinedReg != 0)
             vWant.push_back(idMinedReg);
         vWant.insert(vWant.end(), vCarryReg.begin(), vCarryReg.end());
+        // Guarded pools too: a record reorged out is no longer guarded.
+        foreach(RegPool* rp, vRegPools)
+            if (rp->fGuard && std::find(vWant.begin(), vWant.end(), rp->id) == vWant.end())
+                vWant.push_back(rp->id);
     }
     if (vWant.empty())
         return;
@@ -4892,6 +5010,1489 @@ static void RegRefreshStatus()
         }
 }
 
+// ---- Guardians: tickets on the wire, the ticket thread, the draw, handoff
+// (docs/pool-registry.md, sections 10 to 12)
+//
+// poolticket.{h,cpp} is the part with no network: the ticket, the book of
+// held sets, the draw and the guard budget. This is its caller:
+//
+//   - pooltkt and poolgettkt between NODE_POOLREG peers, read only where
+//     registered pools are open (RegOpen) and -poolguard is not 0; the stated
+//     epoch and seed are judged before any ticket is read, every ticket goes
+//     through Precheck (no hash) before it is queued, and nothing is hashed
+//     on the message thread;
+//   - the ticket thread, at idle priority with a RandomX VM of its own (never
+//     the verification VM under csVerify, which blocks and shares need):
+//     queued tickets checked one budget token at a time (Precheck again,
+//     Verify with no lock, Add under cs_p2pool on the view of that moment),
+//     this node's own ticket made once its seed is buried, the draw over the
+//     held tickets, pool-tickets.dat saved;
+//   - guarded pools: a RegPool with fGuard, carried by the machinery of
+//     registered pools (poolinv, p2xsync, the .part file), kept, pulled or
+//     let go by the guard budget, lingering until 720e + 180.
+//
+// Guardians are availability: nothing here, and nothing a guardian sends,
+// reaches whether a share is valid or what a block pays. Everything is under
+// cs_p2pool unless said otherwise.
+
+// A pooltkt carries at most this many tickets; an asked set at most 4096.
+static const size_t TKT_PER_MESSAGE = 512;
+// Peers whose answers for one epoch may wait at once (section 10).
+static const size_t TKT_ASKED_PEERS = 4;
+// Relays waiting for the ticket budget: per connection and in all. Past
+// them, and whenever the budget is empty, a relay is dropped unscored.
+static const size_t TKT_RELAY_QUEUE = 512;
+static const size_t TKT_RELAY_QUEUE_ALL = 4096;
+// The ticket budget, one for all pools and all peers: a RandomX hash each.
+// Four a second fill three epochs of 4096 within the hour a fresh node has
+// to see the draw (section 10), on the ticket thread's own VM.
+static const int TKT_BUDGET_BURST = 256;
+static const int TKT_BUDGET_PER_SEC = 4;
+// A hash that could not be computed here: nothing is checked for this long.
+static const int64 TKT_NO_HASH_WAIT = 60;
+static const int64 TKT_SAVE_INTERVAL = 60;
+// Fewer held than this for an epoch: peers are asked again every interval.
+static const size_t TKT_FEW = 64;
+// The draw is made again at most this often when tickets or the tip
+// changed, and at least this often for the index's new pools.
+static const int64 TKT_DRAW_INTERVAL = 30;
+static const int64 TKT_DRAW_REFRESH = 10 * 60;
+// Relays that passed and were not held, per interval, before a connection's
+// relays wait behind every answer.
+static const int TKT_WASTE_LOW = 8;
+// Sets served (poolgettkt), all peers together: one every 30 s, 8 at once.
+static const int TKT_SERVE_BURST = 8;
+static const int64 TKT_SERVE_SECS = 30;
+// Nonces tried between two looks at the queue while making a ticket.
+static const uint64 TKT_MAKE_SLICE = 16;
+// Pools whose line is pulled at once to learn its work, beside those kept.
+static const size_t GUARD_MAX_PULLS = 4;
+// A pull with nobody announcing the pool and nothing fetched for this long:
+// the pool is taken as having no shares (no slot; pulled again when a peer
+// announces it).
+static const int64 GUARD_PULL_WAIT = 10 * 60;
+// .btf addresses of guardians handed to the dialler at once.
+static const size_t GUARD_DIAL_MAX = 16;
+
+// The tickets' view of the active chain: the tip and the hashes of the
+// heights the ticket and draw seeds of the previous, current and next epochs
+// sit at, taken under cs_main when the tip moves (section 8: read without
+// cs_main on the lock-free path).
+class CTktView : public CTicketChainView
+{
+public:
+    int nTip;
+    uint256 hashTip;
+    map<int, uint256> mapHash;
+    CTktView() : nTip(-1), hashTip(0) {}
+    int TipHeight() const { return nTip; }
+    bool HashAt(int nHeight, uint256& hashOut) const
+    {
+        map<int, uint256>::const_iterator it = mapHash.find(nHeight);
+        if (it == mapHash.end())
+            return false;
+        hashOut = it->second;
+        return true;
+    }
+};
+
+// The heights a view at this tip keeps.
+static void TktViewHeights(int nTip, set<int>& out)
+{
+    out.clear();
+    int c = pooltkt::EpochOf(nTip);
+    for (int e = c - 1; c >= 0 && e <= c + 1; e++)
+    {
+        if (e < 1)
+            continue;
+        int64 h1 = pooltkt::TicketSeedHeight(e), h2 = pooltkt::DrawSeedHeight(e);
+        if (h1 >= 0 && h1 <= nTip)
+            out.insert((int)h1);
+        if (h2 >= 0 && h2 <= nTip)
+            out.insert((int)h2);
+    }
+}
+
+// The ticket budget: tokens a second, not a token every n seconds.
+struct TktBudget
+{
+    int nTokens;
+    int64 nLast;
+    TktBudget() : nTokens(TKT_BUDGET_BURST), nLast(0) {}
+    void Refill(int64 nNow)
+    {
+        if (nLast == 0 || nNow < nLast)
+        {
+            nLast = nNow;
+            return;
+        }
+        int64 n = (nNow - nLast) * TKT_BUDGET_PER_SEC;
+        nTokens = (int)std::min((int64)TKT_BUDGET_BURST, (int64)nTokens + n);
+        nLast = nNow;
+    }
+    bool Take(int64 nNow)
+    {
+        Refill(nNow);
+        if (nTokens <= 0)
+            return false;
+        nTokens--;
+        return true;
+    }
+    int Tokens(int64 nNow)
+    {
+        Refill(nNow);
+        return nTokens;
+    }
+};
+
+// What the draw gives this node: its place among a pool's 16, and until
+// which height the place holds (the linger end of the draw that gave it).
+struct GuardDrawn
+{
+    uint256 id;
+    int nRank;
+    int64 nUntil;
+    vector<unsigned char> record;
+};
+
+// What this node does with a pool it was drawn for.
+struct GuardEntry
+{
+    int nRank;
+    int64 nUntil;
+    vector<unsigned char> record;
+    bool fEmpty;            // pulled, and nobody had a share of it
+    int64 nPullSince;       // when its pull began (0: not pulling)
+    int nChoice;            // GuardChoice at the last decision
+    // Its line as last held here: a pool let go for want of room keeps its
+    // rank by work, and is not pulled again only to be let go again.
+    CGuardLine line;
+    GuardEntry() : nRank(-1), nUntil(0), fEmpty(false), nPullSince(0), nChoice(GUARD_NOT_DRAWN) {}
+};
+
+static bool fPoolGuard = true;                          // -poolguard
+static int64 nGuardBudget = GUARD_DEFAULT_BYTES;        // -poolguardmb
+static int64 nGuardMaxPoolBytes = GUARD_MAX_POOL_BYTES;
+static unsigned int nGuardMaxPools = GUARD_MAX_POOLS;
+static CTktView tktView;
+static bool fTktViewForTest = false;
+static CTicketBook* pTktBook = NULL;
+static TktQueues tqFile;                                // pool-tickets.dat read back
+static TktBudget tktBudget;
+static P2PoolBudget tktServeBudget(TKT_SERVE_BURST, TKT_SERVE_SECS);
+static int64 nTktNoHashUntil = 0;
+static uint64 nTktTurn = 0;                             // answer queues, in turn
+static bool fTktDirty = false;
+static int64 nTktSavedAt = 0;
+static bool fTktDrawDirty = true;
+static int64 nTktDrawnAt = 0;
+static map<unsigned int, int64> mapTktAskRound;         // when an epoch's set was last asked for
+static set<unsigned int> setTktBuried;                  // epochs whose ticket seed was buried at the last tick
+static unsigned int nTktMakeEpoch = 0;                  // this node's own ticket in the making
+static uint256 hashTktMakeSeed = 0;
+static uint64 nTktMakeNonce = 0;
+static bool fTktKeyForTest = false;
+static unsigned char tktKeyForTest[32];
+static bool fTktPoolsForTest = false;
+static vector<CPoolInfo> vTktPoolsForTest;
+static vector<GuardDrawn> vGuardDrawn;
+static uint64 nGuardDrawSeq = 0, nGuardAppliedSeq = 0;
+static map<uint256, vector<string> > mapGuardSeekAddr;  // a looked-for pool: the .btf of its 16
+static vector<uint256> vGuardSeek;                      // pools looked for
+static map<uint256, GuardEntry> mapGuard;
+static bool fGuardSaveDirty = false;
+static volatile bool fTktThreadStop = false;
+static volatile bool fTktThreadRunning = false;
+static uint64 nTktVerifiedForTest = 0;
+
+static bool TktActive()
+{
+    return RegOpen() && fPoolGuard;
+}
+
+// The ticket thread's own light RandomX VM (section 10): ticket checks and
+// this node's own ticket never wait on, nor delay, the verification VM that
+// blocks and shares use. Zero, pooltkt's sign for "not computed", when no VM
+// can be made here or RandomX is known not to work.
+static CCriticalSection cs_tktVM;
+static void* pTktVM = NULL;
+static int64 nTktVMRetryAt = 0;
+
+static uint256 TktWorkOwnVM(const unsigned char* pHeader80)
+{
+    uint256 h = 0;
+    if (RandomXVerifierKnownUnavailable(2))
+        return h;
+    CRITICAL_BLOCK(cs_tktVM)
+    {
+        if (!pTktVM && GetTime() >= nTktVMRetryAt)
+        {
+            pTktVM = RandomXCreateMinerVM(2);
+            if (!pTktVM)
+                nTktVMRetryAt = GetTime() + TKT_NO_HASH_WAIT;
+        }
+        if (pTktVM)
+        {
+            h = PoWHashHeaderWithVM(pTktVM, pHeader80);
+            if (h == POW_HASH_UNAVAILABLE)
+                h = 0;
+        }
+    }
+    return h;
+}
+
+static CTicketBook& TktBook()
+{
+    if (!pTktBook)
+    {
+        CTicketParams p = CTicketParams::Network();
+        p.fnWork = TktWorkOwnVM;
+        pTktBook = new CTicketBook(p);
+    }
+    return *pTktBook;
+}
+
+static string TktFilePath() { return GetAppDir() + "/pool-tickets.dat"; }
+static string GuardFilePath() { return GetAppDir() + "/pool-guards.dat"; }
+
+// Whether the seed this view gives an epoch is buried, and which it is.
+static bool TktBuriedSeed(unsigned int nEpoch, uint256& hashOut)
+{
+    bool fBuried = false;
+    return pooltkt::TicketSeed(tktView, nEpoch, hashOut, fBuried) && fBuried;
+}
+
+// The epochs whose sets this node takes, holds and asks for: previous (in
+// its linger), current and next, each once its seed is buried.
+static void TktEpochs(vector<unsigned int>& out)
+{
+    out.clear();
+    int c = pooltkt::EpochOf(tktView.nTip);
+    for (int e = c - 1; c >= 0 && e <= c + 1; e++)
+    {
+        uint256 h;
+        if (e >= 1 && pooltkt::EpochInRange(tktView, e) && TktBuriedSeed(e, h))
+            out.push_back((unsigned int)e);
+    }
+}
+
+static void TktDropEpochQueues(TktQueues& q, unsigned int nEpoch)
+{
+    q.mapAnswer.erase(nEpoch);
+    q.mapAnswerBodies.erase(nEpoch);
+    for (std::deque<TktItem>::iterator it = q.qRelay.begin(); it != q.qRelay.end();)
+        if (it->nEpoch == nEpoch)
+            it = q.qRelay.erase(it);
+        else
+            ++it;
+}
+
+static void TktDropEpochAll(unsigned int nEpoch)
+{
+    TktDropEpochQueues(tqFile, nEpoch);
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+    {
+        TktDropEpochQueues(it->second.tq, nEpoch);
+        it->second.mapTktOut.erase(nEpoch);
+    }
+}
+
+// The view moved: the book follows it before any Add (section 10).
+static void TktSyncLocked()
+{
+    CTicketSync s;
+    TktBook().Sync(tktView, s);
+    foreach(unsigned int e, s.vSeedGone)
+    {
+        printf("p2pool: guardian tickets of epoch %u: their seed left the active chain; the set is asked for again\n", e);
+        // Queued tickets were checked against the old seed: they go, and
+        // the set is asked for again; this node's own ticket is made again.
+        TktDropEpochAll(e);
+        mapTktAskRound.erase(e);
+        if (nTktMakeEpoch == e)
+            nTktMakeEpoch = 0;
+    }
+    foreach(unsigned int e, s.vExpired)
+    {
+        TktDropEpochAll(e);
+        mapTktAskRound.erase(e);
+    }
+    for (size_t i = 0; i < s.vRedraw.size(); i++)
+        printf("p2pool: the draw of epoch %u changed seed after it settled (a deep reorg): nodes drawn by the old seed "
+               "keep their pools until height %d\n", s.vRedraw[i], (int)s.vRedrawUntil[i]);
+    if (!s.vSeedGone.empty() || !s.vExpired.empty())
+        fTktDirty = true;
+    // A seed buried since the last tick: its set is asked for (relays of it
+    // were dropped until now).
+    set<unsigned int> setNow;
+    vector<unsigned int> vE;
+    TktEpochs(vE);
+    setNow.insert(vE.begin(), vE.end());
+    foreach(unsigned int e, setNow)
+        if (!setTktBuried.count(e))
+            mapTktAskRound.erase(e);
+    setTktBuried.swap(setNow);
+    fTktDrawDirty = true;
+}
+
+// Every interval, the counts that rank a connection's relays start over.
+static bool TktLowStanding(const RegConn& c)
+{
+    return c.nTktWasted >= TKT_WASTE_LOW && c.nTktWasted > 2 * c.nTktHeld;
+}
+
+// The sets asked of peers: at start, when a seed is newly buried or reorged
+// out, and every interval while an epoch holds few. At most 4 peers' answers
+// wait per epoch; a peer is asked an epoch at most once an interval.
+static void TktAskLocked(int64 nNow)
+{
+    vector<unsigned int> vE;
+    TktEpochs(vE);
+    foreach(unsigned int e, vE)
+    {
+        map<unsigned int, int64>::iterator itR = mapTktAskRound.find(e);
+        bool fWant = itR == mapTktAskRound.end() ||
+                     (TktBook().Held(e) < TKT_FEW && nNow - itR->second >= SYNC_SERVE_INTERVAL);
+        if (!fWant)
+            continue;
+        size_t nOpen = 0;
+        vector<std::pair<std::pair<int, int64>, CNode*> > vCand;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        {
+            CNode* p = it->first;
+            RegConn& c = it->second;
+            if (p->fDisconnect || p->nVersion == 0 || !(p->nServices & NODE_POOLREG))
+                continue;
+            map<unsigned int, int64>::iterator itA = c.mapTktAskedAt.find(e);
+            map<unsigned int, std::deque<TktItem> >::iterator itQ = c.tq.mapAnswer.find(e);
+            if ((itA != c.mapTktAskedAt.end() && nNow - itA->second <= SYNC_ANSWER_WINDOW) ||
+                (itQ != c.tq.mapAnswer.end() && !itQ->second.empty()))
+            {
+                nOpen++;
+                continue;
+            }
+            if (itA != c.mapTktAskedAt.end() && nNow - itA->second < SYNC_SERVE_INTERVAL)
+                continue;
+            vCand.push_back(std::make_pair(std::make_pair(p->fInbound ? 1 : 0, p->nTimeConnected), p));
+        }
+        std::sort(vCand.begin(), vCand.end());
+        size_t nAsked = 0;
+        for (size_t i = 0; i < vCand.size() && nOpen + nAsked < TKT_ASKED_PEERS; i++)
+        {
+            CNode* p = vCand[i].second;
+            RegConn& c = mapRegConn[p];
+            PushReg(p, "poolgettkt", e);
+            c.mapTktAskedAt[e] = nNow;
+            c.mapTktAnswered[e] = 0;
+            c.tq.mapAnswerBodies.erase(e);
+            nAsked++;
+        }
+        if (nAsked)
+        {
+            mapTktAskRound[e] = nNow;
+            LogPrint("p2pool", "p2pool: guardian tickets of epoch %u: %u held, asked %u peer(s) for their set\n", e,
+                     (unsigned)TktBook().Held(e), (unsigned)nAsked);
+        }
+    }
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        if (nNow - it->second.nTktTallySince >= SYNC_SERVE_INTERVAL)
+        {
+            it->second.nTktTallySince = nNow;
+            it->second.nTktWasted = it->second.nTktHeld = 0;
+        }
+}
+
+// On the message thread, once a second.
+static void TktTick(int64 nNow)
+{
+    if (!TktActive())
+        return;
+    CTktView v;
+    bool fNew = false;
+    bool fForTest;
+    uint256 hashKnown;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fForTest = fTktViewForTest;
+        hashKnown = tktView.hashTip;
+    }
+    if (!fForTest)
+    {
+        // cs_main only if free, and never under cs_p2pool (the template code
+        // takes cs_main first): busy, the view is taken a second later.
+        TRY_CRITICAL_BLOCK(cs_main)
+        {
+            if (pindexBest && pindexBest->GetBlockHash() != hashKnown)
+            {
+                v.nTip = pindexBest->nHeight;
+                v.hashTip = pindexBest->GetBlockHash();
+                set<int> setH;
+                TktViewHeights(v.nTip, setH);
+                int nLow = setH.empty() ? v.nTip : *setH.begin();
+                for (CBlockIndex* p = pindexBest; p && p->nHeight >= nLow; p = p->pprev)
+                    if (setH.count(p->nHeight))
+                        v.mapHash[p->nHeight] = p->GetBlockHash();
+                fNew = true;
+            }
+        }
+    }
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (fNew && !fTktViewForTest)
+        {
+            tktView = v;
+            TktSyncLocked();
+        }
+        if (tktView.nTip >= 0)
+            TktAskLocked(nNow);
+    }
+}
+
+// Under cs_p2pool: a held ticket goes to every peer that reads the registry
+// but the one it came from, until its epoch's deadline (a ticket after the
+// deadline travels only in answers).
+static void TktRelayLocked(const CGuardTicket& t, unsigned int nEpoch, CNode* pfrom)
+{
+    if (pooltkt::PastDeadline(tktView, nEpoch))
+        return;
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+    {
+        CNode* p = it->first;
+        if (p == pfrom || p->fDisconnect || p->nVersion == 0 || !(p->nServices & NODE_POOLREG))
+            continue;
+        vector<CGuardTicket>& v = it->second.mapTktOut[nEpoch];
+        if (v.size() < GUARD_MAX_TICKETS)
+            v.push_back(t);
+    }
+}
+
+// On the message thread, every pass: what the ticket thread scored, and the
+// held tickets it relays, in parts of 512, each with its seed (never one
+// that is no longer this node's).
+static void TktFlush()
+{
+    vector<std::pair<CNode*, int> > vScore;
+    struct Out { CNode* p; unsigned int e; uint256 seed; vector<CGuardTicket> v; };
+    vector<Out> vOut;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        {
+            RegConn& c = it->second;
+            if (c.nTktScore)
+            {
+                vScore.push_back(std::make_pair(it->first, c.nTktScore));
+                c.nTktScore = 0;
+            }
+            for (map<unsigned int, vector<CGuardTicket> >::iterator itO = c.mapTktOut.begin(); itO != c.mapTktOut.end(); ++itO)
+            {
+                uint256 hashHeld, hashChain;
+                if (itO->second.empty() || !TktActive() || !TktBook().Seed(itO->first, hashHeld) ||
+                    !TktBuriedSeed(itO->first, hashChain) || hashHeld != hashChain ||
+                    pooltkt::PastDeadline(tktView, itO->first))
+                    continue;
+                for (size_t i = 0; i < itO->second.size(); i += TKT_PER_MESSAGE)
+                {
+                    Out o;
+                    o.p = it->first;
+                    o.e = itO->first;
+                    o.seed = hashHeld;
+                    o.v.assign(itO->second.begin() + i, itO->second.begin() + std::min(itO->second.size(), i + TKT_PER_MESSAGE));
+                    vOut.push_back(o);
+                }
+            }
+            c.mapTktOut.clear();
+        }
+    }
+    for (size_t i = 0; i < vScore.size(); i++)
+        vScore[i].first->Misbehaving(vScore[i].second);
+    for (size_t i = 0; i < vOut.size(); i++)
+        if (!vOut[i].p->fDisconnect)
+            PushReg(vOut[i].p, "pooltkt", vOut[i].e, vOut[i].seed, vOut[i].v);
+}
+
+// pooltkt and poolgettkt (section 10). Only between peers that read the
+// registry, where registered pools are open and this node guards: elsewhere
+// dropped unread, nobody scored, nothing answered.
+static bool TktProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv)
+{
+    if (!(pfrom->nServices & NODE_POOLREG) || !TktActive())
+        return true;
+    int64 nNow = GetTime();
+
+    if (strCommand == "poolgettkt")
+    {
+        unsigned int nEpoch;
+        vRecv >> nEpoch;
+        // Not while this peer has not read what it was sent already.
+        if (SendQueueFull(classReg, pfrom))
+            return true;
+        vector<CGuardTicket> v;
+        uint256 hashSeed = 0;
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            RegConn& c = RegConnOf(pfrom);
+            uint256 hashChain;
+            // The held set of an epoch this node takes, under the seed its
+            // chain has now; once per connection and epoch an interval, from
+            // the serve budget. Anything else: silence.
+            if (!pooltkt::EpochInRange(tktView, nEpoch) || !TktBuriedSeed(nEpoch, hashChain) ||
+                !TktBook().Seed(nEpoch, hashSeed) || hashSeed != hashChain || TktBook().Held(nEpoch) == 0)
+                return true;
+            map<unsigned int, int64>::iterator itS = c.mapTktServedAt.find(nEpoch);
+            if (itS != c.mapTktServedAt.end() && nNow - itS->second < SYNC_SERVE_INTERVAL)
+                return true;
+            if (!tktServeBudget.Take(nNow))
+                return true;
+            c.mapTktServedAt[nEpoch] = nNow;
+            vector<CHeldTicket> vHeld;
+            TktBook().Tickets(nEpoch, vHeld);
+            for (size_t i = 0; i < vHeld.size() && v.size() < GUARD_MAX_TICKETS; i++)
+                v.push_back(vHeld[i].ticket);
+        }
+        for (size_t i = 0; i < v.size(); i += TKT_PER_MESSAGE)
+        {
+            vector<CGuardTicket> part(v.begin() + i, v.begin() + std::min(v.size(), i + TKT_PER_MESSAGE));
+            PushReg(pfrom, "pooltkt", nEpoch, hashSeed, part);
+        }
+        return true;
+    }
+
+    // pooltkt: the epoch, the seed the sender checked them against, the
+    // tickets. Framing is the sender's fault (step 1); nothing is read past it.
+    unsigned int nEpoch;
+    uint256 hashSeed;
+    vRecv >> nEpoch >> hashSeed;
+    uint64 n = ReadCompactSize(vRecv);
+    if (n > TKT_PER_MESSAGE || vRecv.size() != n * GUARD_TICKET_SIZE)
+    {
+        pfrom->Misbehaving(20);
+        return true;
+    }
+    bool fScore = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        RegConn& c = RegConnOf(pfrom);
+        // The message's epoch and seed before any ticket is read (step 2):
+        // an epoch this node does not take, a seed not buried here, another
+        // seed, an unasked relay past the deadline. Nobody scored.
+        uint256 hashChain;
+        if (!pooltkt::EpochInRange(tktView, nEpoch) || !TktBuriedSeed(nEpoch, hashChain) || hashChain != hashSeed)
+            return true;
+        map<unsigned int, int64>::iterator itA = c.mapTktAskedAt.find(nEpoch);
+        const bool fAnswer = itA != c.mapTktAskedAt.end() && nNow - itA->second <= SYNC_ANSWER_WINDOW;
+        if (!fAnswer && pooltkt::PastDeadline(tktView, nEpoch))
+            return true;
+        // An unasked relay that finds the ticket budget empty is dropped
+        // (it comes again, or in an answer).
+        const bool fRelayRoom = fAnswer || tktBudget.Tokens(nNow) > 0;
+        size_t nRelays = tqFile.qRelay.size();
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+            nRelays += it->second.tq.qRelay.size();
+        const uint64 nMsg = ++c.nTktMsg;
+        unsigned char buf[GUARD_TICKET_SIZE];
+        for (uint64 i = 0; i < n && !fScore; i++)
+        {
+            vRecv.read((char*)buf, sizeof(buf));
+            TktItem item;
+            int v = TktBook().Precheck(tktView, buf, sizeof(buf), nEpoch, hashSeed, fAnswer, item.t);
+            // Read up to the first ticket the sender is at fault for, and
+            // scored once for the message.
+            if (TicketScored(v))
+            {
+                fScore = true;
+                continue;
+            }
+            if (v != TICKET_PRECHECK_OK)
+                continue;
+            item.nEpoch = nEpoch;
+            item.hashSeed = hashSeed;
+            item.fOwn = false;
+            item.nMsg = nMsg;
+            if (fAnswer)
+            {
+                // One set's worth an ask; deduplicated within this peer's
+                // queue only. Beyond it, dropped unscored.
+                size_t& nTaken = c.mapTktAnswered[nEpoch];
+                set<uint256>& setBodies = c.tq.mapAnswerBodies[nEpoch];
+                const uint256 hashBody = item.t.BodyHash();
+                if (nTaken >= GUARD_MAX_TICKETS || setBodies.count(hashBody))
+                    continue;
+                nTaken++;
+                setBodies.insert(hashBody);
+                c.tq.mapAnswer[nEpoch].push_back(item);
+            }
+            else if (fRelayRoom && c.tq.qRelay.size() < TKT_RELAY_QUEUE && nRelays < TKT_RELAY_QUEUE_ALL)
+            {
+                c.tq.qRelay.push_back(item);
+                nRelays++;
+            }
+        }
+    }
+    if (fScore)
+        pfrom->Misbehaving(20);
+    return true;
+}
+
+// ---- The ticket thread
+
+// A ticket taken from a queue for its hash: where it came from (a connection
+// by pointer and serial, or this node's file), and whether as an answer.
+struct TktJob
+{
+    TktItem item;
+    CNode* pnode;
+    uint64 nSerial;
+    bool fAnswer;
+    bool fFile;
+};
+
+static void TktDropAllRelays()
+{
+    tqFile.qRelay.clear();
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        it->second.tq.qRelay.clear();
+}
+
+// Under cs_p2pool: the next ticket to hash, with Precheck passed again on
+// the view of now and a ticket budget token taken for it. The order: relays
+// of connections in good standing, older connections first (OlderHeld);
+// then the answer queues in turn, one ticket from each (this node's file
+// among them); then the relays of connections whose relays keep coming back
+// outranked or past the cap. False: nothing to hash now.
+static bool TktPickLocked(int64 nNow, TktJob& job)
+{
+    for (int nTry = 0; nTry < 256; nTry++)
+    {
+        vector<std::pair<int64, CNode*> > vGood, vLow;
+        struct AnsQ { TktQueues* q; unsigned int e; CNode* p; uint64 nSerial; };
+        vector<AnsQ> vAns;
+        for (map<unsigned int, std::deque<TktItem> >::iterator itQ = tqFile.mapAnswer.begin(); itQ != tqFile.mapAnswer.end(); ++itQ)
+            if (!itQ->second.empty())
+            {
+                AnsQ a = { &tqFile, itQ->first, NULL, 0 };
+                vAns.push_back(a);
+            }
+        vector<std::pair<uint64, CNode*> > vBySerial;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        {
+            RegConn& c = it->second;
+            if (it->first->fDisconnect)
+                continue;
+            if (!c.tq.qRelay.empty())
+                (TktLowStanding(c) ? vLow : vGood).push_back(std::make_pair(it->first->nTimeConnected, it->first));
+            vBySerial.push_back(std::make_pair(c.nTktSerial, it->first));
+        }
+        std::sort(vBySerial.begin(), vBySerial.end());
+        for (size_t i = 0; i < vBySerial.size(); i++)
+        {
+            RegConn& c = mapRegConn[vBySerial[i].second];
+            for (map<unsigned int, std::deque<TktItem> >::iterator itQ = c.tq.mapAnswer.begin(); itQ != c.tq.mapAnswer.end(); ++itQ)
+                if (!itQ->second.empty())
+                {
+                    AnsQ a = { &c.tq, itQ->first, vBySerial[i].second, c.nTktSerial };
+                    vAns.push_back(a);
+                }
+        }
+        std::sort(vGood.begin(), vGood.end());
+        std::sort(vLow.begin(), vLow.end());
+        TktQueues* q = NULL;
+        std::deque<TktItem>* pq = NULL;
+        job.fFile = false;
+        job.pnode = NULL;
+        job.nSerial = 0;
+        if (!vGood.empty() || (vAns.empty() && !vLow.empty()))
+        {
+            CNode* p = !vGood.empty() ? vGood[0].second : vLow[0].second;
+            RegConn& c = mapRegConn[p];
+            q = &c.tq;
+            pq = &q->qRelay;
+            job.fAnswer = false;
+            job.pnode = p;
+            job.nSerial = c.nTktSerial;
+        }
+        else if (!vAns.empty())
+        {
+            const AnsQ& a = vAns[(size_t)(nTktTurn++ % vAns.size())];
+            q = a.q;
+            pq = &q->mapAnswer[a.e];
+            job.fAnswer = true;
+            job.fFile = a.p == NULL;
+            job.pnode = a.p;
+            job.nSerial = a.nSerial;
+        }
+        else
+            return false;
+        job.item = pq->front();
+        pq->pop_front();
+        // Step 2 again, on the view of now: the chain may have moved while it
+        // waited. A drop costs no token.
+        const vector<unsigned char> b = job.item.t.Bytes();
+        CGuardTicket t;
+        int v = TktBook().Precheck(tktView, &b[0], b.size(), job.item.nEpoch, job.item.hashSeed, job.fAnswer, t);
+        // This node's own ticket from its file, whose body came in from a
+        // peer first: already checked, it is still this node's own (no hash).
+        if (v == TICKET_DROP_SEEN && job.item.fOwn)
+            TktBook().AddOwnVerified(tktView, job.item.t, job.item.hashSeed, uint256(1));
+        if (v != TICKET_PRECHECK_OK)
+            continue;
+        if (!tktBudget.Take(nNow))
+        {
+            if (!job.fAnswer)
+            {
+                // An unasked relay that finds the budget empty is dropped,
+                // and so is every relay waiting; answers wait.
+                TktDropAllRelays();
+                continue;
+            }
+            pq->push_front(job.item);
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Under cs_p2pool: what the hash said.
+static void TktApplyLocked(const TktJob& job, int v, const uint256& hashWork, int64 nNow)
+{
+    RegConn* pc = NULL;
+    if (!job.fFile && job.pnode)
+    {
+        map<CNode*, RegConn>::iterator it = mapRegConn.find(job.pnode);
+        if (it != mapRegConn.end() && it->second.nTktSerial == job.nSerial)
+            pc = &it->second;
+    }
+    TktQueues* pq = job.fFile ? &tqFile : pc ? &pc->tq : NULL;
+    const unsigned int e = job.item.nEpoch;
+    if (v == TICKET_DROP_NO_HASH)
+    {
+        // This node could not hash: nobody scored, nothing remembered, and
+        // nothing hashed for a while. An answer waits to be tried again.
+        if (nNow >= nTktNoHashUntil)
+            printf("p2pool: guardian tickets: RandomX gave no hash here; ticket checks wait %d s\n", (int)TKT_NO_HASH_WAIT);
+        nTktNoHashUntil = nNow + TKT_NO_HASH_WAIT;
+        if (job.fAnswer && pq)
+            pq->mapAnswer[e].push_front(job.item);
+        return;
+    }
+    if (TicketScored(v))
+    {
+        // A bad signature, or work that fails against the seed the sender
+        // named itself: never honest. An answer's sender is scored once and
+        // its queue dropped (another peer's copies of the same tickets wait
+        // in their own queues); a relay's once per message, and the rest of
+        // that message dropped.
+        if (job.fAnswer)
+        {
+            if (pq)
+            {
+                pq->mapAnswer.erase(e);
+                pq->mapAnswerBodies.erase(e);
+            }
+            if (pc)
+                pc->nTktScore += 20;
+        }
+        else if (pc && pc->nTktScoredMsg != job.item.nMsg)
+        {
+            pc->nTktScore += 20;
+            pc->nTktScoredMsg = job.item.nMsg;
+            for (std::deque<TktItem>::iterator it = pc->tq.qRelay.begin(); it != pc->tq.qRelay.end();)
+                if (it->nMsg == job.item.nMsg)
+                    it = pc->tq.qRelay.erase(it);
+                else
+                    ++it;
+        }
+        LogPrint("p2pool", "p2pool: a guardian ticket of epoch %u refused: %s\n", e, TicketVerdictName(v));
+        return;
+    }
+    nTktVerifiedForTest++;
+    int r = job.item.fOwn ? TktBook().AddOwnVerified(tktView, job.item.t, job.item.hashSeed, hashWork)
+                          : TktBook().Add(tktView, job.item.t, job.item.hashSeed, hashWork);
+    if (r == TICKET_HELD)
+    {
+        // Only a held ticket is relayed.
+        TktRelayLocked(job.item.t, e, job.pnode);
+        fTktDirty = true;
+        fTktDrawDirty = true;
+    }
+    if (!job.fAnswer && pc)
+    {
+        if (r == TICKET_HELD)
+            pc->nTktHeld++;
+        else if (r == TICKET_OUTRANKED || r == TICKET_PAST_CAP)
+            pc->nTktWasted++;
+    }
+}
+
+// This node's own ticket for the current or the next epoch, a slice of
+// nonces at a time (MakeTicketWork; the .btf key signs in nostr.cpp). Only
+// on a node that listens on an onion, which is what makes it reachable as a
+// guardian. True when it hashed.
+static bool TktMakeStep(int64 nNow)
+{
+    unsigned int nEpoch = 0;
+    uint256 hashSeed = 0;
+    uint64 nNonce = 0;
+    unsigned short nCapacity = 0;
+    CTicketParams params;
+    bool fTestKey = false;
+    unsigned char sk[32];
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (TktActive() && tktView.nTip >= 0 && nNow >= nTktNoHashUntil)
+        {
+            int c = pooltkt::EpochOf(tktView.nTip);
+            for (int e = c; e <= c + 1 && nEpoch == 0; e++)
+            {
+                uint256 h, hashOwnSeed;
+                CGuardTicket t;
+                uint256 w;
+                if (e < 1 || !TktBuriedSeed(e, h))
+                    continue;
+                if (TktBook().Own(e, t, w) && TktBook().Seed(e, hashOwnSeed) && hashOwnSeed == h)
+                    continue;
+                nEpoch = e;
+                hashSeed = h;
+            }
+            if (nEpoch != 0)
+            {
+                if (nTktMakeEpoch != nEpoch || hashTktMakeSeed != hashSeed)
+                {
+                    nTktMakeEpoch = nEpoch;
+                    hashTktMakeSeed = hashSeed;
+                    nTktMakeNonce = GetRand(~(uint64)0);
+                }
+                nNonce = nTktMakeNonce;
+                params = TktBook().Params();
+                nCapacity = (unsigned short)std::min((int64)65535, nGuardBudget / (1024 * 1024));
+                fTestKey = fTktKeyForTest;
+                if (fTestKey)
+                    memcpy(sk, tktKeyForTest, 32);
+            }
+        }
+    }
+    if (nEpoch == 0)
+        return false;
+    unsigned char pubkey[32];
+    if (fTestKey)
+    {
+        if (!pooltkt::XOnlyPubKey(sk, pubkey))
+            return false;
+    }
+    else
+    {
+        unsigned char encsk[32];
+        bool fId = !BtfLocalOnionEndpoint().empty() && BtfGetIdentity(pubkey, encsk);
+        memset(encsk, 0, sizeof(encsk));
+        if (!fId)
+            return false;
+    }
+    CGuardTicket t;
+    uint256 hashWork = 0;
+    uint64 nTries = 0;
+    bool fFound = pooltkt::MakeTicketWork(params, hashSeed, nEpoch, pubkey, nCapacity, nNonce, TKT_MAKE_SLICE, t,
+                                          hashWork, nTries, &fTktThreadStop);
+    if (fFound)
+        fFound = fTestKey ? (t.Sign(sk) && t.VerifySig()) : BtfSignGuardTicket(t);
+    memset(sk, 0, sizeof(sk));
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (nTktMakeEpoch == nEpoch && hashTktMakeSeed == hashSeed)
+            nTktMakeNonce = nNonce + std::max(nTries, (uint64)1);
+        if (!fFound && nTries < TKT_MAKE_SLICE && !fTktThreadStop)
+            nTktNoHashUntil = nNow + TKT_NO_HASH_WAIT;
+        if (fFound)
+        {
+            int r = TktBook().AddOwnVerified(tktView, t, hashSeed, hashWork);
+            printf("p2pool: this node's guardian ticket for epoch %u made (%s)\n", nEpoch, TicketVerdictName(r));
+            if (r == TICKET_HELD)
+                TktRelayLocked(t, nEpoch, NULL);
+            if (TicketPassed(r))
+            {
+                fTktDirty = true;
+                fTktDrawDirty = true;
+            }
+            nTktMakeEpoch = 0;
+        }
+    }
+    return true;
+}
+
+// The draw (section 10): this node's place among each active pool's 16 under
+// every draw in force (the previous epoch's while it lingers, the current
+// one's, the next one's once settled, and the seeds of a redraw until their
+// linger ends), and the 16 of each pool this node looks for. Over a copy of
+// the tickets, with no lock held: pools times tickets SHA256d.
+static void TktDrawStep(int64 nNow)
+{
+    bool fGo = false;
+    CRITICAL_BLOCK(cs_p2pool)
+        fGo = TktActive() && tktView.nTip >= 0 &&
+              ((fTktDrawDirty && nNow - nTktDrawnAt >= TKT_DRAW_INTERVAL) || nNow - nTktDrawnAt >= TKT_DRAW_REFRESH);
+    if (!fGo)
+        return;
+    // Active registered pools, pool zero aside (the index has its own lock).
+    vector<CPoolInfo> vInfo;
+    bool fReady = true, fTest;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fTest = fTktPoolsForTest;
+        if (fTest)
+            vInfo = vTktPoolsForTest;
+    }
+    if (!fTest)
+    {
+        fReady = RegIndexReady();
+        if (fReady)
+            PoolIndexList(vInfo);
+    }
+    if (!fReady)
+    {
+        CRITICAL_BLOCK(cs_p2pool)
+            nTktDrawnAt = nNow - TKT_DRAW_INTERVAL + 10;
+        return;
+    }
+    const uint256 idZero = RegZeroId();
+    vector<uint256> vPools;
+    vector<vector<unsigned char> > vRecords;
+    foreach(const CPoolInfo& info, vInfo)
+        if (info.nStatus == POOL_ACTIVE && !info.fZero && info.id != idZero && !info.record.empty())
+        {
+            vPools.push_back(info.id);
+            vRecords.push_back(info.record);
+        }
+    struct Draw { unsigned int e; uint256 hashDraw; int64 nUntil; };
+    vector<Draw> vDraw;
+    map<unsigned int, vector<CHeldTicket> > mapTickets;
+    map<unsigned int, uint256> mapOwnWork;
+    vector<unsigned char> keyOwn;
+    vector<uint256> vSeek;
+    int c;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fTktDrawDirty = false;
+        nTktDrawnAt = nNow;
+        c = pooltkt::EpochOf(tktView.nTip);
+        for (int e = c - 1; e <= c + 1; e++)
+        {
+            if (e < 1 || (e == c - 1 && tktView.nTip >= pooltkt::LingerEndHeight(c)))
+                continue;
+            uint256 hashDraw, hashChain, hashHeld;
+            bool fSettled = false;
+            if (!TktBook().NoteDrawSeed(tktView, e, hashDraw, fSettled) || !fSettled)
+                continue;
+            Draw d = { (unsigned int)e, hashDraw, pooltkt::LingerEndHeight(e + 1) };
+            vDraw.push_back(d);
+            vector<std::pair<uint256, int64> > vOld;
+            TktBook().OldDrawSeedsUntil(e, vOld);
+            for (size_t i = 0; i < vOld.size(); i++)
+            {
+                Draw o = { (unsigned int)e, vOld[i].first, vOld[i].second };
+                vDraw.push_back(o);
+            }
+            if (TktBuriedSeed(e, hashChain) && TktBook().Seed(e, hashHeld) && hashChain == hashHeld)
+            {
+                TktBook().Tickets(e, mapTickets[e]);
+                CGuardTicket own;
+                uint256 w;
+                CHeldTicket held;
+                if (TktBook().Own(e, own, w) && TktBook().HeldByKey(e, own.PubKey(), held) && held.hashWork == w)
+                {
+                    mapOwnWork[e] = w;
+                    keyOwn = own.Key();
+                }
+            }
+        }
+        vSeek = vGuardSeek;
+    }
+    const unsigned int nPlaces = GUARD_PLACES + GUARD_RESERVE;
+    map<uint256, std::pair<int, int64> > mapRank;
+    for (size_t k = 0; k < vDraw.size(); k++)
+    {
+        map<unsigned int, uint256>::const_iterator itOwn = mapOwnWork.find(vDraw[k].e);
+        if (itOwn == mapOwnWork.end())
+            continue;
+        const vector<CHeldTicket>& vT = mapTickets[vDraw[k].e];
+        for (size_t i = 0; i < vPools.size(); i++)
+        {
+            unsigned int r = pooltkt::RankOf(vDraw[k].hashDraw, vPools[i], vT, itOwn->second, nPlaces);
+            if (r >= nPlaces)
+                continue;
+            map<uint256, std::pair<int, int64> >::iterator it = mapRank.find(vPools[i]);
+            if (it == mapRank.end())
+                mapRank[vPools[i]] = std::make_pair((int)r, vDraw[k].nUntil);
+            else
+            {
+                it->second.first = std::min(it->second.first, (int)r);
+                it->second.second = std::max(it->second.second, vDraw[k].nUntil);
+            }
+        }
+    }
+    // A pool looked for: the 16 of the current and the previous epoch's
+    // draws, this node aside, as .btf addresses to dial.
+    map<uint256, vector<string> > mapSeek;
+    foreach(const uint256& id, vSeek)
+    {
+        set<string> setAddr;
+        for (size_t k = 0; k < vDraw.size(); k++)
+        {
+            vector<CDrawPlace> places;
+            pooltkt::Draw(vDraw[k].hashDraw, id, mapTickets[vDraw[k].e], nPlaces, places);
+            foreach(const CDrawPlace& pl, places)
+                if (pl.key.size() == 32 && pl.key != keyOwn)
+                    setAddr.insert(btf::Address(&pl.key[0]));
+        }
+        mapSeek[id].assign(setAddr.begin(), setAddr.end());
+    }
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        vGuardDrawn.clear();
+        for (size_t i = 0; i < vPools.size(); i++)
+        {
+            map<uint256, std::pair<int, int64> >::iterator it = mapRank.find(vPools[i]);
+            if (it == mapRank.end())
+                continue;
+            GuardDrawn g;
+            g.id = vPools[i];
+            g.nRank = it->second.first;
+            g.nUntil = it->second.second;
+            g.record = vRecords[i];
+            vGuardDrawn.push_back(g);
+        }
+        mapGuardSeekAddr.swap(mapSeek);
+        nGuardDrawSeq++;
+    }
+    LogPrint("p2pool", "p2pool: the draw: %u active pool(s), drawn for %u\n", (unsigned)vPools.size(), (unsigned)mapRank.size());
+}
+
+// pool-guards.dat: the pools this node keeps, each with its place and the
+// height its linger ends, so a restart does not forget what it guards under
+// a seed a redraw replaced (the book keeps no old seed in its file).
+static const int GUARD_FILE_VERSION = 1;
+static const size_t GUARD_FILE_MAX = 4 * 1024 * 1024;
+
+struct GuardFileEntry
+{
+    uint256 id;
+    int nRank;
+    int64 nUntil;
+    vector<unsigned char> record;
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(id);
+        READWRITE(nRank);
+        READWRITE(nUntil);
+        READWRITE(record);
+    )
+};
+
+static string GuardFileDataLocked()
+{
+    vector<GuardFileEntry> v;
+    for (map<uint256, GuardEntry>::const_iterator it = mapGuard.begin(); it != mapGuard.end(); ++it)
+        if (it->second.nChoice == GUARD_KEEP && v.size() < 4 * GUARD_MAX_POOLS)
+        {
+            GuardFileEntry f;
+            f.id = it->first;
+            f.nRank = it->second.nRank;
+            f.nUntil = it->second.nUntil;
+            f.record = it->second.record;
+            v.push_back(f);
+        }
+    CDataStream ss(SER_DISK);
+    ss << GUARD_FILE_VERSION << FLATDATA(pchMessageStart) << v;
+    uint256 h = Hash(ss.begin(), ss.end());
+    string data(ss.begin(), ss.end());
+    data.append((const char*)h.begin(), 32);
+    return data;
+}
+
+static bool GuardFileRead(vector<GuardFileEntry>& out)
+{
+    out.clear();
+    FILE* f = fopen(GuardFilePath().c_str(), "rb");
+    if (!f)
+        return false;
+    std::vector<char> buf;
+    char tmp[65536];
+    size_t n;
+    while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0 && buf.size() + n <= GUARD_FILE_MAX)
+        buf.insert(buf.end(), tmp, tmp + n);
+    fclose(f);
+    if (buf.size() < 4 + 4 + 1 + 32)
+        return false;
+    uint256 hashFile = 0;
+    memcpy(hashFile.begin(), &buf[buf.size() - 32], 32);
+    if (Hash(buf.begin(), buf.end() - 32) != hashFile)
+        return false;
+    try
+    {
+        CDataStream ss(&buf[0], &buf[0] + buf.size() - 32, SER_DISK);
+        int nVersion = 0;
+        unsigned char magic[4];
+        ss >> nVersion;
+        if (nVersion != GUARD_FILE_VERSION)
+            return false;
+        ss >> FLATDATA(magic);
+        if (memcmp(magic, pchMessageStart, 4) != 0)
+            return false;
+        ss >> out;
+        if (!ss.empty() || out.size() > 4 * GUARD_MAX_POOLS)
+        {
+            out.clear();
+            return false;
+        }
+    }
+    catch (std::exception&)
+    {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// pool-tickets.dat and pool-guards.dat, when changed (at most once a
+// minute) and at exit. Their bytes are made under cs_p2pool, written outside.
+static void TktSaveStep(int64 nNow, bool fForce)
+{
+    string strTkt, strGuard;
+    bool fTkt = false, fGuard = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (!TktActive() || !fRegFiles)
+            return;
+        if (fTktDirty && (fForce || nNow - nTktSavedAt >= TKT_SAVE_INTERVAL))
+        {
+            strTkt = pooltkt::TicketFileData(TktBook());
+            fTkt = true;
+            fTktDirty = false;
+            nTktSavedAt = nNow;
+        }
+        if (fGuardSaveDirty)
+        {
+            strGuard = GuardFileDataLocked();
+            fGuard = true;
+            fGuardSaveDirty = false;
+        }
+    }
+    if (fTkt)
+        pooltkt::WriteTicketFileData(TktFilePath(), strTkt);
+    string err;
+    if (fGuard && !WriteFileAtomicPrivate(GuardFilePath(), strGuard, err))
+        printf("p2pool: pool-guards.dat: %s\n", err.c_str());
+}
+
+// One pass of the ticket thread: up to nMaxVerify queued tickets hashed,
+// the draw if due, a slice of this node's own ticket when nothing waited,
+// the files if due. True when it hashed anything.
+static bool TktStep(int64 nNow, int nMaxVerify, bool fMake)
+{
+    if (!TktActive())
+        return false;
+    int n = 0;
+    bool fMore = true;
+    while (fMore && n < nMaxVerify && !fTktThreadStop)
+    {
+        TktJob job;
+        CTicketBook* pBook = NULL;
+        fMore = false;
+        CRITICAL_BLOCK(cs_p2pool)
+            if (tktView.nTip >= 0 && nNow >= nTktNoHashUntil && TktPickLocked(nNow, job))
+            {
+                pBook = &TktBook();
+                fMore = true;
+            }
+        if (!fMore)
+            break;
+        // No lock across the hash: the book's parameters never change.
+        uint256 hashWork = 0;
+        int v = pBook->Verify(job.item.t, job.item.hashSeed, hashWork);
+        CRITICAL_BLOCK(cs_p2pool)
+            TktApplyLocked(job, v, hashWork, nNow);
+        n++;
+        if (v == TICKET_DROP_NO_HASH)
+            break;
+    }
+    TktDrawStep(nNow);
+    bool fMade = false;
+    if (fMake && n == 0)
+        fMade = TktMakeStep(nNow);
+    TktSaveStep(nNow, false);
+    return n > 0 || fMade;
+}
+
+static void ThreadPoolTickets(void* parg)
+{
+    // Idle priority: the ticket work is a few minutes of one core a day, and
+    // checks wait for whatever the machine leaves.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#ifdef __linux__
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+    while (!fShutdown && !fTktThreadStop)
+    {
+        bool fBusy = false;
+        try
+        {
+            fBusy = TktStep(GetTime(), 32, true);
+        }
+        catch (std::exception& e)
+        {
+            printf("p2pool: ticket thread: %s\n", e.what());
+        }
+        if (!fBusy)
+            Sleep(250);
+    }
+    TktSaveStep(GetTime(), true);
+    fTktThreadRunning = false;
+}
+
+// ---- Guarded pools
+
+// Under cs_p2pool: whether a peer announces the pool now.
+static bool GuardAnnouncedLocked(const uint256& id)
+{
+    for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        if (!it->first->fDisconnect && it->second.setInv.count(id))
+            return true;
+    return false;
+}
+
+static void GuardNoteAnnouncedLocked(const uint256& id)
+{
+    map<uint256, GuardEntry>::iterator it = mapGuard.find(id);
+    if (it != mapGuard.end() && it->second.fEmpty)
+    {
+        // It has shares now somewhere: pulled again, from that announcer.
+        it->second.fEmpty = false;
+        it->second.nPullSince = 0;
+        it->second.line = CGuardLine();
+        LogPrint("p2pool", "p2pool: guarded pool %s announced by a peer: pulling its line\n", id.GetHex().c_str());
+    }
+}
+
+// Under cs_p2pool: a drawn pool joins this node to be pulled or kept. Its
+// line left from an earlier run (pools/<id>.dat, a restart while it was
+// guarded) is read back, so a lingering pool needs no pull.
+static RegPool* GuardNewPool(const uint256& id, const vector<unsigned char>& record)
+{
+    string err;
+    RegPool* rp = RegNew(id, record, err);
+    if (!rp)
+    {
+        printf("p2pool: guarded pool %s: %s\n", id.GetHex().c_str(), err.c_str());
+        return NULL;
+    }
+    rp->nStatus = POOL_ACTIVE;
+    rp->fStatusKnown = true;
+    if (fRegFiles && !rp->state.strFile.empty())
+    {
+        vector<unsigned char> rec;
+        RegChunks v;
+        if (RegReadFile(rp->state.strFile, rec, v, false) && rec == record)
+        {
+            RegLoadChunks(rp, v, false);
+            if (!rp->state.chain->Empty())
+                rp->nFetch = FETCH_COMPLETE;
+        }
+    }
+    return rp;
+}
+
+// Under cs_p2pool, on the message thread: no longer guarded. A pool this
+// node neither mines nor carries by -poolcarry gives its line back, memory
+// and files, and leaves memory: what the guard budget bounds is all a
+// guardian keeps, however many pools the draw names over the epochs. The
+// pointer is not used after.
+static void GuardRelease(RegPool* rp)
+{
+    if (!rp->fGuard)
+        return;
+    rp->fGuard = false;
+    if (rp->fMined || rp->fCarry)
+        return;
+    LogPrint("p2pool", "p2pool: registered pool %s no longer guarded here: its line is let go\n", rp->id.GetHex().c_str());
+    if (fRegFiles && !rp->state.strFile.empty())
+        remove(rp->state.strFile.c_str());
+    if (fRegFiles && !rp->strPart.empty())
+        remove(rp->strPart.c_str());
+    RegFree(rp);
+}
+
+struct GuardLineCtx
+{
+    map<uint256, CGuardLine> m;
+};
+
+static void GuardLineOf(void* pCtx, const uint256& id, CGuardLine& out)
+{
+    GuardLineCtx* ctx = (GuardLineCtx*)pCtx;
+    map<uint256, CGuardLine>::const_iterator it = ctx->m.find(id);
+    if (it != ctx->m.end())
+        out = it->second;
+}
+
+// On the message thread, once a second: the latest draw taken in, places
+// whose linger is over let go, and the guard budget run over what is known
+// of each line (sections 10 and 11): kept, pulled (at most 4 at once, those
+// a peer announces first), empty, or no room.
+static void GuardApply(int64 nNow)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (!TktActive())
+        {
+            vector<RegPool*> vAll = vRegPools;
+            foreach(RegPool* rp, vAll)
+                GuardRelease(rp);
+            mapGuard.clear();
+            vGuardSeek.clear();
+            return;
+        }
+        const int64 nTip = tktView.nTip;
+        if (nTip < 0)
+            return;
+        if (nGuardAppliedSeq != nGuardDrawSeq)
+        {
+            nGuardAppliedSeq = nGuardDrawSeq;
+            // A pool the draw names takes its place and linger end from the
+            // draws in force now (a redraw's old seed among them, until its
+            // own linger end). One it no longer names keeps what it had: its
+            // tickets may be gone with a reorged ticket seed, or its place
+            // moved at the edge as tickets came in; it lingers to its end.
+            foreach(const GuardDrawn& g, vGuardDrawn)
+            {
+                GuardEntry& ge = mapGuard[g.id];
+                ge.nRank = g.nRank;
+                ge.nUntil = g.nUntil;
+                ge.record = g.record;
+            }
+            fGuardSaveDirty = true;
+        }
+        // A place holds until its linger ends, whatever later draws say (a
+        // redraw, a ticket set that moved at the edges): then it goes.
+        for (map<uint256, GuardEntry>::iterator it = mapGuard.begin(); it != mapGuard.end();)
+        {
+            if (it->second.nUntil > nTip)
+            {
+                ++it;
+                continue;
+            }
+            RegPool* rp = RegById(it->first);
+            if (rp)
+                GuardRelease(rp);
+            mapGuard.erase(it++);
+            fGuardSaveDirty = true;
+        }
+        // What is known of each line. A pool this node mines or carries by
+        // -poolcarry is carried at pool zero's caps and takes nothing of the
+        // guard budget.
+        vector<uint256> vIds;
+        vector<int> vRanks;
+        GuardLineCtx ctx;
+        for (map<uint256, GuardEntry>::iterator it = mapGuard.begin(); it != mapGuard.end(); ++it)
+        {
+            RegPool* rp = RegById(it->first);
+            if (rp && (rp->fMined || rp->fCarry))
+                continue;
+            CGuardLine l;
+            if (rp && rp->nFetch == FETCH_COMPLETE && RegLive(*rp))
+            {
+                l.fKnown = true;
+                l.nShares = (unsigned int)rp->state.chain->Size();
+                l.nBytes = (int64)rp->state.chain->Bytes();
+                l.bnWork = CBigNum(rp->state.chain->TipLineWork());
+                it->second.line = l;
+            }
+            else if (it->second.fEmpty)
+                l.fKnown = true;
+            else if (it->second.line.fKnown)
+                l = it->second.line;
+            ctx.m[it->first] = l;
+            vIds.push_back(it->first);
+            vRanks.push_back(it->second.nRank);
+        }
+        vector<CGuardDecision> vDec;
+        pooltkt::ChooseGuarded(vIds, vRanks, GuardLineOf, &ctx, nGuardBudget, std::min(nGuardMaxPoolBytes, nGuardBudget),
+                               nGuardMaxPools, vDec);
+        size_t nPulls = 0;
+        foreach(RegPool* rp, vRegPools)
+            if (rp->fGuard && rp->nFetch != FETCH_COMPLETE)
+                nPulls++;
+        // Pulls: those a peer announces first, then the rest, at most 4 at
+        // once; one nobody announces and nothing came of for 10 minutes is
+        // taken as empty.
+        for (int nPass = 0; nPass < 3; nPass++)
+            foreach(const CGuardDecision& d, vDec)
+            {
+                GuardEntry& ge = mapGuard[d.poolId];
+                RegPool* rp = RegById(d.poolId);
+                if (nPass == 0)
+                {
+                    ge.nChoice = d.nChoice;
+                    if (d.nChoice == GUARD_KEEP)
+                    {
+                        if (!rp)
+                            rp = GuardNewPool(d.poolId, ge.record);
+                        if (rp && !rp->fGuard)
+                        {
+                            rp->fGuard = true;
+                            fGuardSaveDirty = true;
+                        }
+                        ge.nPullSince = 0;
+                    }
+                    else if (d.nChoice != GUARD_PULL && rp && rp->fGuard)
+                    {
+                        GuardRelease(rp);
+                        fGuardSaveDirty = true;
+                    }
+                    else if (d.nChoice == GUARD_PULL && rp && rp->fGuard)
+                    {
+                        if (!ge.nPullSince)
+                            ge.nPullSince = nNow;
+                        if (rp->state.chain->Empty() && rp->nFetch == FETCH_IDLE && !GuardAnnouncedLocked(d.poolId) &&
+                            nNow - ge.nPullSince >= GUARD_PULL_WAIT)
+                        {
+                            ge.fEmpty = true;
+                            ge.nPullSince = 0;
+                            GuardRelease(rp);
+                            nPulls--;
+                        }
+                    }
+                    continue;
+                }
+                if (d.nChoice != GUARD_PULL || ge.fEmpty || (rp && rp->fGuard) || nPulls >= GUARD_MAX_PULLS)
+                    continue;
+                if (nPass == 1 && !GuardAnnouncedLocked(d.poolId))
+                    continue;
+                if (!rp)
+                    rp = GuardNewPool(d.poolId, ge.record);
+                if (!rp)
+                    continue;
+                rp->fGuard = true;
+                ge.nPullSince = nNow;
+                nPulls++;
+                LogPrint("p2pool", "p2pool: drawn for registered pool %s (place %d): pulling its line\n",
+                         d.poolId.GetHex().c_str(), ge.nRank + 1);
+            }
+        // The pools this node looks for, whose 16 the draw names for the
+        // dialler: the one it mines while its line is not here, and pulls
+        // nobody announces.
+        vector<uint256> vSeek;
+        foreach(RegPool* rp, vRegPools)
+            if (RegLive(*rp) && rp->nFetch != FETCH_COMPLETE &&
+                (rp->fMined || rp->fCarry || (rp->fGuard && !GuardAnnouncedLocked(rp->id))))
+                vSeek.push_back(rp->id);
+        std::sort(vSeek.begin(), vSeek.end());
+        if (vSeek != vGuardSeek)
+        {
+            vGuardSeek.swap(vSeek);
+            fTktDrawDirty = true;
+        }
+    }
+}
+
 static bool fRegTickForce = false;
 
 // On the message thread, every pass: paced serves; once a second: the
@@ -4901,9 +6502,12 @@ static void RegTick()
     static int64 nLast = 0, nLastStatus = 0;
     int64 nNow = GetTime();
     CRITICAL_BLOCK(cs_p2pool)
-        if (vRegPools.empty() && mapRegConn.empty() && idMinedReg == 0 && vCarryReg.empty())
+        if (vRegPools.empty() && mapRegConn.empty() && idMinedReg == 0 && vCarryReg.empty() && !TktActive())
             return;
     PumpRegServes();
+    // Scores the ticket thread found, and the held tickets it relays, go
+    // out from this thread on every pass.
+    TktFlush();
     if (nNow == nLast && !fRegTickForce)
         return;
     nLast = nNow;
@@ -4916,6 +6520,9 @@ static void RegTick()
         foreach(CNode* pnode, vGone)
             RegForgetNode(pnode);
     }
+    // The chain as the tickets see it, the ticket book synced with it, and
+    // the sets asked of peers (section 10).
+    TktTick(nNow);
     if (nNow - nLastStatus >= REG_STATUS_SECS || fRegTickForce)
     {
         nLastStatus = nNow;
@@ -4958,6 +6565,9 @@ static void RegTick()
     }
     foreach(RegPool* rp, vDone)
         RegComplete(rp);
+    // Which drawn pools this node keeps, pulls or lets go (sections 10 and
+    // 11), before poolinv says what it announces.
+    GuardApply(nNow);
     CRITICAL_BLOCK(cs_p2pool)
     {
         vector<uint256> vAnn = RegAnnouncedIdsLocked();
@@ -5090,6 +6700,8 @@ static void OnShares(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<S
 // and scores nobody (section 8).
 static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStream& vRecv)
 {
+    if (strCommand == "pooltkt" || strCommand == "poolgettkt")
+        return TktProcessMessage(pfrom, strCommand, vRecv);
     if (strCommand != "poolinv" && strCommand != "poolwho" && strCommand != "poolat" && strCommand != "p2xshare" &&
         strCommand != "p2xgetsh" && strCommand != "p2xsync" && strCommand != "p2xshares" && strCommand != "p2xnone")
         return false;
@@ -5323,9 +6935,11 @@ static void RegResetForTest(bool fCheckPoW)
         delete rp;
     }
     vRegPools.clear();
+    mapRegById.clear();
     mapRegConn.clear();
     idMinedReg = 0;
     vCarryReg.clear();
+    TktResetForTest();
 }
 
 bool P2PoolRegWant(const uint256& id, bool fMine, string& errOut)
@@ -5427,11 +7041,13 @@ bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out)
         {
             out.fMined = rp->fMined;
             out.fCarry = rp->fCarry;
+            out.fGuard = rp->fGuard;
             out.fCarried = RegCarried(*rp);
             out.fAnnounced = RegAnnounced(*rp);
             out.nStatus = rp->nStatus;
             out.nFetch = rp->nFetch;
             out.nShares = rp->state.chain->Size();
+            out.nBytes = rp->state.chain->Bytes();
             out.nTipHeight = rp->state.chain->Height(rp->state.chain->Tip());
             out.work = rp->state.chain->TipLineWork();
             out.nAnnouncers = 0;
@@ -5602,23 +7218,8 @@ bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive)
     CRITICAL_BLOCK(cs_main)
         CRITICAL_BLOCK(cs_p2pool)
         {
-            for (size_t i = 0; i < vRegPools.size(); i++)
-                if (vRegPools[i]->id == id)
-                {
-                    RegPool* rp = vRegPools[i];
-                    classReg.ForgetPool(&rp->state);
-                    for (std::list<RegServe>::iterator it = lRegServes.begin(); it != lRegServes.end();)
-                        if (it->pool == &rp->state)
-                            it = lRegServes.erase(it);
-                        else
-                            ++it;
-                    if (pPoolMined == &rp->state)
-                        pPoolMined = NULL;
-                    delete rp->state.chain;
-                    delete rp;
-                    vRegPools.erase(vRegPools.begin() + i);
-                    break;
-                }
+            if (RegPool* rpOld = RegById(id))
+                RegFree(rpOld);
             RegPoolsInit();
             RegPool* rp = RegById(id);
             if (rp)
@@ -5634,6 +7235,441 @@ bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive)
             }
         }
     return fWanted;
+}
+
+// ---- Guardians: the node's side
+
+void P2PoolGuardSetOptions(bool fGuard, int64 nMB, int64 nKBps)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fPoolGuard = fGuard;
+        if (nMB > 0)
+            nGuardBudget = nMB * 1024 * 1024;
+        if (nKBps > 0)
+            nRegServeRate = nKBps * 1000;
+    }
+}
+
+bool P2PoolGuarding()
+{
+    return TktActive();
+}
+
+void P2PoolTicketsStart()
+{
+#ifdef BITFLASH_FUZZ
+    return;
+#else
+    if (!TktActive() || fTktThreadRunning)
+        return;
+    // pool-tickets.dat is read here and checked through the ticket budget
+    // like an answer, never hashed where it stands: up to 3 x 4096 hashes
+    // would hold the start for minutes.
+    vector<CTicketFileEpoch> vFile;
+    string why;
+    CTicketParams params;
+    CRITICAL_BLOCK(cs_p2pool)
+        params = TktBook().Params();
+    bool fFile = pooltkt::LoadTicketFile(TktFilePath(), params, vFile, why);
+    vector<GuardFileEntry> vGuards;
+    bool fGuards = GuardFileRead(vGuards);
+    size_t nQueued = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        foreach(const CTicketFileEpoch& fe, vFile)
+        {
+            for (size_t j = 0; j < fe.vOwn.size() + fe.vTickets.size(); j++)
+            {
+                TktItem item;
+                item.fOwn = j < fe.vOwn.size();
+                item.t = item.fOwn ? fe.vOwn[j] : fe.vTickets[j - fe.vOwn.size()];
+                item.nEpoch = fe.nEpoch;
+                item.hashSeed = fe.hashSeed;
+                item.nMsg = 0;
+                tqFile.mapAnswer[fe.nEpoch].push_back(item);
+                nQueued++;
+            }
+        }
+        foreach(const GuardFileEntry& g, vGuards)
+        {
+            GuardEntry& ge = mapGuard[g.id];
+            ge.nRank = g.nRank;
+            ge.nUntil = g.nUntil;
+            ge.record = g.record;
+        }
+    }
+    printf("p2pool: guardian tickets: %s; %u queued to be checked again; %u guarded pool(s) remembered\n",
+           fFile ? "pool-tickets.dat read" : ("no pool-tickets.dat used (" + why + ")").c_str(), (unsigned)nQueued,
+           fGuards ? (unsigned)vGuards.size() : 0);
+    fTktThreadStop = false;
+    fTktThreadRunning = true;
+    if (_beginthread(ThreadPoolTickets, 0, NULL) == (uintptr_t)-1)
+    {
+        fTktThreadRunning = false;
+        printf("Error: _beginthread(ThreadPoolTickets) failed\n");
+    }
+#endif
+}
+
+void P2PoolTicketsStop()
+{
+    fTktThreadStop = true;
+    for (int i = 0; i < 300 && fTktThreadRunning; i++)
+        Sleep(100);
+    if (fTktThreadRunning)
+        printf("p2pool: the ticket thread did not stop within 30 s\n");
+}
+
+void P2PoolGuardDialList(vector<string>& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (!TktActive())
+            return;
+        set<string> setSeen;
+        foreach(const uint256& id, vGuardSeek)
+        {
+            map<uint256, vector<string> >::const_iterator it = mapGuardSeekAddr.find(id);
+            if (it == mapGuardSeekAddr.end())
+                continue;
+            for (size_t i = 0; i < it->second.size() && out.size() < GUARD_DIAL_MAX; i++)
+                if (setSeen.insert(it->second[i]).second)
+                    out.push_back(it->second[i]);
+        }
+    }
+}
+
+bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out)
+{
+    out = P2PoolGuardInfo();
+    vector<CHeldTicket> vT;
+    uint256 hashDraw = 0;
+    vector<unsigned char> keyOwn;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        out.fGuarding = TktActive();
+        if (!out.fGuarding || tktView.nTip < 0)
+            return out.fGuarding;
+        int c = pooltkt::EpochOf(tktView.nTip);
+        out.nEpoch = c;
+        uint256 hashChain, hashHeld;
+        if (!pooltkt::DrawSeed(tktView, c, hashDraw, out.fSettled))
+            return true;
+        if (TktBuriedSeed(c, hashChain) && TktBook().Seed(c, hashHeld) && hashChain == hashHeld)
+            TktBook().Tickets(c, vT);
+        out.nTickets = vT.size();
+        CGuardTicket own;
+        uint256 w;
+        if (TktBook().Own(c, own, w))
+            keyOwn = own.Key();
+        map<uint256, GuardEntry>::const_iterator it = mapGuard.find(id);
+        if (it != mapGuard.end())
+        {
+            out.nOwnRank = it->second.nRank;
+            out.nOwnUntil = it->second.nUntil;
+            static const char* const vChoice[] = { "not drawn", "guarded", "drawn, no shares", "pulling its line",
+                                                   "drawn, no room" };
+            out.strOwn = vChoice[std::max(0, std::min(4, it->second.nChoice))];
+        }
+    }
+    vector<CDrawPlace> places;
+    pooltkt::Draw(hashDraw, id, vT, GUARD_PLACES + GUARD_RESERVE, places);
+    for (size_t i = 0; i < places.size(); i++)
+    {
+        P2PoolGuardianInfo g;
+        g.strBtf = places[i].key.size() == 32 ? btf::Address(&places[i].key[0]) : string();
+        g.nRank = (int)i;
+        g.fSelf = !keyOwn.empty() && places[i].key == keyOwn;
+        g.nCapacityMB = places[i].nCapacityMB;
+        out.vGuardians.push_back(g);
+    }
+    return true;
+}
+
+// Self-tests and fuzz.
+static void TktResetForTest()
+{
+    delete pTktBook;
+    pTktBook = NULL;
+    tktView = CTktView();
+    fTktViewForTest = false;
+    tqFile = TktQueues();
+    tktBudget = TktBudget();
+    tktServeBudget.Reset();
+    nTktNoHashUntil = 0;
+    nTktTurn = 0;
+    fTktDirty = false;
+    nTktSavedAt = 0;
+    fTktDrawDirty = true;
+    nTktDrawnAt = 0;
+    mapTktAskRound.clear();
+    setTktBuried.clear();
+    nTktMakeEpoch = 0;
+    hashTktMakeSeed = 0;
+    nTktMakeNonce = 0;
+    fTktKeyForTest = false;
+    fTktPoolsForTest = false;
+    vTktPoolsForTest.clear();
+    vGuardDrawn.clear();
+    nGuardDrawSeq = nGuardAppliedSeq = 0;
+    mapGuardSeekAddr.clear();
+    vGuardSeek.clear();
+    mapGuard.clear();
+    fGuardSaveDirty = false;
+    fPoolGuard = true;
+    nGuardBudget = GUARD_DEFAULT_BYTES;
+    nGuardMaxPoolBytes = GUARD_MAX_POOL_BYTES;
+    nGuardMaxPools = GUARD_MAX_POOLS;
+    nRegServeRate = 64 * 1000;
+    nTktVerifiedForTest = 0;
+}
+
+void P2PoolTicketParamsForTest(const CTicketParams& params)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        delete pTktBook;
+        pTktBook = new CTicketBook(params);
+    }
+}
+
+void P2PoolTicketViewForTest(const vector<uint256>& vHashes)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fTktViewForTest = true;
+        CTktView v;
+        v.nTip = (int)vHashes.size() - 1;
+        v.hashTip = vHashes.empty() ? uint256(0) : vHashes.back();
+        set<int> setH;
+        TktViewHeights(v.nTip, setH);
+        foreach(int h, setH)
+            v.mapHash[h] = vHashes[h];
+        tktView = v;
+        if (TktActive())
+            TktSyncLocked();
+    }
+}
+
+void P2PoolTicketKeyForTest(const unsigned char seckey[32])
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fTktKeyForTest = seckey != NULL;
+        if (seckey)
+            memcpy(tktKeyForTest, seckey, 32);
+    }
+}
+
+void P2PoolTicketPoolsForTest(const vector<CPoolInfo>& v)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fTktPoolsForTest = true;
+        vTktPoolsForTest = v;
+        fTktDrawDirty = true;
+    }
+}
+
+int P2PoolTicketStepForTest(int nMaxVerify, bool fMake)
+{
+    uint64 nBefore;
+    CRITICAL_BLOCK(cs_p2pool)
+        nBefore = nTktVerifiedForTest;
+    TktStep(GetTime(), nMaxVerify, fMake);
+    uint64 nAfter;
+    CRITICAL_BLOCK(cs_p2pool)
+        nAfter = nTktVerifiedForTest;
+    return (int)(nAfter - nBefore);
+}
+
+void P2PoolTicketAgeForTest(int64 nSecs)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        {
+            RegConn& c = it->second;
+            for (map<unsigned int, int64>::iterator i = c.mapTktAskedAt.begin(); i != c.mapTktAskedAt.end(); ++i)
+                i->second -= nSecs;
+            for (map<unsigned int, int64>::iterator i = c.mapTktServedAt.begin(); i != c.mapTktServedAt.end(); ++i)
+                i->second -= nSecs;
+            c.nTktTallySince -= nSecs;
+        }
+        for (map<unsigned int, int64>::iterator i = mapTktAskRound.begin(); i != mapTktAskRound.end(); ++i)
+            i->second -= nSecs;
+        if (nTktNoHashUntil)
+            nTktNoHashUntil -= nSecs;
+        nTktDrawnAt -= nSecs;
+        nTktSavedAt -= nSecs;
+        tktBudget.nLast -= nSecs;
+        for (map<uint256, GuardEntry>::iterator i = mapGuard.begin(); i != mapGuard.end(); ++i)
+            if (i->second.nPullSince)
+                i->second.nPullSince -= nSecs;
+    }
+}
+
+void P2PoolTicketBudgetForTest(int nTokens)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        tktBudget.nTokens = nTokens;
+        tktBudget.nLast = GetTime();
+    }
+}
+
+size_t P2PoolTicketHeldForTest(unsigned int nEpoch)
+{
+    size_t n;
+    CRITICAL_BLOCK(cs_p2pool)
+        n = TktBook().Held(nEpoch);
+    return n;
+}
+
+bool P2PoolTicketIsHeldForTest(unsigned int nEpoch, const CGuardTicket& t)
+{
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        CHeldTicket h;
+        f = TktBook().HeldByKey(nEpoch, t.PubKey(), h) && h.ticket == t;
+    }
+    return f;
+}
+
+bool P2PoolTicketOwnForTest(unsigned int nEpoch, CGuardTicket& out)
+{
+    bool f;
+    uint256 w;
+    CRITICAL_BLOCK(cs_p2pool)
+        f = TktBook().Own(nEpoch, out, w);
+    return f;
+}
+
+void P2PoolTicketQueuedForTest(CNode* pnode, unsigned int nEpoch, size_t& nRelayOut, size_t& nAnswerOut)
+{
+    nRelayOut = nAnswerOut = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        const TktQueues* q = &tqFile;
+        if (pnode)
+        {
+            map<CNode*, RegConn>::const_iterator it = mapRegConn.find(pnode);
+            if (it == mapRegConn.end())
+                return;
+            q = &it->second.tq;
+        }
+        nRelayOut = q->qRelay.size();
+        map<unsigned int, std::deque<TktItem> >::const_iterator itA = q->mapAnswer.find(nEpoch);
+        if (itA != q->mapAnswer.end())
+            nAnswerOut = itA->second.size();
+    }
+}
+
+bool P2PoolTicketSaveForTest()
+{
+    string data;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        data = pooltkt::TicketFileData(TktBook());
+        fTktDirty = false;
+    }
+    return pooltkt::WriteTicketFileData(TktFilePath(), data);
+}
+
+size_t P2PoolTicketLoadForTest()
+{
+    // As at a start: an empty book, the file's tickets queued as an answer.
+    CTicketParams params;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        params = TktBook().Params();
+        delete pTktBook;
+        pTktBook = new CTicketBook(params);
+        tqFile = TktQueues();
+    }
+    vector<CTicketFileEpoch> vFile;
+    string why;
+    if (!pooltkt::LoadTicketFile(TktFilePath(), params, vFile, why))
+        return 0;
+    size_t n = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        TktSyncLocked();
+        foreach(const CTicketFileEpoch& fe, vFile)
+            for (size_t j = 0; j < fe.vOwn.size() + fe.vTickets.size(); j++)
+            {
+                TktItem item;
+                item.fOwn = j < fe.vOwn.size();
+                item.t = item.fOwn ? fe.vOwn[j] : fe.vTickets[j - fe.vOwn.size()];
+                item.nEpoch = fe.nEpoch;
+                item.hashSeed = fe.hashSeed;
+                item.nMsg = 0;
+                tqFile.mapAnswer[fe.nEpoch].push_back(item);
+                n++;
+            }
+    }
+    return n;
+}
+
+void P2PoolGuardLimitsForTest(int64 nBudget, int64 nMaxPoolBytes, unsigned int nMaxPools)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        nGuardBudget = nBudget;
+        nGuardMaxPoolBytes = nMaxPoolBytes;
+        nGuardMaxPools = nMaxPools;
+    }
+}
+
+void P2PoolGuardEntriesForTest(vector<P2PoolGuardEntryInfo>& out)
+{
+    out.clear();
+    CRITICAL_BLOCK(cs_p2pool)
+        for (map<uint256, GuardEntry>::const_iterator it = mapGuard.begin(); it != mapGuard.end(); ++it)
+        {
+            P2PoolGuardEntryInfo e;
+            e.id = it->first;
+            e.nRank = it->second.nRank;
+            e.nUntil = it->second.nUntil;
+            e.nChoice = it->second.nChoice;
+            e.fEmpty = it->second.fEmpty;
+            RegPool* rp = RegById(it->first);
+            e.fGuard = rp && rp->fGuard;
+            out.push_back(e);
+        }
+}
+
+void P2PoolGuardSaveForTest()
+{
+    bool fFiles;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fFiles = fRegFiles;
+        fRegFiles = true;
+        fGuardSaveDirty = true;
+    }
+    TktSaveStep(GetTime(), true);
+    CRITICAL_BLOCK(cs_p2pool)
+        fRegFiles = fFiles;
+}
+
+size_t P2PoolGuardLoadForTest()
+{
+    vector<GuardFileEntry> v;
+    if (!GuardFileRead(v))
+        return 0;
+    CRITICAL_BLOCK(cs_p2pool)
+        foreach(const GuardFileEntry& g, v)
+        {
+            GuardEntry& ge = mapGuard[g.id];
+            ge.nRank = g.nRank;
+            ge.nUntil = g.nUntil;
+            ge.record = g.record;
+        }
+    return v.size();
 }
 
 // ---- Messages

@@ -32,6 +32,7 @@
 #include "btfaddr.h"
 #include "btfchan.h"
 #include "proxy.h"
+#include "poolticket.h"
 
 using json = nlohmann::json;
 
@@ -439,6 +440,15 @@ std::string BtfLocalAddress()
     if (!EnsureNostrKey())
         return "";
     return g_nostrKey.BtfAddress();
+}
+
+bool BtfSignGuardTicket(CGuardTicket& t)
+{
+    if (!EnsureNostrKey())
+        return false;
+    // Sign fills the body's key from the secret key's, so a ticket ground
+    // for another key could not come out signed by this one.
+    return t.Sign(g_nostrKey.seckey) && memcmp(t.PubKey(), g_nostrKey.xonly, 32) == 0 && t.VerifySig();
 }
 
 // This node's own descriptor, signed and self-certifying -- the same blob

@@ -465,6 +465,40 @@ static void ParseStartupArguments(int argc, char* argv[])
                                          : "Give -poolcarry=<pool id> (64 hex digits, poollist shows them), at most 8.");
         }
     }
+    // Guardians (docs/pool-registry.md, sections 10 and 11): on by default
+    // wherever registered pools are open. -poolguard=0 makes no ticket and
+    // is never drawn; -poolguardmb and -poolguardkbps bound what guarding
+    // keeps and how fast each registered history goes out.
+    {
+        bool fGuard = true;
+        if (arg(argc,argv,"/poolguard") || arg(argc,argv,"-poolguard"))
+        {
+            string v = argval2(argc, argv, "/poolguard", "-poolguard");
+            if (v == "0" || v == "false" || v == "no")
+                fGuard = false;
+            else if (!v.empty() && v != "1" && v != "true" && v != "yes")
+                StartupRefuse(strprintf("-poolguard=%s: give 0 or 1", v.c_str()),
+                              "-poolguard=0 turns guarding off; leave it out to guard, as every node does by default.");
+        }
+        int64 nMB = 0, nKBps = 0;
+        string strMB = argval2(argc, argv, "/poolguardmb", "-poolguardmb");
+        if (!strMB.empty())
+        {
+            nMB = atoi64(strMB.c_str());
+            if (nMB < 1 || nMB > 65535)
+                StartupRefuse(strprintf("-poolguardmb=%s is not a size between 1 and 65535", strMB.c_str()),
+                              "Give the guard budget in MB, or leave it out for 128.");
+        }
+        string strKBps = argval2(argc, argv, "/poolguardkbps", "-poolguardkbps");
+        if (!strKBps.empty())
+        {
+            nKBps = atoi64(strKBps.c_str());
+            if (nKBps < 1 || nKBps > 1000000)
+                StartupRefuse(strprintf("-poolguardkbps=%s is not a rate between 1 and 1000000", strKBps.c_str()),
+                              "Give the pace in KB/s, or leave it out for 64.");
+        }
+        P2PoolGuardSetOptions(fGuard, nMB, nKBps);
+    }
     if (!(arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool")) && (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind")))
         StartupRefuse("-p2poolbind needs -p2pool",
                       "It chooses where the P2Pool stratum listens; add -p2pool to mine with P2Pool.");
@@ -1765,6 +1799,10 @@ int main(int argc, char* argv[])
     // above returns without a stop, and from here on the only ways out (the
     // headless loop, the window) stop it and wait for its last save.
     PoolIndexStart();
+    // Guardian tickets (docs/pool-registry.md, section 10): a thread of their
+    // own at idle priority, where registered pools are open and -poolguard
+    // is not 0; stopped with a last save of pool-tickets.dat.
+    P2PoolTicketsStart();
 #endif
 
     if (nMineMode == MINE_OPERATOR || fP2PoolMode) {
@@ -1841,8 +1879,10 @@ int main(int argc, char* argv[])
         while (!fShutdown) Sleep(500);
         StopNode();
         // The pool index thread is not one of StopNode's slots: wait here
-        // for its last save of pool-registry.dat (poolindex.h).
+        // for its last save of pool-registry.dat (poolindex.h), and the
+        // ticket thread for its last save of pool-tickets.dat.
         PoolIndexStop();
+        P2PoolTicketsStop();
         BtfStopManagedTor();
         // Checkpoints, releases wallet.dat from this directory's Berkeley DB
         // environment, and closes it. Declared since 2009 and never once
@@ -1879,6 +1919,7 @@ int main(int argc, char* argv[])
     fShutdown = true;
     StopNode();
     PoolIndexStop();
+    P2PoolTicketsStop();
     BtfStopManagedTor();
     DBFlush(true);
     WalletSQLiteRuntimeClose();
