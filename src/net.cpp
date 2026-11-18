@@ -1636,6 +1636,70 @@ static int DialP2PoolPeers(int nBudget)
     return nConnected;
 }
 
+// The guardians of a registered pool this node looks for
+// (docs/pool-registry.md, section 10): the one it mines while its line is
+// not here, and pools it is drawn for that no peer announces. The draw names
+// their .btf addresses (p2pool_net.cpp); they are dialled like P2Pool peers,
+// up to GUARD_EXTRA_PEERS past the usual target, resolved from the peer
+// cache and, on a miss, through the descriptors on Nostr. Each answers with
+// poolinv if it holds the pool, and the fetch asks it from there.
+void P2PoolGuardDialList(vector<string>& out);   // p2pool_net.h
+static const int GUARD_EXTRA_PEERS = 3;
+static const int GUARD_DIALS_PER_ROUND = 2;
+
+static int DialGuardPeers(int nBudget)
+{
+    vector<string> vAddr;
+    P2PoolGuardDialList(vAddr);
+    if (vAddr.empty())
+        return 0;
+    set<string> setAddr(vAddr.begin(), vAddr.end());
+    int nHave = 0;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (!pnode->strBtfAddr.empty() && setAddr.count(pnode->strBtfAddr))
+                nHave++;
+    if (nHave >= GUARD_EXTRA_PEERS)
+        return 0;
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+    map<string, const CachedBtfPeer*> mapCache;
+    foreach(const CachedBtfPeer& p, peers)
+        mapCache[p.btfAddr] = &p;
+    int nConnected = 0, nTried = 0;
+    const string strSelf = BtfLocalAddress();
+    foreach(const string& strAddr, vAddr)
+    {
+        if (fShutdown || nTried >= nBudget || nHave + nConnected >= GUARD_EXTRA_PEERS)
+            break;
+        if (strAddr == strSelf || BtfAlreadyConnected(strAddr) || !BtfDialDue(strAddr))
+            continue;
+        string strMeeting, strOnion;
+        unsigned char enc[32];
+        map<string, const CachedBtfPeer*>::const_iterator it = mapCache.find(strAddr);
+        if (it != mapCache.end() && HexToBytes(it->second->encHex, enc, 32))
+        {
+            strMeeting = it->second->meeting;
+            strOnion = it->second->onion;
+        }
+        else if (!BtfResolve(strAddr, strMeeting, enc, &strOnion))
+        {
+            nTried++;
+            BtfNoteDialResult(strAddr, false);
+            continue;
+        }
+        nTried++;
+        bool fOk = ConnectNodeBtfResolved(strAddr, strMeeting, strOnion, enc) != NULL;
+        BtfNoteDialResult(strAddr, fOk);
+        if (fOk)
+            nConnected++;
+    }
+    if (nTried)
+        LogPrint("p2pool", "p2pool: dialled %d guardian(s) of pools this node looks for, %d answered\n", nTried, nConnected);
+    return nConnected;
+}
+
 // The listed peers of this node's local pools (docs/pool-registry.md,
 // section 18): an ordinary outbound connection to each one that answers,
 // kept as /connectbtf keeps one. They come on top of the ordinary peers and
@@ -1755,6 +1819,10 @@ void ThreadReconnectCachedBtfPeers(void* parg)
         if (fP2PoolMode && !fBtfIsolated && CountP2PoolPeersConnected() < P2POOL_TARGET_PEERS &&
             CountBtfPeersConnected() - nListed < BTF_TARGET_PEERS + P2POOL_EXTRA_PEERS)
             DialP2PoolPeers(P2POOL_DIALS_PER_ROUND);
+
+        // Guardians of the registered pools this node looks for.
+        if (!fBtfIsolated)
+            DialGuardPeers(GUARD_DIALS_PER_ROUND);
 
         int nHave = CountBtfPeersConnected() - nListed;
         if (nHave < BTF_TARGET_PEERS)

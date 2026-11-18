@@ -318,6 +318,25 @@ bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned i
     unsigned char pubkey[32];
     if (!XOnlyPubKey(seckey, pubkey))
         return false;
+    CGuardTicket t;
+    uint256 hashWork = 0;
+    if (!MakeTicketWork(params, hashSeed, nEpoch, pubkey, nCapacityMB, nNonceStart, nMaxTries, t, hashWork,
+                        nTriesOut, pfStop))
+        return false;
+    if (!t.Sign(seckey) || !t.VerifySig())
+        return false;
+    ticketOut = t;
+    hashWorkOut = hashWork;
+    return true;
+}
+
+bool MakeTicketWork(const CTicketParams& params, const uint256& hashSeed, unsigned int nEpoch,
+                    const unsigned char pubkey[32], unsigned short nCapacityMB,
+                    uint64 nNonceStart, uint64 nMaxTries,
+                    CGuardTicket& ticketOut, uint256& hashWorkOut, uint64& nTriesOut,
+                    const volatile bool* pfStop)
+{
+    nTriesOut = 0;
     const uint256 hashTarget = params.Target();
     CGuardTicket t;
     t.SetBody(params.magic, nEpoch, pubkey, nCapacityMB, nNonceStart);
@@ -334,8 +353,6 @@ bool MakeTicket(const CTicketParams& params, const uint256& hashSeed, unsigned i
         nTriesOut = i + 1;
         if (hashWork <= hashTarget)
         {
-            if (!t.Sign(seckey) || !t.VerifySig())
-                return false;
             ticketOut = t;
             hashWorkOut = hashWork;
             return true;
@@ -622,15 +639,35 @@ int CTicketBook::Accept(const CTicketChainView& view, const CGuardTicket& ticket
 int CTicketBook::AddOwn(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed)
 {
     int v = Accept(view, ticket, hashSeed, true);
-    if (!TicketPassed(v) && v != TICKET_DROP_SEEN)
-        return v;
+    if (TicketPassed(v) || v == TICKET_DROP_SEEN)
+        MarkOwn(ticket, hashSeed);
+    return v;
+}
+
+int CTicketBook::AddOwnVerified(const CTicketChainView& view, const CGuardTicket& ticket, const uint256& hashSeed,
+                                const uint256& hashWork, const unsigned char workKey[32])
+{
+    if (memcmp(ticket.PubKey(), workKey, 32) != 0)
+        return TICKET_BAD_WORK;
+    const std::vector<unsigned char> b = ticket.Bytes();
+    CGuardTicket t;
+    int v = Precheck(view, &b[0], b.size(), ticket.Epoch(), hashSeed, true, t);
+    if (v == TICKET_PRECHECK_OK)
+        v = ticket.VerifySig() ? Add(view, ticket, hashSeed, hashWork) : (int)TICKET_BAD_SIG;
+    if (TicketPassed(v) || v == TICKET_DROP_SEEN)
+        MarkOwn(ticket, hashSeed);
+    return v;
+}
+
+void CTicketBook::MarkOwn(const CGuardTicket& ticket, const uint256& hashSeed)
+{
     std::map<unsigned int, CTicketEpoch>::iterator it = mapEpochs.find(ticket.Epoch());
     if (it == mapEpochs.end() || it->second.hashSeed != hashSeed)
-        return v;
+        return;
     CTicketEpoch& ep = it->second;
     std::map<uint256, uint256>::const_iterator itC = ep.mapChecked.find(ticket.BodyHash());
     if (itC == ep.mapChecked.end())
-        return v;
+        return;
     // The lowest of this node's tickets for the epoch is its ticket.
     if (!ep.fOwn || itC->second < ep.hashOwnWork)
     {
@@ -638,7 +675,6 @@ int CTicketBook::AddOwn(const CTicketChainView& view, const CGuardTicket& ticket
         ep.own = ticket;
         ep.hashOwnWork = itC->second;
     }
-    return v;
 }
 
 bool CTicketBook::Own(unsigned int nEpoch, CGuardTicket& ticketOut, uint256& hashWorkOut) const
@@ -746,6 +782,14 @@ void CTicketBook::OldDrawSeeds(unsigned int nEpoch, std::vector<uint256>& out) c
         out.push_back(it->second[i].first);
 }
 
+void CTicketBook::OldDrawSeedsUntil(unsigned int nEpoch, std::vector<std::pair<uint256, int64> >& out) const
+{
+    out.clear();
+    std::map<unsigned int, std::vector<std::pair<uint256, int64> > >::const_iterator it = mapOldDrawSeed.find(nEpoch);
+    if (it != mapOldDrawSeed.end())
+        out = it->second;
+}
+
 size_t CTicketBook::Gone(unsigned int nEpoch) const
 {
     std::map<unsigned int, CTicketEpoch>::const_iterator it = mapEpochs.find(nEpoch);
@@ -844,6 +888,16 @@ bool CTicketBook::Draw(const CTicketChainView& view, unsigned int nEpoch, const 
     if (pooltkt::TicketSeed(view, nEpoch, hashSeed, fBuried) && Seed(nEpoch, hashHeldSeed) && hashSeed == hashHeldSeed)
         Tickets(nEpoch, vTickets);
     pooltkt::Draw(hashDraw, poolId, vTickets, GUARD_PLACES + GUARD_RESERVE, out);
+    return true;
+}
+
+bool CTicketBook::NoteDrawSeed(const CTicketChainView& view, unsigned int nEpoch, uint256& hashDrawOut, bool& fSettledOut)
+{
+    hashDrawOut = 0;
+    if (!pooltkt::DrawSeed(view, nEpoch, hashDrawOut, fSettledOut))
+        return false;
+    if (fSettledOut)
+        mapDrawnSeed[nEpoch] = hashDrawOut;
     return true;
 }
 
@@ -1018,7 +1072,23 @@ bool SaveTicketFile(const std::string& strPath, const CTicketBook& book)
 {
     if (strPath.empty())
         return false;
-    std::vector<CTicketFileEpoch> vEpochs;
+    return WriteTicketFileData(strPath, TicketFileData(book));
+}
+
+bool WriteTicketFileData(const std::string& strPath, const std::string& data)
+{
+    std::string err;
+    if (strPath.empty() || !WriteFileAtomicPrivate(strPath, data, err))
+    {
+        printf("pool tickets: %s\n", err.empty() ? "no path" : err.c_str());
+        return false;
+    }
+    return true;
+}
+
+void TicketFileEpochs(const CTicketBook& book, std::vector<CTicketFileEpoch>& vEpochs)
+{
+    vEpochs.clear();
     const std::map<unsigned int, CTicketEpoch>& all = book.All();
     for (std::map<unsigned int, CTicketEpoch>::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -1033,18 +1103,25 @@ bool SaveTicketFile(const std::string& strPath, const CTicketBook& book)
             fe.vTickets.push_back(vHeld[i].ticket);
         vEpochs.push_back(fe);
     }
+}
+
+std::string TicketFileBytes(const unsigned char magic[4], const std::vector<CTicketFileEpoch>& vEpochs)
+{
+    unsigned char m[4];
+    memcpy(m, magic, 4);
     CDataStream ss(SER_DISK);
-    ss << TICKET_FILE_VERSION << FLATDATA(book.Params().magic) << vEpochs;
+    ss << TICKET_FILE_VERSION << FLATDATA(m) << vEpochs;
     uint256 h = Hash(ss.begin(), ss.end());
     std::string data(ss.begin(), ss.end());
     data.append((const char*)h.begin(), 32);
-    std::string err;
-    if (!WriteFileAtomicPrivate(strPath, data, err))
-    {
-        printf("pool tickets: %s\n", err.c_str());
-        return false;
-    }
-    return true;
+    return data;
+}
+
+std::string TicketFileData(const CTicketBook& book)
+{
+    std::vector<CTicketFileEpoch> vEpochs;
+    TicketFileEpochs(book, vEpochs);
+    return TicketFileBytes(book.Params().magic, vEpochs);
 }
 
 bool LoadTicketFile(const std::string& strPath, const CTicketParams& params,

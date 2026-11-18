@@ -38,10 +38,10 @@ J=${J:-3}
 RANDOMX_DIR=${RANDOMX_DIR:-$HOME/RandomX}
 BUILD=$OUT/build
 SUM=$OUT/SUMMARY.txt
-TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-p2plocal fuzz-p2preg fuzz-poolindex fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
+TARGETS="fuzz-script fuzz-net-message fuzz-sigcheck fuzz-light-pow fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-v4-templates fuzz-p2pool fuzz-p2plocal fuzz-p2preg fuzz-pooltkt fuzz-poolindex fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
 # Harnesses that write a structured starting corpus of their own
 # (BITFLASH_FUZZ_WRITE_SEEDS); the rest start from one byte.
-SELF_SEEDING="fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-p2plocal fuzz-p2preg fuzz-poolindex fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
+SELF_SEEDING="fuzz-p2p-payload fuzz-deserialize fuzz-decoders fuzz-script fuzz-v4-templates fuzz-p2pool fuzz-p2plocal fuzz-p2preg fuzz-pooltkt fuzz-poolindex fuzz-light-peer fuzz-tor-control fuzz-socks5 fuzz-rpc-preauth fuzz-rpc-postauth fuzz-http-client fuzz-chat-frame fuzz-chat-relay fuzz-nostr fuzz-swap"
 
 mkdir -p "$OUT" "$BUILD" "$CORPUS" "$OUT/crashes"
 export HOME=$OUT/home
