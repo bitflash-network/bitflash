@@ -17706,6 +17706,730 @@ static int RunPoolTicketsSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// ---- p2pool-guardians: tickets on the wire, the draw, handoff and revival --
+// docs/pool-registry.md, sections 10 to 12, and the Phase C items of section
+// 15 that need the network: the closed mainnet gate, a fresh node filling its
+// sets by poolgettkt, answer queues drained in turn, an asked peer that
+// disconnects and one dropped after a bad signature (an honest peer's copies
+// still held), a message naming another seed, the deadline for relays and
+// not for answers, only held tickets relayed, a connection whose relays come
+// back outranked served last, a hash that could not be computed, this node's
+// own ticket, a restart reading pool-tickets.dat back through the queue, a
+// seed reorged out, the draw wired to the active pools, guard ranking by line
+// work, a guard budget full in bytes and in pools, a line over the per-pool
+// cap, an empty pool, a pool announced mid-epoch, a mined pool whose every
+// guardian is gone found through a carrier, and a redraw mid-handoff.
+
+namespace {
+
+void GuardSendTickets(CNode* p, unsigned int nEpoch, const uint256& hashSeed, const std::vector<CGuardTicket>& v)
+{
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << nEpoch << hashSeed << v;
+    SendP2PoolTest(p, "pooltkt", ss);
+}
+
+void GuardAsk(CNode* p, unsigned int nEpoch)
+{
+    CDataStream ss(SER_NETWORK, VERSION);
+    ss << nEpoch;
+    SendP2PoolTest(p, "poolgettkt", ss);
+}
+
+// The tickets of every pooltkt a peer was sent for an epoch.
+std::vector<CGuardTicket> GuardSent(CNode* p, unsigned int nEpoch)
+{
+    std::vector<CGuardTicket> out;
+    foreach(const SentMessage& m, SentTo(p))
+    {
+        if (m.strCommand != "pooltkt" || m.payload.empty())
+            continue;
+        try
+        {
+            CDataStream ss((const char*)&m.payload[0], (const char*)&m.payload[0] + m.payload.size(), SER_NETWORK, VERSION);
+            unsigned int e;
+            uint256 h;
+            std::vector<CGuardTicket> v;
+            ss >> e >> h >> v;
+            if (e == nEpoch)
+                out.insert(out.end(), v.begin(), v.end());
+        }
+        catch (std::exception&) {}
+    }
+    return out;
+}
+
+// The epochs of every poolgettkt a peer was sent.
+std::multiset<unsigned int> GuardAsked(CNode* p)
+{
+    std::multiset<unsigned int> out;
+    foreach(const SentMessage& m, SentTo(p))
+        if (m.strCommand == "poolgettkt" && m.payload.size() == 4)
+            out.insert((unsigned int)(m.payload[0] | (m.payload[1] << 8) | (m.payload[2] << 16) | (m.payload[3] << 24)));
+    return out;
+}
+
+bool GuardHas(const std::vector<CGuardTicket>& v, const CGuardTicket& t)
+{
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i] == t)
+            return true;
+    return false;
+}
+
+// Tickets of keys iFirst .. iFirst + n - 1 for an epoch, with their work.
+std::vector<CHeldTicket> GuardMake(const CTicketParams& params, const uint256& hashSeed, unsigned int nEpoch,
+                                   unsigned int iFirst, unsigned int n)
+{
+    std::vector<CHeldTicket> v;
+    for (unsigned int i = 0; i < n; i++)
+    {
+        CHeldTicket h;
+        if (TicketTestMake(params, hashSeed, nEpoch, iFirst + i, 0, h.ticket, h.hashWork))
+        {
+            h.hashBody = h.ticket.BodyHash();
+            v.push_back(h);
+        }
+    }
+    return v;
+}
+
+std::vector<CGuardTicket> GuardBodies(const std::vector<CHeldTicket>& v, size_t nFrom, size_t nTo)
+{
+    std::vector<CGuardTicket> out;
+    for (size_t i = nFrom; i < nTo && i < v.size(); i++)
+        out.push_back(v[i].ticket);
+    return out;
+}
+
+size_t GuardQueued(CNode* p, unsigned int nEpoch)
+{
+    size_t r = 0, a = 0;
+    P2PoolTicketQueuedForTest(p, nEpoch, r, a);
+    return r + a;
+}
+
+poolreg::PoolRecord GuardRecord(int i)
+{
+    poolreg::PoolRecord rec = poolreg::PoolZero();
+    rec.nSpacing = 30; rec.nWindow = 360; rec.nRetarget = 120; rec.nUncleDepth = 2;
+    rec.nUnclePct = 90; rec.nFloor = 0x1f0fffff;
+    rec.name = strprintf("guard-pool-%d", i);
+    return rec;
+}
+
+CPoolInfo GuardInfo(const poolreg::PoolRecord& rec)
+{
+    CPoolInfo info;
+    info.record = rec.Encode();
+    info.rec = rec;
+    poolreg::PoolId(info.record, (const unsigned char*)pchMessageStart, info.id.begin());
+    info.nStatus = POOL_ACTIVE;
+    return info;
+}
+
+const P2PoolGuardEntryInfo* GuardEntry(const std::vector<P2PoolGuardEntryInfo>& v, const uint256& id)
+{
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i].id == id)
+            return &v[i];
+    return NULL;
+}
+
+std::vector<P2PoolGuardEntryInfo> GuardEntries()
+{
+    std::vector<P2PoolGuardEntryInfo> v;
+    P2PoolGuardEntriesForTest(v);
+    return v;
+}
+
+// The pools a node whose ticket has this work is drawn for under a seed.
+std::set<uint256> GuardDrawnFor(const uint256& hashDraw, const std::vector<CPoolInfo>& vPools,
+                                const std::vector<CHeldTicket>& vHeld, const uint256& hashOwnWork)
+{
+    std::set<uint256> out;
+    for (size_t i = 0; i < vPools.size(); i++)
+        if (pooltkt::RankOf(hashDraw, vPools[i].id, vHeld, hashOwnWork, 16) < 16)
+            out.insert(vPools[i].id);
+    return out;
+}
+
+// A pool let go by the guard budget: not guarded, not announced, nothing of
+// it kept (gone from memory once neither mined nor carried).
+bool GuardLetGo(const uint256& id)
+{
+    P2PoolRegStatusInfo st;
+    return !P2PoolRegStatus(id, st) || (!st.fGuard && !st.fAnnounced && st.nShares == 0);
+}
+
+// One draw and the message thread's pass: the draw is made at most every
+// 30 s, so the clock is moved past that first.
+void GuardDrawAndApply()
+{
+    P2PoolTicketAgeForTest(31);
+    P2PoolTicketStepForTest(0, false);
+    P2PoolRegTickForTest();
+}
+
+} // namespace
+
+static int RunP2PoolGuardiansSelfTest()
+{
+    printf("p2pool-guardians self-test\n");
+    std::string tmp, cwd;
+    if (!MakeTempDir(tmp) || !GetCurrentDir(cwd) || !SetCurrentDir(tmp))
+    {
+        printf("  FAIL could not set up a temporary data directory\n");
+        return 1;
+    }
+    strSetDataDir = tmp;
+    int nFail = 0;
+    auto ok = [&nFail](bool f, const char* psz) { if (!Check(f, psz)) nFail++; };
+    string err;
+    CBigNum bnFloor;
+    bnFloor.SetCompact(0x207fffff);
+    P2PoolResetForTest(bnFloor, false);
+
+    CTicketParams params = CTicketParams::Network();
+    params.fnWork = TicketTestWork;
+    TicketTestView w;
+    w.Grow(3700, 0);                    // epoch 5: its deadline (3480) past, epoch 6's seed (3600) buried
+    unsigned char skOwn[32];
+    TicketTestKey(400, skOwn);
+    const uint256 seed4 = w.v[2160], seed5 = w.v[2880], seed6 = w.v[3600];
+    std::vector<CHeldTicket> t6 = GuardMake(params, seed6, 6, 1, 12);
+    std::vector<CHeldTicket> t4 = GuardMake(params, seed4, 4, 13, 8);
+    std::vector<CHeldTicket> t5 = GuardMake(params, seed5, 5, 30, 4);
+    ok(t6.size() == 12 && t4.size() == 8 && t5.size() == 4, "test tickets made for epochs 4, 5 and 6");
+
+    CNode* pA = NewRegTestNode(false, "BF1guard-a");
+    CNode* pB = NewRegTestNode(false, "BF1guard-b");
+    CNode* pC = NewRegTestNode(true, "BF1guard-c");
+    CNode* pOld = NewP2PoolTestNode(false);         // a 1.2.34 node: NODE_P2POOL only
+    std::vector<CNode*> vNodes2Free;
+    vNodes2Free.push_back(pA); vNodes2Free.push_back(pB); vNodes2Free.push_back(pC); vNodes2Free.push_back(pOld);
+
+    // ---- the closed gate: nothing made, relayed, served or asked for
+    PoolBurnsOpenForTest(false);
+    if (PoolBurnsOpen())
+        printf("  (registered pools are open on this network: the closed gate is not checked here)\n");
+    else
+    {
+        P2PoolTicketParamsForTest(params);
+        P2PoolTicketViewForTest(w.v);
+        P2PoolTicketKeyForTest(skOwn);
+        P2PoolOnVersion(pA);
+        GuardSendTickets(pA, 6, seed6, GuardBodies(t6, 0, 4));
+        GuardAsk(pA, 6);
+        P2PoolRegTickForTest();
+        int nHashed = 0;
+        for (int i = 0; i < 2000; i++)
+            nHashed += P2PoolTicketStepForTest(64, true);
+        CGuardTicket own;
+        ok(!P2PoolGuarding() && pA->nMisbehavior == 0 && GuardQueued(pA, 6) == 0 && nHashed == 0 &&
+           P2PoolTicketHeldForTest(6) == 0 && !P2PoolTicketOwnForTest(5, own) && !P2PoolTicketOwnForTest(6, own) &&
+           CountSent(pA, "pooltkt") == 0 && CountSent(pA, "poolgettkt") == 0 && !SentRegMessage(pA),
+           "mainnet closed: pooltkt and poolgettkt dropped unread and unscored, nothing asked, no ticket made");
+    }
+    PoolBurnsOpenForTest(true);
+    P2PoolResetForTest(bnFloor, false);
+    P2PoolTicketParamsForTest(params);
+    P2PoolTicketViewForTest(w.v);
+    ok(P2PoolGuarding(), "open: this node guards");
+    const int nZeroWork = P2PoolShareWorkTokens(), nZeroServe = P2PoolHistoryServeTokens(),
+              nZeroAsk = P2PoolHistoryAskTokens();
+
+    // ---- a fresh node asks for the sets: previous, current, next
+    P2PoolOnVersion(pA);
+    P2PoolOnVersion(pB);
+    P2PoolOnVersion(pC);
+    P2PoolOnVersion(pOld);
+    P2PoolRegTickForTest();
+    {
+        std::multiset<unsigned int> a = GuardAsked(pA), c = GuardAsked(pC);
+        ok(a.count(4) == 1 && a.count(5) == 1 && a.count(6) == 1 && a.size() == 3 && c.size() == 3 &&
+           GuardAsked(pB).size() == 3 && CountSent(pOld, "poolgettkt") == 0,
+           "a fresh node asks peers that read the registry for epochs 4, 5 and 6, a 1.2.34 peer for nothing");
+        P2PoolRegTickForTest();
+        ok(GuardAsked(pA).size() == 3, "and asks the same peer an epoch once an interval");
+    }
+
+    // ---- answers wait in their own queues, drained in turn
+    {
+        GuardSendTickets(pA, 6, seed6, GuardBodies(t6, 0, 8));
+        GuardSendTickets(pB, 6, seed6, GuardBodies(t6, 4, 12));
+        ok(GuardQueued(pA, 6) == 8 && GuardQueued(pB, 6) == 8 && P2PoolTicketHeldForTest(6) == 0,
+           "two answers queued whole, nothing hashed on the message thread");
+        P2PoolTicketBudgetForTest(4);
+        int n = P2PoolTicketStepForTest(64, false);
+        ok(n == 4 && GuardQueued(pA, 6) == 6 && GuardQueued(pB, 6) == 6,
+           "four budget tokens: two tickets from each queue, in turn");
+        P2PoolTicketBudgetForTest(256);
+        n += P2PoolTicketStepForTest(64, false);
+        ok(P2PoolTicketHeldForTest(6) == 12 && n == 12 && GuardQueued(pA, 6) == 0 && GuardQueued(pB, 6) == 0,
+           "all twelve held, each body hashed once: the second copy of a body is dropped before any hash");
+    }
+
+    // ---- only held tickets go on, never back to their sender, never to a 1.2.34 peer
+    {
+        P2PoolRegTickForTest();
+        std::vector<CGuardTicket> toC = GuardSent(pC, 6), toA = GuardSent(pA, 6);
+        bool fNotBack = true;
+        for (size_t i = 0; i < 4; i++)
+            fNotBack = fNotBack && !GuardHas(toA, t6[i].ticket);
+        ok(toC.size() == 12 && fNotBack && CountSent(pOld, "pooltkt") == 0,
+           "held tickets relayed to the other peers, not back to the one that sent them, not to a 1.2.34 peer");
+        size_t nBefore = CountSent(pB, "pooltkt");
+        GuardAsk(pB, 6);
+        size_t nAfter = CountSent(pB, "pooltkt");
+        std::vector<CGuardTicket> served = GuardSent(pB, 6);
+        GuardAsk(pB, 6);
+        GuardAsk(pOld, 6);
+        ok(nAfter == nBefore + 1 && served.size() >= 12 && CountSent(pB, "pooltkt") == nAfter &&
+           CountSent(pOld, "pooltkt") == 0,
+           "poolgettkt served the held set once an interval, and a 1.2.34 peer nothing");
+    }
+
+    // ---- a disconnected peer's queue goes; a bad signature drops its sender's queue
+    {
+        // The bad-signature copy of a body is checked before the real one.
+        std::vector<CGuardTicket> vBad = GuardBodies(t4, 0, 8);
+        vBad[0].sig[0] ^= 1;
+        GuardSendTickets(pA, 4, seed4, vBad);
+        int nMis = pA->nMisbehavior;
+        P2PoolTicketStepForTest(64, false);
+        P2PoolRegTickForTest();
+        bool fScored = pA->nMisbehavior == nMis + 20 && GuardQueued(pA, 4) == 0 && P2PoolTicketHeldForTest(4) == 0;
+        GuardSendTickets(pB, 4, seed4, GuardBodies(t4, 0, 8));      // the honest copies
+        GuardSendTickets(pC, 4, seed4, GuardBodies(t4, 1, 8));
+        size_t nC = GuardQueued(pC, 4);
+        pC->fDisconnect = true;
+        P2PoolRegTickForTest();
+        ok(nC == 7 && GuardQueued(pC, 4) == 0, "an asked peer that disconnects takes its queued copies with it");
+        P2PoolTicketStepForTest(64, false);
+        P2PoolRegTickForTest();
+        bool fAll = true;
+        for (size_t i = 0; i < t4.size(); i++)
+            fAll = fAll && P2PoolTicketIsHeldForTest(4, t4[i].ticket);
+        ok(fScored && fAll && P2PoolTicketHeldForTest(4) == 8 && pB->nMisbehavior == 0,
+           "a bad signature: its sender scored once and its queue dropped, nothing of it remembered; the honest "
+           "copies, the real ticket among them, all held");
+    }
+
+    // ---- another seed, an epoch out of range, framing
+    CNode* pD = NewRegTestNode(false, "BF1guard-d");
+    CNode* pE = NewRegTestNode(false, "BF1guard-e");
+    vNodes2Free.push_back(pD); vNodes2Free.push_back(pE);
+    P2PoolOnVersion(pD);
+    P2PoolOnVersion(pE);
+    std::vector<CHeldTicket> t6b = GuardMake(params, seed6, 6, 50, 1);
+    {
+        GuardSendTickets(pD, 6, uint256(12345), GuardBodies(t6b, 0, 1));
+        GuardSendTickets(pD, 9, seed6, GuardBodies(t6b, 0, 1));
+        ok(pD->nMisbehavior == 0 && GuardQueued(pD, 6) == 0 && GuardQueued(pD, 9) == 0,
+           "a message naming another seed, or an epoch this node does not take, dropped unread and unscored");
+        CDataStream ss(SER_NETWORK, VERSION);
+        ss << (unsigned int)6 << seed6;
+        WriteCompactSize(ss, 1);
+        ss.write(std::string(117, 'x').data(), 117);
+        SendP2PoolTest(pE, "pooltkt", ss);
+        std::vector<CGuardTicket> vWrong = GuardBodies(t6b, 0, 1);
+        GuardSendTickets(pD, 5, seed5, vWrong);                     // a body of epoch 6 in a message of epoch 5
+        ok(pE->nMisbehavior == 20 && pD->nMisbehavior == 0,
+           "a message that is not whole tickets is scored; one dropped at its epoch check reads none of them");
+        pE->nMisbehavior = 0;
+    }
+
+    // ---- the deadline: relays of epoch 5 dropped, answers taken
+    {
+        GuardSendTickets(pD, 5, seed5, GuardBodies(t5, 0, 4));      // pD was never asked
+        ok(GuardQueued(pD, 5) == 0 && pD->nMisbehavior == 0, "an unasked relay after the deadline: dropped, unscored");
+        GuardSendTickets(pB, 5, seed5, GuardBodies(t5, 0, 4));      // pB was asked for epoch 5
+        P2PoolTicketStepForTest(64, false);
+        ok(P2PoolTicketHeldForTest(5) == 4, "an answer after the deadline: taken");
+        GuardSendTickets(pD, 6, seed6, GuardBodies(t6b, 0, 1));
+        ok(GuardQueued(pD, 6) == 1, "a relay before the deadline: queued");
+        P2PoolTicketStepForTest(64, false);
+        P2PoolRegTickForTest();
+        ok(P2PoolTicketHeldForTest(6) == 13 && GuardHas(GuardSent(pA, 6), t6b[0].ticket) &&
+           !GuardHas(GuardSent(pD, 6), t6b[0].ticket),
+           "and once held, relayed on to the others");
+    }
+
+    // ---- a connection whose relays keep coming back outranked is served last
+    {
+        unsigned char sk[32];
+        TicketTestKey(60, sk);
+        std::vector<CHeldTicket> vKey;
+        uint64 nNonce = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            CHeldTicket h;
+            uint64 nTries = 0;
+            if (!pooltkt::MakeTicket(params, seed6, 6, sk, 128, nNonce, 1000000, h.ticket, h.hashWork, nTries))
+                break;
+            nNonce = h.ticket.Nonce() + 1;
+            vKey.push_back(h);
+        }
+        size_t iBest = 0;
+        for (size_t i = 1; i < vKey.size(); i++)
+            if (vKey[i].hashWork < vKey[iBest].hashWork)
+                iBest = i;
+        std::vector<CGuardTicket> vRelay(1, vKey[iBest].ticket);
+        for (size_t i = 0; i < vKey.size(); i++)
+            if (i != iBest)
+                vRelay.push_back(vKey[i].ticket);
+        GuardSendTickets(pD, 6, seed6, vRelay);
+        P2PoolTicketStepForTest(64, false);
+        P2PoolRegTickForTest();
+        bool fOneHeld = P2PoolTicketIsHeldForTest(6, vKey[iBest].ticket);
+        size_t nRelayed = 0;
+        std::vector<CGuardTicket> toA = GuardSent(pA, 6);
+        for (size_t i = 0; i < vKey.size(); i++)
+            nRelayed += GuardHas(toA, vKey[i].ticket) ? 1 : 0;
+        ok(vKey.size() == 10 && fOneHeld && nRelayed == 1 && pD->nMisbehavior == 0,
+           "one ticket per key: the lowest work hash held and relayed, the nine others neither, nobody scored");
+        std::vector<CHeldTicket> vOne = GuardMake(params, seed6, 6, 61, 2);
+        GuardSendTickets(pD, 6, seed6, GuardBodies(vOne, 0, 1));
+        GuardSendTickets(pE, 6, seed6, GuardBodies(vOne, 1, 2));
+        P2PoolTicketBudgetForTest(1);
+        P2PoolTicketStepForTest(64, false);
+        ok(P2PoolTicketIsHeldForTest(6, vOne[1].ticket) && !P2PoolTicketIsHeldForTest(6, vOne[0].ticket) &&
+           GuardQueued(pD, 6) == 0 && pD->nMisbehavior == 0,
+           "with one token, the relay of a connection in good standing is checked first; the outranked one's "
+           "then finds the budget empty and is dropped, unscored");
+        P2PoolTicketBudgetForTest(256);
+        P2PoolTicketStepForTest(64, false);
+    }
+
+    // ---- a hash that could not be computed: unscored, nothing remembered, a pause
+    {
+        std::vector<CHeldTicket> vN = GuardMake(params, seed6, 6, 70, 1);
+        g_fTicketTestHashFails = true;
+        GuardSendTickets(pE, 6, seed6, GuardBodies(vN, 0, 1));
+        int n1 = P2PoolTicketStepForTest(64, false);
+        GuardSendTickets(pE, 6, seed6, GuardBodies(vN, 0, 1));
+        uint64 nHashes = g_nTicketTestHashes;
+        P2PoolTicketStepForTest(64, false);
+        g_fTicketTestHashFails = false;
+        ok(n1 == 0 && g_nTicketTestHashes == nHashes && pE->nMisbehavior == 0 && !P2PoolTicketIsHeldForTest(6, vN[0].ticket),
+           "RandomX gives no hash: the ticket dropped unscored and checks pause");
+        P2PoolTicketAgeForTest(61);
+        P2PoolTicketStepForTest(64, false);
+        ok(P2PoolTicketIsHeldForTest(6, vN[0].ticket), "after the pause the same ticket, sent again, is held");
+    }
+
+    // ---- this node's own tickets
+    P2PoolTicketKeyForTest(skOwn);
+    CGuardTicket own5, own6;
+    {
+        bool f5 = false, f6 = false;
+        for (int i = 0; i < 20000 && !(f5 && f6); i++)
+        {
+            P2PoolTicketStepForTest(0, true);
+            f5 = P2PoolTicketOwnForTest(5, own5);
+            f6 = P2PoolTicketOwnForTest(6, own6);
+        }
+        P2PoolRegTickForTest();
+        ok(f5 && f6 && P2PoolTicketIsHeldForTest(5, own5) && P2PoolTicketIsHeldForTest(6, own6) &&
+           GuardHas(GuardSent(pA, 6), own6) && !GuardHas(GuardSent(pA, 5), own5),
+           "own tickets made for epochs 5 and 6 once their seeds are buried; epoch 6's relayed, epoch 5's (past "
+           "its deadline) only served");
+    }
+
+    // ---- a restart: pool-tickets.dat read back through the queue
+    {
+        P2PoolTicketBudgetForTest(256);
+        size_t n4 = P2PoolTicketHeldForTest(4), n5 = P2PoolTicketHeldForTest(5), n6 = P2PoolTicketHeldForTest(6);
+        bool fSaved = P2PoolTicketSaveForTest();
+        size_t nQueued = P2PoolTicketLoadForTest();
+        bool fEmpty = P2PoolTicketHeldForTest(6) == 0;
+        for (int i = 0; i < 20; i++)
+            P2PoolTicketStepForTest(64, false);
+        CGuardTicket o5, o6;
+        ok(fSaved && fEmpty && nQueued == n4 + n5 + n6 + 2 && P2PoolTicketHeldForTest(4) == n4 &&
+           P2PoolTicketHeldForTest(5) == n5 && P2PoolTicketHeldForTest(6) == n6 && P2PoolTicketOwnForTest(5, o5) &&
+           o5 == own5 && P2PoolTicketOwnForTest(6, o6) && o6 == own6,
+           "restart: the file's tickets queued (none hashed at start), then checked again to the same sets and own tickets");
+    }
+
+    // ---- a seed reorged out: the set dropped, asked for again, rebuilt
+    std::vector<CHeldTicket> vT6x;
+    {
+        w.Cut(3599);
+        w.Grow(3700, 1);
+        P2PoolTicketViewForTest(w.v);
+        const uint256 seed6x = w.v[3600];
+        CGuardTicket o;
+        bool fGone = P2PoolTicketHeldForTest(6) == 0 && !P2PoolTicketOwnForTest(6, o) && P2PoolTicketHeldForTest(5) > 0;
+        P2PoolRegTickForTest();
+        bool fAsked = GuardAsked(pD).count(6) == 1;
+        GuardSendTickets(pD, 6, seed6, GuardBodies(t6, 0, 4));
+        bool fOldDropped = GuardQueued(pD, 6) == 0 && pD->nMisbehavior == 0;
+        vT6x = GuardMake(params, seed6x, 6, 200, 40);
+        P2PoolTicketBudgetForTest(256);
+        GuardSendTickets(pD, 6, seed6x, GuardBodies(vT6x, 0, vT6x.size()));
+        for (int i = 0; i < 4; i++)
+            P2PoolTicketStepForTest(64, false);
+        bool fOwn = false;
+        for (int i = 0; i < 20000 && !fOwn; i++)
+        {
+            P2PoolTicketStepForTest(0, true);
+            fOwn = P2PoolTicketOwnForTest(6, o);
+        }
+        ok(fGone && fAsked && fOldDropped && vT6x.size() == 40 && P2PoolTicketHeldForTest(6) == 41 && fOwn &&
+           P2PoolTicketIsHeldForTest(6, o),
+           "epoch 6's seed reorged out: its set and own ticket gone, the set asked for again (tickets on the old "
+           "seed dropped unscored), rebuilt on the new seed, own ticket made again");
+    }
+
+    // ---- the draw over the active pools, and the guard budget
+    std::vector<CPoolInfo> vPools;
+    for (int i = 0; i < 24; i++)
+        vPools.push_back(GuardInfo(GuardRecord(i)));
+    const uint256 idP1 = vPools[0].id, idP2 = vPools[1].id, idP3 = vPools[2].id, idP4 = vPools[3].id;
+    TestMainView main;
+    main.nBits = 0x1d00ffff;
+    main.nTip = 61000;
+    main.nNow = GetTime();
+    for (int h = 60990; h <= 61000; h++)
+        main.heights[Hash(BEGIN(h), END(h))] = h;
+    p2pool::PoolRules rules1, rules2;
+    p2pool::RulesForRegistered(vPools[0].rec, (const unsigned char*)pchMessageStart, rules1, err);
+    p2pool::RulesForRegistered(vPools[1].rec, (const unsigned char*)pchMessageStart, rules2, err);
+    p2pool::ShareChain mirror1(rules1, false), mirror2(rules2, false);
+    vector<p2pool::Share> line1 = RegLine(mirror1, main, 30, 1), line2 = RegLine(mirror2, main, 40, 2);
+    {
+        P2PoolTicketPoolsForTest(std::vector<CPoolInfo>(vPools.begin(), vPools.begin() + 4));
+        GuardDrawAndApply();
+        std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
+        bool fAll = v.size() == 4;
+        for (size_t i = 0; i < v.size(); i++)
+            fAll = fAll && v[i].nRank >= 0 && v[i].nRank < 8 && v[i].nChoice == GUARD_PULL && v[i].fGuard &&
+                   v[i].nUntil == pooltkt::LingerEndHeight(6);
+        ok(fAll, "few tickets: drawn as a guardian of all four active pools, each pulled to learn its line, held "
+                 "until epoch 5's linger ends");
+
+        SendPoolInv(pA, vector<uint256>(1, idP1));
+        SendPoolInv(pB, vector<uint256>(1, idP2));
+        P2PoolRegTickForTest();
+        uint256 id, resume;
+        bool f1 = LastRegSync(pA, id, resume) && id == idP1;
+        bool f2 = LastRegSync(pB, id, resume) && id == idP2;
+        ok(f1 && f2, "a pulled pool is asked of the peer that announces it (p2xsync)");
+        SendRegPart(pA, idP1, 29, 1, line1);
+        SendRegPart(pB, idP2, 39, 1, line2);
+        P2PoolRegAgeForTest(301);
+        P2PoolRegTickForTest();
+        P2PoolRegAgeForTest(61);
+        P2PoolRegTickForTest();
+        P2PoolRegStatusInfo s1, s2;
+        ok(P2PoolRegStatus(idP1, s1) && P2PoolRegStatus(idP2, s2) && s1.fGuard && s2.fGuard && s1.fAnnounced &&
+           s2.fAnnounced && s1.nShares == 30 && s2.nShares == 40,
+           "both lines pulled whole, kept within the guard budget and announced");
+
+        // Room for one line in bytes: the heavier line is kept, the other
+        // let go and no longer announced.
+        const int64 nB1 = (int64)s1.nBytes, nB2 = (int64)s2.nBytes;
+        P2PoolGuardLimitsForTest(nB2 + nB1 / 2, GUARD_MAX_POOL_BYTES, GUARD_MAX_POOLS);
+        P2PoolRegTickForTest();
+        std::vector<P2PoolGuardEntryInfo> v1 = GuardEntries();
+        const P2PoolGuardEntryInfo* e1 = GuardEntry(v1, idP1);
+        const P2PoolGuardEntryInfo* e2 = GuardEntry(v1, idP2);
+        P2PoolRegStatus(idP2, s2);
+        ok(nB2 > nB1 && e1 && e2 && e1->nChoice == GUARD_NO_ROOM && GuardLetGo(idP1) &&
+           e2->nChoice == GUARD_KEEP && s2.fGuard && s2.fAnnounced,
+           "a guard budget full in bytes: ranked by line work, the heavier kept, the lighter let go and not announced");
+        P2PoolGuardLimitsForTest(GUARD_DEFAULT_BYTES, GUARD_MAX_POOL_BYTES, 1);
+        P2PoolRegTickForTest();
+        v1 = GuardEntries();
+        e1 = GuardEntry(v1, idP1);
+        e2 = GuardEntry(v1, idP2);
+        ok(e1 && e2 && e1->nChoice == GUARD_NO_ROOM && e2->nChoice == GUARD_KEEP && GuardLetGo(idP1),
+           "a guard budget full in pools: the lighter is not pulled again only to be let go again");
+        P2PoolGuardLimitsForTest(GUARD_DEFAULT_BYTES, (nB1 + nB2) / 2, GUARD_MAX_POOLS);
+        P2PoolRegTickForTest();
+        v1 = GuardEntries();
+        e1 = GuardEntry(v1, idP1);
+        e2 = GuardEntry(v1, idP2);
+        ok(e1 && e2 && e2->nChoice == GUARD_NO_ROOM && GuardLetGo(idP2) && e1->nChoice == GUARD_KEEP,
+           "a line over the per-pool cap: guarded by nobody here, not announced; a line under it takes the slot");
+        P2PoolGuardLimitsForTest(GUARD_DEFAULT_BYTES, GUARD_MAX_POOL_BYTES, GUARD_MAX_POOLS);
+        P2PoolRegTickForTest();
+    }
+
+    // ---- an empty pool, and the same pool announced mid-epoch
+    CNode* pF = NewRegTestNode(false, "BF1guard-f");
+    vNodes2Free.push_back(pF);
+    {
+        P2PoolTicketAgeForTest(601);
+        P2PoolRegTickForTest();
+        std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
+        const P2PoolGuardEntryInfo* e3 = GuardEntry(v, idP3);
+        const P2PoolGuardEntryInfo* e4 = GuardEntry(v, idP4);
+        ok(e3 && e4 && e3->fEmpty && e4->fEmpty && !e3->fGuard && !e4->fGuard,
+           "a drawn pool nobody announces and nothing came of in 10 minutes: no shares, no slot, let go");
+        if (e3 && e4 && !(e3->fEmpty && e4->fEmpty && !e3->fGuard && !e4->fGuard))
+        {
+            P2PoolRegStatusInfo st3;
+            bool f3 = P2PoolRegStatus(idP3, st3);
+            printf("       P3: empty %d guard %d choice %d; pool %d fetch %d shares %u announcers %u\n", e3->fEmpty,
+                   e3->fGuard, e3->nChoice, f3, f3 ? st3.nFetch : -1, f3 ? (unsigned)st3.nShares : 0,
+                   f3 ? (unsigned)st3.nAnnouncers : 0);
+        }
+        P2PoolOnVersion(pF);
+        SendPoolInv(pF, vector<uint256>(1, idP3));
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        uint256 id, resume;
+        v = GuardEntries();
+        e3 = GuardEntry(v, idP3);
+        ok(e3 && !e3->fEmpty && e3->fGuard && LastRegSync(pF, id, resume) && id == idP3,
+           "the same pool announced mid-epoch by a peer: pulled from that peer");
+        size_t nKeep = 0;
+        for (size_t i = 0; i < v.size(); i++)
+            nKeep += v[i].nChoice == GUARD_KEEP ? 1 : 0;
+        P2PoolGuardSaveForTest();
+        ok(nKeep >= 1 && P2PoolGuardLoadForTest() == nKeep, "pool-guards.dat keeps the pools kept, read back whole");
+    }
+
+    // ---- a mined pool whose every guardian is gone: found through a carrier
+    {
+        poolreg::PoolRecord rec5 = GuardRecord(100);
+        CPoolInfo info5 = GuardInfo(rec5);
+        const uint256 id5 = info5.id;
+        ok(P2PoolRegAddForTest(rec5, true, false, false, err), "a pool to mine joins with nothing of it here");
+        P2PoolRegTickForTest();
+        GuardDrawAndApply();
+        vector<string> vDial;
+        P2PoolGuardDialList(vDial);
+        std::set<string> setDial(vDial.begin(), vDial.end()), setWant;
+        for (size_t i = 0; i < t4.size(); i++)
+            setWant.insert(btf::Address(t4[i].ticket.PubKey()));
+        for (size_t i = 0; i < t5.size(); i++)
+            setWant.insert(btf::Address(t5[i].ticket.PubKey()));
+        ok(setDial == setWant && vDial.size() <= 16,
+           "its guardians and reserve of this epoch and the last, this node aside, named to the dialler");
+        bool fWho = false;
+        uint256 id5c = id5;   // begin() is not const
+        CNode* vAsk[] = { pA, pB, pD, pE, pF };
+        for (size_t i = 0; i < 5; i++)
+        {
+            vector<unsigned char> who;
+            if (LastSent(vAsk[i], "poolwho", who) && who.size() == 32 && memcmp(&who[0], id5c.begin(), 32) == 0)
+                fWho = true;
+        }
+        ok(fWho, "no guardian reachable and nobody announcing it: peers are asked who carries it (poolwho)");
+        CNode* pG = NewRegTestNode(false, "BF1guard-carrier");
+        vNodes2Free.push_back(pG);
+        P2PoolOnVersion(pG);
+        SendPoolInv(pG, vector<uint256>(1, id5));
+        P2PoolRegTickForTest();
+        uint256 id, resume;
+        bool fAsked = LastRegSync(pG, id, resume) && id == id5;
+        p2pool::PoolRules rules5;
+        p2pool::RulesForRegistered(rec5, (const unsigned char*)pchMessageStart, rules5, err);
+        p2pool::ShareChain mirror5(rules5, false);
+        vector<p2pool::Share> line5 = RegLine(mirror5, main, 10, 5);
+        SendRegPart(pG, id5, 9, 1, line5);
+        P2PoolRegAgeForTest(301);
+        P2PoolRegTickForTest();
+        string why;
+        ok(fAsked && P2PoolMinedReady(why) && RegShares(id5) == 10,
+           "a peer that carries it, no guardian, gives the line; the old window is mined on");
+    }
+
+    // ---- a redraw mid-handoff
+    {
+        P2PoolTicketKeyForTest(skOwn);
+        w.Grow(4400, 1);                  // epoch 6, between its start (4320) and its linger end (4500)
+        P2PoolTicketViewForTest(w.v);
+        CGuardTicket own;
+        bool fOwn = P2PoolTicketOwnForTest(6, own);
+        const uint256 seed6x = w.v[3600];
+        std::vector<CHeldTicket> vHeld6 = vT6x;
+        CHeldTicket hOwn;
+        hOwn.ticket = own;
+        hOwn.hashWork = own.WorkHash(params, seed6x);
+        hOwn.hashBody = own.BodyHash();
+        vHeld6.push_back(hOwn);
+        P2PoolTicketPoolsForTest(vPools);
+        GuardDrawAndApply();
+        const int64 nLinger6 = pooltkt::LingerEndHeight(6), nLinger7 = pooltkt::LingerEndHeight(7);
+        std::set<uint256> setA = GuardDrawnFor(w.v[4260], vPools, vHeld6, hOwn.hashWork);
+        std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
+        std::set<uint256> set7, set6;
+        for (size_t i = 0; i < v.size(); i++)
+            (v[i].nUntil == nLinger7 ? set7 : set6).insert(v[i].id);
+        ok(fOwn && P2PoolTicketHeldForTest(6) == vHeld6.size() && v.size() == vPools.size() && set7 == setA,
+           "drawn by epoch 6's seed: those pools held until epoch 7's linger end, the rest until epoch 6's");
+        w.Cut(4259);
+        w.Grow(4400, 2);                  // a reorg through the draw seed (4260), 141 blocks deep
+        P2PoolTicketViewForTest(w.v);
+        GuardDrawAndApply();
+        std::set<uint256> setB = GuardDrawnFor(w.v[4260], vPools, vHeld6, hOwn.hashWork);
+        v = GuardEntries();
+        std::set<uint256> s7, sOld, sRest, setAonly;
+        for (std::set<uint256>::iterator it = setA.begin(); it != setA.end(); ++it)
+            if (!setB.count(*it))
+                setAonly.insert(*it);
+        for (size_t i = 0; i < v.size(); i++)
+            (v[i].nUntil == nLinger7 ? s7 : v[i].nUntil == 4400 + GUARD_LINGER_BLOCKS ? sOld : sRest).insert(v[i].id);
+        if (setAonly.empty())
+            printf("  (the two draws gave this node the same pools: the old seed's linger is not told apart here)\n");
+        ok(setA != setB && s7 == setB && sOld == setAonly && v.size() == vPools.size(),
+           "a redraw: the new seed's pools pulled for the epoch, the old seed's kept until 180 blocks after the "
+           "redraw was seen (later than 720e + 180)");
+        w.Grow((int)nLinger6, 2);
+        P2PoolTicketViewForTest(w.v);
+        GuardDrawAndApply();
+        v = GuardEntries();
+        std::set<uint256> sLeft;
+        for (size_t i = 0; i < v.size(); i++)
+            sLeft.insert(v[i].id);
+        std::set<uint256> sAB = setA;
+        sAB.insert(setB.begin(), setB.end());
+        ok(sLeft == sAB, "at 720e + 180 the previous epoch's guardians let go; both seeds' pools stay");
+        w.Grow(4400 + GUARD_LINGER_BLOCKS, 2);
+        P2PoolTicketViewForTest(w.v);
+        GuardDrawAndApply();
+        v = GuardEntries();
+        sLeft.clear();
+        for (size_t i = 0; i < v.size(); i++)
+            sLeft.insert(v[i].id);
+        ok(sLeft == setB, "and when the old seed's linger ends, only the new seed's pools stay");
+    }
+
+    // ---- pool zero and a 1.2.34 peer through all of it
+    {
+        size_t nZero;
+        CRITICAL_BLOCK(cs_p2pool)
+            nZero = P2PoolChain().Size();
+        // (Pool zero's history-ask budget is spent by pool zero itself: a
+        // version from a peer while its share chain is empty asks for it.)
+        (void)nZeroAsk;
+        ok(!SentRegMessage(pOld) && pOld->nMisbehavior == 0 && nZero == 0 && P2PoolOrphanCount() == 0 &&
+           P2PoolShareWorkTokens() == nZeroWork && P2PoolHistoryServeTokens() == nZeroServe,
+           "pool zero's share and serve budgets, chain and orphans untouched by tickets and guarded pools; a 1.2.34 "
+           "peer sent nothing of them and never scored");
+    }
+
+    vector<CNode*> vEnd = vNodes2Free;
+    for (size_t i = 0; i < vEnd.size(); i++)
+    {
+        P2PoolForgetDeferred(vEnd[i]);
+        delete vEnd[i];
+    }
+    P2PoolResetForTest(bnProofOfWorkLimit, true);
+    PoolBurnsOpenForTest(false);
+    SetCurrentDir(cwd);
+    RemoveTree(tmp);
+    printf("%s (%d failure%s)\n", nFail == 0 ? "p2pool-guardians: all passed" : "p2pool-guardians: FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    fflush(stdout);
+    return nFail ? 1 : 0;
+}
+
 // ---- pool-index: the pool registry read off the active chain -------------
 // docs/pool-registry.md, sections 3, 4 and 7: appearances and the 30
 // confirmations, duplicates, a reorg on either side of 30, a record on both
@@ -24437,6 +25161,8 @@ int RunSelfTest(const std::string& name)
         return RunPoolTicketsSelfTest();
     if (name == "pool-tickets-grind")
         return RunPoolTicketsGrind();
+    if (name == "p2pool-guardians")
+        return RunP2PoolGuardiansSelfTest();
     if (name == "consensus-safety")
         return RunConsensusSafetySelfTest();
     if (name == "reorg-safety")
@@ -24607,6 +25333,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, p2pool-registered, pool-index, pool-tickets\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, p2pool-registered, p2pool-guardians, pool-index, pool-tickets\n");
     return 1;
 }
