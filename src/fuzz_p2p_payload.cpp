@@ -291,7 +291,7 @@ static void HandleOne(CNode& node, size_t nIndex, unsigned char nFlags, const ui
     try
     {
         bool fDone = false;
-        if (strCommand.compare(0, 3, "p2p") == 0)
+        if (P2PoolCommand(strCommand))
         {
             CDataStream vCopy(vMsg);
             fDone = P2PoolProcessMessage(&node, strCommand, vCopy);

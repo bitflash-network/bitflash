@@ -492,7 +492,14 @@ crowd real pools out of the message.
   a pool not announced (not carried, or a guarded or `-poolcarry` pool this
   node holds no shares of yet), or naming pool zero's id,
   gets `p2xnone`, at the cost of one map lookup, and scores nobody. Requests are rationed by the budgets
-  below, as `p2psync` is today.
+  below, as `p2psync` is today. The asking side keeps within them too: it
+  sends one connection at most 3 `p2xsync` for a pool and 8 in all per
+  interval (counted over `SYNC_SERVE_INTERVAL` plus 30 s, so the server's
+  own count has always started over), and the same peer asked again for
+  the same fetch spends from the history-ask budget even when this node
+  dialled it. An ask whose first part has not come within 3 minutes leaves
+  that peer alone for a minute, as a `p2xnone` would, and the fetch asks
+  another announcer; the late answer is still taken within its window.
 - *Answers* (`p2xshares`, and `p2xshare` sent in answer to `p2xgetsh`) are taken
   only for the pool asked, from the peer asked, soon after asking (the rule
   `p2pshares` has today, kept per pool; for `p2xshares` "soon" is the
@@ -581,7 +588,11 @@ piece of shared P2Pool state in `p2pool_net.cpp` is split into two classes,
   (`P2PoolPeerProven`) stays exactly as in 1.2.34. Registered-class messages
   never score a peer for routing (above); a peer that sends an invalid share of
   a registered pool is scored, as it would be for an invalid pool zero share,
-  because only a dishonest peer does that.
+  because only a dishonest peer does that. A peer is proven for a registered
+  pool as for pool zero (dialled, or it sent a share of that pool this node
+  took), per (connection, pool); the shares a proven peer sends unasked are
+  hashed on a budget of that (connection, pool) and one of the pool, as a
+  local pool's members in session are (section 18), never on pool zero's.
 
 The rule covers every other piece of shared state too, and Phase B lists each
 in the code: the global cap on deferred entries (`MAX_DEFERRED`) and the
@@ -636,7 +647,24 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   `-p2poolpayto`/`-p2poolbind` do not change. Until the pool is active and its
   share chain is here, the stratum serves no template and the log says why
   (pending, unknown id, waiting for its line), as it does today while pool
-  zero's history is on its way.
+  zero's history is on its way. A mined pool with nothing of it on this
+  node starts its line here 2 minutes after it becomes active if no peer
+  announces it, and in any case 10 minutes after it becomes active, whatever
+  was asked meanwhile: peers that announce it but have no share of it yet
+  answer `p2xnone`, and one that never answers holds nothing up (both are
+  asked again a minute later, within what a peer answers, section 8); peers
+  are asked `poolwho` meanwhile. An answer that comes after the line started
+  here is still taken, and the line with more work wins.
+- **Not on mainnet before the release that opens it.** Until
+  `POOL_REGISTRY_MAINNET_OPEN` (`src/poolindex.h`) is true, a mainnet node
+  refuses to start with `-p2pool=<poolid>` or `-poolcarry`, and no
+  registered pool is ever live there whatever its status in the index
+  (anyone can burn a record with `sendburn`): nothing of one is fetched,
+  mined, carried, announced, relayed or served, its files are not read, and
+  every `p2x*` and `pool*` message is dropped unread, nobody scored. One
+  check in `p2pool_net.cpp` (`RegOpen`, the same `PoolBurnsOpen()` that
+  closes `poolcreate everpool "send"`) gates all of it. Pool zero and local
+  pools are not registered pools and are unaffected. Testnet is open.
 - The node carries the pool it mines (keeps its chain in
   `pools/<poolid>.dat`, relays it, announces it), plus pool zero, plus what the
   draw gives it (section 10), plus any given with `-poolcarry=<poolid>`
@@ -1114,7 +1142,7 @@ mines and `-poolcarry` pools. Mining is unaffected.
 | tickets | at most 4096 per epoch, 118 bytes each: about 0.5 MB a day for each peer they are relayed to; an asked set adds up to 4 answers of 480 KB, about 1.9 MB per epoch, 5.8 MB at start (section 10) |
 | RandomX | three budgets: pool zero's (unchanged), one for all registered pools together, one for tickets; never one per pool |
 | requests from one connection | at most 8 registered pools' histories per `SYNC_SERVE_INTERVAL`; per carried pool one paced serve in flight, 3 `p2xsync` asks and one history's worth of shares per interval, resumed asks included; asks about pools not carried, 8 per interval per connection, the rest dropped (section 8) |
-| a fetch in progress | `pools/<poolid>.part`, within the pool's byte cap; deleted when the line is complete, after 24 hours without a new share, or when the pool is no longer wanted (section 17) |
+| a fetch in progress | `pools/<poolid>.part`: only the shares the share chain took (never one it already held, whatever its bytes), written from the chain's own copies, and never past the pool's byte cap (`MAX_CHAIN_BYTES`; past it the fetch goes on in memory only, and a restart resumes from what the file holds); read back no further than that cap. Deleted once the line is complete and written to `pools/<poolid>.dat`, after 24 hours without a new share (shares already held do not count), or when the index, loaded and at its tip, says the pool is no longer active (section 17) |
 | local pools (section 18) | at most 4 per node, each with pool zero's caps (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), 16 listed peers and 16 sessions; their traffic in the registered class |
 
 What it costs in practice: an honest pool's line is about 2900 shares with
@@ -1318,7 +1346,23 @@ pool's share chain is kept on disk throughout. Nothing is re-anchored by hand.
   slow serve older than 15 minutes under 1 KB/s ended when an ask waits; a
   partial fetch written to `pools/<poolid>.part`, read back after a restart
   through `AddHistory`, and resumed; no template, `poolinv` or serve before
-  the chain is complete; the file deleted when it is.
+  the chain is complete; the file deleted when it is. The partial file
+  takes only shares the chain took (held ids resent with padded bodies add
+  nothing), stops at the pool's byte cap with the fetch going on in memory,
+  and goes a day after its last new share however many held ones keep
+  coming; a part cut short at its end is cut off at start and the next part
+  read back after the last whole one; a `.dat` that could not be written
+  keeps it; a fetch read back at start keeps its file while the index has
+  not loaded, is behind or is rebuilding, resumes once the ready index says
+  active, and goes once it says otherwise. A silent announcer is left after
+  3 minutes for another; a peer is asked at most 3 times a pool an interval;
+  a mined pool whose only announcer never answers starts its line 10
+  minutes after it became active.
+- The mainnet gate: with registered pools closed, `-p2pool=<pool id>` and
+  `-poolcarry` are refused, the mined pool has no template and takes no
+  share, nothing is carried or announced, and a pushed share, a `p2xsync`,
+  a `p2xgetsh`, a `poolwho` and a `poolinv` are dropped unread, nobody
+  scored; opened again, all is as before.
 - Transport (section 17): `gettorinfo` `transports` for bundled rungs and for
   user lines of each kind, `meek_lite` reported as meek, redone on a change
   of rung; and no pool behaviour reading it (budgets, slots, rate, pulls and
@@ -1343,7 +1387,7 @@ pool's share chain is kept on disk throughout. Nothing is re-anchored by hand.
   guardian of both the old and the new set gone at once during a handoff (the
   new set pulls from miners and announcing peers, or the pool revives).
 - P2Pool local: the self-tests of section 18.
-- Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended).
+- Fuzz targets for the record parser, for `ShareX` and for the `p2lhello` handler (`fuzz_p2pool` extended), and for the registered pools' messages (`fuzz_p2preg`).
 
 ### Testnet proof with real coins (Phase D)
 
@@ -1433,7 +1477,7 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 |---|---|---|
 | A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
 | B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
-| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | after B1 |
+| B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) in progress |
 | C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | after B2 |
 | D | the testnet proof of section 15 | after C |
 
@@ -1564,7 +1608,12 @@ served differently:
   history* or *ended early* ends the window. Whatever arrives, the window closes 60 minutes after the ask; a
   fetch still moving then goes on with a new ask, from where it stopped
   (below). The shares taken for one ask stay under one history's worth
-  (`3 x HISTORY_SHARES + 2 x 100`, with the pool's `HISTORY_SHARES`).
+  (`3 x HISTORY_SHARES + 2 x 100`, with the pool's `HISTORY_SHARES`). The
+  fetch itself does not sit out that hour on one peer: if no part has come
+  3 minutes after the ask and another peer announces the pool, that one is
+  asked (the first answer is still taken if it comes within its window),
+  always within the 3 asks a pool and 8 in all a peer answers per interval
+  (section 8).
 
 So the slowest link a fetch survives moves a part every 5 minutes, about
 1 KB/s, and a server at the default rate gives every serve at least 8 KB/s
@@ -1649,14 +1698,25 @@ is taken as it arrives (`AddHistory` per part).
   it only to the partial file below, never to `pools/<poolid>.dat`.
 - **Kept across a restart.** The partial file, `pools/<poolid>.part`, holds
   the snapshot's tip height and the shares taken so far, oldest first;
-  each part taken is appended and flushed before the next is asked for, so
-  a restart loses at most the part in transit. At start the file is read back
+  for each part, the shares `AddHistory` took from it (not those already
+  held: a peer resending held ids with padded bodies adds nothing) are
+  written, from the chain's own copies, where the last whole part ends, and
+  flushed before the next is asked for, so a restart loses at most the part
+  in transit. A part cut short in the file (a stop while writing, a failed
+  write) is cut off when the file is read back, so the next part follows the
+  last whole one. At start the file is read back
   through `AddHistory` with that height (clamped as a received part is), its
   shares checked through the registered RandomX budget like received ones,
-  and the fetch resumes. It counts against the pool's byte cap; it is deleted
-  when the chain is complete (and is then written to `pools/<poolid>.dat`),
-  after 24 hours without a new share, or when the pool is no longer mined,
-  carried or guarded. This is not the "never kept in part" of section 12,
+  and the fetch resumes. It never grows past the pool's byte cap (past it
+  the fetch goes on in memory only), and is read back no further than that.
+  It is deleted once the chain is complete and written to
+  `pools/<poolid>.dat` (a `.dat` that could not be written keeps it), after
+  24 hours without a new share, or when the pool is no longer mined,
+  carried or guarded. "No longer" is the index's word only once the index is
+  ready: loaded, at the active chain's tip and not reading the chain again
+  (it loads after the node starts); until then a pool it does not name
+  keeps its partial file, carried by nobody meanwhile. This is not the
+  "never kept in part" of section 12,
   which is about a guardian keeping part of a line to serve.
 - **The resume point.** When a fetch breaks (a dropped circuit, a window
   closed, a restart), the node asks again with `p2xsync` naming its resume

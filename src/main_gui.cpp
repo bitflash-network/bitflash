@@ -164,8 +164,14 @@ static void PrintUsage()
     printf("Mining mode:\n");
     printf("  /p2pool                    (pooled mining with no pool: XMRig points at this node,\n");
     printf("                              blocks pay every miner of the share window; docs/p2pool.md)\n");
+    printf("  /p2pool=POOLID             (mine this Everpool pool instead, 64 hex digits: a pool\n");
+    printf("                              recorded on the chain; poollist shows them; testnet only\n");
+    printf("                              until a release opens Everpool pools on mainnet)\n");
     printf("  /p2pool=local:NAME         (mine this node's local pool NAME instead: a private pool of\n");
     printf("                              your own machines; poolcreate local / pooljoin make one)\n");
+    printf("  /poolcarry=POOLID[,...]    (keep and relay these Everpool pools too, without mining\n");
+    printf("                              them; at most 8; with or without /p2pool; testnet only\n");
+    printf("                              until a release opens Everpool pools on mainnet)\n");
     printf("  /p2poolport=N              (default 3333, on 127.0.0.1)\n");
     printf("  /p2poolbind=IP             (also serve stratum on this private address, for miners on\n");
     printf("                              your local network: 10.x, 172.16-31.x, 192.168.x, 169.254.x,\n");
@@ -395,9 +401,17 @@ static void ParseStartupArguments(int argc, char* argv[])
         // one, refuses rather than quietly mine pool zero. Whether the named
         // local pool is on this node is known once P2PoolInit has read them.
         string strChoiceWhyNot;
-        if (!P2PoolParseChoice(argval2(argc, argv, "/p2pool", "-p2pool"), strP2PoolLocalName, strChoiceWhyNot))
-            StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, or -p2pool=local:<name> for a "
-                                     "local pool of this node (poollist shows them).");
+        uint256 idReg = 0;
+        if (!P2PoolParseChoice(argval2(argc, argv, "/p2pool", "-p2pool"), strP2PoolLocalName, idReg, strChoiceWhyNot))
+            StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, -p2pool=<pool id> for an Everpool "
+                                     "pool, or -p2pool=local:<name> for a local pool of this node (poollist shows them).");
+        // An Everpool pool: mined once its record is active on this node's
+        // chain and its line is here; until then the stratum serves no work
+        // and the log says why.
+        // Not on mainnet before the release that opens them there.
+        if (idReg != 0 && !P2PoolRegWant(idReg, true, strChoiceWhyNot))
+            StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, or -p2pool=local:<name> for a local "
+                                           "pool of this node.");
         string strPort = argval2(argc, argv, "/p2poolport", "-p2poolport");
         if (!strPort.empty())
         {
@@ -425,7 +439,33 @@ static void ParseStartupArguments(int argc, char* argv[])
                               "machine on your local network, such as -p2poolbind=192.168.1.10.");
         }
     }
-    else if (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind"))
+    // -poolcarry=<pool id>[,...] (docs/pool-registry.md, section 9): Everpool
+    // pools this node keeps and relays without mining them, at most 8, with
+    // or without -p2pool. The option may be given more than once.
+    {
+        vector<uint256> vCarry;
+        for (int i = 1; i < argc; i++)
+        {
+            string s = argv[i];
+            size_t eq = s.find('=');
+            string key = s.substr(0, eq);
+            if (key != "-poolcarry" && key != "/poolcarry")
+                continue;
+            string strWhyNot;
+            if (eq == string::npos || !P2PoolParseCarry(s.substr(eq + 1), vCarry, strWhyNot))
+                StartupRefuse(eq == string::npos ? string("-poolcarry needs a pool id") : strWhyNot,
+                              "Give -poolcarry=<pool id> (64 hex digits, poollist shows them), at most 8.");
+        }
+        foreach(const uint256& id, vCarry)
+        {
+            string strWhyNot;
+            if (!P2PoolRegWant(id, false, strWhyNot))
+                StartupRefuse(strWhyNot, strWhyNot == P2POOL_REG_CLOSED
+                                         ? "Leave -poolcarry out on mainnet, or run on testnet with -testnet."
+                                         : "Give -poolcarry=<pool id> (64 hex digits, poollist shows them), at most 8.");
+        }
+    }
+    if (!(arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool")) && (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind")))
         StartupRefuse("-p2poolbind needs -p2pool",
                       "It chooses where the P2Pool stratum listens; add -p2pool to mine with P2Pool.");
 

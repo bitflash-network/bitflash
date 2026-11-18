@@ -401,6 +401,7 @@ tests: btfchat.exe test_bip32.exe test_btfchan.exe test_btfaddr.exe test_btfchat
 	./bitflash.exe -selftest=p2pool-lan
 	./bitflash.exe -selftest=p2pool-local
 	./bitflash.exe -selftest=p2pool-local-node
+	./bitflash.exe -selftest=p2pool-registered
 	./bitflash.exe -selftest=sigcheck
 	./bitflash.exe -selftest=btc-swap
 	./bitflash.exe -selftest=btc-light
