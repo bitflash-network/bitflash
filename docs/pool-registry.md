@@ -1681,8 +1681,9 @@ The time rules need no change: a share may run 120 s ahead of a node's clock,
 and a line counts as live for 180 share intervals. That clock is the node's
 own, never the offset its peers' version messages suggest: over Tor those
 come in late, and only late, so their median drifts behind (184 s measured on
-a Snowflake node in Phase D, while the bridge carried pool zero's histories),
-which put every fresh share past the 120 s and had it refused. Keep the
+a Snowflake node in Phase D while it caught up after its start, 39 to 62 s on
+direct nodes started beside it), which put every fresh share past the 120 s
+and had it refused. Keep the
 system clock right (NTP); a share's time is each node's own policy, so no
 other node judges anything differently for it.
 

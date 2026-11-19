@@ -10021,8 +10021,8 @@ static int RunP2PoolRegisteredSelfTest()
 
     // ---- a share's time is judged by this node's own clock, not by the
     // offset peers' version messages suggest (found in the phase D step 7
-    // testnet run: on a node behind Snowflake the versions came in minutes
-    // late, while the bridge carried pool zero's histories, and the median of
+    // testnet run: on a node behind Snowflake, catching up after its start,
+    // the versions were read minutes after they were sent, and the median of
     // them put its adjusted clock 184 s behind; every fresh share of every
     // peer was then more than 120 s ahead of it and refused)
     CNode* pClk = NewRegTestNode(true, "BF1clock");
