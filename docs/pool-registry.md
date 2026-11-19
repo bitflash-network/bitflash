@@ -1903,6 +1903,18 @@ where a Snowflake node and an obfs4 node on testnet mine a registered pool
 against the pass mark above, guard it, and fetch a dormant window and a live
 line across a restart, with the measured delays written back here.
 
+The delays are read from `sharetime.log`, which a node started with
+`-sharetimelog` writes in its data directory: one line per registered share
+event, `<unix ms> <event> <pool id, 16 hex> <share id> <share height> <peer>`,
+for a share found on this node (`found`), received from a peer (`recv`),
+sent to one (`send`) and asked for (`getsh`, `probe`). `debug.log` carries no
+time and collapses share lines within 3 s of each other, so it cannot serve.
+The `poolprobe <pool id>` RPC asks every connected peer that announced the
+pool for this node's tip share; the `probe` line and the answer's `recv`
+line give the round trip. The answer is a share already held: taken for
+nothing, nobody scored. Both are off unless asked for, and change nothing in
+the protocol.
+
 ## 18. P2Pool local: a private pool
 
 Everpool is public on purpose: anyone can find a pool, join it and keep it
