@@ -653,8 +653,12 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   was asked meanwhile: peers that announce it but have no share of it yet
   answer `p2xnone`, and one that never answers holds nothing up (both are
   asked again a minute later, within what a peer answers, section 8); peers
-  are asked `poolwho` meanwhile. An answer that comes after the line started
-  here is still taken, and the line with more work wins.
+  are asked `poolwho` meanwhile, the first ones that read the registry as
+  soon as they connect. A carrier a peer names in its `poolat` answer is
+  dialled (below, *Dialling guardians*) and counts as an announcer for the
+  2 minutes while it is (named within the last 10 minutes); the 10 minutes
+  hold whatever. An answer that comes after the line started here is still
+  taken, and the line with more work wins.
 - **Not on mainnet before the release that opens it.** Until
   `POOL_REGISTRY_MAINNET_OPEN` (`src/poolindex.h`) is true, a mainnet node
   refuses to start with `-p2pool=<poolid>` or `-poolcarry`, and no
@@ -1219,7 +1223,16 @@ about who keeps a copy.
   here, and for pulls nobody announces, the draws in force name up to 16
   .btf addresses (this node aside); the dialler resolves them from its peer
   cache, through Nostr on a miss, and keeps up to 3 connections to them past
-  its usual peers, 2 dials a round.
+  its usual peers, 2 dials a round. Ahead of them come the carriers that
+  peers named in answer to this node's `poolwho` for a pool it mines,
+  carries or guards (the newest 8 a pool, each for 10 minutes after it was
+  named, newest first), on a node with `-poolguard=0` too, which has no
+  guardians to dial: each was seen announcing the pool, where a guardian may
+  hold nothing of it. (Before this, the names went only into pool zero's
+  peer cache, which marks addresses it already holds and is dialled from
+  only while fewer than 3 pool zero peers are connected, so a node reached a
+  carrier named to it only if its ordinary dialling happened to; on
+  testnet's few nodes it usually does, on a larger network it would not.)
 - **Files**: `pool-tickets.dat` is written when the sets changed, at most
   once a minute, and at exit; it is read at start and queued as an answer,
   never hashed where it stands. `pool-guards.dat` keeps the pools kept, each

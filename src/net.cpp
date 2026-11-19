@@ -1639,7 +1639,8 @@ static int DialP2PoolPeers(int nBudget)
 // The guardians of a registered pool this node looks for
 // (docs/pool-registry.md, section 10): the one it mines while its line is
 // not here, and pools it is drawn for that no peer announces. The draw names
-// their .btf addresses (p2pool_net.cpp); they are dialled like P2Pool peers,
+// their .btf addresses (p2pool_net.cpp), after the carriers a peer named in
+// answer to poolwho (also with -poolguard=0); they are dialled like P2Pool peers,
 // up to GUARD_EXTRA_PEERS past the usual target, resolved from the peer
 // cache and, on a miss, through the descriptors on Nostr. Each answers with
 // poolinv if it holds the pool, and the fetch asks it from there.
