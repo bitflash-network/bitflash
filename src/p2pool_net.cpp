@@ -69,7 +69,8 @@ static void ShareTimeLog(const char* pszEvent, const uint256& idPool, const uint
     std::string strLine = ShareTimeLine(nMillis, pszEvent, idPool, idShare, nHeight, ShareTimePeer(pnode));
     CRITICAL_BLOCK(cs_shareTimeLog)
     {
-        FILE* f = fopen((GetAppDir() + "/sharetime.log").c_str(), "a");
+        // Binary: the same "\n" line ends on every platform.
+        FILE* f = fopen((GetAppDir() + "/sharetime.log").c_str(), "ab");
         if (f)
         {
             fwrite(strLine.data(), 1, strLine.size(), f);
