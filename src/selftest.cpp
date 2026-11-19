@@ -9972,6 +9972,110 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(!P2PoolPeerProven(pIn), "a peer that sent only registered shares is not proven for pool zero") ? 0 : 1;
     }
 
+    // ---- -sharetimelog and poolprobe (section 15, Phase D step 7: a share's
+    // delay between two nodes is measured from these lines)
+    {
+        uint256 idS = 0x5a;
+        nFail += Check(ShareTimeLine(1700000000123LL, "found", idA, idS, 7, "") ==
+                           strprintf("1700000000123 found %s %s 7 -\n", idA.ToString().substr(0, 16).c_str(),
+                                     idS.ToString().c_str()),
+                       "a share time line: milliseconds, event, pool id (16 hex), share id, height, peer or -") ? 0 : 1;
+        const string strLog = tmp + "/sharetime.log";
+        remove(strLog.c_str());
+        p2pool::Share s0 = RulesShare(mirrorA, main, lineA.back(), payTo(6), t + 30 * 44);
+        bool fOff = mirrorA.Add(s0, main, err) && P2PoolSubmitShare(s0, err) && !FileExists(strLog.c_str());
+        lineA.push_back(s0.GetId());
+        fShareTimeLog = true;
+        p2pool::Share s = RulesShare(mirrorA, main, lineA.back(), payTo(5), t + 30 * 45);
+        bool fFound = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err);
+        lineA.push_back(s.GetId());
+        size_t nGetsh = CountSent(pNew, "p2xgetsh");
+        size_t nHeld = RegShares(idA);
+        vector<string> vAsked;
+        uint256 idProbed;
+        bool fProbe = P2PoolProbe(idA, vAsked, idProbed) && idProbed == s.GetId() && vAsked.size() == 1 &&
+                      vAsked[0] == "BF1announcer" && CountSent(pNew, "p2xgetsh") == nGetsh + 1 &&
+                      CountSent(pIn, "p2xgetsh") == 0;
+        vector<string> vNone;
+        uint256 idNone;
+        bool fNotCarried = !P2PoolProbe(uint256(777), vNone, idNone) && !P2PoolProbe(idZero, vNone, idNone);
+        // The answer is a share already held: taken for nothing, nobody scored.
+        SendRegItem(pNew, "p2xshare", idA, p2pool::ShareX(s));
+        fShareTimeLog = false;
+        string body = ReadWholeFile(strLog);
+        const string strShare = s.GetId().ToString();
+        const string strPool = idA.ToString().substr(0, 16);
+        const string strH = strprintf(" %u ", s.data.nShareHeight);
+        bool fLines = body.find(" found " + strPool + " " + strShare + strH + "-\n") != string::npos &&
+                      body.find(" send " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(" probe " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(" recv " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(s0.GetId().ToString()) == string::npos;
+        nFail += Check(fOff && fFound && fProbe && fNotCarried && fLines && RegShares(idA) == nHeld &&
+                           pNew->nMisbehavior == 0,
+                       "-sharetimelog writes found, send, probe and recv with the share's id; poolprobe asks the announcer "
+                       "for the tip, the answer costs nothing and scores nobody; nothing is written with it off") ? 0 : 1;
+        if (!fLines)
+            printf("       sharetime.log:\n%s", body.c_str());
+    }
+
+    // ---- a share's time is judged by this node's own clock, not by the
+    // offset peers' version messages suggest (found in the phase D step 7
+    // testnet run: on a node behind Snowflake, catching up after its start,
+    // the versions were read minutes after they were sent, and the median of
+    // them put its adjusted clock 184 s behind; every fresh share of every
+    // peer was then more than 120 s ahead of it and refused)
+    CNode* pClk = NewRegTestNode(true, "BF1clock");
+    {
+        // Version samples from late messages: four peers that look 184 s
+        // behind, which is the median with this node's own zero.
+        const int64 nNow0 = GetTime();
+        for (unsigned int i = 0; i < 4; i++)
+            AddTimeData(0x0a630100 + i, nNow0 - 184);
+        const int64 nSkew = GetAdjustedTime() - GetTime();
+        main.nNow = GetTime();
+        size_t nHeld = RegShares(idA);
+        p2pool::Share s = RulesShare(mirrorA, main, lineA.back(), payTo(7), (unsigned int)GetTime());
+        mirrorA.Add(s, main, err);
+        lineA.push_back(s.GetId());
+        SendRegItem(pClk, "p2xshare", idA, p2pool::ShareX(s));
+        bool fTaken = RegShares(idA) == nHeld + 1 && pClk->nMisbehavior == 0;
+        // Back to no offset for anything after: five samples at zero.
+        for (unsigned int i = 0; i < 5; i++)
+            AddTimeData(0x0a630200 + i, GetTime());
+        nFail += Check(nSkew <= -180 && fTaken && GetAdjustedTime() - GetTime() <= 1,
+                       "a fresh share is taken while late version messages put the adjusted clock 184 s behind: "
+                       "its time is judged by this node's own clock") ? 0 : 1;
+        if (nSkew > -180 || !fTaken)
+            printf("       adjusted clock %+lld s, share taken: %s\n", (long long)nSkew, fTaken ? "yes" : "no");
+
+        // The other way: this node's own clock is slow and its peers say so
+        // (adjusted clock 184 s ahead). A share 250 s ahead of the own clock
+        // is within the limit by the adjusted one, and is taken, as before.
+        // The median is taken over every sample so far (and only at an odd
+        // count), so add until it moves.
+        for (unsigned int i = 0; i < 200 && GetAdjustedTime() - GetTime() < 180; i++)
+            AddTimeData(0x0a630300 + i, GetTime() + 184);
+        const int64 nAhead = GetAdjustedTime() - GetTime();
+        main.nNow = GetTime() + 184;
+        nHeld = RegShares(idA);
+        p2pool::Share sa = RulesShare(mirrorA, main, lineA.back(), payTo(7), (unsigned int)(GetTime() + 250));
+        mirrorA.Add(sa, main, err);
+        lineA.push_back(sa.GetId());
+        SendRegItem(pClk, "p2xshare", idA, p2pool::ShareX(sa));
+        bool fAheadTaken = RegShares(idA) == nHeld + 1 && pClk->nMisbehavior == 0;
+        for (unsigned int i = 0; i < 400 && GetAdjustedTime() - GetTime() > 1; i++)
+            AddTimeData(0x0a630600 + i, GetTime());
+        main.nNow = GetTime();
+        nFail += Check(nAhead >= 180 && fAheadTaken,
+                       "a share ahead of a slow own clock is taken when peers' offsets put the adjusted clock "
+                       "ahead: the later of the two clocks judges") ? 0 : 1;
+        if (nAhead < 180 || !fAheadTaken)
+            printf("       adjusted clock %+lld s, share taken: %s\n", (long long)nAhead, fAheadTaken ? "yes" : "no");
+        // Every sample back at zero offset.
+        nFail += Check(GetAdjustedTime() - GetTime() <= 1, "the clock offset is back to zero") ? 0 : 1;
+    }
+
     // ---- section 8: pool zero beside all that
     p2pool::ShareChain zeroMirror(bnFloor, false);
     CNode* pZ = NewP2PoolTestNode(false);
@@ -10206,7 +10310,23 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fAsked, "a peer announcing it is asked for its line") ? 0 : 1;
 
         vector<p2pool::Share> part1(lineB.begin(), lineB.begin() + 100);
+        const string strTimeLog = tmp + "/sharetime.log";
+        remove(strTimeLog.c_str());
+        fShareTimeLog = true;
         SendRegPart(pF, idB, 130, 0, part1);
+        fShareTimeLog = false;
+        {
+            string body = ReadWholeFile(strTimeLog);
+            const string strPoolB = idB.ToString().substr(0, 16);
+            size_t nHist = 0, at = 0;
+            while ((at = body.find(" hist ", at)) != string::npos) { nHist++; at++; }
+            bool fHist = nHist == 100 &&
+                         body.find(" hist " + strPoolB + " " + part1[0].GetId().ToString() + " 0 BF1fetchpeer\n") != string::npos &&
+                         body.find(" hist " + strPoolB + " " + part1[99].GetId().ToString() + " 99 BF1fetchpeer\n") != string::npos;
+            nFail += Check(fHist, "-sharetimelog writes each share of a history part as it arrives (hist), with the peer") ? 0 : 1;
+            if (!fHist)
+                printf("       %u hist line(s)\n", (unsigned)nHist);
+        }
         P2PoolRegStatusInfo st;
         bool fTaken = RegShares(idB) == 100 && FileExists(strPartB.c_str()) && !FileExists(strDatB.c_str()) &&
                       P2PoolRegStatus(idB, st) && !st.fAnnounced && !st.fCarried;
@@ -10762,7 +10882,7 @@ static int RunP2PoolRegisteredSelfTest()
                        "goes after 10 minutes") ? 0 : 1;
     }
 
-    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil, pW1, pW2 };
+    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil, pW1, pW2, pClk };
     for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
     {
         P2PoolForgetDeferred(vAll[i]);

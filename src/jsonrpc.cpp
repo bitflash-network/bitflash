@@ -5436,11 +5436,41 @@ static json rpc_poolinfo(const json& p)
     return j;
 }
 
+// poolprobe <pool id>: asks every connected peer that announced the pool
+// for this node's tip share (p2xgetsh). With -sharetimelog, the asks and the
+// answers are in sharetime.log, so half each round trip can be read there
+// (docs/pool-registry.md, section 15, Phase D step 7).
+static json rpc_poolprobe(const json& p)
+{
+    static const char* pszUsage = "poolprobe <pool id>";
+    if (p.size() < 1 || !p[0].is_string())
+        throw runtime_error(pszUsage);
+    string s = p[0].get<string>();
+    for (size_t i = 0; i < s.size(); i++)
+        s[i] = (char)tolower((unsigned char)s[i]);
+    if (s.size() != 64 || !IsHex(s))
+        throw runtime_error(pszUsage);
+    uint256 id;
+    id.SetHex(s);
+    vector<string> vAsked;
+    uint256 idShare;
+    if (!P2PoolProbe(id, vAsked, idShare))
+        throw runtime_error("this node does not carry that registered pool, or holds nothing of it");
+    json j;
+    j["share"] = idShare.GetHex();
+    json a = json::array();
+    for (size_t i = 0; i < vAsked.size(); i++)
+        a.push_back(vAsked[i]);
+    j["asked"] = a;
+    j["logged"] = fShareTimeLog;
+    return j;
+}
+
 // Calls that take their own locks, run without cs_main (Dispatch).
 static bool RunsWithoutMainLock(const string& method)
 {
     return method == "poolcreate" || method == "pooljoin" || method == "poolpeers" || method == "poolleave" ||
-           method == "poollist" || method == "poolinfo";
+           method == "poollist" || method == "poolinfo" || method == "poolprobe";
 }
 
 static json rpc_help(const json&)
@@ -5456,7 +5486,7 @@ static json rpc_help(const json&)
            "templatehash spendscript vaultcreate vaultunvault vaultwithdraw vaultrecover ctvbatch ctvexpand listv4contracts "
            "inheritcreate inheritinfo inheritrenew inheritcancel inheritpackage inheritimport inheritclaim "
            "gettorinfo settorbridges gettreasuryinfo donate sendburn "
-           "poolcreate pooljoin poolpeers poolleave poollist poolinfo help";
+           "poolcreate pooljoin poolpeers poolleave poollist poolinfo poolprobe help";
 }
 
 struct RpcEntry { const char* name; RpcMethod fn; };
@@ -5543,6 +5573,7 @@ static const RpcEntry kMethods[] = {
     { "poolleave",        rpc_poolleave },
     { "poollist",         rpc_poollist },
     { "poolinfo",         rpc_poolinfo },
+    { "poolprobe",        rpc_poolprobe },
     { "help",             rpc_help },
 };
 

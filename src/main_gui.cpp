@@ -499,6 +499,9 @@ static void ParseStartupArguments(int argc, char* argv[])
         }
         P2PoolGuardSetOptions(fGuard, nMB, nKBps);
     }
+    // Share times for measuring delays between nodes (sharetime.log).
+    if (arg(argc,argv,"/sharetimelog") || arg(argc,argv,"-sharetimelog"))
+        fShareTimeLog = true;
     if (!(arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool")) && (arg(argc,argv,"/p2poolbind") || arg(argc,argv,"-p2poolbind")))
         StartupRefuse("-p2poolbind needs -p2pool",
                       "It chooses where the P2Pool stratum listens; add -p2pool to mine with P2Pool.");
