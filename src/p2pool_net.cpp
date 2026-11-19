@@ -975,9 +975,17 @@ static void LogBlockPayouts(const Share& s)
     }
 }
 
+// This node's own clock, not the offset its peers' version messages suggest
+// (GetAdjustedTime). Over Tor those samples only ever come in late: a version
+// waits behind whatever else the circuit, the bridge or the message thread
+// carries, so the median drifts behind. On a node behind Snowflake that drift
+// reached 184 s while the bridge carried pool zero's histories, and every
+// fresh share then ran more than MAX_SHARE_FUTURE ahead of the adjusted clock
+// and was refused. A share's time is policy judged by each node on its own
+// (InnocentRefusal), so nothing another node checks changes.
 int64 NodeMainView::Now() const
 {
-    return GetAdjustedTime();
+    return GetTime();
 }
 
 static void RelayLocalShare(PoolState& ps, const Share& s, CNode* pfrom);

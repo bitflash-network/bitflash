@@ -61,7 +61,8 @@ p2pool::ShareChain& P2PoolChain();
 // saved in p2pool.dat (every two minutes while it runs).
 void P2PoolInit();
 
-// What the share chain takes from the node: its adjusted clock.
+// What the share chain takes from the node: its own clock (GetTime, not the
+// peer-adjusted one; see Now() in p2pool_net.cpp).
 class NodeMainView : public p2pool::MainView
 {
 public:

@@ -10825,7 +10825,38 @@ static int RunP2PoolRegisteredSelfTest()
                        "goes after 10 minutes") ? 0 : 1;
     }
 
-    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil, pW1, pW2 };
+    // ---- a share's time is judged by this node's own clock, not by the
+    // offset peers' version messages suggest (found in the phase D step 7
+    // testnet run: on a node behind Snowflake the versions came in minutes
+    // late, while the bridge carried pool zero's histories, and the median of
+    // them put its adjusted clock 184 s behind; every fresh share of every
+    // peer was then more than 120 s ahead of it and refused)
+    CNode* pClk = NewRegTestNode(true, "BF1clock");
+    {
+        // Version samples from late messages: four peers that look 184 s
+        // behind, which is the median with this node's own zero.
+        const int64 nNow0 = GetTime();
+        for (unsigned int i = 0; i < 4; i++)
+            AddTimeData(0x0a630100 + i, nNow0 - 184);
+        bool fSkewed = GetAdjustedTime() <= GetTime() - 180;
+        main.nNow = GetTime();
+        size_t nHeld = RegShares(idA);
+        p2pool::Share s = RulesShare(mirrorA, main, lineA.back(), payTo(7), (unsigned int)GetTime());
+        mirrorA.Add(s, main, err);
+        SendRegItem(pClk, "p2xshare", idA, p2pool::ShareX(s));
+        bool fTaken = RegShares(idA) == nHeld + 1 && pClk->nMisbehavior == 0;
+        // Back to no offset for anything after: five samples at zero.
+        for (unsigned int i = 0; i < 5; i++)
+            AddTimeData(0x0a630200 + i, GetTime());
+        nFail += Check(fSkewed && fTaken && GetAdjustedTime() - GetTime() <= 1,
+                       "a fresh share is taken while late version messages put the adjusted clock 184 s behind: "
+                       "its time is judged by this node's own clock") ? 0 : 1;
+        if (!fSkewed || !fTaken)
+            printf("       adjusted clock %+lld s, share taken: %s\n", (long long)(GetAdjustedTime() - GetTime()),
+                   fTaken ? "yes" : "no");
+    }
+
+    CNode* vAll[] = { pOld, pNew, pIn, pZ, pF, pE, pGn, pS, pT, pX, pSil, pW1, pW2, pClk };
     for (size_t i = 0; i < sizeof(vAll) / sizeof(vAll[0]); i++)
     {
         P2PoolForgetDeferred(vAll[i]);
