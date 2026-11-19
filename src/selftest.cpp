@@ -10253,7 +10253,23 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fAsked, "a peer announcing it is asked for its line") ? 0 : 1;
 
         vector<p2pool::Share> part1(lineB.begin(), lineB.begin() + 100);
+        const string strTimeLog = tmp + "/sharetime.log";
+        remove(strTimeLog.c_str());
+        fShareTimeLog = true;
         SendRegPart(pF, idB, 130, 0, part1);
+        fShareTimeLog = false;
+        {
+            string body = ReadWholeFile(strTimeLog);
+            const string strPoolB = idB.ToString().substr(0, 16);
+            size_t nHist = 0, at = 0;
+            while ((at = body.find(" hist ", at)) != string::npos) { nHist++; at++; }
+            bool fHist = nHist == 100 &&
+                         body.find(" hist " + strPoolB + " " + part1[0].GetId().ToString() + " 0 BF1fetchpeer\n") != string::npos &&
+                         body.find(" hist " + strPoolB + " " + part1[99].GetId().ToString() + " 99 BF1fetchpeer\n") != string::npos;
+            nFail += Check(fHist, "-sharetimelog writes each share of a history part as it arrives (hist), with the peer") ? 0 : 1;
+            if (!fHist)
+                printf("       %u hist line(s)\n", (unsigned)nHist);
+        }
         P2PoolRegStatusInfo st;
         bool fTaken = RegShares(idB) == 100 && FileExists(strPartB.c_str()) && !FileExists(strDatB.c_str()) &&
                       P2PoolRegStatus(idB, st) && !st.fAnnounced && !st.fCarried;

@@ -7243,6 +7243,12 @@ static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStrea
                 pfrom->Misbehaving(20);
                 return true;
             }
+        // Each share of a history part as it arrives, whether or not it is
+        // then taken: a fetch resumed after a restart shows here which
+        // shares came again.
+        if (fShareTimeLog)
+            foreach(const ShareX& s, vx)
+                ShareTimeLog("hist", id, s.GetId(), (int)s.data.nShareHeight, pfrom);
         vector<Share> part(vx.begin(), vx.end());
         OnShares(rp->state, pfrom, nTipHeight, part, nFlag);
         return true;
