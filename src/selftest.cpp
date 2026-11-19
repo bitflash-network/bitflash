@@ -9996,7 +9996,7 @@ static int RunP2PoolRegisteredSelfTest()
         bool fProbe = P2PoolProbe(idA, vAsked, idProbed) && idProbed == s.GetId() && vAsked.size() == 1 &&
                       vAsked[0] == "BF1announcer" && CountSent(pNew, "p2xgetsh") == nGetsh + 1 &&
                       CountSent(pIn, "p2xgetsh") == 0;
-        vector<uint256> vNone;
+        vector<string> vNone;
         uint256 idNone;
         bool fNotCarried = !P2PoolProbe(uint256(777), vNone, idNone) && !P2PoolProbe(idZero, vNone, idNone);
         // The answer is a share already held: taken for nothing, nobody scored.
