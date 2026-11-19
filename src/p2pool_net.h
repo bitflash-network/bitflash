@@ -38,6 +38,21 @@ void P2PoolOnVersion(CNode* pfrom);
 // A share this node's own miner found: keep it and send it to every peer.
 bool P2PoolSubmitShare(const p2pool::Share& share, string& errOut, bool* pfBlock = NULL);
 
+// -sharetimelog: a registered pool's share events (found here, received,
+// sent, asked for, probed) written with the wall clock in milliseconds to
+// sharetime.log in the data directory, one line each:
+//   <unix ms> <event> <pool id, 16 hex> <share id> <share height or -1> <peer or ->
+// For measuring a share's delay between nodes (docs/pool-registry.md,
+// sections 15 and 17). Off by default.
+extern bool fShareTimeLog;
+std::string ShareTimeLine(int64 nMillis, const char* pszEvent, const uint256& idPool, const uint256& idShare,
+                          int nHeight, const std::string& strPeer);
+// poolprobe: ask every connected peer that announced the pool for this
+// node's tip share (p2xgetsh); the share and the peers asked come back.
+// False when the pool is not carried here or nothing of it is held. Its
+// answer is a share already held: taken for nothing, nobody scored.
+bool P2PoolProbe(const uint256& idPool, vector<string>& vAskedOut, uint256& idShareOut);
+
 // The share chain, under cs_p2pool. Created on first use.
 extern CCriticalSection cs_p2pool;
 p2pool::ShareChain& P2PoolChain();

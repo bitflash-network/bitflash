@@ -9972,6 +9972,53 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(!P2PoolPeerProven(pIn), "a peer that sent only registered shares is not proven for pool zero") ? 0 : 1;
     }
 
+    // ---- -sharetimelog and poolprobe (section 15, Phase D step 7: a share's
+    // delay between two nodes is measured from these lines)
+    {
+        uint256 idS = 0x5a;
+        nFail += Check(ShareTimeLine(1700000000123LL, "found", idA, idS, 7, "") ==
+                           strprintf("1700000000123 found %s %s 7 -\n", idA.ToString().substr(0, 16).c_str(),
+                                     idS.ToString().c_str()),
+                       "a share time line: milliseconds, event, pool id (16 hex), share id, height, peer or -") ? 0 : 1;
+        const string strLog = tmp + "/sharetime.log";
+        remove(strLog.c_str());
+        p2pool::Share s0 = RulesShare(mirrorA, main, lineA.back(), payTo(6), t + 30 * 44);
+        bool fOff = mirrorA.Add(s0, main, err) && P2PoolSubmitShare(s0, err) && !FileExists(strLog.c_str());
+        lineA.push_back(s0.GetId());
+        fShareTimeLog = true;
+        p2pool::Share s = RulesShare(mirrorA, main, lineA.back(), payTo(5), t + 30 * 45);
+        bool fFound = mirrorA.Add(s, main, err) && P2PoolSubmitShare(s, err);
+        lineA.push_back(s.GetId());
+        size_t nGetsh = CountSent(pNew, "p2xgetsh");
+        size_t nHeld = RegShares(idA);
+        vector<string> vAsked;
+        uint256 idProbed;
+        bool fProbe = P2PoolProbe(idA, vAsked, idProbed) && idProbed == s.GetId() && vAsked.size() == 1 &&
+                      vAsked[0] == "BF1announcer" && CountSent(pNew, "p2xgetsh") == nGetsh + 1 &&
+                      CountSent(pIn, "p2xgetsh") == 0;
+        vector<uint256> vNone;
+        uint256 idNone;
+        bool fNotCarried = !P2PoolProbe(uint256(777), vNone, idNone) && !P2PoolProbe(idZero, vNone, idNone);
+        // The answer is a share already held: taken for nothing, nobody scored.
+        SendRegItem(pNew, "p2xshare", idA, p2pool::ShareX(s));
+        fShareTimeLog = false;
+        string body = ReadWholeFile(strLog);
+        const string strShare = s.GetId().ToString();
+        const string strPool = idA.ToString().substr(0, 16);
+        const string strH = strprintf(" %u ", s.data.nShareHeight);
+        bool fLines = body.find(" found " + strPool + " " + strShare + strH + "-\n") != string::npos &&
+                      body.find(" send " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(" probe " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(" recv " + strPool + " " + strShare + strH + "BF1announcer\n") != string::npos &&
+                      body.find(s0.GetId().ToString()) == string::npos;
+        nFail += Check(fOff && fFound && fProbe && fNotCarried && fLines && RegShares(idA) == nHeld &&
+                           pNew->nMisbehavior == 0,
+                       "-sharetimelog writes found, send, probe and recv with the share's id; poolprobe asks the announcer "
+                       "for the tip, the answer costs nothing and scores nobody; nothing is written with it off") ? 0 : 1;
+        if (!fLines)
+            printf("       sharetime.log:\n%s", body.c_str());
+    }
+
     // ---- section 8: pool zero beside all that
     p2pool::ShareChain zeroMirror(bnFloor, false);
     CNode* pZ = NewP2PoolTestNode(false);

@@ -7,6 +7,7 @@
 #include "poolticket.h"
 #include "btfaddr.h"
 #include "nostr.h"
+#include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -29,6 +30,53 @@
 using namespace p2pool;
 
 CCriticalSection cs_p2pool;
+
+// ---- Share times (-sharetimelog) --------------------------------------------
+//
+// The delay of a registered pool's share between two nodes is measured from
+// these lines (docs/pool-registry.md, sections 15 and 17): found here,
+// received from a peer, sent to one, asked for. Each line carries the wall
+// clock in milliseconds, on hosts whose clocks NTP keeps close, and goes to
+// sharetime.log in the data directory, never collapsed the way debug.log
+// lines are. Off by default.
+bool fShareTimeLog = false;
+static CCriticalSection cs_shareTimeLog;
+
+std::string ShareTimeLine(int64 nMillis, const char* pszEvent, const uint256& idPool, const uint256& idShare,
+                          int nHeight, const std::string& strPeer)
+{
+    return strprintf("%lld %s %s %s %d %s\n", (long long)nMillis, pszEvent, idPool.ToString().substr(0, 16).c_str(),
+                     idShare.ToString().c_str(), nHeight, strPeer.empty() ? "-" : strPeer.c_str());
+}
+
+// A peer as the lines name it: the start of its .btf address, else its
+// network address.
+static std::string ShareTimePeer(CNode* pnode)
+{
+    if (!pnode)
+        return "";
+    if (!pnode->strBtfAddr.empty())
+        return pnode->strBtfAddr.substr(0, 16);
+    return pnode->addr.ToString();
+}
+
+static void ShareTimeLog(const char* pszEvent, const uint256& idPool, const uint256& idShare, int nHeight, CNode* pnode)
+{
+    if (!fShareTimeLog)
+        return;
+    int64 nMillis = (int64)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string strLine = ShareTimeLine(nMillis, pszEvent, idPool, idShare, nHeight, ShareTimePeer(pnode));
+    CRITICAL_BLOCK(cs_shareTimeLog)
+    {
+        FILE* f = fopen((GetAppDir() + "/sharetime.log").c_str(), "a");
+        if (f)
+        {
+            fwrite(strLine.data(), 1, strLine.size(), f);
+            fclose(f);
+        }
+    }
+}
 
 // ---- Pools and their two classes (docs/pool-registry.md, section 8) --------
 //
@@ -1417,6 +1465,8 @@ bool P2PoolSubmitShare(const Share& share, string& errOut, bool* pfBlock)
         if (fOk)
             NoteChainGrew(ps);
     }
+    if (fOk && share.data.fX && !share.data.fSalt && fShareTimeLog)
+        ShareTimeLog("found", share.data.poolId, share.GetId(), (int)share.data.nShareHeight, NULL);
     if (fOk)
         MaybeSaveShares(ps);
     if (pfBlock)
@@ -2417,7 +2467,11 @@ static void PushShare(PoolState& ps, CNode* pnode, const Share& s)
     else if (HandleOf(ps, pnode, h))
         PushReg(pnode, "p2lshare", h, s);
     else if (RegIdFor(ps, pnode, id, true))
+    {
+        if (fShareTimeLog)
+            ShareTimeLog("send", id, s.GetId(), (int)s.data.nShareHeight, pnode);
         PushReg(pnode, "p2xshare", id, ShareX(s));
+    }
 }
 
 static void PushGetSh(PoolState& ps, CNode* pnode, const vector<uint256>& vIds)
@@ -2436,6 +2490,8 @@ static void PushGetSh(PoolState& ps, CNode* pnode, const vector<uint256>& vIds)
     {
         CRITICAL_BLOCK(cs_p2pool)
             NoteAskedLocked(ps, vIds);
+        for (size_t i = 0; i < vIds.size(); i++)
+            ShareTimeLog("getsh", id, vIds[i], -1, pnode);
         PushReg(pnode, "p2xgetsh", id, vIds);
     }
 }
@@ -6933,12 +6989,44 @@ static bool RelayRegShare(PoolState& ps, const Share& s, CNode* pfrom)
         if (!RegCarried(*rp))
             return true;
         ShareX x(s);
+        const uint256 idShare = fShareTimeLog ? s.GetId() : uint256(0);
         for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
         {
             CNode* p = it->first;
             if (p != pfrom && !p->fDisconnect && p->nVersion != 0 && (p->nServices & NODE_POOLREG) &&
                 it->second.setInv.count(rp->id))
+            {
+                ShareTimeLog("send", rp->id, idShare, (int)s.data.nShareHeight, p);
                 PushReg(p, "p2xshare", rp->id, x);
+            }
+        }
+    }
+    return true;
+}
+
+bool P2PoolProbe(const uint256& idPool, vector<string>& vAskedOut, uint256& idShareOut)
+{
+    vAskedOut.clear();
+    idShareOut = 0;
+    if (!RegOpen() || idPool == RegZeroId())
+        return false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        RegPool* rp = RegById(idPool);
+        if (!rp || !RegCarried(*rp) || rp->state.chain->Empty())
+            return false;
+        idShareOut = rp->state.chain->Tip();
+        const int nHeight = rp->state.chain->Height(idShareOut);
+        vector<uint256> vIds(1, idShareOut);
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
+        {
+            CNode* p = it->first;
+            if (p->fDisconnect || p->nVersion == 0 || !(p->nServices & NODE_POOLREG) || !it->second.setInv.count(idPool))
+                continue;
+            NoteAskedLocked(rp->state, vIds);
+            ShareTimeLog("probe", idPool, idShareOut, nHeight, p);
+            PushReg(p, "p2xgetsh", idPool, vIds);
+            vAskedOut.push_back(ShareTimePeer(p));
         }
     }
     return true;
@@ -7074,6 +7162,8 @@ static bool RegProcessMessage(CNode* pfrom, const string& strCommand, CDataStrea
             pfrom->Misbehaving(20);
             return true;
         }
+        if (fShareTimeLog)
+            ShareTimeLog("recv", id, s.GetId(), (int)s.data.nShareHeight, pfrom);
         OnShare(rp->state, pfrom, s);
         return true;
     }
