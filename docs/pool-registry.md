@@ -1678,14 +1678,16 @@ by share, the delay measured for that share and the rate of the other miners'
 shares measured over the run.
 
 The time rules need no change: a share may run 120 s ahead of a node's clock,
-and a line counts as live for 180 share intervals. That clock is the node's
-own, never the offset its peers' version messages suggest: over Tor those
-come in late, and only late, so their median drifts behind (184 s measured on
-a Snowflake node in Phase D while it caught up after its start, 39 to 62 s on
-direct nodes started beside it), which put every fresh share past the 120 s
-and had it refused. Keep the
-system clock right (NTP); a share's time is each node's own policy, so no
-other node judges anything differently for it.
+and a line counts as live for 180 share intervals. That clock is the later
+of the node's own and the one its peers' version messages suggest. The peers'
+clock alone does not do: over Tor those messages come in late, and only late,
+so their median drifts behind (184 s measured on a Snowflake node in Phase D
+while it caught up after its start, 39 to 62 s on direct nodes started beside
+it), which put every fresh share past the 120 s and had it refused. The own
+clock alone does not do either, on a node whose clock is slow and has no NTP;
+the later of the two serves both, and peers still move it at most 70 minutes
+ahead, as before. Keep the system clock right (NTP); a share's time is each
+node's own policy, so no other node judges anything differently for it.
 
 **Histories over slow links.** A line of 3 to 9 MB takes minutes over meek,
 and a guardian behind Snowflake serves at whatever its circuit carries. Pool zero keeps its rules

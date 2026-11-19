@@ -10048,6 +10048,32 @@ static int RunP2PoolRegisteredSelfTest()
                        "its time is judged by this node's own clock") ? 0 : 1;
         if (nSkew > -180 || !fTaken)
             printf("       adjusted clock %+lld s, share taken: %s\n", (long long)nSkew, fTaken ? "yes" : "no");
+
+        // The other way: this node's own clock is slow and its peers say so
+        // (adjusted clock 184 s ahead). A share 250 s ahead of the own clock
+        // is within the limit by the adjusted one, and is taken, as before.
+        // The median is taken over every sample so far (and only at an odd
+        // count), so add until it moves.
+        for (unsigned int i = 0; i < 200 && GetAdjustedTime() - GetTime() < 180; i++)
+            AddTimeData(0x0a630300 + i, GetTime() + 184);
+        const int64 nAhead = GetAdjustedTime() - GetTime();
+        main.nNow = GetTime() + 184;
+        nHeld = RegShares(idA);
+        p2pool::Share sa = RulesShare(mirrorA, main, lineA.back(), payTo(7), (unsigned int)(GetTime() + 250));
+        mirrorA.Add(sa, main, err);
+        lineA.push_back(sa.GetId());
+        SendRegItem(pClk, "p2xshare", idA, p2pool::ShareX(sa));
+        bool fAheadTaken = RegShares(idA) == nHeld + 1 && pClk->nMisbehavior == 0;
+        for (unsigned int i = 0; i < 400 && GetAdjustedTime() - GetTime() > 1; i++)
+            AddTimeData(0x0a630600 + i, GetTime());
+        main.nNow = GetTime();
+        nFail += Check(nAhead >= 180 && fAheadTaken,
+                       "a share ahead of a slow own clock is taken when peers' offsets put the adjusted clock "
+                       "ahead: the later of the two clocks judges") ? 0 : 1;
+        if (nAhead < 180 || !fAheadTaken)
+            printf("       adjusted clock %+lld s, share taken: %s\n", (long long)nAhead, fAheadTaken ? "yes" : "no");
+        // Every sample back at zero offset.
+        nFail += Check(GetAdjustedTime() - GetTime() <= 1, "the clock offset is back to zero") ? 0 : 1;
     }
 
     // ---- section 8: pool zero beside all that

@@ -984,9 +984,16 @@ static void LogBlockPayouts(const Share& s)
 // beside it); every fresh share then ran more than MAX_SHARE_FUTURE ahead of
 // the adjusted clock and was refused. A share's time is policy judged by each node on its own
 // (InnocentRefusal), so nothing another node checks changes.
+//
+// The later of the two clocks: a node whose own clock is slow and has no NTP
+// still takes fresh shares when its peers' offsets say it is behind (what the
+// adjusted clock was for), and late version messages that drag the adjusted
+// clock behind no longer push fresh shares past the limit. Peers can move
+// the adjusted clock at most MAX_TIME_ADJUSTMENT ahead, the same reach they
+// had before.
 int64 NodeMainView::Now() const
 {
-    return GetTime();
+    return std::max(GetTime(), GetAdjustedTime());
 }
 
 static void RelayLocalShare(PoolState& ps, const Share& s, CNode* pfrom);
