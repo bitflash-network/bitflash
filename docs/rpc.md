@@ -73,7 +73,7 @@ null.
 | `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
 | `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
 | `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
-| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first |
+| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first - See [Examples](rpc#Examples) |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
 | `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), `transports` (sorted kinds in the bridge lines Tor has now, e.g. `["obfs4"]`; `[]` without bridges; `null` plus `transportsnote` with an external Tor), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
@@ -140,6 +140,61 @@ confirmations, never on the memory pool, and match a deposit by address and
 amount rather than by the txid first seen. `gettransaction` says
 `bip125-replaceable: yes` while that is possible.
 
+## Examples
+### listtransactions - Export transactions to CSV
+This example `listtransactions` RPC call to extract all transactions to a `.json` file.  Then it use `jq` to convert th JSON to a CSV formated file which can be imported in any spreadsheet tool like [LibreOffice](https://www.libreoffice.org/).
+
+First extract transactions and pipe it to a text file (uss 100000 to get all transactions).
+`
+  listtransactions '[1000000]' > <filename>.json
+`
+*Replace `<filename>` to what you want it called.*
+
+Then we use `jq` to convert the JSON to CSV formatted file and at the same time convert UNIX timestamps to ISO dates (UTC time)
+`
+  jq -r '
+    def to_iso: if . == null then null else (. | todateiso8601) end;
+    [
+    "txid",
+    "category",
+    "address",
+    "detail_amount",
+    "vout",
+    "tx_amount",
+    "confirmations",
+    "blockindex",
+    "blockhash",
+    "blocktime_iso",
+    "time_iso",
+    "timereceived_iso",
+    "generated",
+    "bip125_replaceable"
+    ] as $cols |
+    $cols,
+    (
+    .result[] as $tx |
+    ($tx.details // [{}])[] as $d |
+    [
+      $tx.txid,
+      $d.category,
+      $d.address,
+      $d.amount,
+      $d.vout,
+      $tx.amount,
+      $tx.confirmations,
+      $tx.blockindex,
+      $tx.blockhash,
+      ($tx.blocktime | to_iso),
+      ($tx.time | to_iso),
+      ($tx.timereceived | to_iso),
+      ($tx.generated // false),
+      $tx["bip125-replaceable"]
+    ]
+      ) |
+      @csv
+      ' <filename>.json > <filename>.csv
+`
+*Replace `<filename>` to what you want it called.*
 ## Local pools and their password
 
 `poolcreate local` and `pooljoin` take the pool's password, if it has one, as
