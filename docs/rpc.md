@@ -141,10 +141,10 @@ amount rather than by the txid first seen. `gettransaction` says
 `bip125-replaceable: yes` while that is possible.
 
 ## Examples
-### listtransactions - Export transactions to CSV
-This example `listtransactions` RPC call to extract all transactions to a `.json` file.  Then it use `jq` to convert th JSON to a CSV formated file which can be imported in any spreadsheet tool like [LibreOffice](https://www.libreoffice.org/).
+### `listtransactions` - Export transactions to CSV
+This example used `listtransactions` RPC call to extract all transactions to a `.json` file.  Then it use [jq](https://jqlang.org/) to convert the JSON file to a CSV formated file which can be imported in any spreadsheet tool like [LibreOffice](https://www.libreoffice.org/).
 
-First extract transactions and pipe it to a text file (uss 100000 to get all transactions).
+First extract transactions and pipe it to a text file (use 1000000 to get all transactions).
 ```bash
   listtransactions '[1000000]' > <filename>.json
 ```
