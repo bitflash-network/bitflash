@@ -145,13 +145,13 @@ amount rather than by the txid first seen. `gettransaction` says
 This example `listtransactions` RPC call to extract all transactions to a `.json` file.  Then it use `jq` to convert th JSON to a CSV formated file which can be imported in any spreadsheet tool like [LibreOffice](https://www.libreoffice.org/).
 
 First extract transactions and pipe it to a text file (uss 100000 to get all transactions).
-`
+```bash
   listtransactions '[1000000]' > <filename>.json
-`
+```
 *Replace `<filename>` to what you want it called.*
 
 Then we use `jq` to convert the JSON to CSV formatted file and at the same time convert UNIX timestamps to ISO dates (UTC time)
-`
+```bash
   jq -r '
     def to_iso: if . == null then null else (. | todateiso8601) end;
     [
@@ -193,7 +193,7 @@ Then we use `jq` to convert the JSON to CSV formatted file and at the same time 
       ) |
       @csv
       ' <filename>.json > <filename>.csv
-`
+```
 *Replace `<filename>` to what you want it called.*
 ## Local pools and their password
 
