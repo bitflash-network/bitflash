@@ -194,6 +194,9 @@ Then we use `jq` to convert the JSON to CSV formatted file and at the same time 
       ' <filename>.json > <filename>.csv
 ```
 *Replace `<filename>` to what you want it called.*
+
+Each row is one entry of `details`, so a transaction with several outputs gives several rows that repeat its `tx_amount`: add up `detail_amount`, not `tx_amount`. For a payment you sent, `tx_amount` minus the sum of its `detail_amount` rows is the fee (negative). A payment between two addresses of the same wallet has one row with an empty category, and its `tx_amount` is just the fee.
+
 ## Local pools and their password
 
 `poolcreate local` and `pooljoin` take the pool's password, if it has one, as
