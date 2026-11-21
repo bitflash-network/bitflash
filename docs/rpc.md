@@ -73,7 +73,7 @@ null.
 | `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
 | `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
 | `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
-| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first - See [Examples](#Examples) |
+| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first; to export them to a spreadsheet see [Examples](#examples) |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
 | `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), `transports` (sorted kinds in the bridge lines Tor has now, e.g. `["obfs4"]`; `[]` without bridges; `null` plus `transportsnote` with an external Tor), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
