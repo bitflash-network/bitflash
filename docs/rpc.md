@@ -142,7 +142,7 @@ amount rather than by the txid first seen. `gettransaction` says
 
 ## Examples
 ### `listtransactions` - Export transactions to CSV
-This example used `listtransactions` RPC call to extract all transactions to a `.json` file.  Then it use [jq](https://jqlang.org/) to convert the JSON file to a CSV formated file which can be imported in any spreadsheet tool like [LibreOffice](https://www.libreoffice.org/).
+This example uses the `listtransactions` RPC call to save all wallet transactions to a `.json` file, then [jq](https://jqlang.org/) to turn it into a CSV file that any spreadsheet tool, such as [LibreOffice](https://www.libreoffice.org/), can open.
 
 First extract transactions and pipe it to a text file (use 1000000 to get all transactions).
 ```bash
