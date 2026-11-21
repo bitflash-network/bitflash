@@ -172,7 +172,7 @@ Then we use `jq` to convert the JSON to CSV formatted file and at the same time 
     $cols,
     (
     .result[] as $tx |
-    ($tx.details // [{}])[] as $d |
+    (if ($tx.details | length) > 0 then $tx.details else [{}] end)[] as $d |
     [
       $tx.txid,
       $d.category,
