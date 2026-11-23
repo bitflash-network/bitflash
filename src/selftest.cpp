@@ -11910,9 +11910,13 @@ static int RunPoolSettingsSelfTest()
     };
 
     std::atomic<bool> fStop(false);
-    std::atomic<int> nMixed(0), nReads(0), nWrites(0);
+    std::atomic<int> nMixed(0), nReads(0), nWrites(0), nReading(0);
     std::vector<std::thread> threads;
+    // The writers wait for every reader to have read once: on a loaded
+    // machine they could otherwise finish before a reader first ran.
     threads.emplace_back([&]() {
+        while (nReading < 3)
+            std::this_thread::yield();
         for (int i = 0; i < 20000; i++)
         {
             SetPoolSettings((i & 1) ? b : a);
@@ -11920,6 +11924,8 @@ static int RunPoolSettingsSelfTest()
         }
     });
     threads.emplace_back([&]() {
+        while (nReading < 3)
+            std::this_thread::yield();
         for (int i = 0; i < 20000; i++)
         {
             SetParticipantPool((i & 1) ? a.strParticipantPool : b.strParticipantPool);
@@ -11929,6 +11935,7 @@ static int RunPoolSettingsSelfTest()
     for (int t = 0; t < 3; t++)
     {
         threads.emplace_back([&, t]() {
+            bool fFirst = true;
             while (!fStop)
             {
                 if (t == 2)
@@ -11945,6 +11952,11 @@ static int RunPoolSettingsSelfTest()
                         nMixed++;
                 }
                 nReads++;
+                if (fFirst)
+                {
+                    fFirst = false;
+                    nReading++;
+                }
             }
         });
     }
