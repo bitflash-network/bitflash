@@ -73,7 +73,7 @@ null.
 | `estimatefee` | -- | `feeRatePerKB` (BTF per 1000 bytes) to be in the next block, from what is waiting now; 0 when everything waiting fits and the minimum is enough |
 | `settxfee` | `ratePerKB` | the rate this wallet pays per 1000 bytes; 0 is the minimum |
 | `bumpfee` | `txid`, [`ratePerKB`] | speeds up a payment of ours still waiting: the same payment, a higher fee from its change (BIP125); `txid` of the replacement, `oldFee`, `newFee` |
-| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first |
+| `listtransactions` | `[count=10]` | the last `count` wallet transactions, oldest first; to export them to a spreadsheet see [Examples](#examples) |
 | `listsinceblock` | `[blockhash]` | every wallet transaction in blocks after that one, plus unconfirmed, and `lastblock` |
 | `gettorinfo` | — | `transport` (`direct`, `user`, or a bundled rung such as `snowflake`), `transports` (sorted kinds in the bridge lines Tor has now, e.g. `["obfs4"]`; `[]` without bridges; `null` plus `transportsnote` with an external Tor), Tor's `bootstrap` percent and `bootstrapline`, the `ladder` of bundled rungs, `userbridges` count and file, `lastworking`, `connections` |
 | `settorbridges` | `["line", ...]` \| `"now"` \| `"forget"` | lines: save to `bridges.txt` and switch Tor to them now; `now`: climb to the next bundled rung right away; `forget`: next start tries direct Tor first again |
@@ -139,6 +139,66 @@ it with one paying more -- or paying somebody else. Credit deposits on
 confirmations, never on the memory pool, and match a deposit by address and
 amount rather than by the txid first seen. `gettransaction` says
 `bip125-replaceable: yes` while that is possible.
+
+## Examples
+### `listtransactions` - Export transactions to CSV
+This example uses the `listtransactions` RPC call to save all wallet transactions to a `.json` file, then [jq](https://jqlang.org/) to turn it into a CSV file that any spreadsheet tool, such as [LibreOffice](https://www.libreoffice.org/), can open.
+
+First save the transactions to a file, with the RPC credentials the node was started with (port 18432 on testnet). A count of 1000000 is more than any wallet holds, so it returns them all:
+```bash
+curl -s -u USER:PASSWORD -H 'Content-Type: application/json' \
+  -d '{"id":1,"method":"listtransactions","params":[1000000]}' \
+  http://127.0.0.1:8432/ > <filename>.json
+```
+*Replace `<filename>` to what you want it called.*
+
+Then we use `jq` to convert the JSON to CSV formatted file and at the same time convert UNIX timestamps to ISO dates (UTC time)
+```bash
+  jq -r '
+    def to_iso: if . == null then null else (. | todateiso8601) end;
+    [
+    "txid",
+    "category",
+    "address",
+    "detail_amount",
+    "vout",
+    "tx_amount",
+    "confirmations",
+    "blockindex",
+    "blockhash",
+    "blocktime_iso",
+    "time_iso",
+    "timereceived_iso",
+    "generated",
+    "bip125_replaceable"
+    ] as $cols |
+    $cols,
+    (
+    .result[] as $tx |
+    (if ($tx.details | length) > 0 then $tx.details else [{}] end)[] as $d |
+    [
+      $tx.txid,
+      $d.category,
+      $d.address,
+      $d.amount,
+      $d.vout,
+      $tx.amount,
+      $tx.confirmations,
+      $tx.blockindex,
+      $tx.blockhash,
+      ($tx.blocktime | to_iso),
+      ($tx.time | to_iso),
+      ($tx.timereceived | to_iso),
+      ($tx.generated // false),
+      $tx["bip125-replaceable"]
+    ]
+      ) |
+      @csv
+      ' <filename>.json > <filename>.csv
+```
+*Replace `<filename>` to what you want it called.*
+
+Each row is one entry of `details`, so a transaction with several outputs gives several rows that repeat its `tx_amount`: add up `detail_amount`, not `tx_amount`. For a payment you sent, `tx_amount` minus the sum of its `detail_amount` rows is the fee (negative). A payment between two addresses of the same wallet has one row with an empty category, and its `tx_amount` is just the fee.
 
 ## Local pools and their password
 
