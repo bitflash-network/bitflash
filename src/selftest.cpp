@@ -5690,7 +5690,6 @@ static int RunMultisigSelfTest()
         nFail += Check(RulesV3Time() == RULES_V3_TIME_MAINNET && RulesV3Time() == 1795262400 &&
                        RulesV3Active(GetAdjustedTime()) == ((unsigned int)GetAdjustedTime() >= RulesV3Time()),
                        "rules v3 on mainnet switch on at 2026-11-21 12:00 UTC, not before") ? 0 : 1;
-        bool fV3Now = RulesV3Active(GetAdjustedTime());
 
         // ---- IsMine and relay policy
         nFail += Check(!IsMine(ms), "2-of-3 with one key elsewhere is not 'mine': the wallet cannot spend it alone... " ) ? 0 : 1;
@@ -5713,7 +5712,22 @@ static int RunMultisigSelfTest()
         txStd.vout[0].scriptPubKey = ms4;
         nFail += Check(!txStd.IsStandard(), "four keys is not (relay policy, not validity)") ? 0 : 1;
         txStd.vout[0].scriptPubKey = p2sh;
-        nFail += Check(txStd.IsStandard() == fV3Now, "a pay-to-script-hash output is relayed only once rules v3 are live") ? 0 : 1;
+        // Relay follows the tip's median time past, not the clock: in this
+        // test a one-block tip on each side of the switch, and no tip.
+        {
+            CBlockIndex* pindexBestSaved = pindexBest;
+            CBlockIndex tipOld, tipNew;
+            tipOld.nTime = RulesV3Time() - 1;
+            tipNew.nTime = RulesV3Time();
+            pindexBest = NULL;
+            bool fNone = txStd.IsStandard();
+            pindexBest = &tipOld;
+            bool fOld = txStd.IsStandard();
+            pindexBest = &tipNew;
+            bool fNew = txStd.IsStandard();
+            pindexBest = pindexBestSaved;
+            nFail += Check(!fNone && !fOld && fNew, "a pay-to-script-hash output is relayed only once rules v3 are live") ? 0 : 1;
+        }
         txStd.vout[0].scriptPubKey = p2pkh;
         txStd.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(72, 1) << std::vector<unsigned char>(72, 2) << std::vector<unsigned char>(72, 3);
         nFail += Check(txStd.IsStandard(), "a scriptSig with three signatures fits the relay limit") ? 0 : 1;
