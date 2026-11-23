@@ -18826,6 +18826,32 @@ static int RunP2PoolGuardiansSelfTest()
             (v[i].nUntil == nLinger7 ? set7 : set6).insert(v[i].id);
         ok(fOwn && P2PoolTicketHeldForTest(6) == vHeld6.size() && v.size() == vPools.size() && set7 == setA,
            "drawn by epoch 6's seed: those pools held until epoch 7's linger end, the rest until epoch 6's");
+        // poolinfo: the two draws apart, this node's place in each; its place
+        // over all is the best of them.
+        bool fDraws = true, fApart = false;
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            P2PoolGuardInfo gi;
+            fDraws = fDraws && P2PoolGuardians(v[i].id, gi) && gi.nEpoch == 6 && gi.vDraws.size() == 2 &&
+                     gi.vDraws[0].nEpoch == 5 && gi.vDraws[1].nEpoch == 6 && gi.vDraws[0].fSettled &&
+                     gi.vDraws[1].fSettled && gi.vDraws[0].nUntil == nLinger6 && gi.vDraws[1].nUntil == nLinger7 &&
+                     gi.vDraws[1].nTickets == vHeld6.size() && gi.vDraws[1].vGuardians.size() == gi.vGuardians.size();
+            if (!fDraws)
+                break;
+            int nBest = -1;
+            for (size_t k = 0; k < gi.vDraws.size(); k++)
+            {
+                const int r = gi.vDraws[k].nOwnRank;
+                if (r >= 0 && (nBest < 0 || r < nBest))
+                    nBest = r;
+                fDraws = fDraws && (r < 0 || (r < (int)gi.vDraws[k].vGuardians.size() &&
+                                              gi.vDraws[k].vGuardians[r].fSelf));
+            }
+            fDraws = fDraws && gi.nOwnRank == nBest && (gi.vDraws[1].nOwnRank >= 0) == (setA.count(v[i].id) != 0);
+            fApart = fApart || gi.vDraws[1].nOwnRank != gi.nOwnRank;
+        }
+        ok(fDraws && fApart, "poolinfo lists the previous epoch's draw and this one's, with this node's place in "
+                             "each; its place over all is the best of them");
         w.Cut(4259);
         w.Grow(4400, 2);                  // a reorg through the draw seed (4260), 141 blocks deep
         P2PoolTicketViewForTest(w.v);

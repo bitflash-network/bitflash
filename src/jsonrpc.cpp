@@ -4907,6 +4907,23 @@ static void AddCarriedJson(json& j, const uint256& id)
 
 // A registered pool's guardians this epoch, in this node's view of the
 // tickets (docs/pool-registry.md, section 10): availability, never trust.
+static json GuardianListJson(const vector<P2PoolGuardianInfo>& v)
+{
+    json a = json::array();
+    for (size_t i = 0; i < v.size(); i++)
+    {
+        json o;
+        o["btf"] = v[i].strBtf;
+        o["place"] = v[i].nRank + 1;
+        o["role"] = v[i].nRank < 8 ? "guardian" : "reserve";
+        o["capacitymb"] = v[i].nCapacityMB;
+        if (v[i].fSelf)
+            o["self"] = true;
+        a.push_back(o);
+    }
+    return a;
+}
+
 static json GuardiansJson(const uint256& id)
 {
     json g;
@@ -4921,19 +4938,21 @@ static json GuardiansJson(const uint256& id)
     g["epoch"] = gi.nEpoch;
     g["settled"] = gi.fSettled;
     g["tickets"] = (uint64_t)gi.nTickets;
-    json a = json::array();
-    for (size_t i = 0; i < gi.vGuardians.size(); i++)
+    g["list"] = GuardianListJson(gi.vGuardians);
+    json draws = json::array();
+    for (size_t i = 0; i < gi.vDraws.size(); i++)
     {
+        const P2PoolGuardDrawInfo& d = gi.vDraws[i];
         json o;
-        o["btf"] = gi.vGuardians[i].strBtf;
-        o["place"] = gi.vGuardians[i].nRank + 1;
-        o["role"] = gi.vGuardians[i].nRank < 8 ? "guardian" : "reserve";
-        o["capacitymb"] = gi.vGuardians[i].nCapacityMB;
-        if (gi.vGuardians[i].fSelf)
-            o["self"] = true;
-        a.push_back(o);
+        o["epoch"] = d.nEpoch;
+        o["settled"] = d.fSettled;
+        o["until"] = d.nUntil;
+        o["tickets"] = (uint64_t)d.nTickets;
+        o["ownplace"] = d.nOwnRank < 0 ? json(nullptr) : json(d.nOwnRank + 1);
+        o["list"] = GuardianListJson(d.vGuardians);
+        draws.push_back(o);
     }
-    g["list"] = a;
+    g["draws"] = draws;
     json own;
     own["place"] = gi.nOwnRank < 0 ? json(nullptr) : json(gi.nOwnRank + 1);
     own["state"] = gi.strOwn.empty() ? string("not drawn") : gi.strOwn;
