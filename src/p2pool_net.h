@@ -349,6 +349,16 @@ struct P2PoolGuardianInfo
     bool fSelf;
     unsigned short nCapacityMB;
 };
+struct P2PoolGuardDrawInfo
+{
+    int nEpoch;
+    bool fSettled;
+    int64 nUntil;           // the height its guardians let go at
+    size_t nTickets;        // held for the epoch
+    vector<P2PoolGuardianInfo> vGuardians;  // the pool's 16 in this node's view, lowest score first
+    int nOwnRank;           // this node's place in this draw, -1 when not drawn
+    P2PoolGuardDrawInfo() : nEpoch(-1), fSettled(false), nUntil(0), nTickets(0), nOwnRank(-1) {}
+};
 struct P2PoolGuardInfo
 {
     bool fGuarding;         // false: tickets are off here (mainnet closed, or -poolguard=0)
@@ -359,6 +369,9 @@ struct P2PoolGuardInfo
     int nOwnRank;           // this node's place for it, -1 when not drawn
     int64 nOwnUntil;        // until which height that place holds
     string strOwn;          // what this node does with it
+    vector<P2PoolGuardDrawInfo> vDraws; // the draws in force, oldest epoch first: the previous
+                                        // epoch's while its guardians linger, this epoch's, and
+                                        // the next one's once settled
     P2PoolGuardInfo() : fGuarding(false), nEpoch(-1), fSettled(false), nTickets(0), nOwnRank(-1), nOwnUntil(0) {}
 };
 // A pool's guardians this epoch, as poolinfo shows them.

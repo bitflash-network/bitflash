@@ -7832,9 +7832,12 @@ void P2PoolGuardDialList(vector<string>& out)
 bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out)
 {
     out = P2PoolGuardInfo();
-    vector<CHeldTicket> vT;
-    uint256 hashDraw = 0;
-    vector<unsigned char> keyOwn;
+    // The draws in force, as TktDrawIfDue takes them, oldest epoch first (a
+    // seed that a redraw replaced is not listed).
+    vector<P2PoolGuardDrawInfo> vDraws;
+    vector<vector<CHeldTicket> > vTickets;
+    vector<uint256> vSeeds;
+    vector<vector<unsigned char> > vKeyOwn;
     CRITICAL_BLOCK(cs_p2pool)
     {
         out.fGuarding = TktActive();
@@ -7842,16 +7845,30 @@ bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out)
             return out.fGuarding;
         int c = pooltkt::EpochOf(tktView.nTip);
         out.nEpoch = c;
-        uint256 hashChain, hashHeld;
-        if (!pooltkt::DrawSeed(tktView, c, hashDraw, out.fSettled))
-            return true;
-        if (TktBuriedSeed(c, hashChain) && TktBook().Seed(c, hashHeld) && hashChain == hashHeld)
-            TktBook().Tickets(c, vT);
-        out.nTickets = vT.size();
-        CGuardTicket own;
-        uint256 w;
-        if (TktBook().Own(c, own, w))
-            keyOwn = own.Key();
+        for (int e = c - 1; e <= c + 1; e++)
+        {
+            if (e < 1 || (e == c - 1 && tktView.nTip >= pooltkt::LingerEndHeight(c)))
+                continue;
+            P2PoolGuardDrawInfo d;
+            uint256 hashDraw;
+            if (!pooltkt::DrawSeed(tktView, e, hashDraw, d.fSettled) || (e != c && !d.fSettled))
+                continue;
+            d.nEpoch = e;
+            d.nUntil = pooltkt::LingerEndHeight(e + 1);
+            vector<CHeldTicket> vT;
+            vector<unsigned char> keyOwn;
+            uint256 hashChain, hashHeld, w;
+            if (TktBuriedSeed(e, hashChain) && TktBook().Seed(e, hashHeld) && hashChain == hashHeld)
+                TktBook().Tickets(e, vT);
+            CGuardTicket own;
+            if (TktBook().Own(e, own, w))
+                keyOwn = own.Key();
+            d.nTickets = vT.size();
+            vDraws.push_back(d);
+            vTickets.push_back(vT);
+            vSeeds.push_back(hashDraw);
+            vKeyOwn.push_back(keyOwn);
+        }
         map<uint256, GuardEntry>::const_iterator it = mapGuard.find(id);
         if (it != mapGuard.end())
         {
@@ -7866,17 +7883,30 @@ bool P2PoolGuardians(const uint256& id, P2PoolGuardInfo& out)
                 out.strOwn = "drawn; mined or carried here, outside the guard budget";
         }
     }
-    vector<CDrawPlace> places;
-    pooltkt::Draw(hashDraw, id, vT, GUARD_PLACES + GUARD_RESERVE, places);
-    for (size_t i = 0; i < places.size(); i++)
+    for (size_t k = 0; k < vDraws.size(); k++)
     {
-        P2PoolGuardianInfo g;
-        g.strBtf = places[i].key.size() == 32 ? btf::Address(&places[i].key[0]) : string();
-        g.nRank = (int)i;
-        g.fSelf = !keyOwn.empty() && places[i].key == keyOwn;
-        g.nCapacityMB = places[i].nCapacityMB;
-        out.vGuardians.push_back(g);
+        P2PoolGuardDrawInfo& d = vDraws[k];
+        vector<CDrawPlace> places;
+        pooltkt::Draw(vSeeds[k], id, vTickets[k], GUARD_PLACES + GUARD_RESERVE, places);
+        for (size_t i = 0; i < places.size(); i++)
+        {
+            P2PoolGuardianInfo g;
+            g.strBtf = places[i].key.size() == 32 ? btf::Address(&places[i].key[0]) : string();
+            g.nRank = (int)i;
+            g.fSelf = !vKeyOwn[k].empty() && places[i].key == vKeyOwn[k];
+            g.nCapacityMB = places[i].nCapacityMB;
+            if (g.fSelf)
+                d.nOwnRank = (int)i;
+            d.vGuardians.push_back(g);
+        }
+        if (d.nEpoch == out.nEpoch)
+        {
+            out.fSettled = d.fSettled;
+            out.nTickets = d.nTickets;
+            out.vGuardians = d.vGuardians;
+        }
     }
+    out.vDraws.swap(vDraws);
     return true;
 }
 
