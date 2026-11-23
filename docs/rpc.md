@@ -146,7 +146,10 @@ This example uses the `listtransactions` RPC call to save all wallet transaction
 
 First save the transactions to a file, with the RPC credentials the node was started with (port 18432 on testnet). A count of 1000000 is more than any wallet holds, so it returns them all:
 ```bash
-curl -s -u USER:PASSWORD -H 'Content-Type: application/json' \n  -d '{"id":1,"method":"listtransactions","params":[1000000]}' \n  http://127.0.0.1:8432/ > <filename>.json
+curl -s -u USER:PASSWORD -H 'Content-Type: application/json' \
+  -d '{"id":1,"method":"listtransactions","params":[1000000]}' \
+  http://127.0.0.1:8432/ > <filename>.json
+```
 *Replace `<filename>` to what you want it called.*
 
 Then we use `jq` to convert the JSON to CSV formatted file and at the same time convert UNIX timestamps to ISO dates (UTC time)
