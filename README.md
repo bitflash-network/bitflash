@@ -17,15 +17,15 @@ RandomX proof of work, nodes reached only through Tor onion services, no premine
 </div>
 
 > [!IMPORTANT]
-> **Every node should run 1.2.33 before 2026-11-21 12:00 UTC**, when rules v3 activate on
-> mainnet. It holds pay-to-script-hash outputs back until the chain's median time has passed the
-> switch, and makes Windows nodes read large script numbers exactly as Linux nodes do, a
-> consensus fix. Windows users in particular should upgrade.
+> **Rules v3 have been active on mainnet since 2026-11-21 12:00 UTC.** Upgrade any node older than
+> 1.2.33 now: it makes Windows nodes read large script numbers exactly as Linux nodes do, a
+> consensus fix.
 >
 > **1.2.33 or newer is required before 2026-12-25 12:00 UTC**, when rules v4 activate and atomic
-> swaps open on mainnet (rules v4 on testnet: 2026-11-20 12:00 UTC). This applies to wallets,
-> explorers and exchanges as well as miners. A node on 1.2.31 or older stops following the chain
-> at the first block that uses the new opcodes, and swap offers from 1.2.32 or older are refused.
+> swaps open on mainnet (on testnet, rules v4 have been active since 2026-11-20). This applies to
+> wallets, explorers and exchanges as well as miners. A node on 1.2.31 or older stops following
+> the chain at the first block that uses the new opcodes, and swap offers from 1.2.32 or older are
+> refused.
 > See [Network upgrades](#network-upgrades).
 
 > [!NOTE]
@@ -260,10 +260,10 @@ same; coins sent to the wrong network cannot be recovered.
 | Upgrade | Contents | Mainnet activation |
 |---|---|---|
 | PoW v2 and rules v2 | XMRig-compatible RandomX, strict DER and low-S signatures, BIP34 and BIP30, corrected retarget | Active since 2026-09-21 |
-| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, median-time lock-time finality | 2026-11-21 12:00 UTC |
+| Rules v3 | Pay-to-script-hash, `OP_CHECKLOCKTIMEVERIFY`, median-time lock-time finality | Active since 2026-11-21 |
 | Rules v4 | BIP68 and `OP_CHECKSEQUENCEVERIFY`, `OP_CHECKTEMPLATEVERIFY`, `OP_CHECKSIGFROMSTACK` | 2026-12-25 12:00 UTC |
 
-Rules v4 activate on testnet on 2026-11-20 12:00 UTC. Each upgrade is specified in
+Rules v4 have been active on testnet since 2026-11-20. Each upgrade is specified in
 [docs/pow-v2.md](docs/pow-v2.md), [docs/rules-v2.md](docs/rules-v2.md) and
 [docs/rules-v4.md](docs/rules-v4.md). A node that has not upgraded before an activation
 follows a different chain without warning, so keep every node current.
