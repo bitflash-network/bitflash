@@ -524,6 +524,7 @@ struct PendingPayout {
     std::string                  id;
     int                          blockHeight;
     int                          matureAtHeight;
+    std::string                  blockHash;  // "" in a ledger of an older release
     std::map<std::string, int64> amounts; // address -> satoshis
     std::map<std::string, std::string> paidTxids; // address -> txid
     int64                        nextAttempt;
@@ -551,6 +552,7 @@ struct PoolRoundProof {
     int64                        operatorReward;
     int                          skippedDust;
     int64                        forfeitedBadAddress;
+    bool                         fOrphaned;  // the block left the main chain; nothing is paid
     std::map<std::string, uint64> shares;
     std::map<std::string, int64>  payouts;
     std::map<std::string, std::string> paidTxids;
@@ -558,11 +560,17 @@ struct PoolRoundProof {
     PoolRoundProof()
         : blockHeight(0), matureAtHeight(0), createdAt(0), feePercent(0.0),
           totalShares(0), coinbaseValue(0), subsidy(0), minerReward(0), operatorReward(0),
-          skippedDust(0), forfeitedBadAddress(0) {}
+          skippedDust(0), forfeitedBadAddress(0), fOrphaned(false) {}
 };
 static std::vector<PoolRoundProof> gPoolRounds;
 static std::mutex                  gPoolRoundsMutex;
 static const size_t                MAX_POOL_ROUNDS = 200;
+
+// When a round is paid: once the wallet can spend its coinbase, which is 20
+// blocks after consensus allows it (CMerkleTx::GetBlocksToMaturity). A payout
+// started at COINBASE_MATURITY is paid with somebody else's older block, or
+// fails until this one can be spent.
+static const int                   POOL_PAYOUT_MATURITY = COINBASE_MATURITY + 20;
 
 static std::string PayoutFilePath()
 {
@@ -576,9 +584,14 @@ static std::string PoolRoundsFilePath()
     return GetAppDir() + "/pool_rounds.json";
 }
 
-static std::string PayoutIdForBlock(int blockHeight)
+// The hash is part of the name: a pool can find two blocks at one height, the
+// first orphaned by a reorganization, and the two must not share a ledger line
+// or the wallet record that says a payout was already sent.
+static std::string PayoutIdForBlock(int blockHeight, const std::string& blockHash)
 {
-    return strprintf("block-%d", blockHeight);
+    if (blockHash.empty())
+        return strprintf("block-%d", blockHeight);   // a ledger of an older release
+    return strprintf("block-%d-%s", blockHeight, blockHash.substr(0, 16).c_str());
 }
 
 static bool PayoutFullyPaid(const PendingPayout& pp)
@@ -596,6 +609,7 @@ static void SavePendingPayoutsLocked()
         nlohmann::json obj;
         obj["id"] = pp.id;
         obj["blockHeight"] = pp.blockHeight;
+        obj["blockHash"] = pp.blockHash;
         obj["matureAtHeight"] = pp.matureAtHeight;
         obj["nextAttempt"] = pp.nextAttempt;
         nlohmann::json amounts = nlohmann::json::object();
@@ -651,8 +665,10 @@ static void LoadPendingPayouts()
                 pp.id = obj["id"].get<std::string>();
             if (pp.blockHeight == 0)
                 pp.blockHeight = pp.matureAtHeight - COINBASE_MATURITY;
+            if (obj.contains("blockHash") && obj["blockHash"].is_string())
+                pp.blockHash = obj["blockHash"].get<std::string>();
             if (pp.id.empty())
-                pp.id = PayoutIdForBlock(pp.blockHeight);
+                pp.id = PayoutIdForBlock(pp.blockHeight, pp.blockHash);
             if (obj.contains("nextAttempt"))
                 pp.nextAttempt = obj["nextAttempt"].get<int64>();
             for (auto it = obj["amounts"].begin(); it != obj["amounts"].end(); ++it)
@@ -693,6 +709,7 @@ static nlohmann::json PoolRoundToJson(const PoolRoundProof& r)
     j["skippedDust"] = r.skippedDust;
     j["forfeitedBadAddressSatoshis"] = r.forfeitedBadAddress;
     j["forfeitedBadAddressBtf"] = FormatMoney(r.forfeitedBadAddress);
+    j["orphaned"] = r.fOrphaned;
 
     j["shares"] = nlohmann::json::object();
     for (const auto& kv : r.shares)
@@ -775,6 +792,7 @@ static void LoadPoolRounds()
             if (obj.contains("operatorRewardSatoshis")) r.operatorReward = obj["operatorRewardSatoshis"].get<int64>();
             if (obj.contains("skippedDust")) r.skippedDust = obj["skippedDust"].get<int>();
             if (obj.contains("forfeitedBadAddressSatoshis")) r.forfeitedBadAddress = obj["forfeitedBadAddressSatoshis"].get<int64>();
+            if (obj.contains("orphaned") && obj["orphaned"].is_boolean()) r.fOrphaned = obj["orphaned"].get<bool>();
             if (obj.contains("shares") && obj["shares"].is_object())
                 for (auto it = obj["shares"].begin(); it != obj["shares"].end(); ++it)
                     r.shares[it.key()] = it.value().get<uint64>();
@@ -881,9 +899,9 @@ static void QueuePayouts(int blockHeight,
     const double dPoolFeePercent = poolSet.dPoolFeePercent;
     const bool fPoolFeeToTreasury = poolSet.fPoolFeeToTreasury;
     PoolRoundProof round;
-    round.id = PayoutIdForBlock(blockHeight);
+    round.id = PayoutIdForBlock(blockHeight, blockHash);
     round.blockHeight = blockHeight;
-    round.matureAtHeight = blockHeight + COINBASE_MATURITY;
+    round.matureAtHeight = blockHeight + POOL_PAYOUT_MATURITY;
     round.createdAt = GetTime();
     round.blockHash = blockHash;
     round.coinbaseTxid = coinbaseTxid;
@@ -918,7 +936,8 @@ static void QueuePayouts(int blockHeight,
     PendingPayout pp;
     pp.id = round.id;
     pp.blockHeight = blockHeight;
-    pp.matureAtHeight = blockHeight + COINBASE_MATURITY;
+    pp.blockHash = blockHash;
+    pp.matureAtHeight = blockHeight + POOL_PAYOUT_MATURITY;
 
     int skipped = 0;
     int64 burned = 0; // amount owed to miners with bad/empty addresses
@@ -975,13 +994,63 @@ static void QueuePayouts(int blockHeight,
                         : "");
 }
 
+// Whether a round's block is in the chain the node follows now. Takes cs_main:
+// never called with the ledger or the rounds locked.
+static bool RoundBlockInMainChain(const std::string& blockHash)
+{
+    uint256 hash;
+    hash.SetHex(blockHash);
+    CRITICAL_BLOCK(cs_main)
+    {
+        map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
+        return mi != mapBlockIndex.end() && mi->second->IsInMainChain();
+    }
+    return false;
+}
+
+// The block hash of a round, for a ledger line an older release wrote without
+// it ("" if no record of the round is left either).
+static std::string RoundBlockHash(const std::string& id)
+{
+    std::lock_guard<std::mutex> lk(gPoolRoundsMutex);
+    for (const PoolRoundProof& r : gPoolRounds)
+        if (r.id == id)
+            return r.blockHash;
+    return "";
+}
+
+// A round of a block that is not in the main chain at payout time has no
+// coinbase to pay it with: it leaves the ledger, unpaid, and its record says so.
+static void DropOrphanedRound(const std::string& id, int blockHeight)
+{
+    {
+        std::lock_guard<std::mutex> ledger(gPayoutLedgerMutex);
+        for (auto it = gPendingPayouts.begin(); it != gPendingPayouts.end(); ) {
+            if (it->id == id)
+                it = gPendingPayouts.erase(it);
+            else
+                ++it;
+        }
+        SavePendingPayoutsLocked();
+    }
+    {
+        std::lock_guard<std::mutex> lk(gPoolRoundsMutex);
+        for (PoolRoundProof& r : gPoolRounds)
+            if (r.id == id)
+                r.fOrphaned = true;
+        SavePoolRoundsLocked();
+    }
+    LogPrint("payout", "[payout] block %d of payout %s is not in the main chain: round dropped, nothing paid\n",
+             blockHeight, id.c_str());
+}
+
 // Called from event loop: copy matured entries to the exec queue (fast).
 // The ledger entry stays on disk until every recipient has a txid recorded.
 // On restart, FindRecordedPoolPayout() checks wallet metadata before sending,
 // so a crash after SendMoney but before the ledger update does not double-pay.
 static void FlushMaturePayouts()
 {
-    std::vector<PendingPayout> ready;
+    std::vector<PendingPayout> due;
     {
         std::lock_guard<std::mutex> ledger(gPayoutLedgerMutex);
         std::lock_guard<std::mutex> queue(gPayoutExecMutex);
@@ -995,13 +1064,21 @@ static void FlushMaturePayouts()
                 continue;
             if (gQueuedPayouts.count(pp.id))
                 continue;
-            LogPrint("payout", "[payout] block height %d matured -- queuing payout %s (%zu recipients)\n",
-                     pp.matureAtHeight, pp.id.c_str(), pp.amounts.size());
-            ready.push_back(pp);
-            gQueuedPayouts.insert(pp.id);
+            due.push_back(pp);
         }
-        for (auto& pp : ready)
-            gPayoutExecQueue.push_back(pp);
+    }
+    for (PendingPayout& pp : due) {
+        std::string blockHash = pp.blockHash.empty() ? RoundBlockHash(pp.id) : pp.blockHash;
+        // A round no record names a block for is paid as before: it cannot be checked.
+        if (!blockHash.empty() && !RoundBlockInMainChain(blockHash)) {
+            DropOrphanedRound(pp.id, pp.blockHeight);
+            continue;
+        }
+        LogPrint("payout", "[payout] block height %d matured -- queuing payout %s (%zu recipients)\n",
+                 pp.matureAtHeight, pp.id.c_str(), pp.amounts.size());
+        std::lock_guard<std::mutex> queue(gPayoutExecMutex);
+        gQueuedPayouts.insert(pp.id);
+        gPayoutExecQueue.push_back(pp);
     }
 }
 
@@ -2439,6 +2516,83 @@ int RunPoolStratumSelfTest()
         }
     }
     check(proofOk, "pool round proof ledger is written and paid txid is recorded");
+
+    // A matured round is paid only if its block is in the main chain.
+    {
+        std::vector<PendingPayout> savedPending;
+        std::vector<PendingPayout> savedQueue;
+        std::set<std::string> savedQueued;
+        int savedBest = nBestHeight;
+        {
+            std::lock_guard<std::mutex> ledger(gPayoutLedgerMutex);
+            std::lock_guard<std::mutex> queue(gPayoutExecMutex);
+            savedPending.swap(gPendingPayouts);
+            savedQueue.swap(gPayoutExecQueue);
+            savedQueued.swap(gQueuedPayouts);
+        }
+        std::string payoutPath = PayoutFilePath();
+        std::string payoutBak = payoutPath + ".selftest-bak";
+        bool fHadFile = rename(payoutPath.c_str(), payoutBak.c_str()) == 0;
+        check(PayoutIdForBlock(7, std::string(64, 'a')) != PayoutIdForBlock(7, std::string(64, 'b')),
+              "two blocks at one height have two payout names");
+        check(PayoutIdForBlock(7, "") == "block-7", "a ledger line of an older release keeps its name");
+
+        uint256 hashMain = block.GetHash();
+        CBlockIndex* pindexTest = new CBlockIndex;
+        CBlockIndex* pindexNextTest = new CBlockIndex;
+        pindexTest->phashBlock = NULL;
+        pindexTest->nHeight = 7;
+        pindexTest->pnext = pindexNextTest;   // IsInMainChain: it has a next
+        CRITICAL_BLOCK(cs_main)
+            mapBlockIndex[hashMain] = pindexTest;
+        check(RoundBlockInMainChain(hashMain.GetHex()), "a block with a successor in the index is in the main chain");
+        check(!RoundBlockInMainChain(std::string(64, '1')), "an unknown block is not");
+
+        PendingPayout good, orphan, young, legacy;
+        good.id = "good"; good.blockHeight = 7; good.matureAtHeight = 7 + POOL_PAYOUT_MATURITY;
+        good.blockHash = hashMain.GetHex(); good.amounts[miner.address] = COIN;
+        orphan = good; orphan.id = "orphan"; orphan.blockHash = std::string(64, '1');
+        young = good; young.id = "young"; young.matureAtHeight = 7 + POOL_PAYOUT_MATURITY + 1;
+        legacy = good; legacy.id = "legacy"; legacy.blockHash = "";
+        PoolRoundProof rec;
+        rec.id = "legacy"; rec.blockHash = std::string(64, '2');
+        gPoolRounds.clear();
+        gPoolRounds.push_back(rec);
+        nBestHeight = 7 + POOL_PAYOUT_MATURITY;
+        gPendingPayouts.push_back(good);
+        gPendingPayouts.push_back(orphan);
+        gPendingPayouts.push_back(young);
+        gPendingPayouts.push_back(legacy);
+        FlushMaturePayouts();
+        check(gPayoutExecQueue.size() == 1 && gPayoutExecQueue[0].id == "good",
+              "only the round whose block is in the main chain is paid");
+        bool fOrphanGone = true, fYoungKept = false;
+        for (const PendingPayout& pp : gPendingPayouts) {
+            if (pp.id == "orphan" || pp.id == "legacy")
+                fOrphanGone = false;
+            if (pp.id == "young")
+                fYoungKept = true;
+        }
+        check(fOrphanGone, "orphaned rounds leave the ledger, the older one by its record's hash");
+        check(fYoungKept, "a round not yet mature stays");
+        check(gPoolRounds.size() == 1 && gPoolRounds[0].fOrphaned, "an orphaned round's record says so");
+        nBestHeight = savedBest;
+        remove(payoutPath.c_str());
+        remove((payoutPath + ".tmp").c_str());
+        if (fHadFile)
+            rename(payoutBak.c_str(), payoutPath.c_str());
+        {
+            std::lock_guard<std::mutex> ledger(gPayoutLedgerMutex);
+            std::lock_guard<std::mutex> queue(gPayoutExecMutex);
+            gPendingPayouts.swap(savedPending);
+            gPayoutExecQueue.swap(savedQueue);
+            gQueuedPayouts.swap(savedQueued);
+        }
+        CRITICAL_BLOCK(cs_main)
+            mapBlockIndex.erase(hashMain);
+        delete pindexTest;
+        delete pindexNextTest;
+    }
 
     remove(proofPath.c_str());
     remove((proofPath + ".tmp").c_str());
