@@ -19,11 +19,27 @@ pool is announced and compare.
 Every node on 1.2.36 or newer also guards pools for the network, at idle
 priority and within a fixed budget (128 MB of disk, 64 KB/s). Nothing to set.
 
-## On Windows
+## In the wallet's window (from 1.2.37)
 
-The wallet's window has no Everpool screen yet (it comes in a later release).
-Until then, `Everpool.cmd`, beside `Bitflash.exe` in the Windows zip, does it
-from a simple menu. Double-click it:
+Click **Everpool** (in the menu bar, or the button beside Backup Wallet):
+
+- the pool list: pool zero first, then every pool on the chain with its name
+  and fingerprint (hover for the full id, right-click to copy it), age, fee,
+  status (pending with its confirmations, or active), recent blocks, and what
+  your node does with it; pools with names alike are flagged;
+- pick a pool to see its rules, fee address and recent blocks, and press
+  **Mine this pool** (or **Mine pool zero**): Bitflash asks to restart, and
+  after the restart it serves that pool's work on the address shown (copy it
+  into the Bitflash Miner or XMRig); **Turn P2Pool mining off** undoes it;
+- **Create a pool...**: name, your fee and its address, and the share rules
+  if you want other than the defaults. The review shows the pool's id and
+  fingerprint, the fee, the 1 BTF burn and that a pool can never be edited or
+  deleted; nothing is sent until you tick the box and press the burn button.
+
+## On Windows, without the window
+
+`Everpool.cmd`, beside `Bitflash.exe` in the Windows zip, does the same from
+a simple menu, for a node run without the window. Double-click it:
 
 | choice | what it does |
 |---|---|
