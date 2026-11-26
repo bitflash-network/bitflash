@@ -25745,6 +25745,11 @@ static int RunPoWUnavailableSelfTest()
     return nFail == 0 ? 0 : 1;
 }
 
+// The attack and scale harness of Everpool (run by name, never by default).
+#include "selftest_attack.inc"
+#include "selftest_attack2.inc"
+#include "selftest_attack3.inc"
+
 int RunSelfTest(const std::string& name)
 {
     // The self-tests load block indexes of their own; LoadBlockIndex never
@@ -25792,6 +25797,20 @@ int RunSelfTest(const std::string& name)
         return RunConsensusLimitsSelfTest();
     if (name == "chain-work")
         return RunChainWorkSelfTest();
+    if (name == "attack-sybil")
+        return RunAttackSybilSelfTest();
+    if (name == "attack-ticket-flood")
+        return RunAttackTicketFloodSelfTest();
+    if (name == "attack-shares")
+        return RunAttackSharesSelfTest();
+    if (name == "attack-flood")
+        return RunAttackFloodSelfTest();
+    if (name == "attack-withhold")
+        return RunAttackWithholdSelfTest();
+    if (name == "attack-stale")
+        return RunAttackStaleSelfTest();
+    if (name == "attack-scale")
+        return RunAttackScaleSelfTest();
     if (name == "pool-index")
         return RunPoolIndexSelfTest();
     if (name == "pool-tickets")
