@@ -155,7 +155,7 @@ all: bitflash
 $(LIGHT_POW_OBJS): override CXXFLAGS := $(filter-out -fpermissive,$(CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
 $(LIGHT_POW_OBJS): override FUZZ_CXXFLAGS := $(filter-out -fpermissive,$(FUZZ_CXXFLAGS)) -Ipow_vendor/rvn -DSPH_UNALIGNED=0 -fno-strict-aliasing
 $(LIGHT_POW_OBJS): $(LIGHT_POW_HEADERS)
-obj/selftest.o obj-chat/selftest.o obj-node/selftest.o obj-chatterm/selftest.o obj-fuzz/selftest.o: dgb_pow.h rvn_kawpow.h light_pow_common.h test_light_pow.h test_light_pow_vectors.h
+obj/selftest.o obj-chat/selftest.o obj-node/selftest.o obj-chatterm/selftest.o obj-fuzz/selftest.o: dgb_pow.h rvn_kawpow.h light_pow_common.h test_light_pow.h test_light_pow_vectors.h selftest_attack.inc selftest_attack2.inc selftest_attack3.inc
 
 
 # Keep upstream Keccak translation units in C, as their declarations require.
