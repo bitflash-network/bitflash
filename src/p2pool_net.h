@@ -315,6 +315,12 @@ void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n);
 // SetMaxBytesForTest), so a line past what a carried pool may hold is seen
 // without hundreds of megabytes of shares.
 void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n);
+// Self-tests: the rate the lines of registered pools are written at made
+// nRate bytes a second (0: the default, 64 KB/s), and the seconds between
+// two writes of a pool's line then (id 0: pool zero; -1: no such pool); the
+// bytes of every complete registered line this node holds.
+int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate);
+uint64 P2PoolRegSavedBytesForTest();
 
 // ---- Guardians (docs/pool-registry.md, sections 10 to 12)
 //

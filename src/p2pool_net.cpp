@@ -535,6 +535,8 @@ static RegPool* RegOf(PoolState& ps);
 static uint256 RegZeroId();
 static const vector<unsigned char>* RegRecordOf(PoolState& ps);
 static bool RegSaveAllowed(PoolState& ps);
+// Under cs_p2pool: seconds between two writes of a pool's line to its file.
+static int64 RegSaveIntervalLocked(PoolState& ps);
 // Under cs_p2pool: whether a registered pool's p2xsync to this peer stays
 // within what the peer answers (3 per pool, 8 in all, an interval), and the
 // count of one sent. True, and nothing counted, for any other pool.
@@ -933,7 +935,7 @@ static bool MaybeSaveShares(PoolState& ps, bool fNow = false)
     bool fReg = false;
     CRITICAL_BLOCK(cs_p2pool)
     {
-        if (!fNow && GetTime() - ps.nLastSave < 120)
+        if (!fNow && GetTime() - ps.nLastSave < RegSaveIntervalLocked(ps))
             return false;
         // A registered pool's line goes to pools/<id>.dat only once it is
         // complete; a fetch in progress has its own file (section 17).
@@ -4259,6 +4261,29 @@ static bool RegSaveAllowed(PoolState& ps)
 {
     RegPool* rp = RegOf(ps);
     return !rp || rp->nFetch == FETCH_COMPLETE;
+}
+
+// Each save writes a pool's whole line again (and copies it under
+// cs_p2pool first). Pool zero and local pools: every 120 s at most, as in
+// 1.2.34. Registered pools: every 120 s, or slower so that all the lines of
+// registered pools this node keeps are written at REG_SAVE_RATE on average,
+// whatever their number: a guardian keeps up to 128 MB of other people's
+// lines by default, and a pool kept near its 64 MB cap with a share every 20
+// seconds had every guardian write 64 MB every two minutes (about 46 GB a
+// day for one pool). At 64 KB/s, the default guard budget is written about
+// every 34 minutes. A line not yet written is caught up from peers after a
+// restart (a share far ahead of the tip asks for the line).
+static const int64 REG_SAVE_RATE = 64 * 1024;
+static int64 nRegSaveRate = REG_SAVE_RATE;      // self-tests may lower it
+static int64 RegSaveIntervalLocked(PoolState& ps)
+{
+    if (!RegOf(ps))
+        return 120;
+    uint64 nAll = 0;
+    foreach(RegPool* rp, vRegPools)
+        if (rp->nFetch == FETCH_COMPLETE)
+            nAll += (uint64)rp->state.chain->Bytes();
+    return std::max((int64)120, (int64)(nAll / (uint64)std::max((int64)1, nRegSaveRate)));
 }
 
 static bool RegInSessionLocked(PoolState& ps, CNode* pnode)
@@ -7718,6 +7743,30 @@ void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n)
         if (rp)
             rp->nPartCapForTest = n;
     }
+}
+
+int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate)
+{
+    int64 n = -1;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        nRegSaveRate = nRate > 0 ? nRate : REG_SAVE_RATE;
+        if (id == 0)
+            n = RegSaveIntervalLocked(PoolZero());
+        else if (RegPool* rp = RegById(id))
+            n = RegSaveIntervalLocked(rp->state);
+    }
+    return n;
+}
+
+uint64 P2PoolRegSavedBytesForTest()
+{
+    uint64 n = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+        foreach(RegPool* rp, vRegPools)
+            if (rp->nFetch == FETCH_COMPLETE)
+                n += (uint64)rp->state.chain->Bytes();
+    return n;
 }
 
 void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n)

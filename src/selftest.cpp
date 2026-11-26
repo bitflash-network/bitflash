@@ -10644,6 +10644,23 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fKeep, "a line complete whose .dat could not be written keeps its partial file") ? 0 : 1;
     }
 
+    // ---- the lines of registered pools are written at a bounded rate, all
+    // of them together: every 120 s while they are small, slower as they
+    // grow; pool zero every 120 s as before
+    {
+        const uint64 nAll = P2PoolRegSavedBytesForTest();
+        const int64 nDefault = P2PoolRegSaveIntervalForTest(idE, 0);
+        const int64 nSlow = P2PoolRegSaveIntervalForTest(idE, 1);
+        const int64 nZero = P2PoolRegSaveIntervalForTest(0, 1);
+        P2PoolRegSaveIntervalForTest(0, 0);
+        nFail += Check(nAll > 120 && nDefault == 120 && nSlow == (int64)nAll && nZero == 120,
+                       "registered lines are saved every 120 s while small, and no faster than the save rate over "
+                       "all of them as they grow; pool zero's every 120 s") ? 0 : 1;
+        if (!(nAll > 120 && nDefault == 120 && nSlow == (int64)nAll && nZero == 120))
+            printf("       bytes %u, interval %d, at 1 B/s %d, pool zero %d\n", (unsigned)nAll, (int)nDefault, (int)nSlow,
+                   (int)nZero);
+    }
+
     // ---- an empty part that says the line ends is no answer: the fetch
     // neither completes nor catches up on it, and asks another announcer
     {
