@@ -285,6 +285,7 @@ windows: deps-windows
 	@cp src/bitflash.exe Bitflash-$(VERSION)-windows/Bitflash.exe
 	@cp src/btfchat.exe Bitflash-$(VERSION)-windows/BtfChat.exe
 	@cp THIRD-PARTY-NOTICES.txt Bitflash-$(VERSION)-windows/
+	@cp scripts/everpool.ps1 scripts/Everpool.cmd Bitflash-$(VERSION)-windows/
 	@ldd src/bitflash.exe | grep ucrt64 | awk '{print $$3}' | \
 	  xargs -I{} cp {} Bitflash-$(VERSION)-windows/ 2>/dev/null || true
 	@ldd src/btfchat.exe | grep ucrt64 | awk '{print $$3}' | \
