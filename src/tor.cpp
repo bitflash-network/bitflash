@@ -1659,6 +1659,76 @@ static void MarkManagedTorDead(int nExitCode)
         g_managedTorStatus = strprintf("stopped unexpectedly, Tor exit code %d", nExitCode);
 }
 
+// Deaths of a Tor that had been up less than TOR_QUICK_DEATH_SECS, in a row.
+static int g_nTorQuickDeaths = 0;
+static const int64 TOR_QUICK_DEATH_SECS = 300;
+static const int TOR_MAX_QUICK_DEATHS = 5;
+
+// A managed Tor that stops is started again, with the same transport and the
+// same onion. Before this the watchdog marked it dead and returned: the node
+// went on dialling a SOCKS port nobody listened on, and the Nostr relays
+// through it, for as long as it ran. Seen on a Windows wallet on 26/11: Tor
+// exited (code 0) and the wallet sat at 0 peers for hours, until it was
+// closed and opened again. A Tor that keeps dying straight after it starts is
+// given up on after TOR_MAX_QUICK_DEATHS tries in a row, with a status that
+// says so, rather than restarted forever.
+static void RestartManagedTorAfterExit(const std::string& strWhy)
+{
+    std::string torPath;
+    CRITICAL_BLOCK(cs_managedTor)
+        torPath = g_managedTorPath;
+
+    int64 nUp = g_managedTorStartedAt ? GetTime() - g_managedTorStartedAt : 0;
+    if (nUp < TOR_QUICK_DEATH_SECS)
+        g_nTorQuickDeaths++;
+    else
+        g_nTorQuickDeaths = 1;
+
+    for (int nTry = 1; ; nTry++)
+    {
+        if (g_nTorQuickDeaths > TOR_MAX_QUICK_DEATHS)
+        {
+            printf("managed Tor: %s; it stopped %d times in a row within %d s of starting, "
+                   "so it is not started again. Restart Bitflash.\n",
+                   strWhy.c_str(), g_nTorQuickDeaths - 1, (int)TOR_QUICK_DEATH_SECS);
+            CRITICAL_BLOCK(cs_managedTor)
+                g_managedTorStatus = strprintf("%s; stopped %d times in a row, not restarted (restart Bitflash)",
+                                               strWhy.c_str(), g_nTorQuickDeaths - 1);
+            return;
+        }
+        // A pause before each start, longer after each quick death: a Tor
+        // that dies at once is not hammered.
+        int nWaitSecs = 10 * g_nTorQuickDeaths;
+        printf("managed Tor: %s after %d s up; starting it again in %d s\n",
+               strWhy.c_str(), (int)nUp, nWaitSecs);
+        for (int i = 0; i < nWaitSecs * 2; i++)
+        {
+            if (fShutdown)
+                return;
+            Sleep(500);
+        }
+        if (fShutdown || BtfManagedTorEnabled())
+            return;   // shutting down, or something else started it meanwhile
+
+        std::string strErr;
+        if (BtfStartManagedTor(torPath, strErr))
+        {
+            // The node may have begun its shutdown while Tor was starting,
+            // after its own stop of Tor had found nothing to stop.
+            if (fShutdown)
+                BtfStopManagedTor();
+            else
+                printf("managed Tor: started again\n");
+            return;   // the new Tor has its own watchdog
+        }
+        printf("managed Tor: could not start it again: %s\n", strErr.c_str());
+        CRITICAL_BLOCK(cs_managedTor)
+            g_managedTorStatus = strprintf("%s; restart failed: %s", strWhy.c_str(), strErr.c_str());
+        g_nTorQuickDeaths++;
+        nUp = 0;
+    }
+}
+
 static void ThreadManagedTorWatchdog(void*)
 {
     for (;;)
@@ -1674,14 +1744,20 @@ static void ThreadManagedTorWatchdog(void*)
         int nExitCode = 0;
         if (!ManagedTorProcessAlive(fExited, nExitCode))
         {
+            std::string strWhy;
             if (fExited)
+            {
                 MarkManagedTorDead(nExitCode);
+                strWhy = strprintf("Tor stopped unexpectedly (exit code %d)", nExitCode);
+            }
             else
             {
                 BtfStopManagedTor();
                 CRITICAL_BLOCK(cs_managedTor)
                     g_managedTorStatus = "stopped unexpectedly, Tor process handle is gone";
+                strWhy = "Tor stopped unexpectedly (process handle gone)";
             }
+            RestartManagedTorAfterExit(strWhy);
             return;
         }
 

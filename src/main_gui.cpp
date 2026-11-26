@@ -17,6 +17,9 @@
 #include <thread>         // hardware_concurrency, to sanity-check /genproclimit
 #ifndef _WIN32
 #include <csignal>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 // BITFLASH_NO_GUI builds the same entry point without ImGui, GLFW or OpenGL,
@@ -325,6 +328,102 @@ static bool fJsonRpc = false;
 // id is never on the command line).
 static string strP2PoolLocalName;
 
+// One Bitflash per data directory (per network: testnet has its own).
+//
+// Nothing stopped a second one. Opened while the first was still closing (its
+// window gone, its threads, wallet flush and Tor still going) or started twice,
+// the second read the first's Tor pid file and killed that Tor, or the first,
+// finishing its shutdown, took the second's down with it. Seen on a Windows
+// wallet on 26/11: Tor gone, 0 peers for hours, fixed only by closing and
+// opening it again. Worse, the block index and wallet.dat share a Berkeley DB
+// environment opened with DB_RECOVER, which a second process rebuilds under
+// the first.
+//
+// The lock is an open file: the operating system lets it go when the process
+// ends, however it ends, so a crash leaves nothing to clean up. Not inherited
+// by Tor or by a relaunch (O_CLOEXEC; Windows handles are not inherited
+// unless asked), or a Tor left running would hold it.
+#ifdef _WIN32
+static HANDLE g_hDataDirLock = INVALID_HANDLE_VALUE;
+#else
+static int g_fdDataDirLock = -1;
+#endif
+
+enum DataDirLockResult { DATADIR_LOCKED, DATADIR_BUSY, DATADIR_LOCK_UNAVAILABLE };
+
+static DataDirLockResult TryLockDataDir(const string& strPath)
+{
+#ifdef _WIN32
+    HANDLE h = CreateFileA(strPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0 /* no sharing */,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_SHARING_VIOLATION ? DATADIR_BUSY : DATADIR_LOCK_UNAVAILABLE;
+    g_hDataDirLock = h;
+    return DATADIR_LOCKED;
+#else
+    int fd = open(strPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return DATADIR_LOCK_UNAVAILABLE;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        int e = errno;
+        close(fd);
+        return e == EWOULDBLOCK ? DATADIR_BUSY : DATADIR_LOCK_UNAVAILABLE;
+    }
+    g_fdDataDirLock = fd;
+    return DATADIR_LOCKED;
+#endif
+}
+
+// Waits up to a minute for a Bitflash that is still closing; refuses to start
+// if one is still there after that.
+static void LockDataDirOrRefuse(bool fHeadless)
+{
+    string strPath = GetAppDir() + "/.lock";
+    const int WAIT_SECS = 60;
+    bool fSaidWaiting = false;
+    for (int i = 0; i <= WAIT_SECS * 2; i++)
+    {
+        DataDirLockResult r = TryLockDataDir(strPath);
+        if (r == DATADIR_LOCKED)
+        {
+            if (fSaidWaiting)
+                fprintf(stderr, "The other Bitflash has closed; starting.\n");
+            return;
+        }
+        if (r == DATADIR_LOCK_UNAVAILABLE)
+        {
+            // A read-only or odd file system: no worse than before the lock.
+            fprintf(stderr, "Note: could not lock %s; make sure no other Bitflash uses this data directory.\n",
+                    strPath.c_str());
+            return;
+        }
+        if (!fSaidWaiting)
+        {
+            fprintf(stderr, "Another Bitflash is using %s (still closing?); waiting up to %d s for it.\n",
+                    GetAppDir().c_str(), WAIT_SECS);
+            fSaidWaiting = true;
+        }
+        Sleep(500);
+    }
+
+    string strWhat = "Bitflash is already running with this data folder.";
+    string strDetail = strprintf("%s is in use by another Bitflash. Close it first (it may still be "
+                                 "shutting down: give it a minute), or start this one with -datadir=<another folder>.",
+                                 GetAppDir().c_str());
+    AttachTerminal();
+    fprintf(stderr, "\nRefusing to start: %s\n%s\n", strWhat.c_str(), strDetail.c_str());
+    fflush(stderr);
+#ifdef _WIN32
+    if (!fHeadless && GetConsoleWindow() == NULL)
+        MessageBoxA(NULL, (strWhat + "\n\n" + strDetail).c_str(), "Bitflash",
+                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+#else
+    (void)fHeadless;
+#endif
+    exit(1);
+}
+
 static void ParseStartupArguments(int argc, char* argv[])
 {
     if (arg(argc,argv,"/datadir") || arg(argc,argv,"-datadir"))
@@ -332,6 +431,20 @@ static void ParseStartupArguments(int argc, char* argv[])
 
     bool fUseTestNet = arg(argc, argv, "/testnet") || arg(argc, argv, "-testnet");
     SelectChainParams(fUseTestNet);
+
+    // Before anything opens a file in the data directory or starts Tor. The
+    // self-tests make their own directories and some start children of their
+    // own on them, so they take no lock here.
+    if (argval2(argc, argv, "/selftest", "-selftest").empty() &&
+        argval2(argc, argv, "/selftestmutatewallet", "-selftestmutatewallet").empty())
+    {
+#ifdef BITFLASH_NO_GUI
+        LockDataDirOrRefuse(true);
+#else
+        LockDataDirOrRefuse(arg(argc,argv,"/nogui") || arg(argc,argv,"-nogui") ||
+                            arg(argc,argv,"/daemon") || arg(argc,argv,"-daemon"));
+#endif
+    }
 
     if (arg(argc,argv,"/debug") || arg(argc,argv,"-debug"))
         fDebug = true;
