@@ -4899,7 +4899,8 @@ static void AddCarriedJson(json& j, const uint256& id)
     j["guarded"] = st.fGuard;
     json c;
     static const char* const vFetch[] = { "nothing yet", "fetching its line", "catching up", "complete" };
-    c["state"] = vFetch[std::max(0, std::min(3, st.nFetch))];
+    c["state"] = st.fOverCap ? "let go: its line passed what this node holds of a pool"
+                             : vFetch[std::max(0, std::min(3, st.nFetch))];
     c["announced"] = st.fAnnounced;
     c["shares"] = (uint64_t)st.nShares;
     c["height"] = st.nTipHeight;

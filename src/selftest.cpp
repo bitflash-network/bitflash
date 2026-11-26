@@ -10644,6 +10644,87 @@ static int RunP2PoolRegisteredSelfTest()
         nFail += Check(fKeep, "a line complete whose .dat could not be written keeps its partial file") ? 0 : 1;
     }
 
+    // ---- an empty part that says the line ends is no answer: the fetch
+    // neither completes nor catches up on it, and asks another announcer
+    {
+        poolreg::PoolRecord recM = recB;
+        recM.name = "regtest-empty";
+        p2pool::PoolRules rulesM;
+        p2pool::RulesForRegistered(recM, magic, rulesM, err);
+        const uint256 idM = rulesM.poolId;
+        p2pool::ShareChain mirrorM(rulesM, false);
+        vector<p2pool::Share> lineM = RegLine(mirrorM, main, 30, 44);
+        CNode* pM1 = NewRegTestNode(false, "BF1mpeer");
+        CNode* pM2 = NewRegTestNode(false, "BF1npeer");
+        P2PoolRegAddForTest(recM, false, true, false, err);
+        P2PoolOnVersion(pM1);
+        SendPoolInv(pM1, vector<uint256>(1, idM));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        const bool fAsked = CountSent(pM1, "p2xsync") >= 1;
+        SendRegPart(pM1, idM, 29, 1, vector<p2pool::Share>());
+        P2PoolRegTickForTest();
+        const int nF1 = P2PoolRegFetchForTest(idM);
+        const bool fNotEnded = nF1 != P2PoolRegStatusInfo::FETCH_CATCHUP && nF1 != P2PoolRegStatusInfo::FETCH_COMPLETE &&
+                               pM1->nMisbehavior == 0;
+        P2PoolOnVersion(pM2);
+        SendPoolInv(pM2, vector<uint256>(1, idM));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        const bool fOther = CountSent(pM2, "p2xsync") >= 1;
+        SendRegPart(pM2, idM, 29, 1, lineM);
+        const int nF2 = P2PoolRegFetchForTest(idM);
+        nFail += Check(fAsked && fNotEnded && fOther && RegShares(idM) == 30 &&
+                       (nF2 == P2PoolRegStatusInfo::FETCH_CATCHUP || nF2 == P2PoolRegStatusInfo::FETCH_COMPLETE),
+                       "an empty part that says the line ends neither completes the fetch nor scores its sender; "
+                       "another announcer is asked and its line taken") ? 0 : 1;
+        if (!(fAsked && fNotEnded && fOther && RegShares(idM) == 30))
+            printf("       asked %d, fetch after the empty end %d, other asked %d, shares %u, fetch %d\n", fAsked, nF1,
+                   fOther, (unsigned)RegShares(idM), nF2);
+    }
+
+    // ---- a carried pool whose line passes its byte cap and half again is
+    // let go: memory and files, and not fetched or carried again
+    {
+        poolreg::PoolRecord recK = recB;
+        recK.name = "regtest-cap";
+        p2pool::PoolRules rulesK;
+        p2pool::RulesForRegistered(recK, magic, rulesK, err);
+        const uint256 idK = rulesK.poolId;
+        const string strPartK = tmp + "/pools/" + idK.GetHex() + ".part";
+        p2pool::ShareChain mirrorK(rulesK, false);
+        vector<p2pool::Share> lineK = RegLine(mirrorK, main, 40, 45);
+        CNode* pK = NewRegTestNode(false, "BF1kpeer");
+        P2PoolRegAddForTest(recK, false, true, true, err);
+        P2PoolOnVersion(pK);
+        SendPoolInv(pK, vector<uint256>(1, idK));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        SendRegPart(pK, idK, 39, 0, vector<p2pool::Share>(lineK.begin(), lineK.begin() + 20));
+        P2PoolRegStatusInfo st = P2PoolRegStatusInfo();
+        const bool fTook = P2PoolRegStatus(idK, st) && st.nShares == 20 && FileExists(strPartK.c_str()) && !st.fOverCap;
+        // The cap at a third of what it holds: half again is still below it.
+        P2PoolRegSetMaxBytesForTest(idK, st.nBytes / 3);
+        P2PoolRegTickForTest();
+        const bool fLetGo = P2PoolRegStatus(idK, st) && st.fOverCap && !st.fCarried && st.nShares == 0 &&
+                            !FileExists(strPartK.c_str());
+        SendRegPart(pK, idK, 39, 0, vector<p2pool::Share>(lineK.begin() + 20, lineK.end()));
+        P2PoolRegAgeForTest(700);
+        P2PoolRefillBudgetsForTest();
+        const size_t nSyncs = CountSent(pK, "p2xsync");
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        const bool fStays = P2PoolRegStatus(idK, st) && st.fOverCap && st.nShares == 0 &&
+                            CountSent(pK, "p2xsync") == nSyncs && pK->nMisbehavior == 0;
+        nFail += Check(fTook && fLetGo && fStays,
+                       "a carried pool whose line passes its byte cap and half again is let go, memory and files; "
+                       "its shares are not taken and its line is not asked for again") ? 0 : 1;
+        if (!(fTook && fLetGo && fStays))
+            printf("       took %d, let go %d, stays %d (shares %u, over %d)\n", fTook, fLetGo, fStays,
+                   (unsigned)st.nShares, st.fOverCap);
+    }
+
     // ---- at a start the index has not loaded yet: the partial file stays
     poolreg::PoolRecord recG = recB;
     recG.name = "regtest-g";
@@ -19095,11 +19176,18 @@ static int RunP2PoolGuardiansSelfTest()
     // in this run: when its linger ends its files go too (every restart left
     // the lines it had kept on disk for good)
     {
+        // Any pool known to the guard, kept (pool-guards.dat holds the kept
+        // ones only) with a linger end past the tip.
         std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
         uint256 idK = 0;
         for (size_t i = 0; i < v.size() && idK == 0; i++)
             if (v[i].nChoice == GUARD_KEEP)
                 idK = v[i].id;
+        if (idK == 0 && !v.empty())
+            idK = v[0].id;
+        for (size_t i = 0; i < v.size(); i++)
+            if (v[i].id == idK)
+                P2PoolGuardSetEntryForTest(idK, v[i].nRank < 0 ? 0 : v[i].nRank, v[i].nUntil + 100);
         P2PoolGuardSaveForTest();
         P2PoolGuardRestartForTest();
         const size_t nLoaded = P2PoolGuardLoadForTest();
@@ -19116,12 +19204,21 @@ static int RunP2PoolGuardiansSelfTest()
         v = GuardEntries();
         const bool fBefore = idK != 0 && nLoaded >= 1 && GuardEntry(v, idK) && !GuardEntry(v, idK)->fGuard &&
                              FileExists((strBaseK + ".dat").c_str()) && FileExists((strBaseK + ".part").c_str());
+        if (!fBefore)
+            printf("       before: kept %d loaded %u entry %d guard %d dat %d part %d\n", idK != 0, (unsigned)nLoaded,
+                   GuardEntry(v, idK) != NULL, GuardEntry(v, idK) ? GuardEntry(v, idK)->fGuard : -1,
+                   FileExists((strBaseK + ".dat").c_str()), FileExists((strBaseK + ".part").c_str()));
         P2PoolGuardSetEntryForTest(idK, 0, 1);
         P2PoolRegTickForTest();
         v = GuardEntries();
-        ok(fBefore && !GuardEntry(v, idK) && !FileExists((strBaseK + ".dat").c_str()) &&
-           !FileExists((strBaseK + ".part").c_str()),
-           "a pool read back from pool-guards.dat whose linger ends with nothing of it in memory: its files go");
+        const bool fGone = fBefore && !GuardEntry(v, idK) && !FileExists((strBaseK + ".dat").c_str()) &&
+                           !FileExists((strBaseK + ".part").c_str());
+        ok(fGone, "a pool read back from pool-guards.dat whose linger ends with nothing of it in memory: its files go");
+        if (!fGone)
+            printf("       kept %d loaded %u entry %d guard %d; after: entry %d dat %d part %d\n", idK != 0, (unsigned)nLoaded,
+                   GuardEntry(v, idK) != NULL, GuardEntry(v, idK) ? GuardEntry(v, idK)->fGuard : -1,
+                   GuardEntry(v, idK) != NULL, FileExists((strBaseK + ".dat").c_str()),
+                   FileExists((strBaseK + ".part").c_str()));
         P2PoolRegFilesForTest(false);
     }
 

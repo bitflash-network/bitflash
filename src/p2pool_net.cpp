@@ -3982,6 +3982,10 @@ struct RegPool
     // Since when the pool is active and wanted here (0: it is not).
     int64 nWantedSince;
     int64 nWhoAt;                   // when peers were last asked poolwho for it
+    // A mined or -poolcarry pool whose line passed what this node holds of
+    // a pool (RegOverCap): let go, and neither fetched, carried nor mined
+    // again in this run.
+    bool fOverCap;
     // Carriers a peer named in answer to this node's poolwho (poolat), each
     // with when it was named: dialled with the guardians for POOLAT_HINT_TTL
     // (P2PoolGuardDialList), whether or not the line has started here since,
@@ -3993,7 +3997,7 @@ struct RegPool
         : id(idIn), rec(recIn), record(recordIn), state(&classReg, chainIn, strFileIn), strPart(strPartIn),
           fMined(false), fCarry(false), fGuard(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
           pFetchPeer(NULL), nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
-          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0) {}
+          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0), fOverCap(false) {}
 };
 
 // A guardian ticket waiting for the ticket budget (section 10): checked
@@ -4217,10 +4221,26 @@ static bool RegLive(const RegPool& rp)
     return RegOpen() && rp.nStatus == POOL_ACTIVE;
 }
 
-// Wanted and live: a fetch runs, answers to it are taken.
+// Wanted and live: a fetch runs, answers to it are taken. Not a pool let go
+// for passing what this node holds of one (RegOverCap).
 static bool RegActive(const RegPool& rp)
 {
-    return RegWanted(rp) && RegLive(rp);
+    return !rp.fOverCap && RegWanted(rp) && RegLive(rp);
+}
+
+// What a mined or -poolcarry registered pool may hold here before it is let
+// go: its byte cap and half again. ShareChain::ByteCap lets a chain grow to
+// what its tip's line and the uncles it names hold plus half the cap, since
+// a template's window needs them all and none is ever evicted; for pool zero
+// that rise takes most of the network's hashrate. A registered pool's creator
+// alone at the floor fills a window of 2160 with shares paying 6480 addresses
+// each (about 220 KB a share) in about an hour of one machine, and its line
+// would reach about 2 GB on every node that mines or carries it. Past this
+// the line is not one this node can keep within section 11's caps.
+static uint64 RegCarryMaxBytes(const RegPool& rp)
+{
+    const uint64 nCap = (uint64)rp.state.chain->MaxBytes();
+    return nCap + nCap / 2;
 }
 
 // Carried: its shares taken, relayed and served, its line mined on.
@@ -4771,9 +4791,14 @@ static void RegOnPart(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<
         if (rp->pFetchPeer == pfrom)
         {
             rp->nLastPartAt = nNow;
-            if (!fOk)
+            if (!fOk || (nFlag == PART_END && part.empty()))
             {
-                // Scored already; another announcer is asked.
+                // Scored already; another announcer is asked. An empty part
+                // that says the line ends is no answer either (unscored): a
+                // server with nothing of the pool says p2xnone, and a serve
+                // always sends from the resume point less the uncle depth,
+                // so it is never empty. Taken as the end, it completed a
+                // fetch with nothing, or cut a catch-up short.
                 RegConnOf(pfrom).mapNoneAt[rp->id] = nNow;
                 rp->nAskAt = 0;
                 rp->nRetryAt = nNow;
@@ -6989,8 +7014,23 @@ static void RegTick()
     {
         foreach(RegPool* rp, vRegPools)
         {
-            if (!RegWanted(*rp))
+            if (!RegWanted(*rp) || rp->fOverCap)
                 continue;
+            if ((rp->fMined || rp->fCarry) && (uint64)rp->state.chain->Bytes() > RegCarryMaxBytes(*rp))
+            {
+                // Its line passed what this node holds of a pool: let go,
+                // memory and files, and not fetched, carried or mined again
+                // in this run (a guarded pool is bounded by the guard budget
+                // instead, GuardApply).
+                printf("p2pool: registered pool %s: its share chain holds %u MB, past the %u MB this node holds of a "
+                       "pool; it is no longer carried or mined here (until a restart)\n", rp->id.GetHex().c_str(),
+                       (unsigned)(rp->state.chain->Bytes() / 1000000), (unsigned)(RegCarryMaxBytes(*rp) / 1000000));
+                rp->fOverCap = true;
+                RegDropFetch(rp);
+                if (fRegFiles && !rp->state.strFile.empty())
+                    remove(rp->state.strFile.c_str());
+                continue;
+            }
             if (!RegLive(*rp))
             {
                 // Not carried, not mined, not announced; a complete line
@@ -7554,6 +7594,12 @@ bool P2PoolMinedReady(string& whyOut)
             whyOut = "the pool this node mines is not recorded on the chain this node follows";
             f = false;
         }
+        else if (rp->fOverCap)
+        {
+            whyOut = "the share chain of the pool this node mines grew past what this node holds of a pool "
+                     "(its shares pay so many addresses that its line passes 192 MB); it is not mined here";
+            f = false;
+        }
         else if (rp->nFetch != FETCH_COMPLETE)
         {
             whyOut = "waiting for the share chain of the pool this node mines from peers";
@@ -7590,6 +7636,7 @@ bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out)
             foreach(const RegServe& r, lRegServes)
                 if (r.pool == &rp->state)
                     out.nServes++;
+            out.fOverCap = rp->fOverCap;
             f = true;
         }
     }
@@ -7670,6 +7717,16 @@ void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n)
         RegPool* rp = RegById(id);
         if (rp)
             rp->nPartCapForTest = n;
+    }
+}
+
+void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        RegPool* rp = RegById(id);
+        if (rp)
+            rp->state.chain->SetMaxBytesForTest(n);
     }
 }
 

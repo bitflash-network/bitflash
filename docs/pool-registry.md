@@ -1266,7 +1266,7 @@ about who keeps a copy.
 | guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares. Pulls (at most 4) stop at that per-pool cap too (section 10, *Pulls*) |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
 | on Snowflake or meek | exactly as every node: the same budgets, slots, rates and pulls; the circuit alone sets the speed (section 17) |
-| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
+| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. Pool zero's byte cap rises with what its tip's line and the uncles it names hold (`ShareChain::ByteCap`), which for pool zero takes most of the network's hashrate; a registered pool's creator alone at the floor could fill a window of 2160 with shares that each pay 6480 addresses (about 220 KB a share, about 2 GB of line). So a registered pool whose chain passes its byte cap and half again (192 MB) is let go, memory and files, and neither fetched, carried nor mined again until a restart (`poolinfo` says so, and mining it says why). The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s, pacing every registered history serve (guarded, mined and carried pools alike, section 17); past it a `p2xsync` waits (`DeferSync`), never refused for good. A local pool's serves (section 18) keep 64 KB/s whatever it says |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
 | tickets | at most 4096 per epoch, 118 bytes each: about 0.5 MB a day for each peer they are relayed to; an asked set adds up to 4 answers of 480 KB, about 1.9 MB per epoch, 5.8 MB at start (section 10) |
@@ -1835,7 +1835,11 @@ is taken as it arrives (`AddHistory` per part).
   catch up with the shares found while the snapshot was sent, which on a live
   pool can be an hour of them. The chain is **complete** when that catch-up's
   *end of history* part is taken in full, or 5 minutes after the catch-up
-  ask with no answer. *Ended early* never completes a chain. Until it is
+  ask with no answer. *Ended early* never completes a chain, and neither
+  does an *end of history* part with no share in it: a server with nothing
+  of the pool says `p2xnone`, and a serve always sends from the resume point
+  less the uncle depth, so an empty last part is taken as no answer
+  (unscored) and another announcer is asked. Until it is
   complete the node builds no template on it,
   does not announce it in `poolinv`, does not serve or relay it, and writes
   it only to the partial file below, never to `pools/<poolid>.dat`.

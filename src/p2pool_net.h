@@ -283,6 +283,7 @@ struct P2PoolRegStatusInfo
     uint256 work;           // the tip line's work over the last window
     size_t nAnnouncers;     // peers whose latest poolinv names it
     size_t nServes;         // paced serves of it in flight
+    bool fOverCap;          // mined or carried, let go: its line passed what this node holds of a pool
 };
 // A wanted pool's state on this node; false for a pool not wanted here.
 bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out);
@@ -310,6 +311,10 @@ bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive = true);
 void P2PoolRegIndexForTest(bool fReady, const vector<std::pair<uint256, int> >& vStatus);
 void P2PoolRegUseNodeIndexForTest();
 void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n);
+// Self-tests: a registered pool's byte cap made smaller (its chain's
+// SetMaxBytesForTest), so a line past what a carried pool may hold is seen
+// without hundreds of megabytes of shares.
+void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n);
 
 // ---- Guardians (docs/pool-registry.md, sections 10 to 12)
 //
