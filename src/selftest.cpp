@@ -9827,7 +9827,8 @@ static int RunP2PoolRegisteredSelfTest()
         for (size_t i = 0; i < sizeof(vNo) / sizeof(vNo[0]); i++)
             fNo = fNo && !P2PoolCommand(vNo[i]);
         nFail += Check(fYes && fNo, "the p2x* and pool* commands take the lock-free path, and nothing else new does") ? 0 : 1;
-        nFail += Check((nLocalServices & NODE_POOLREG) != 0 && NODE_POOLREG == (1 << 3),
+        nFail += Check((nLocalServices & NODE_POOLREG) != 0 && (LocalServicesNow() & NODE_POOLREG) != 0 &&
+                       NODE_POOLREG == (1 << 3),
                        "this node says NODE_POOLREG, bit 3") ? 0 : 1;
     }
 
@@ -10780,6 +10781,8 @@ static int RunP2PoolRegisteredSelfTest()
                        pX->nMisbehavior == 0 && LastPoolInv(pNew).empty(),
                        "closed: a share is not taken or relayed, nothing is served or answered, nobody is scored, "
                        "and no pool is announced") ? 0 : 1;
+        nFail += Check((LocalServicesNow() & NODE_POOLREG) == 0 && (LocalServicesNow() & NODE_P2POOL) != 0,
+                       "closed: the version message does not say NODE_POOLREG (pool zero's NODE_P2POOL stays)") ? 0 : 1;
         PoolBurnsOpenForTest(true);
         P2PoolRegTickForTest();
         nFail += Check(P2PoolRegStatus(idA, st) && st.fCarried && P2PoolMinedReady(why),
@@ -18697,6 +18700,57 @@ static int RunP2PoolGuardiansSelfTest()
         ok(nKeep >= 1 && P2PoolGuardLoadForTest() == nKeep, "pool-guards.dat keeps the pools kept, read back whole");
     }
 
+    // ---- a pull that goes nowhere gives its slot back; a pull past what a
+    // guardian keeps of one pool stops there
+    {
+        // P3 is pulled from pF, which announces it and serves nothing: a
+        // peer could so hold every pull slot of this node for good.
+        size_t nSync0 = CountSent(pF, "p2xsync");
+        P2PoolGuardAgeForTest(GUARD_PULL_STALL + 1);
+        P2PoolRegTickForTest();
+        std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
+        const P2PoolGuardEntryInfo* e3 = GuardEntry(v, idP3);
+        const bool fStalled = e3 && !e3->fEmpty && !e3->fGuard;
+        P2PoolGuardAgeForTest(GUARD_PULL_BACKOFF / 2);
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        v = GuardEntries();
+        e3 = GuardEntry(v, idP3);
+        const bool fWaits = e3 && !e3->fGuard;
+        ok(fStalled && fWaits, "a pull its announcer serves nothing of for 20 minutes gives its slot back, and is not "
+                               "pulled again for 2 hours while the peer still announces the pool");
+        P2PoolGuardAgeForTest(GUARD_PULL_BACKOFF / 2 + 1);
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        v = GuardEntries();
+        e3 = GuardEntry(v, idP3);
+        ok(e3 && e3->fGuard && CountSent(pF, "p2xsync") > nSync0, "then it is pulled again, from that peer");
+
+        // A line bigger than the per-pool cap, in a part that does not end
+        // it: the pull stops, the line is known as too big, and nothing of
+        // it is kept.
+        p2pool::PoolRules rules3;
+        p2pool::RulesForRegistered(vPools[2].rec, (const unsigned char*)pchMessageStart, rules3, err);
+        p2pool::ShareChain mirror3(rules3, false);
+        vector<p2pool::Share> line3 = RegLine(mirror3, main, 60, 3);
+        const int64 nCap = (int64)mirror3.Bytes() * 45 / 60;
+        P2PoolGuardLimitsForTest(GUARD_DEFAULT_BYTES, nCap, GUARD_MAX_POOLS);
+        SendRegPart(pF, idP3, 59, 0, line3);
+        P2PoolRegStatusInfo st3;
+        const bool fTook = P2PoolRegStatus(idP3, st3) && st3.nShares == 60;
+        P2PoolRegTickForTest();
+        P2PoolRegTickForTest();
+        v = GuardEntries();
+        e3 = GuardEntry(v, idP3);
+        ok(fTook && e3 && e3->nChoice == GUARD_NO_ROOM && !e3->fGuard && GuardLetGo(idP3),
+           "a pull past the per-pool cap stops there: the pool is not guarded here, and not pulled again");
+        if (!(fTook && e3 && e3->nChoice == GUARD_NO_ROOM && !e3->fGuard))
+            printf("       took %d (%u shares), entry %d choice %d guard %d\n", fTook, (unsigned)st3.nShares, e3 != NULL,
+                   e3 ? e3->nChoice : -1, e3 ? e3->fGuard : -1);
+        P2PoolGuardLimitsForTest(GUARD_DEFAULT_BYTES, GUARD_MAX_POOL_BYTES, GUARD_MAX_POOLS);
+        P2PoolRegTickForTest();
+    }
+
     // ---- a mined pool whose every guardian is gone: found through a carrier
     {
         poolreg::PoolRecord rec5 = GuardRecord(100);
@@ -19035,6 +19089,40 @@ static int RunP2PoolGuardiansSelfTest()
            "and the first draw after the restart keeps the file's better place and later linger end");
         if (e && !(e->nRank == 0 && e->nUntil == nUntilX + 100))
             printf("       place %d until %d (file: place 1, until %d)\n", e->nRank + 1, (int)e->nUntil, (int)(nUntilX + 100));
+    }
+
+    // ---- a pool read back from pool-guards.dat and not pulled or kept again
+    // in this run: when its linger ends its files go too (every restart left
+    // the lines it had kept on disk for good)
+    {
+        std::vector<P2PoolGuardEntryInfo> v = GuardEntries();
+        uint256 idK = 0;
+        for (size_t i = 0; i < v.size() && idK == 0; i++)
+            if (v[i].nChoice == GUARD_KEEP)
+                idK = v[i].id;
+        P2PoolGuardSaveForTest();
+        P2PoolGuardRestartForTest();
+        const size_t nLoaded = P2PoolGuardLoadForTest();
+        P2PoolRegFilesForTest(true);
+        _mkdir((GetAppDir() + "/pools").c_str());
+        const string strBaseK = GetAppDir() + "/pools/" + idK.GetHex();
+        const char* vExt[] = { ".dat", ".part" };
+        for (int i = 0; i < 2; i++)
+            if (FILE* f = fopen((strBaseK + vExt[i]).c_str(), "wb"))
+            {
+                fputs("a line", f);
+                fclose(f);
+            }
+        v = GuardEntries();
+        const bool fBefore = idK != 0 && nLoaded >= 1 && GuardEntry(v, idK) && !GuardEntry(v, idK)->fGuard &&
+                             FileExists((strBaseK + ".dat").c_str()) && FileExists((strBaseK + ".part").c_str());
+        P2PoolGuardSetEntryForTest(idK, 0, 1);
+        P2PoolRegTickForTest();
+        v = GuardEntries();
+        ok(fBefore && !GuardEntry(v, idK) && !FileExists((strBaseK + ".dat").c_str()) &&
+           !FileExists((strBaseK + ".part").c_str()),
+           "a pool read back from pool-guards.dat whose linger ends with nothing of it in memory: its files go");
+        P2PoolRegFilesForTest(false);
     }
 
     // ---- pool zero and a 1.2.34 peer through all of it

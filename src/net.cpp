@@ -22,6 +22,7 @@
 #include "btfaddr.h"
 #include "proxy.h"
 #include "p2pool_net.h"
+#include "poolindex.h"
 #include "chatdir.h"
 #include "tor.h"
 
@@ -63,6 +64,21 @@ uint64 nLocalServices = 0;
 #else
 uint64 nLocalServices = (fClient ? 0 : (NODE_NETWORK | NODE_CHAT | NODE_P2POOL | NODE_POOLREG));
 #endif
+
+// NODE_POOLREG tells a peer this node reads the pool registry and answers
+// its messages (docs/pool-registry.md, section 8). Where registered pools
+// are closed (mainnet until POOL_REGISTRY_MAINNET_OPEN) every one of them is
+// dropped unread, so the bit is not said there: a release cut while mainnet
+// is closed would otherwise put nodes on mainnet that a node of the release
+// that opens it takes for registry peers, and sends tickets, poolgettkt and
+// poolwho that are never answered (each holding one of its few asks).
+uint64 LocalServicesNow()
+{
+    uint64 n = nLocalServices;
+    if (!PoolBurnsOpen())
+        n &= ~(uint64)NODE_POOLREG;
+    return n;
+}
 CAddress addrLocalHost(0, GetDefaultPort(), nLocalServices);
 unsigned short nListenPort = GetDefaultPort(); // local P2P port (tunable via /port)
 CNode nodeLocalHost(INVALID_SOCKET, CAddress("127.0.0.1", nLocalServices));

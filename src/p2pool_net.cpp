@@ -5010,14 +5010,24 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
     // not an interval later.
     if (nNow - rp->nWhoAt >= POOLWHO_INTERVAL)
     {
-        size_t nAsked = 0;
-        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && nAsked < POOLWHO_PEERS; ++it)
+        // Four peers from a random start among those that read the registry:
+        // always the first four (by the map's pointer order) would ask the
+        // same peers every time, which may know nothing of the pool, and
+        // never the others.
+        vector<map<CNode*, RegConn>::iterator> vCand;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
         {
             CNode* p = it->first;
-            if (p->fDisconnect || p->nVersion == 0 || !(p->nServices & NODE_POOLREG))
-                continue;
+            if (!p->fDisconnect && p->nVersion != 0 && (p->nServices & NODE_POOLREG))
+                vCand.push_back(it);
+        }
+        size_t nAsked = 0;
+        const size_t nStart = vCand.empty() ? 0 : (size_t)GetRand(vCand.size());
+        for (size_t i = 0; i < vCand.size() && nAsked < POOLWHO_PEERS; i++)
+        {
+            map<CNode*, RegConn>::iterator it = vCand[(nStart + i) % vCand.size()];
             it->second.mapWhoAsked[rp->id] = nNow;
-            PushReg(p, "poolwho", rp->id);
+            PushReg(it->first, "poolwho", rp->id);
             nAsked++;
         }
         if (nAsked)
@@ -5185,6 +5195,9 @@ static const size_t GUARD_MAX_PULLS = 4;
 // the pool is taken as having no shares (no slot; pulled again when a peer
 // announces it).
 static const int64 GUARD_PULL_WAIT = 10 * 60;
+// GUARD_PULL_STALL, GUARD_PULL_MIN_RATE, GUARD_PULL_LONGEST and
+// GUARD_PULL_BACKOFF (p2pool_net.h): a pull that goes nowhere gives its slot
+// back, whoever announces the pool.
 // .btf addresses of guardians handed to the dialler at once.
 static const size_t GUARD_DIAL_MAX = 16;
 // A tip older than this (or the node in initial block download): no own
@@ -5282,6 +5295,7 @@ struct GuardEntry
     vector<unsigned char> record;
     bool fEmpty;            // pulled, and nobody had a share of it
     int64 nPullSince;       // when its pull began (0: not pulling)
+    int64 nPullRetryAt;     // a pull that went nowhere: not pulled again before this
     int nChoice;            // GuardChoice at the last decision
     // Its line as last held here: a pool let go for want of room keeps its
     // rank by work, and is not pulled again only to be let go again.
@@ -5297,7 +5311,8 @@ struct GuardEntry
     int nFileRank;
     int64 nFileUntil;
     GuardEntry()
-        : nRank(-1), nUntil(0), fEmpty(false), nPullSince(0), nChoice(GUARD_NOT_DRAWN), fNamed(false), nFileRank(-1),
+        : nRank(-1), nUntil(0), fEmpty(false), nPullSince(0), nPullRetryAt(0), nChoice(GUARD_NOT_DRAWN), fNamed(false),
+          nFileRank(-1),
           nFileUntil(0) {}
 };
 
@@ -6694,6 +6709,19 @@ static void GuardRelease(RegPool* rp)
     RegFree(rp);
 }
 
+// Under cs_p2pool: a guarded pool that is not in memory (read back from
+// pool-guards.dat and never pulled or kept again in this run) leaves the
+// guard: its files go too, unless this node mines or carries the pool.
+// Without this, every restart left the lines it had kept on disk for good.
+static void GuardRemoveFiles(const uint256& id)
+{
+    if (!fRegFiles || id == idMinedReg || std::find(vCarryReg.begin(), vCarryReg.end(), id) != vCarryReg.end())
+        return;
+    const string strBase = RegDir() + "/" + id.GetHex();
+    remove((strBase + ".dat").c_str());
+    remove((strBase + ".part").c_str());
+}
+
 struct GuardLineCtx
 {
     map<uint256, CGuardLine> m;
@@ -6772,6 +6800,8 @@ static void GuardApply(int64 nNow)
             RegPool* rp = RegById(it->first);
             if (rp)
                 GuardRelease(rp);
+            else
+                GuardRemoveFiles(it->first);
             mapGuard.erase(it++);
             fGuardSaveDirty = true;
         }
@@ -6810,6 +6840,7 @@ static void GuardApply(int64 nNow)
         foreach(RegPool* rp, vRegPools)
             if (rp->fGuard && rp->nFetch != FETCH_COMPLETE)
                 nPulls++;
+        const int64 nPullCap = std::min(nGuardMaxPoolBytes, nGuardBudget);
         // Pulls: those a peer announces first, then the rest, at most 4 at
         // once; one nobody announces and nothing came of for 10 minutes is
         // taken as empty.
@@ -6841,18 +6872,53 @@ static void GuardApply(int64 nNow)
                     {
                         if (!ge.nPullSince)
                             ge.nPullSince = nNow;
+                        const int64 nPulled = (int64)rp->state.chain->Bytes();
+                        const int64 nFor = nNow - ge.nPullSince;
                         if (rp->state.chain->Empty() && rp->nFetch == FETCH_IDLE && !GuardAnnouncedLocked(d.poolId) &&
-                            nNow - ge.nPullSince >= GUARD_PULL_WAIT)
+                            nFor >= GUARD_PULL_WAIT)
                         {
                             ge.fEmpty = true;
                             ge.nPullSince = 0;
                             GuardRelease(rp);
                             nPulls--;
                         }
+                        else if (nPulled > nPullCap)
+                        {
+                            // Past what this node keeps of one pool: it is
+                            // not guarded here, so the rest of its line is
+                            // not fetched (a pull held up to the chain's own
+                            // cap, 128 MB, four at once). What was seen of it
+                            // stays known, so it is not pulled again.
+                            ge.line = CGuardLine();
+                            ge.line.fKnown = true;
+                            ge.line.nShares = (unsigned int)rp->state.chain->Size();
+                            ge.line.nBytes = nPulled;
+                            ge.line.bnWork = CBigNum(rp->state.chain->TipLineWork());
+                            ge.nPullSince = 0;
+                            LogPrint("p2pool", "p2pool: registered pool %s: its line passes what this node guards of a "
+                                     "pool (%d MB); not pulled further\n", d.poolId.GetHex().c_str(),
+                                     (int)(nPullCap / (1024 * 1024)));
+                            GuardRelease(rp);
+                            nPulls--;
+                        }
+                        else if (nFor >= GUARD_PULL_LONGEST ||
+                                 (nFor >= GUARD_PULL_STALL && nPulled < nFor * GUARD_PULL_MIN_RATE))
+                        {
+                            // Going nowhere, whoever announces it: the slot
+                            // goes to another pool, and this one waits.
+                            ge.nPullRetryAt = nNow + GUARD_PULL_BACKOFF;
+                            ge.nPullSince = 0;
+                            LogPrint("p2pool", "p2pool: registered pool %s: its pull took %d bytes in %d s; tried again "
+                                     "in %d s\n", d.poolId.GetHex().c_str(), (int)nPulled, (int)nFor,
+                                     (int)GUARD_PULL_BACKOFF);
+                            GuardRelease(rp);
+                            nPulls--;
+                        }
                     }
                     continue;
                 }
-                if (d.nChoice != GUARD_PULL || ge.fEmpty || (rp && rp->fGuard) || nPulls >= GUARD_MAX_PULLS)
+                if (d.nChoice != GUARD_PULL || ge.fEmpty || (rp && rp->fGuard) || nPulls >= GUARD_MAX_PULLS ||
+                    nNow < ge.nPullRetryAt)
                     continue;
                 if (nPass == 1 && !GuardAnnouncedLocked(d.poolId))
                     continue;
@@ -8035,9 +8101,31 @@ void P2PoolTicketAgeForTest(int64 nSecs)
         nTktSavedAt -= nSecs;
         tktBudget.nLast -= nSecs;
         for (map<uint256, GuardEntry>::iterator i = mapGuard.begin(); i != mapGuard.end(); ++i)
+        {
             if (i->second.nPullSince)
                 i->second.nPullSince -= nSecs;
+            if (i->second.nPullRetryAt)
+                i->second.nPullRetryAt -= nSecs;
+        }
     }
+}
+
+void P2PoolRegFilesForTest(bool fFiles)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+        fRegFiles = fFiles;
+}
+
+void P2PoolGuardAgeForTest(int64 nSecs)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+        for (map<uint256, GuardEntry>::iterator i = mapGuard.begin(); i != mapGuard.end(); ++i)
+        {
+            if (i->second.nPullSince)
+                i->second.nPullSince -= nSecs;
+            if (i->second.nPullRetryAt)
+                i->second.nPullRetryAt -= nSecs;
+        }
 }
 
 void P2PoolTicketBudgetForTest(int nTokens)

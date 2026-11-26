@@ -402,6 +402,24 @@ void P2PoolTicketQueuedForTest(CNode* pnode, unsigned int nEpoch, size_t& nRelay
 bool P2PoolTicketSaveForTest();
 size_t P2PoolTicketLoadForTest();
 void P2PoolGuardLimitsForTest(int64 nBudget, int64 nMaxPoolBytes, unsigned int nMaxPools);
+// A guard pull (section 10) holds one of 4 slots. A peer that announces a
+// pool and then serves nothing, or drips it, must not hold a slot for good:
+// that would keep this node from pulling any pool it is drawn for. A pull
+// that averages under GUARD_PULL_MIN_RATE bytes a second once it is
+// GUARD_PULL_STALL old, or that is not complete GUARD_PULL_LONGEST after it
+// began, gives its slot back, and the pool is not pulled again for
+// GUARD_PULL_BACKOFF (a peer announcing it again does not shorten that).
+// A pull past what this node would keep of one pool (the per-pool guard cap,
+// or the budget if smaller) stops there: the pool cannot be guarded here, so
+// the rest of its line is not fetched (section 11).
+static const int64 GUARD_PULL_STALL = 20 * 60;
+static const int64 GUARD_PULL_MIN_RATE = 1000;
+static const int64 GUARD_PULL_LONGEST = 4 * 60 * 60;
+static const int64 GUARD_PULL_BACKOFF = 2 * 60 * 60;
+// Self-tests: the guard clocks (pulls and their backoff) moved back; whether
+// registered pools keep files (pools/<id>.dat and .part).
+void P2PoolGuardAgeForTest(int64 nSecs);
+void P2PoolRegFilesForTest(bool fFiles);
 struct P2PoolGuardEntryInfo
 {
     uint256 id;
