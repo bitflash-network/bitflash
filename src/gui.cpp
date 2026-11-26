@@ -101,6 +101,7 @@ static bool        g_torAutoBridges       = true;
 static char        g_bridgeText[4096]     = {};
 static std::string g_bridgeTextLoaded;
 static std::string g_torActionMsg;
+static bool        g_p2poolChosen         = false;   // Everpool saved a pool for the next start
 
 struct TxRow { std::string date, desc; int64 amount; int depth; uint256 hash; bool fCanSpeedUp; };
 static std::vector<TxRow> g_txRows;
@@ -1038,6 +1039,9 @@ static void DrawOptionsDialog()
             g_bridgeTextLoaded = text;
         }
         g_torActionMsg.clear();
+        int nChoice = P2POOL_CHOICE_OFF;
+        uint256 idChoice = 0;
+        g_p2poolChosen = P2PoolChoiceRead(nChoice, idChoice) && nChoice != P2POOL_CHOICE_OFF;
     }
     wasOpen = true;
 
@@ -1084,10 +1088,7 @@ static void DrawOptionsDialog()
             // P2Pool and operator mode share the stratum and do not go
             // together (-p2pool refuses -operator): while P2Pool runs or is
             // chosen for the next start (Everpool), operator mode waits.
-            int nChoice = P2POOL_CHOICE_OFF;
-            uint256 idChoice = 0;
-            bool fP2PoolWanted = fP2PoolMode ||
-                                 (P2PoolChoiceRead(nChoice, idChoice) && nChoice != P2POOL_CHOICE_OFF);
+            bool fP2PoolWanted = fP2PoolMode || g_p2poolChosen;
             ImGui::BeginDisabled(fP2PoolWanted && nMineMode != MINE_OPERATOR);
             ImGui::RadioButton("Operator -- run a pool for other miners",  &g_mineRadio, MINE_OPERATOR);
             ImGui::EndDisabled();

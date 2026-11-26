@@ -393,6 +393,17 @@ static void AskRefresh()
     std::thread(LoadThread, g_sent).detach();
 }
 
+// The choice saved for the next start, read again with each refresh and
+// after every save (not on every frame).
+static bool g_savedFile = false;
+static int g_savedKind = P2POOL_CHOICE_OFF;
+static uint256 g_savedId = 0;
+
+static void ReadSaved()
+{
+    g_savedFile = P2PoolChoiceRead(g_savedKind, g_savedId);
+}
+
 static void TakeRefresh()
 {
     std::lock_guard<std::mutex> lk(g_lock);
@@ -401,6 +412,7 @@ static void TakeRefresh()
     g_shown = g_result;
     g_haveShown = true;
     g_done = false;
+    ReadSaved();
 }
 
 // ---- "Mine this pool" -------------------------------------------------------
@@ -431,7 +443,9 @@ static bool SameChoice(int nKindA, const uint256& idA, int nKindB, const uint256
 static void SaveChoice(int nKind, const uint256& id)
 {
     std::string err;
-    if (!P2PoolChoiceWrite(nKind, id, err))
+    bool fWritten = P2PoolChoiceWrite(nKind, id, err);
+    ReadSaved();
+    if (!fWritten)
     {
         g_mineMsg = "Not saved: " + err;
         g_mineNeedsRestart = false;
@@ -469,9 +483,9 @@ static void DrawStratumLine()
 static void DrawMiningBox()
 {
     const P2PoolChoiceInfo running = P2PoolChoiceRunning();
-    int nSaved = P2POOL_CHOICE_OFF;
-    uint256 idSaved = 0;
-    bool fSavedFile = P2PoolChoiceRead(nSaved, idSaved);
+    const int nSaved = g_savedKind;
+    const uint256 idSaved = g_savedId;
+    const bool fSavedFile = g_savedFile;
 
     ImGui::SeparatorText("Your P2Pool mining");
     if (fP2PoolMode)
@@ -859,8 +873,11 @@ static void DrawCreateDialog()
 {
     if (!g_showCreate)
         return;
+    // As tall as its content, never taller than the window: the rest scrolls.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowSizeConstraints(ImVec2(600.0f, 0.0f), ImVec2(600.0f, vp->Size.y - 40.0f));
     ImGui::SetNextWindowSize(ImVec2(600.0f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Create an Everpool pool", &g_showCreate, ImGuiWindowFlags_NoCollapse))
     {
         if (!PoolBurnsOpen())
@@ -1089,9 +1106,9 @@ static void DrawDetail(const EvRow& r)
     ImGui::Spacing();
     int nKind = r.fZero ? P2POOL_CHOICE_ZERO : P2POOL_CHOICE_REGISTERED;
     uint256 id = r.fZero ? uint256(0) : r.id;
-    int nSaved = P2POOL_CHOICE_OFF;
-    uint256 idSaved = 0;
-    bool fSaved = P2PoolChoiceRead(nSaved, idSaved);
+    const int nSaved = g_savedKind;
+    const uint256 idSaved = g_savedId;
+    const bool fSaved = g_savedFile;
     bool fRunning = fP2PoolMode && SameChoice(nKind, id, running.nKind, running.id);
     bool fIsSaved = fSaved ? SameChoice(nKind, id, nSaved, idSaved) : fRunning;
     std::string strWhyNot;

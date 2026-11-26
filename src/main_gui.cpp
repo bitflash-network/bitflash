@@ -1943,6 +1943,21 @@ int main(int argc, char* argv[])
     // chain to re-announce our own transactions, and there is no chain to walk.
     printf("btfchat: no peer-to-peer node -- Bitflash nodes over Tor to resolve, onion to talk\n");
 #else
+    // The window's saved pool and a wallet that stores operator mode do not
+    // go together (the window refuses to save one while the other is set, but
+    // a wallet can be copied): operator mode, the explicit choice in Options,
+    // wins, and the Everpool screen says why P2Pool is off.
+    {
+        P2PoolChoiceInfo running = P2PoolChoiceRunning();
+        if (fP2PoolMode && !running.fFromCommandLine && nMineMode == MINE_OPERATOR)
+        {
+            fP2PoolMode = false;
+            running.nKind = P2POOL_CHOICE_OFF;
+            running.strProblem = "this wallet runs a pool as operator (Options), and P2Pool does not go with it";
+            P2PoolChoiceSetRunning(running);
+            printf("p2pool-choice: not mined: operator mode is on\n");
+        }
+    }
     ReacceptWalletTransactions();
 
     if (!StartNode(strErrors))
