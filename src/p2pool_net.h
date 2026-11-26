@@ -19,6 +19,7 @@
 #define BITFLASH_P2POOL_NET_H
 
 // Include headers.h first: it has no include guard.
+#include <functional>
 #include "p2pool_chain.h"
 
 // Handles a P2Pool message; false when strCommand is not one. Called from
@@ -286,6 +287,59 @@ struct P2PoolRegStatusInfo
 };
 // A wanted pool's state on this node; false for a pool not wanted here.
 bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out);
+
+// ---- The wallet window's choice of pool (the Everpool screen)
+//
+// Which pool P2Pool mines is fixed at startup: the registered pool mined is
+// wanted before P2PoolInit reads its files, and the stratum starts with the
+// node. So the wallet window does not switch pools in a running node: it
+// writes its choice to GetAppDir()/p2pool-choice and the next start of the
+// window reads it, as if -p2pool or -p2pool=<pool id> had been given. The
+// command line always decides when it says anything about P2Pool (or asks
+// for -operator), and a headless node (-nogui) never reads the file.
+//
+// The file holds one word: "off", "zero" (pool zero, -p2pool alone) or a
+// pool id of 64 hex digits (-p2pool=<pool id>).
+enum
+{
+    P2POOL_CHOICE_OFF = 0,
+    P2POOL_CHOICE_ZERO = 1,
+    P2POOL_CHOICE_REGISTERED = 2,
+    P2POOL_CHOICE_LOCAL = 3,     // -p2pool=local:<name>, the command line only
+};
+// The file's text read as a choice; false when it is none of the three
+// words (a registered id goes through P2PoolParseChoice, so pool zero's own
+// id reads as pool zero).
+bool P2PoolChoiceParse(const string& strText, int& nKindOut, uint256& idOut);
+// The word for a choice (P2POOL_CHOICE_LOCAL has none: empty).
+string P2PoolChoiceFormat(int nKind, const uint256& id);
+string P2PoolChoicePath();
+// No file, or one that does not read: off.
+bool P2PoolChoiceRead(int& nKindOut, uint256& idOut);
+bool P2PoolChoiceWrite(int nKind, const uint256& id, string& errOut);
+// What this run mines, as startup decided it, and from where: for the
+// window to show beside the saved choice. strProblem: why a saved choice
+// was not taken (the node then started without P2Pool).
+struct P2PoolChoiceInfo
+{
+    int nKind;
+    uint256 id;
+    string strLocal;
+    bool fFromCommandLine;
+    string strProblem;
+    P2PoolChoiceInfo() : nKind(P2POOL_CHOICE_OFF), id(0), fFromCommandLine(false) {}
+};
+void P2PoolChoiceSetRunning(const P2PoolChoiceInfo& info);
+P2PoolChoiceInfo P2PoolChoiceRunning();
+
+// The payout window the next share of the mined pool would pay, behind its
+// tip (without that share itself): copied under cs_p2pool, for the window
+// to weigh this wallet's part outside every lock. False with no share yet.
+bool P2PoolMinedWindow(vector<p2pool::WindowShare>& out, uint256& idPoolOut, unsigned int& nFeeBpsOut);
+// The work of a window's shares whose script fnMine says is ours, and of all.
+void P2PoolWindowPart(const vector<p2pool::WindowShare>& window,
+                      const std::function<bool(const vector<unsigned char>&)>& fnMine,
+                      uint64& nMineOut, uint64& nTotalOut);
 
 // Self-tests and fuzz: a registered pool from its record, active, mined or
 // carried (fFiles false: no files); its status set; its fetch state (-1: no

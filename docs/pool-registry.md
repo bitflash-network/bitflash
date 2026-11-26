@@ -702,6 +702,44 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 | `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint, at most 32 of them; the answer carries the index's state and a note that names are not unique (section 12) |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
 
+### In the wallet window
+
+The window's **Everpool** screen (menu bar, or the button beside Backup
+Wallet; `src/gui_everpool.cpp`) shows the same registry without the command
+line, and runs nothing until it is opened:
+
+- The pool list: pool zero first, marked as the default pool, then every
+  recorded pool in `poollist`'s order, each by name *and* fingerprint (the
+  full id on hover, copied with a right click), its age, its fee, its status
+  (pending with its confirmations, active), the blocks naming it in the last
+  720 and, for a pool whose line this node holds, a hashrate estimated from
+  that line's work, and whether this node mines, carries or guards it. Pools
+  named alike are flagged. A pool sent from the window shows as "sent,
+  waiting for a block" until its burn is mined.
+- A pool's details: its rules, fee and fee address, the block that recorded
+  it, the blocks that named it lately, this node's line (complete, fetching,
+  let go) and, for the pool mined, this wallet's part of its current window.
+- **Mine this pool.** Which pool a node mines is fixed when it starts (the
+  pool is wanted before its files are read, and the stratum starts with the
+  node), so the window does not switch a running node. It writes its choice
+  to `p2pool-choice` in the data directory (`off`, `zero` or a pool id) and
+  offers to restart; the next start of the window reads it as if `-p2pool` or
+  `-p2pool=<poolid>` had been given. The command line decides whenever it
+  says anything about P2Pool or asks for `-operator`, a headless node never
+  reads the file, and a saved pool that cannot be mined (mainnet closed, a
+  ninth pool) never stops the window from starting: it starts without P2Pool
+  and the screen says why. Operator mode and P2Pool exclude each other in the
+  window as on the command line. The stratum address to give the Bitflash
+  Miner or XMRig is shown with a copy button.
+- **Create a pool.** The form's fields are `poolcreate everpool`'s
+  parameters, handed to the same code (`EverpoolCreate` in `jsonrpc.cpp`
+  calls `CreateEverpool`): the same defaults, checks and errors, recomputed as
+  the fields change. The review shows the id and fingerprint, the fee and fee
+  address, the 1 BTF burn, the 30 confirmations, and that a pool can never be
+  edited or deleted; sending needs a tick and a press, and a locked wallet is
+  refused as the Send dialog refuses it. Where `PoolBurnsOpen()` is false the
+  form is a preview only.
+
 ## 10. Rotating replication: guardians
 
 The registry makes a pool permanent; the share chain still has to live

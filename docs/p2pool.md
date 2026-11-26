@@ -182,6 +182,10 @@ share's validity depend on what else a node holds.
   point at the miner's own node: `127.0.0.1:3333`.
 - No pool onion, no pool directory, no operator fee. The stratum is not part
   of the P2P network: miners reach it directly, never over Tor.
+- Without the command line: the wallet window's **Everpool** screen turns
+  P2Pool on (pool zero or an Everpool pool), shows the stratum address to
+  copy, and turns it off again; the choice takes effect when the window
+  restarts (docs/pool-registry.md, section 9, *In the wallet window*).
 
 Options:
 
