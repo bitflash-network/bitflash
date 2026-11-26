@@ -151,8 +151,12 @@ function Create-Pool {
     Write-Host ''
     Write-Host 'Creating a pool burns 1 BTF and records it on the chain for good. It can never'
     Write-Host 'be edited or deleted: changing anything makes a different pool.'
-    $name = Read-Host 'Name (letters, digits, spaces)'
+    $name = Read-Host 'Name (1 to 32 letters, digits, - or _; no spaces)'
     if (-not $name) { return }
+    if ($name -cnotmatch '^[A-Za-z0-9_-]{1,32}$') {
+        Write-Host 'A pool name is 1 to 32 of A-Z, a-z, 0-9, - and _ (no spaces or accents).'
+        return
+    }
     $fee = Read-Host 'Fee for you, the creator, in percent (0 to 3, Enter for 0)'
     $rec = @{ name = $name }
     if ($fee) {

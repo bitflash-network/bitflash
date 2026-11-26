@@ -51,8 +51,8 @@ curl -s -u USER:PASS -d '{"id":1,"method":"poollist","params":[]}' http://127.0.
 curl -s -u USER:PASS -d '{"id":1,"method":"poolinfo","params":["POOL_ID"]}' http://127.0.0.1:8432/
 
 # review a new pool (sends nothing), then create it (burns 1 BTF)
-curl -s -u USER:PASS -d '{"id":1,"method":"poolcreate","params":["everpool",{"name":"my pool","feebps":100,"feeaddress":"YOUR_ADDRESS"}]}' http://127.0.0.1:8432/
-curl -s -u USER:PASS -d '{"id":1,"method":"poolcreate","params":["everpool",{"name":"my pool","feebps":100,"feeaddress":"YOUR_ADDRESS"},"send"]}' http://127.0.0.1:8432/
+curl -s -u USER:PASS -d '{"id":1,"method":"poolcreate","params":["everpool",{"name":"my-pool","feebps":100,"feeaddress":"YOUR_ADDRESS"}]}' http://127.0.0.1:8432/
+curl -s -u USER:PASS -d '{"id":1,"method":"poolcreate","params":["everpool",{"name":"my-pool","feebps":100,"feeaddress":"YOUR_ADDRESS"},"send"]}' http://127.0.0.1:8432/
 ```
 
 `feebps` is the creator's fee in hundredths of a percent (100 is 1%, at most
