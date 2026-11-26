@@ -423,7 +423,11 @@ static std::vector<Net> MakeNets()
     n.coin = "btc"; n.label = "Bitcoin"; n.timespan = 1209600; n.spacing = 600; n.filters = true;
     n.services = 64; n.blockInv = 0x40000002; n.agent = "/Bitflash:btc-light/";
     n.name = "main"; n.magic = 0xd9b4bef9; n.port = 8333;
-    n.seeds = {"x49.seed.bitcoin.sprovoost.nl", "x49.dnsseed.emzy.de", "x49.seed.mainnet.achownodes.xyz"};
+    // A Tor exit often fails to resolve a seed's name (SOCKS reply 4) while
+    // the peers behind it answer: ten that answered over Tor on 2026-11-26.
+    n.seeds = {"x49.seed.bitcoin.sprovoost.nl", "x49.dnsseed.emzy.de", "x49.seed.mainnet.achownodes.xyz",
+               "77.22.35.172:8333", "217.46.70.21:8333", "195.192.48.251:8333", "151.115.89.14:8333", "79.134.103.198:8333",
+               "24.64.49.26:8333", "216.73.124.26:8333", "148.52.207.4:8333", "23.95.114.106:8333", "95.215.96.198:8333"};
     n.pkhVersion = 0; n.shVersion = 5; n.shVersion2 = 5; n.hrp = "bc"; n.limitBits = 0x1d00ffff;
     // assumevalid block 938343
     n.minimumWork = "0000000000000000000000000000000000000001128750f82f4c366153a3a030";
@@ -452,8 +456,12 @@ static std::vector<Net> MakeNets()
     // and asked for MSG_BLOCK it sends them without MWEB data (net_processing.cpp).
     l.filters = false; l.services = 1; l.blockInv = 2; l.agent = "/Bitflash:ltc-light/";
     l.name = "main"; l.magic = 0xdbb6c0fb; l.port = 9333;
+    // Over Tor these names often do not resolve: twelve peers that answered on 2026-11-26.
     l.seeds = {"seed-a.litecoin.loshan.co.uk", "dnsseed.thrasher.io", "dnsseed.litecointools.com",
-               "dnsseed.litecoinpool.org", "dnsseed.koin-project.com"};
+               "dnsseed.litecoinpool.org", "dnsseed.koin-project.com",
+               "82.148.252.205:9333", "111.108.29.123:9333", "51.89.41.222:9333", "185.186.77.147:9333", "178.32.153.231:9333",
+               "204.186.122.245:9333", "135.181.116.224:9333", "5.9.177.158:9333", "176.9.150.253:9333", "169.58.33.141:9333",
+               "94.156.250.162:9333", "34.173.138.238:9333"};
     l.pkhVersion = 48; l.shVersion = 50; l.shVersion2 = 5; l.hrp = "ltc"; l.limitBits = 0x1e0fffff;
     l.genesis = GenesisHeader(1, ltcMerkle, 1317972665, 0x1e0ffff0, 2084524493);
     l.anchorHeight = 3203424; l.anchor.assign(LTC_MAIN_ANCHOR, LTC_MAIN_ANCHOR + sizeof(LTC_MAIN_ANCHOR)/sizeof(LTC_MAIN_ANCHOR[0]));
@@ -478,7 +486,13 @@ static std::vector<Net> MakeNets()
     // No BIP157; a block is up to 1 MB, but a headers message of AuxPoWs is more.
     d.filters = false; d.services = 1; d.blockInv = 2; d.agent = "/Bitflash:doge-light/"; d.maxBlock = 32000000;
     d.name = "main"; d.magic = 0xc0c0c0c0; d.port = 22556; d.strictChainId = true;
-    d.seeds = {"seed.multidoge.org", "seed2.multidoge.org"};
+    // These two names were all it had: over Tor neither resolved, and on
+    // 2026-11-26 a mainnet swap's wallets could not see a paid contract until
+    // peers were given by hand. Twelve that answered over Tor that day.
+    d.seeds = {"seed.multidoge.org", "seed2.multidoge.org",
+               "51.68.25.30:22556", "157.90.211.32:22556", "159.203.65.214:22556", "135.125.67.241:22556",
+               "135.125.119.142:22556", "63.143.39.34:22556", "116.202.164.103:22556", "51.91.196.151:22556",
+               "135.181.141.137:22556", "65.108.131.152:22556", "84.32.186.163:22556", "161.97.146.8:22556"};
     d.pkhVersion = 30; d.shVersion = 22; d.shVersion2 = 22;
     d.genesis = GenesisHeader(1, dogeMerkle, 1386325540, 0x1e0ffff0, 99943);
     d.anchorHeight = DOGE_MAIN_ANCHOR_HEIGHT; d.anchor.assign(DOGE_MAIN_ANCHOR, DOGE_MAIN_ANCHOR + sizeof(DOGE_MAIN_ANCHOR)/sizeof(DOGE_MAIN_ANCHOR[0]));
@@ -506,10 +520,14 @@ static std::vector<Net> MakeNets()
     // seconds a block there are many, most of them a few hundred bytes.
     g.filters = false; g.services = 1; g.blockInv = 2; g.agent = "/Bitflash:dgb-light/"; g.scanBatch = 200;
     g.name = "main"; g.magic = 0xdab6c3fa; g.port = 12024; g.pkhVersion = 30; g.shVersion = 63; g.shVersion2 = 5; g.hrp = "dgb";
-    // Over Tor these names often do not resolve: nine peers that answered on 2026-11-06.
+    // Over Tor these names often do not resolve: nine peers that answered on
+    // 2026-11-06, and eleven more that answered on 2026-11-26.
     g.seeds = {"seed.digibyte.io", "seed.diginode.tools", "seed.digibyte.link", "seed.aroundtheblock.app", "seed.tuyul.cc",
                "23.252.125.42:12024", "24.116.234.41:12024", "32.220.187.168:12024", "35.132.227.95:12024", "35.87.253.194:12024",
-               "45.229.196.41:12024", "47.243.23.126:12024", "51.159.211.131:12024", "64.182.71.16:12024"};
+               "45.229.196.41:12024", "47.243.23.126:12024", "51.159.211.131:12024", "64.182.71.16:12024",
+               "75.119.148.100:12024", "88.116.245.118:12024", "81.102.59.146:12024", "162.141.142.246:12024",
+               "101.103.9.144:12024", "169.58.72.240:12024", "95.111.238.51:12024", "77.8.160.197:12024",
+               "47.75.194.174:12024", "144.126.224.248:12024", "85.239.234.52:12024"};
     g.anchorHeight = DGB_MAIN_ANCHOR_HEIGHT; g.anchor.assign(DGB_MAIN_ANCHOR, DGB_MAIN_ANCHOR + sizeof(DGB_MAIN_ANCHOR)/sizeof(DGB_MAIN_ANCHOR[0]));
     v.push_back(g);
     g.name = "test"; g.magic = 0xe7b9c6fe; g.port = 12033; g.pkhVersion = 126; g.shVersion = 140; g.shVersion2 = 140; g.hrp = "dgbt";
@@ -527,8 +545,11 @@ static std::vector<Net> MakeNets()
     r.filters = false; r.services = 1; r.blockInv = 2; r.agent = "/Bitflash:rvn-light/";
     r.name = "main"; r.magic = 0x4e564152; r.port = 8767; r.pkhVersion = 60; r.shVersion = 122; r.shVersion2 = 122;
     r.kawpow = true; r.headerSize = 120; r.limitBits = 0x1e00ffff;
-    // Over Tor these names often do not resolve: two peers that answered on 2026-11-06.
-    r.seeds = {"seed-raven.bitactivate.com", "seed-raven.ravencoin.com", "seed-raven.ravencoin.org", "142.93.153.10:8767", "143.198.227.50:8767"};
+    // Over Tor these names often do not resolve: two peers that answered on
+    // 2026-11-06, and three more on 2026-11-26. Of the 96 addresses the seeds
+    // gave that day only these five answered over Tor; the rest timed out.
+    r.seeds = {"seed-raven.bitactivate.com", "seed-raven.ravencoin.com", "seed-raven.ravencoin.org", "142.93.153.10:8767", "143.198.227.50:8767",
+               "139.59.130.42:8767", "165.232.147.4:8767", "104.248.197.234:8767"};
     r.anchorHeight = RVN_MAIN_ANCHOR_HEIGHT; r.anchor.assign(RVN_MAIN_ANCHOR, RVN_MAIN_ANCHOR + sizeof(RVN_MAIN_ANCHOR)/sizeof(RVN_MAIN_ANCHOR[0]));
     r.maxReorg = 60;
     v.push_back(r);
@@ -547,8 +568,14 @@ static std::vector<Net> MakeNets()
     // blocks, whose limit is 32 MB and adapts upward (ABLA).
     c.filters = false; c.services = 1; c.blockInv = 2; c.agent = "/Bitflash:bch-light/"; c.maxBlock = 256000000;
     c.name = "main"; c.magic = 0xe8f3e1e3; c.port = 8333;
+    // Over Tor these names often do not resolve, and with no peer saved yet a
+    // new wallet stalled for good: ten Bitcoin Cash Node peers that answered
+    // over Tor on 2026-11-26 (eCash shares the magic and port; these are not
+    // eCash nodes, checked by their user agent).
     c.seeds = {"seed.flowee.cash", "seed-bch.bitcoinforks.org", "btccash-seeder.bitcoinunlimited.info", "seed.bchd.cash",
-               "seed.bch.loping.net", "bchseed.c3-soft.com", "bch.bitjson.com"};
+               "seed.bch.loping.net", "bchseed.c3-soft.com", "bch.bitjson.com",
+               "47.238.182.90:8333", "108.171.203.178:8333", "52.213.7.152:8333", "3.142.98.179:8333", "35.214.5.128:8333",
+               "164.90.247.43:8333", "40.74.66.219:8333", "38.242.156.122:8333", "97.78.222.142:8333", "74.194.195.4:8333"};
     c.pkhVersion = 0; c.shVersion = 5; c.shVersion2 = 5;
     c.asertHeight = 661647; c.asertBits = 0x1804dafe; c.asertParentTime = 1605447844; c.asertHalfLife = 172800;
     c.genesis = GenesisHeader(1, btcMerkle, 1231006505, 0x1d00ffff, 2083236893);
@@ -572,7 +599,12 @@ static std::vector<Net> MakeNets()
     x.cashPrefix = "ecash"; x.forkId = true;
     x.filters = false; x.services = 1; x.blockInv = 2; x.agent = "/Bitflash:xec-light/"; x.maxBlock = 256000000;
     x.name = "main"; x.magic = 0xe8f3e1e3; x.port = 8333;
-    x.seeds = {"seed.bitcoinabc.org", "seeder.fabien.cash", "seeder.status.cash"};
+    // Over Tor these names often do not resolve: eleven Bitcoin ABC peers that
+    // answered over Tor on 2026-11-26 (checked by user agent, not BCH nodes).
+    x.seeds = {"seed.bitcoinabc.org", "seeder.fabien.cash", "seeder.status.cash",
+               "46.242.56.75:8333", "51.159.5.210:8333", "172.93.221.151:8333", "91.176.220.19:8333", "45.67.221.234:8333",
+               "62.171.183.65:8333", "207.244.228.122:8333", "91.134.92.123:8333", "85.190.254.126:8333", "13.140.179.153:8333",
+               "84.247.187.110:8333"};
     x.pkhVersion = 0; x.shVersion = 5; x.shVersion2 = 5;
     // Bitcoin ABC reads the anchor from the chain at axionHeight, the last
     // block before eCash and Bitcoin Cash split, and its half-life is two
