@@ -724,6 +724,9 @@ public:
 
 extern bool fClient;
 extern uint64 nLocalServices;
+// The services this node says in its version message: nLocalServices, less
+// NODE_POOLREG where registered pools are closed (PoolBurnsOpen, net.cpp).
+uint64 LocalServicesNow();
 extern CAddress addrLocalHost;
 extern unsigned short nListenPort;
 extern CNode* pnodeLocalHost;
@@ -1043,7 +1046,7 @@ public:
         // nBestHeight goes last so a node that predates it stops reading after
         // addr and treats the rest as trailing bytes, which cost it a log line
         // and nothing else.
-        PushMessage("version", VERSION, nLocalServices, nTime, addr, nBestHeight,
+        PushMessage("version", VERSION, LocalServicesNow(), nTime, addr, nBestHeight,
                     std::string(BITFLASH_VERSION_STRING));
     }
 

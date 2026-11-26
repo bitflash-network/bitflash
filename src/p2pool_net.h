@@ -283,6 +283,7 @@ struct P2PoolRegStatusInfo
     uint256 work;           // the tip line's work over the last window
     size_t nAnnouncers;     // peers whose latest poolinv names it
     size_t nServes;         // paced serves of it in flight
+    bool fOverCap;          // mined or carried, let go: its line passed what this node holds of a pool
 };
 // A wanted pool's state on this node; false for a pool not wanted here.
 bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out);
@@ -310,6 +311,22 @@ bool P2PoolRegReloadForTest(const uint256& id, bool fForceActive = true);
 void P2PoolRegIndexForTest(bool fReady, const vector<std::pair<uint256, int> >& vStatus);
 void P2PoolRegUseNodeIndexForTest();
 void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n);
+// Self-tests: a registered pool's byte cap made smaller (its chain's
+// SetMaxBytesForTest), so a line past what a carried pool may hold is seen
+// without hundreds of megabytes of shares.
+void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n);
+// Self-tests: the rate the lines of registered pools are written at made
+// nRate bytes a second (0: the default, 64 KB/s), and the seconds between
+// two writes of a pool's line then (id 0: pool zero; -1: no such pool); the
+// bytes of every complete registered line this node holds.
+int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate);
+// Self-tests: the newest anchor of a pool, as the index would give it (the
+// share data hash it names and its block's time), from now on in this
+// process; and whether the line that ended the pool's fetch lacked it and
+// other announcers were asked (section 10, reviving a dormant pool).
+void P2PoolRegAnchorForTest(const uint256& id, const uint256& hashShareData, int64 nBlockTime);
+bool P2PoolRegAnchorMissingForTest(const uint256& id);
+uint64 P2PoolRegSavedBytesForTest();
 
 // ---- Guardians (docs/pool-registry.md, sections 10 to 12)
 //
@@ -402,6 +419,24 @@ void P2PoolTicketQueuedForTest(CNode* pnode, unsigned int nEpoch, size_t& nRelay
 bool P2PoolTicketSaveForTest();
 size_t P2PoolTicketLoadForTest();
 void P2PoolGuardLimitsForTest(int64 nBudget, int64 nMaxPoolBytes, unsigned int nMaxPools);
+// A guard pull (section 10) holds one of 4 slots. A peer that announces a
+// pool and then serves nothing, or drips it, must not hold a slot for good:
+// that would keep this node from pulling any pool it is drawn for. A pull
+// that averages under GUARD_PULL_MIN_RATE bytes a second once it is
+// GUARD_PULL_STALL old, or that is not complete GUARD_PULL_LONGEST after it
+// began, gives its slot back, and the pool is not pulled again for
+// GUARD_PULL_BACKOFF (a peer announcing it again does not shorten that).
+// A pull past what this node would keep of one pool (the per-pool guard cap,
+// or the budget if smaller) stops there: the pool cannot be guarded here, so
+// the rest of its line is not fetched (section 11).
+static const int64 GUARD_PULL_STALL = 20 * 60;
+static const int64 GUARD_PULL_MIN_RATE = 1000;
+static const int64 GUARD_PULL_LONGEST = 4 * 60 * 60;
+static const int64 GUARD_PULL_BACKOFF = 2 * 60 * 60;
+// Self-tests: the guard clocks (pulls and their backoff) moved back; whether
+// registered pools keep files (pools/<id>.dat and .part).
+void P2PoolGuardAgeForTest(int64 nSecs);
+void P2PoolRegFilesForTest(bool fFiles);
 struct P2PoolGuardEntryInfo
 {
     uint256 id;

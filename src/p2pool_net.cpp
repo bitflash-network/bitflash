@@ -535,6 +535,8 @@ static RegPool* RegOf(PoolState& ps);
 static uint256 RegZeroId();
 static const vector<unsigned char>* RegRecordOf(PoolState& ps);
 static bool RegSaveAllowed(PoolState& ps);
+// Under cs_p2pool: seconds between two writes of a pool's line to its file.
+static int64 RegSaveIntervalLocked(PoolState& ps);
 // Under cs_p2pool: whether a registered pool's p2xsync to this peer stays
 // within what the peer answers (3 per pool, 8 in all, an interval), and the
 // count of one sent. True, and nothing counted, for any other pool.
@@ -933,7 +935,7 @@ static bool MaybeSaveShares(PoolState& ps, bool fNow = false)
     bool fReg = false;
     CRITICAL_BLOCK(cs_p2pool)
     {
-        if (!fNow && GetTime() - ps.nLastSave < 120)
+        if (!fNow && GetTime() - ps.nLastSave < RegSaveIntervalLocked(ps))
             return false;
         // A registered pool's line goes to pools/<id>.dat only once it is
         // complete; a fetch in progress has its own file (section 17).
@@ -3982,6 +3984,16 @@ struct RegPool
     // Since when the pool is active and wanted here (0: it is not).
     int64 nWantedSince;
     int64 nWhoAt;                   // when peers were last asked poolwho for it
+    // A mined or -poolcarry pool whose line passed what this node holds of
+    // a pool (RegOverCap): let go, and neither fetched, carried nor mined
+    // again in this run.
+    bool fOverCap;
+    // The share data hash of the pool's newest anchor, when the line taken
+    // at the end of a fetch did not hold it (section 10, reviving a dormant
+    // pool, step 2): other announcers were asked for their lines, and the
+    // outcome is logged once at nAnchorRecheckAt.
+    uint256 hashAnchorMissing;
+    int64 nAnchorRecheckAt;
     // Carriers a peer named in answer to this node's poolwho (poolat), each
     // with when it was named: dialled with the guardians for POOLAT_HINT_TTL
     // (P2PoolGuardDialList), whether or not the line has started here since,
@@ -3993,7 +4005,8 @@ struct RegPool
         : id(idIn), rec(recIn), record(recordIn), state(&classReg, chainIn, strFileIn), strPart(strPartIn),
           fMined(false), fCarry(false), fGuard(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
           pFetchPeer(NULL), nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
-          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0) {}
+          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0), fOverCap(false),
+          hashAnchorMissing(0), nAnchorRecheckAt(0) {}
 };
 
 // A guardian ticket waiting for the ticket budget (section 10): checked
@@ -4217,10 +4230,26 @@ static bool RegLive(const RegPool& rp)
     return RegOpen() && rp.nStatus == POOL_ACTIVE;
 }
 
-// Wanted and live: a fetch runs, answers to it are taken.
+// Wanted and live: a fetch runs, answers to it are taken. Not a pool let go
+// for passing what this node holds of one (RegOverCap).
 static bool RegActive(const RegPool& rp)
 {
-    return RegWanted(rp) && RegLive(rp);
+    return !rp.fOverCap && RegWanted(rp) && RegLive(rp);
+}
+
+// What a mined or -poolcarry registered pool may hold here before it is let
+// go: its byte cap and half again. ShareChain::ByteCap lets a chain grow to
+// what its tip's line and the uncles it names hold plus half the cap, since
+// a template's window needs them all and none is ever evicted; for pool zero
+// that rise takes most of the network's hashrate. A registered pool's creator
+// alone at the floor fills a window of 2160 with shares paying 6480 addresses
+// each (about 220 KB a share) in about an hour of one machine, and its line
+// would reach about 2 GB on every node that mines or carries it. Past this
+// the line is not one this node can keep within section 11's caps.
+static uint64 RegCarryMaxBytes(const RegPool& rp)
+{
+    const uint64 nCap = (uint64)rp.state.chain->MaxBytes();
+    return nCap + nCap / 2;
 }
 
 // Carried: its shares taken, relayed and served, its line mined on.
@@ -4239,6 +4268,29 @@ static bool RegSaveAllowed(PoolState& ps)
 {
     RegPool* rp = RegOf(ps);
     return !rp || rp->nFetch == FETCH_COMPLETE;
+}
+
+// Each save writes a pool's whole line again (and copies it under
+// cs_p2pool first). Pool zero and local pools: every 120 s at most, as in
+// 1.2.34. Registered pools: every 120 s, or slower so that all the lines of
+// registered pools this node keeps are written at REG_SAVE_RATE on average,
+// whatever their number: a guardian keeps up to 128 MB of other people's
+// lines by default, and a pool kept near its 64 MB cap with a share every 20
+// seconds had every guardian write 64 MB every two minutes (about 46 GB a
+// day for one pool). At 64 KB/s, the default guard budget is written about
+// every 34 minutes. A line not yet written is caught up from peers after a
+// restart (a share far ahead of the tip asks for the line).
+static const int64 REG_SAVE_RATE = 64 * 1024;
+static int64 nRegSaveRate = REG_SAVE_RATE;      // self-tests may lower it
+static int64 RegSaveIntervalLocked(PoolState& ps)
+{
+    if (!RegOf(ps))
+        return 120;
+    uint64 nAll = 0;
+    foreach(RegPool* rp, vRegPools)
+        if (rp->nFetch == FETCH_COMPLETE)
+            nAll += (uint64)rp->state.chain->Bytes();
+    return std::max((int64)120, (int64)(nAll / (uint64)std::max((int64)1, nRegSaveRate)));
 }
 
 static bool RegInSessionLocked(PoolState& ps, CNode* pnode)
@@ -4679,6 +4731,8 @@ static void RegDropFetch(RegPool* rp)
     rp->fPartFull = false;
 }
 
+static void RegCheckAnchor(RegPool* rp);
+
 // Not under cs_p2pool: the line is complete. It goes to pools/<id>.dat, the
 // partial file goes, and from now on the pool is announced, served, relayed
 // and mined on.
@@ -4713,6 +4767,7 @@ static void RegComplete(RegPool* rp)
     printf("p2pool: registered pool %s: its line is complete here (%u shares, tip at height %d)%s\n",
            rp->id.GetHex().c_str(), (unsigned)nShares, nTip,
            fSaved ? "" : "; its file could not be written, its partial file is kept");
+    RegCheckAnchor(rp);
 }
 
 static bool RegPartInWindow(PoolState& ps, CNode* pfrom)
@@ -4771,9 +4826,14 @@ static void RegOnPart(PoolState& ps, CNode* pfrom, int nTipHeight, const vector<
         if (rp->pFetchPeer == pfrom)
         {
             rp->nLastPartAt = nNow;
-            if (!fOk)
+            if (!fOk || (nFlag == PART_END && part.empty()))
             {
-                // Scored already; another announcer is asked.
+                // Scored already; another announcer is asked. An empty part
+                // that says the line ends is no answer either (unscored): a
+                // server with nothing of the pool says p2xnone, and a serve
+                // always sends from the resume point less the uncle depth,
+                // so it is never empty. Taken as the end, it completed a
+                // fetch with nothing, or cut a catch-up short.
                 RegConnOf(pfrom).mapNoneAt[rp->id] = nNow;
                 rp->nAskAt = 0;
                 rp->nRetryAt = nNow;
@@ -4907,6 +4967,108 @@ static void RegApplyInvLocked(CNode* pnode, RegConn& c, int64 nNow)
     }
 }
 
+// Section 10, reviving a dormant pool, step 2: the main-chain anchors tell
+// which offered line is the real one. A line that ends a fetch without the
+// share the pool's newest anchor names, though the line reaches back past
+// that block's time, is the sign of a stale or private line: a warning, and
+// every other announcer (up to REG_ANCHOR_ASKS) is asked for its line, which
+// joins the chain beside it. The tip is still chosen by work alone, as for
+// every pool: a tip that rested on which main blocks a node holds split
+// honest nodes for good on testnet (docs/p2pool.md), so the anchor decides
+// what is fetched, never what is valid or which line is mined on. An anchor
+// is a claim anybody may put in a block of their own; a false one costs
+// that block and buys a log line and a few asks.
+static bool RegIndexLookup(const uint256& id, CPoolInfo& out);
+static const size_t REG_ANCHOR_ASKS = 4;
+static const int64 REG_ANCHOR_RECHECK = 10 * 60;
+static bool fRegAnchorForTest = false;
+static map<uint256, std::pair<uint256, int64> > mapRegAnchorForTest;
+
+// Not under cs_p2pool: the share data hash the pool's newest counted anchor
+// names, and the time of the block it is in.
+static bool RegNewestAnchor(const uint256& id, uint256& hashOut, int64& nTimeOut)
+{
+    bool fTest = false;
+    CRITICAL_BLOCK(cs_p2pool)
+        if (fRegAnchorForTest)
+        {
+            fTest = true;
+            map<uint256, std::pair<uint256, int64> >::const_iterator it = mapRegAnchorForTest.find(id);
+            if (it == mapRegAnchorForTest.end())
+                return false;
+            hashOut = it->second.first;
+            nTimeOut = it->second.second;
+        }
+    if (fTest)
+        return true;
+    CPoolInfo info;
+    if (!RegIndexLookup(id, info))
+        return false;
+    for (size_t i = 0; i < info.vRecentAnchors.size(); i++)
+    {
+        const CPoolAnchor& a = info.vRecentAnchors[i];
+        if (a.nDroppedAt != -1 || a.hashShareData == 0)
+            continue;
+        bool fFound = false;
+        CRITICAL_BLOCK(cs_main)
+        {
+            map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(a.hashBlock);
+            if (it != mapBlockIndex.end() && it->second->IsInMainChain())
+            {
+                nTimeOut = (int64)it->second->nTime;
+                fFound = true;
+            }
+        }
+        if (!fFound)
+            return false;
+        hashOut = a.hashShareData;
+        return true;
+    }
+    return false;
+}
+
+// Not under cs_p2pool: a fetch has just completed.
+static void RegCheckAnchor(RegPool* rp)
+{
+    uint256 id;
+    CRITICAL_BLOCK(cs_p2pool)
+        id = rp->id;
+    uint256 hashAnchor = 0;
+    int64 nAnchorTime = 0;
+    if (!RegNewestAnchor(id, hashAnchor, nAnchorTime))
+        return;
+    size_t nAsked = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (rp->nFetch != FETCH_COMPLETE || rp->state.chain->Empty() || rp->state.chain->HasDataHash(hashAnchor))
+            return;
+        // Only a line that reaches back to that block can be expected to
+        // hold it: one whose oldest share is younger was pruned past it.
+        vector<uint256> vIds;
+        vector<int> vHeights;
+        rp->state.chain->HistoryIds(vIds, vHeights);
+        Share sOldest;
+        if (vIds.empty() || !rp->state.chain->GetHeld(vIds[0], sOldest) || (int64)sOldest.nTime > nAnchorTime)
+            return;
+        const int64 nNow = GetTime();
+        rp->hashAnchorMissing = hashAnchor;
+        rp->nAnchorRecheckAt = nNow + REG_ANCHOR_RECHECK;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && nAsked < REG_ANCHOR_ASKS; ++it)
+        {
+            CNode* p = it->first;
+            if (p == rp->pFetchPeer || !RegCanAsk(*rp, p, it->second, nNow) || !HistoryAskAllowed(rp->state, p))
+                continue;
+            RegPeerOf(*rp, p);
+            AskHistory(rp->state, p);
+            nAsked++;
+        }
+    }
+    printf("p2pool: WARNING: registered pool %s: the line taken does not hold the share of the pool's newest anchor "
+           "on the main chain (a block of %s), though it reaches back that far: a peer may have served a stale or "
+           "private line; %u other announcer(s) asked for theirs\n", id.GetHex().c_str(),
+           DateTimeStr(nAnchorTime).c_str(), (unsigned)nAsked);
+}
+
 // Under cs_p2pool, on the message thread: one step of a fetch. True when
 // the line has just become complete (RegComplete is the caller's, outside
 // the lock).
@@ -5010,14 +5172,24 @@ static bool RegFetchStep(RegPool* rp, int64 nNow)
     // not an interval later.
     if (nNow - rp->nWhoAt >= POOLWHO_INTERVAL)
     {
-        size_t nAsked = 0;
-        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && nAsked < POOLWHO_PEERS; ++it)
+        // Four peers from a random start among those that read the registry:
+        // always the first four (by the map's pointer order) would ask the
+        // same peers every time, which may know nothing of the pool, and
+        // never the others.
+        vector<map<CNode*, RegConn>::iterator> vCand;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end(); ++it)
         {
             CNode* p = it->first;
-            if (p->fDisconnect || p->nVersion == 0 || !(p->nServices & NODE_POOLREG))
-                continue;
+            if (!p->fDisconnect && p->nVersion != 0 && (p->nServices & NODE_POOLREG))
+                vCand.push_back(it);
+        }
+        size_t nAsked = 0;
+        const size_t nStart = vCand.empty() ? 0 : (size_t)GetRand(vCand.size());
+        for (size_t i = 0; i < vCand.size() && nAsked < POOLWHO_PEERS; i++)
+        {
+            map<CNode*, RegConn>::iterator it = vCand[(nStart + i) % vCand.size()];
             it->second.mapWhoAsked[rp->id] = nNow;
-            PushReg(p, "poolwho", rp->id);
+            PushReg(it->first, "poolwho", rp->id);
             nAsked++;
         }
         if (nAsked)
@@ -5185,6 +5357,9 @@ static const size_t GUARD_MAX_PULLS = 4;
 // the pool is taken as having no shares (no slot; pulled again when a peer
 // announces it).
 static const int64 GUARD_PULL_WAIT = 10 * 60;
+// GUARD_PULL_STALL, GUARD_PULL_MIN_RATE, GUARD_PULL_LONGEST and
+// GUARD_PULL_BACKOFF (p2pool_net.h): a pull that goes nowhere gives its slot
+// back, whoever announces the pool.
 // .btf addresses of guardians handed to the dialler at once.
 static const size_t GUARD_DIAL_MAX = 16;
 // A tip older than this (or the node in initial block download): no own
@@ -5282,6 +5457,7 @@ struct GuardEntry
     vector<unsigned char> record;
     bool fEmpty;            // pulled, and nobody had a share of it
     int64 nPullSince;       // when its pull began (0: not pulling)
+    int64 nPullRetryAt;     // a pull that went nowhere: not pulled again before this
     int nChoice;            // GuardChoice at the last decision
     // Its line as last held here: a pool let go for want of room keeps its
     // rank by work, and is not pulled again only to be let go again.
@@ -5297,7 +5473,8 @@ struct GuardEntry
     int nFileRank;
     int64 nFileUntil;
     GuardEntry()
-        : nRank(-1), nUntil(0), fEmpty(false), nPullSince(0), nChoice(GUARD_NOT_DRAWN), fNamed(false), nFileRank(-1),
+        : nRank(-1), nUntil(0), fEmpty(false), nPullSince(0), nPullRetryAt(0), nChoice(GUARD_NOT_DRAWN), fNamed(false),
+          nFileRank(-1),
           nFileUntil(0) {}
 };
 
@@ -6694,6 +6871,19 @@ static void GuardRelease(RegPool* rp)
     RegFree(rp);
 }
 
+// Under cs_p2pool: a guarded pool that is not in memory (read back from
+// pool-guards.dat and never pulled or kept again in this run) leaves the
+// guard: its files go too, unless this node mines or carries the pool.
+// Without this, every restart left the lines it had kept on disk for good.
+static void GuardRemoveFiles(const uint256& id)
+{
+    if (!fRegFiles || id == idMinedReg || std::find(vCarryReg.begin(), vCarryReg.end(), id) != vCarryReg.end())
+        return;
+    const string strBase = RegDir() + "/" + id.GetHex();
+    remove((strBase + ".dat").c_str());
+    remove((strBase + ".part").c_str());
+}
+
 struct GuardLineCtx
 {
     map<uint256, CGuardLine> m;
@@ -6772,6 +6962,8 @@ static void GuardApply(int64 nNow)
             RegPool* rp = RegById(it->first);
             if (rp)
                 GuardRelease(rp);
+            else
+                GuardRemoveFiles(it->first);
             mapGuard.erase(it++);
             fGuardSaveDirty = true;
         }
@@ -6810,6 +7002,7 @@ static void GuardApply(int64 nNow)
         foreach(RegPool* rp, vRegPools)
             if (rp->fGuard && rp->nFetch != FETCH_COMPLETE)
                 nPulls++;
+        const int64 nPullCap = std::min(nGuardMaxPoolBytes, nGuardBudget);
         // Pulls: those a peer announces first, then the rest, at most 4 at
         // once; one nobody announces and nothing came of for 10 minutes is
         // taken as empty.
@@ -6841,18 +7034,53 @@ static void GuardApply(int64 nNow)
                     {
                         if (!ge.nPullSince)
                             ge.nPullSince = nNow;
+                        const int64 nPulled = (int64)rp->state.chain->Bytes();
+                        const int64 nFor = nNow - ge.nPullSince;
                         if (rp->state.chain->Empty() && rp->nFetch == FETCH_IDLE && !GuardAnnouncedLocked(d.poolId) &&
-                            nNow - ge.nPullSince >= GUARD_PULL_WAIT)
+                            nFor >= GUARD_PULL_WAIT)
                         {
                             ge.fEmpty = true;
                             ge.nPullSince = 0;
                             GuardRelease(rp);
                             nPulls--;
                         }
+                        else if (nPulled > nPullCap)
+                        {
+                            // Past what this node keeps of one pool: it is
+                            // not guarded here, so the rest of its line is
+                            // not fetched (a pull held up to the chain's own
+                            // cap, 128 MB, four at once). What was seen of it
+                            // stays known, so it is not pulled again.
+                            ge.line = CGuardLine();
+                            ge.line.fKnown = true;
+                            ge.line.nShares = (unsigned int)rp->state.chain->Size();
+                            ge.line.nBytes = nPulled;
+                            ge.line.bnWork = CBigNum(rp->state.chain->TipLineWork());
+                            ge.nPullSince = 0;
+                            LogPrint("p2pool", "p2pool: registered pool %s: its line passes what this node guards of a "
+                                     "pool (%d MB); not pulled further\n", d.poolId.GetHex().c_str(),
+                                     (int)(nPullCap / (1024 * 1024)));
+                            GuardRelease(rp);
+                            nPulls--;
+                        }
+                        else if (nFor >= GUARD_PULL_LONGEST ||
+                                 (nFor >= GUARD_PULL_STALL && nPulled < nFor * GUARD_PULL_MIN_RATE))
+                        {
+                            // Going nowhere, whoever announces it: the slot
+                            // goes to another pool, and this one waits.
+                            ge.nPullRetryAt = nNow + GUARD_PULL_BACKOFF;
+                            ge.nPullSince = 0;
+                            LogPrint("p2pool", "p2pool: registered pool %s: its pull took %d bytes in %d s; tried again "
+                                     "in %d s\n", d.poolId.GetHex().c_str(), (int)nPulled, (int)nFor,
+                                     (int)GUARD_PULL_BACKOFF);
+                            GuardRelease(rp);
+                            nPulls--;
+                        }
                     }
                     continue;
                 }
-                if (d.nChoice != GUARD_PULL || ge.fEmpty || (rp && rp->fGuard) || nPulls >= GUARD_MAX_PULLS)
+                if (d.nChoice != GUARD_PULL || ge.fEmpty || (rp && rp->fGuard) || nPulls >= GUARD_MAX_PULLS ||
+                    nNow < ge.nPullRetryAt)
                     continue;
                 if (nPass == 1 && !GuardAnnouncedLocked(d.poolId))
                     continue;
@@ -6923,8 +7151,23 @@ static void RegTick()
     {
         foreach(RegPool* rp, vRegPools)
         {
-            if (!RegWanted(*rp))
+            if (!RegWanted(*rp) || rp->fOverCap)
                 continue;
+            if ((rp->fMined || rp->fCarry) && (uint64)rp->state.chain->Bytes() > RegCarryMaxBytes(*rp))
+            {
+                // Its line passed what this node holds of a pool: let go,
+                // memory and files, and not fetched, carried or mined again
+                // in this run (a guarded pool is bounded by the guard budget
+                // instead, GuardApply).
+                printf("p2pool: registered pool %s: its share chain holds %u MB, past the %u MB this node holds of a "
+                       "pool; it is no longer carried or mined here (until a restart)\n", rp->id.GetHex().c_str(),
+                       (unsigned)(rp->state.chain->Bytes() / 1000000), (unsigned)(RegCarryMaxBytes(*rp) / 1000000));
+                rp->fOverCap = true;
+                RegDropFetch(rp);
+                if (fRegFiles && !rp->state.strFile.empty())
+                    remove(rp->state.strFile.c_str());
+                continue;
+            }
             if (!RegLive(*rp))
             {
                 // Not carried, not mined, not announced; a complete line
@@ -6941,6 +7184,17 @@ static void RegTick()
             }
             if (!rp->nWantedSince)
                 rp->nWantedSince = nNow;
+            if (rp->hashAnchorMissing != 0 && nNow >= rp->nAnchorRecheckAt)
+            {
+                // What the other announcers' lines brought (RegCheckAnchor).
+                if (rp->state.chain->HasDataHash(rp->hashAnchorMissing))
+                    printf("p2pool: registered pool %s: its chain now holds the share of its newest anchor\n",
+                           rp->id.GetHex().c_str());
+                else
+                    printf("p2pool: WARNING: registered pool %s: still no line here holds the share of its newest "
+                           "anchor; the tip stays the one with the most work\n", rp->id.GetHex().c_str());
+                rp->hashAnchorMissing = 0;
+            }
             if (rp->nFetch == FETCH_COMPLETE)
                 continue;
             if (rp->nFetch == FETCH_RUNNING && rp->nLastNewShare && nNow - rp->nLastNewShare > REG_PART_EXPIRY)
@@ -7488,6 +7742,12 @@ bool P2PoolMinedReady(string& whyOut)
             whyOut = "the pool this node mines is not recorded on the chain this node follows";
             f = false;
         }
+        else if (rp->fOverCap)
+        {
+            whyOut = "the share chain of the pool this node mines grew past what this node holds of a pool "
+                     "(its shares pay so many addresses that its line passes 192 MB); it is not mined here";
+            f = false;
+        }
         else if (rp->nFetch != FETCH_COMPLETE)
         {
             whyOut = "waiting for the share chain of the pool this node mines from peers";
@@ -7524,6 +7784,7 @@ bool P2PoolRegStatus(const uint256& id, P2PoolRegStatusInfo& out)
             foreach(const RegServe& r, lRegServes)
                 if (r.pool == &rp->state)
                     out.nServes++;
+            out.fOverCap = rp->fOverCap;
             f = true;
         }
     }
@@ -7607,6 +7868,58 @@ void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n)
     }
 }
 
+void P2PoolRegAnchorForTest(const uint256& id, const uint256& hashShareData, int64 nBlockTime)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fRegAnchorForTest = true;
+        mapRegAnchorForTest[id] = std::make_pair(hashShareData, nBlockTime);
+    }
+}
+
+bool P2PoolRegAnchorMissingForTest(const uint256& id)
+{
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+        if (RegPool* rp = RegById(id))
+            f = rp->hashAnchorMissing != 0;
+    return f;
+}
+
+int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate)
+{
+    int64 n = -1;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        nRegSaveRate = nRate > 0 ? nRate : REG_SAVE_RATE;
+        if (id == 0)
+            n = RegSaveIntervalLocked(PoolZero());
+        else if (RegPool* rp = RegById(id))
+            n = RegSaveIntervalLocked(rp->state);
+    }
+    return n;
+}
+
+uint64 P2PoolRegSavedBytesForTest()
+{
+    uint64 n = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+        foreach(RegPool* rp, vRegPools)
+            if (rp->nFetch == FETCH_COMPLETE)
+                n += (uint64)rp->state.chain->Bytes();
+    return n;
+}
+
+void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        RegPool* rp = RegById(id);
+        if (rp)
+            rp->state.chain->SetMaxBytesForTest(n);
+    }
+}
+
 int P2PoolRegFetchForTest(const uint256& id)
 {
     int n = -1;
@@ -7639,6 +7952,7 @@ void P2PoolRegAgeForTest(int64 nSecs)
             if (rp->nLastNewShare) rp->nLastNewShare -= nSecs;
             if (rp->nWantedSince) rp->nWantedSince -= nSecs;
             if (rp->nWhoAt) rp->nWhoAt -= nSecs;
+            if (rp->nAnchorRecheckAt) rp->nAnchorRecheckAt -= nSecs;
             for (size_t i = 0; i < rp->vHintAt.size(); i++)
                 rp->vHintAt[i].second -= nSecs;
             for (map<CNode*, PeerPool>::iterator it = rp->state.mapPeer.begin(); it != rp->state.mapPeer.end(); ++it)
@@ -8035,9 +8349,31 @@ void P2PoolTicketAgeForTest(int64 nSecs)
         nTktSavedAt -= nSecs;
         tktBudget.nLast -= nSecs;
         for (map<uint256, GuardEntry>::iterator i = mapGuard.begin(); i != mapGuard.end(); ++i)
+        {
             if (i->second.nPullSince)
                 i->second.nPullSince -= nSecs;
+            if (i->second.nPullRetryAt)
+                i->second.nPullRetryAt -= nSecs;
+        }
     }
+}
+
+void P2PoolRegFilesForTest(bool fFiles)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+        fRegFiles = fFiles;
+}
+
+void P2PoolGuardAgeForTest(int64 nSecs)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+        for (map<uint256, GuardEntry>::iterator i = mapGuard.begin(); i != mapGuard.end(); ++i)
+        {
+            if (i->second.nPullSince)
+                i->second.nPullSince -= nSecs;
+            if (i->second.nPullRetryAt)
+                i->second.nPullRetryAt -= nSecs;
+        }
 }
 
 void P2PoolTicketBudgetForTest(int nTokens)

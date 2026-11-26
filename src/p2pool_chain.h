@@ -147,6 +147,9 @@ public:
     bool Has(const uint256& id) const { return mapShares.count(id) != 0; }
     // The parent a share held names, without copying the share.
     bool ParentOf(const uint256& id, uint256& parentOut) const;
+    // Whether a share held, on any line, has this share data hash (what a
+    // main-chain anchor names), without copying the shares.
+    bool HasDataHash(const uint256& hashData) const;
     uint256 Tip() const { return hashTip; }
     int Height(const uint256& id) const;
     // The work of the tip's line over the last window of shares (or as many

@@ -454,7 +454,10 @@ and wallets must say which they show (section 12).
 **A new service bit**, `NODE_POOLREG = (1 << 3)`, says a node reads the
 registry and speaks the messages below. Nodes of 1.2.34 and earlier do not set
 it; nothing below is ever sent to them, and nothing changes in what they are
-sent. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
+sent. A node says the bit only where registered pools are open (testnet, and
+mainnet once `POOL_REGISTRY_MAINNET_OPEN` is set): a release cut while
+mainnet is closed drops every message below unread, so it does not claim to
+answer them. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
 peer, old or new, exactly as today.
 
 New messages, only between `NODE_POOLREG` peers (an older node ignores unknown
@@ -696,7 +699,7 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 |---|---|
 | `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4. Until the release that carries and mines registered pools on mainnet, `"send"` and `"publishzero"` are refused there before any other check (one constant, `POOL_REGISTRY_MAINNET_OPEN` in `src/poolindex.h`, opens them), so nobody burns 1 BTF for a pool that cannot be mined; the preview works on mainnet and says so, and testnet is unchanged |
 | `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
-| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint; the answer carries the index's state and a note that names are not unique (section 12) |
+| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint, at most 32 of them; the answer carries the index's state and a note that names are not unique (section 12) |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
 
 ## 10. Rotating replication: guardians
@@ -1077,11 +1080,22 @@ A pool is dormant when nobody mines it: its newest share is older than its
 2. **The anchors pick out the true line.** The index knows the main-chain
    blocks whose coinbase anchored P (section 7), each naming one share's data
    hash. A line containing the most recently anchored share is the line the
-   pool's last block was found on. A node prefers, among histories of equal
-   standing, one that contains it, and logs a warning when the heaviest line
-   it was given does not: that is the sign of a guardian serving a stale or
-   private line. (It is a preference, not a validity rule: an honest guardian
-   may not hold a share that was a block on a side line.)
+   pool's last block was found on. When the line that ends a fetch does not
+   hold that share although it reaches back past that block's time, the node
+   logs a warning (the sign of a peer serving a stale or private line), asks
+   up to 4 other announcers for their lines, which join the chain beside it,
+   and logs 10 minutes later whether the chain now holds the anchored share
+   (`RegCheckAnchor`, `p2pool_net.cpp`). The anchor decides what is fetched,
+   never which line is mined on: the tip stays the line with the most work,
+   as for every pool. An earlier draft had the node prefer the anchored line
+   "among histories of equal standing"; that is dropped. Equal work almost
+   never happens, a stale prefix of the true line is lighter than the line
+   itself (so fetching the true line is what fixes it), and a tip chosen by
+   which main blocks a node holds would split honest nodes for good, the
+   failure `docs/p2pool.md` records from testnet. (It is not a validity rule
+   either: an honest guardian may not hold a share that was a block on a side
+   line, and an anchor is a claim anybody may put in a block of their own; a
+   false one costs that block and buys a log line and a few asks.)
 3. The node mines on the tip. The retarget is slow to ease after a long gap:
    the first share after it is at the old difficulty (its retarget window does
    not contain the gap), and from then on each share's target is the mean of
@@ -1095,7 +1109,7 @@ A pool is dormant when nobody mines it: its newest share is older than its
    over does not. This is not the reviver's choice alone: once a line is
    dormant, anybody can replace it with a cheap live one, since live beats
    dormant whatever the work (pool zero has the same rule today), and the
-   anchor preference of step 2 does not stop it. A dormant window's value is
+   anchor check of step 2 does not stop it. A dormant window's value is
    the goodwill of whoever mines next; a pool whose miners want their window
    paid keeps mining it.
 4. **If no copy is left anywhere,** the node waits as long as a starting pool
@@ -1212,7 +1226,15 @@ about who keeps a copy.
   are asked `poolwho`. A pull with nothing fetched and nobody announcing the
   pool after 10 minutes takes the pool as having no shares (no slot), until a
   peer announces it. A pool let go for want of room keeps the size and work
-  its line had, so it is not pulled again only to be let go again.
+  its line had, so it is not pulled again only to be let go again. A pull
+  stops as soon as its line passes what this node would keep of one pool
+  (the per-pool cap, or the budget if smaller): the pool cannot be guarded
+  here, its size is kept as known, and the rest is not fetched, so pulls
+  hold at most 4 times that cap beside the budget. A pull that averages
+  under 1 KB/s once it is 20 minutes old, or is not complete after 4 hours,
+  gives its slot back whoever announces the pool, and the pool is not pulled
+  again for 2 hours: a peer that announces pools and serves nothing of them
+  cannot hold the slots.
 - **Letting go**: a guarded pool this node neither mines nor carries by
   `-poolcarry`, once no longer kept, gives back its line in memory and on
   disk (`pools/<id>.dat`), so a guardian holds what the guard budget allows
@@ -1252,10 +1274,11 @@ about who keeps a copy.
 |---|---|
 | registry index | a few hundred bytes per pool, on disk and in memory; grows only by burns of 1 BTF |
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
-| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
+| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares. Pulls (at most 4) stop at that per-pool cap too (section 10, *Pulls*) |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
+| disk writes of lines | each save writes a pool's whole line again: pool zero and local pools every 120 s at most, as before; registered pools (guarded, mined or carried) every 120 s while small, and slower as they grow, so all their lines together are written at 64 KB/s on average (the default guard budget about every 34 minutes). A line not yet written when the node stops is caught up from peers after the restart |
 | on Snowflake or meek | exactly as every node: the same budgets, slots, rates and pulls; the circuit alone sets the speed (section 17) |
-| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
+| a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. Pool zero's byte cap rises with what its tip's line and the uncles it names hold (`ShareChain::ByteCap`), which for pool zero takes most of the network's hashrate; a registered pool's creator alone at the floor could fill a window of 2160 with shares that each pay 6480 addresses (about 220 KB a share, about 2 GB of line). So a registered pool whose chain passes its byte cap and half again (192 MB) is let go, memory and files, and neither fetched, carried nor mined again until a restart (`poolinfo` says so, and mining it says why). The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |
 | guard bandwidth | `-poolguardkbps`, default 64 KB/s, pacing every registered history serve (guarded, mined and carried pools alike, section 17); past it a `p2xsync` waits (`DeferSync`), never refused for good. A local pool's serves (section 18) keep 64 KB/s whatever it says |
 | share relay | as pool zero: one share per spacing on average (the retarget keeps it there), each at most `MAX_SHARE_BYTES`, sent only to peers that announced the pool |
 | tickets | at most 4096 per epoch, 118 bytes each: about 0.5 MB a day for each peer they are relayed to; an asked set adds up to 4 answers of 480 KB, about 1.9 MB per epoch, 5.8 MB at start (section 10) |
@@ -1333,9 +1356,12 @@ probability, independently, so holding all 16 places of one chosen pool takes
 about (A / (H + A))^16 per epoch: with A = H, one pool in 65,536 per epoch;
 taking a chosen pool with even odds takes A around 22 times H. Aiming instead,
 grinding tickets after the draw seed is known until 16 of them top one pool,
-costs about 16 times H tickets for near-certain capture of that one pool: the
-same order. Raising H is the honest answer: every guarding node makes one
-ticket a day.
+costs on the order of 16 times H tickets for that one pool, but the cost is
+heavy-tailed: measured (the attack harness, `-selftest=attack-stale`), the
+median is about 20.5 H, the 10th percentile 5.8 H and the 90th 97.4 H, so a
+lucky grinder captures a chosen pool for a few H and an unlucky one pays
+around a hundred. The same order as the blind figure above. Raising H is the
+honest answer: every guarding node makes one ticket a day.
 
 The estimate (A / (H + A))^16 treats the 16 places as independent. They are
 drawn without replacement from the held set, so the true figure is a little
@@ -1824,7 +1850,11 @@ is taken as it arrives (`AddHistory` per part).
   catch up with the shares found while the snapshot was sent, which on a live
   pool can be an hour of them. The chain is **complete** when that catch-up's
   *end of history* part is taken in full, or 5 minutes after the catch-up
-  ask with no answer. *Ended early* never completes a chain. Until it is
+  ask with no answer. *Ended early* never completes a chain, and neither
+  does an *end of history* part with no share in it: a server with nothing
+  of the pool says `p2xnone`, and a serve always sends from the resume point
+  less the uncle depth, so an empty last part is taken as no answer
+  (unscored) and another announcer is asked. Until it is
   complete the node builds no template on it,
   does not announce it in `poolinv`, does not serve or relay it, and writes
   it only to the partial file below, never to `pools/<poolid>.dat`.
