@@ -165,13 +165,11 @@ static void PrintUsage()
     printf("  /p2pool                    (pooled mining with no pool: XMRig points at this node,\n");
     printf("                              blocks pay every miner of the share window; docs/p2pool.md)\n");
     printf("  /p2pool=POOLID             (mine this Everpool pool instead, 64 hex digits: a pool\n");
-    printf("                              recorded on the chain; poollist shows them; testnet only\n");
-    printf("                              until a release opens Everpool pools on mainnet)\n");
+    printf("                              recorded on the chain; poollist shows them)\n");
     printf("  /p2pool=local:NAME         (mine this node's local pool NAME instead: a private pool of\n");
     printf("                              your own machines; poolcreate local / pooljoin make one)\n");
     printf("  /poolcarry=POOLID[,...]    (keep and relay these Everpool pools too, without mining\n");
-    printf("                              them; at most 8; with or without /p2pool; testnet only\n");
-    printf("                              until a release opens Everpool pools on mainnet)\n");
+    printf("                              them; at most 8; with or without /p2pool)\n");
     printf("  /p2poolport=N              (default 3333, on 127.0.0.1)\n");
     printf("  /p2poolbind=IP             (also serve stratum on this private address, for miners on\n");
     printf("                              your local network: 10.x, 172.16-31.x, 192.168.x, 169.254.x,\n");
@@ -408,7 +406,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         // An Everpool pool: mined once its record is active on this node's
         // chain and its line is here; until then the stratum serves no work
         // and the log says why.
-        // Not on mainnet before the release that opens them there.
+        // Refused where registered pools are closed (mainnet before 1.2.36).
         if (idReg != 0 && !P2PoolRegWant(idReg, true, strChoiceWhyNot))
             StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, or -p2pool=local:<name> for a local "
                                            "pool of this node.");

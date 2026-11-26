@@ -20439,10 +20439,18 @@ static int RunPoolIndexSelfTest()
             nFail += Check(fPreview, "poolcreate everpool shows the record, the id and the fee, and sends nothing "
                                      "without \"send\"") ? 0 : 1;
 
-            // Mainnet is closed to burns in this release
-            // (POOL_REGISTRY_MAINNET_OPEN): "send" and "publishzero" are
-            // refused before any other check, and the preview says so. The
-            // wallet is left unlocked: nothing may reach it.
+            // Where mainnet is closed to burns (POOL_REGISTRY_MAINNET_OPEN
+            // false, every release before 1.2.36): "send" and "publishzero"
+            // are refused before any other check, and the preview says so.
+            // The wallet is left unlocked: nothing may reach it. Where it is
+            // open, the preview says how to send and nothing is sent here.
+            if (POOL_REGISTRY_MAINNET_OPEN)
+            {
+                nFail += Check(!IsTestNet() && PoolBurnsOpen() && RpcOk(rc) &&
+                               rc["result"]["send"].get<std::string>().find("burns 1 BTF") != std::string::npos,
+                               "mainnet open: the preview says how to send") ? 0 : 1;
+            }
+            else
             {
                 const std::string strClosed = "registered pools open on mainnet in a later release";
                 json pZeroG = { { "name", "bitflash" }, { "spacing", 10 }, { "window", 2160 }, { "retarget", 720 },
@@ -20599,11 +20607,12 @@ static int RunPoolIndexSelfTest()
                 fWalletEncrypted = fEncWas;
                 fWalletLocked = fLockWas;
                 SelectChainParams(false);
-                nFail += Check(fOpen && !PoolBurnsOpen() && RpcOk(rtp) && rtp["result"]["sent"] == false &&
+                nFail += Check(fOpen && PoolBurnsOpen() == POOL_REGISTRY_MAINNET_OPEN && RpcOk(rtp) &&
+                               rtp["result"]["sent"] == false &&
                                rtp["result"]["send"].get<std::string>().find("burns 1 BTF") != std::string::npos &&
                                !RpcOk(rts) && RpcError(rts) == "wallet is locked",
-                               "testnet: \"send\" is not gated and reaches the wallet's burn path; mainnet is "
-                               "closed again") ? 0 : 1;
+                               "testnet: \"send\" is not gated and reaches the wallet's burn path; mainnet back "
+                               "to its own gate") ? 0 : 1;
             }
 
             // The node's index back to empty for what follows.

@@ -247,14 +247,13 @@ bool P2PoolLocalStillListed(const string& strPeer);
 // is carried, mined and announced; never whether a share of it is valid.
 
 static const size_t MAX_POOL_CARRY = 8;
-// Registered pools are open on testnet, and on mainnet once the release that
-// carries and mines them there sets POOL_REGISTRY_MAINNET_OPEN (poolindex.h,
-// docs/pool-registry.md section 9). Until then, on mainnet, no registered
-// pool is mined, carried, announced, relayed or served, every registry
-// message is dropped unread, and -p2pool=<pool id> and -poolcarry are
-// refused with this.
+// Registered pools are open on testnet, and on mainnet from 1.2.36, where
+// POOL_REGISTRY_MAINNET_OPEN is set (poolindex.h, docs/pool-registry.md
+// section 9). Where it is not, on mainnet, no registered pool is mined,
+// carried, announced, relayed or served, every registry message is dropped
+// unread, and -p2pool=<pool id> and -poolcarry are refused with this.
 static const char* const P2POOL_REG_CLOSED =
-    "Everpool pools are not open on mainnet in this release: -p2pool=<pool id> and -poolcarry work on testnet only";
+    "Everpool pools are not open on mainnet in this build: -p2pool=<pool id> and -poolcarry work on testnet only";
 // The pool mined (fMine) or one more carried. Before P2PoolInit, which reads
 // back their files (pools/<id>.dat, or pools/<id>.part for a fetch in
 // progress); a pool with no file here joins once the registry index names

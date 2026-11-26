@@ -1,7 +1,7 @@
 # Everpool: the P2Pool that no one can delete, edit or shut down
 
 Status: design done (Phase A); implemented (Phases B and C, section 16) and
-proved on testnet with real coins (Phase D); not open on mainnet yet. The phases are at the end. The protocol is also published on its own, for
+proved on testnet with real coins (Phase D); open on mainnet from release 1.2.36. The phases are at the end. The protocol is also published on its own, for
 any chain to adopt, at https://github.com/bitflash-network/everpool. Main-chain consensus does not change: everything below is node
 software and P2Pool protocol, and ships in an ordinary release.
 
@@ -455,9 +455,9 @@ and wallets must say which they show (section 12).
 registry and speaks the messages below. Nodes of 1.2.34 and earlier do not set
 it; nothing below is ever sent to them, and nothing changes in what they are
 sent. A node says the bit only where registered pools are open (testnet, and
-mainnet once `POOL_REGISTRY_MAINNET_OPEN` is set): a release cut while
-mainnet is closed drops every message below unread, so it does not claim to
-answer them. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
+mainnet from 1.2.36, where `POOL_REGISTRY_MAINNET_OPEN` is set): a release
+cut while mainnet was closed drops every message below unread, so it does not
+claim to answer them. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
 peer, old or new, exactly as today.
 
 New messages, only between `NODE_POOLREG` peers (an older node ignores unknown
@@ -662,8 +662,8 @@ it can validate, so two nodes never exchange shares one of them cannot judge.
   2 minutes while it is (named within the last 10 minutes); the 10 minutes
   hold whatever. An answer that comes after the line started here is still
   taken, and the line with more work wins.
-- **Not on mainnet before the release that opens it.** Until
-  `POOL_REGISTRY_MAINNET_OPEN` (`src/poolindex.h`) is true, a mainnet node
+- **Open on mainnet from 1.2.36.** Where `POOL_REGISTRY_MAINNET_OPEN`
+  (`src/poolindex.h`) is false, as in every release before 1.2.36, a mainnet node
   refuses to start with `-p2pool=<poolid>` or `-poolcarry`, and no
   registered pool is ever live there whatever its status in the index
   (anyone can burn a record with `sendburn`): nothing of one is fetched,
@@ -697,7 +697,7 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 
 | call | does |
 |---|---|
-| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4. Until the release that carries and mines registered pools on mainnet, `"send"` and `"publishzero"` are refused there before any other check (one constant, `POOL_REGISTRY_MAINNET_OPEN` in `src/poolindex.h`, opens them), so nobody burns 1 BTF for a pool that cannot be mined; the preview works on mainnet and says so, and testnet is unchanged |
+| `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4. Before 1.2.36, which opens registered pools on mainnet, `"send"` and `"publishzero"` were refused there before any other check (one constant, `POOL_REGISTRY_MAINNET_OPEN` in `src/poolindex.h`, opens them), so nobody burned 1 BTF for a pool that could not be mined; the preview worked on mainnet and said so. Testnet was always open |
 | `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
 | `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint, at most 32 of them; the answer carries the index's state and a note that names are not unique (section 12) |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
