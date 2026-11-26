@@ -454,7 +454,10 @@ and wallets must say which they show (section 12).
 **A new service bit**, `NODE_POOLREG = (1 << 3)`, says a node reads the
 registry and speaks the messages below. Nodes of 1.2.34 and earlier do not set
 it; nothing below is ever sent to them, and nothing changes in what they are
-sent. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
+sent. A node says the bit only where registered pools are open (testnet, and
+mainnet once `POOL_REGISTRY_MAINNET_OPEN` is set): a release cut while
+mainnet is closed drops every message below unread, so it does not claim to
+answer them. Pool zero traffic stays on its own messages, to every `NODE_P2POOL`
 peer, old or new, exactly as today.
 
 New messages, only between `NODE_POOLREG` peers (an older node ignores unknown
@@ -696,7 +699,7 @@ RPC (in `src/jsonrpc.cpp`, with the other wallet calls):
 |---|---|
 | `poolcreate everpool {"name", "spacing", "window", "retarget", "floor", "uncledepth", "unclepct", "feebps", "feeaddress"} ["send" \| "dryrun" \| "publishzero"]` | builds the record, checks it canonically (the record's own check, the bytes read back as the same record, and the burn's script read back by the parser the index uses), and returns its hex, its id, its fingerprint, the fee and the burn, and whether the index already has it. Nothing is sent unless the third parameter is `"send"` or `"publishzero"`: then it burns 1 BTF into the record through the wallet's burn path (the one `sendburn` uses) and returns the txid too. The name is required; other unset fields take these defaults: window 2160, retarget 720, floor `0x1f0fffff`, uncle depth 3, uncle share 80, no fee (pool zero's values), and a spacing of 30 or `ceil(60 / depth)`, whichever is larger, so the defaults with any given depth make a valid record (pool zero alone may have 10). A record that breaks a rule of section 1 is refused with the rule it breaks, sent or not. `"send"` is refused for a pool the index already has (it would burn 1 BTF for nothing), for a burn of the same record already waiting to be mined or unconfirmed in the node's wallet, while the node is catching up and while the index is behind the node's tip (it could not tell); the checks and the burn run under one hold of the chain lock, so a block cannot land between them. The answer lists the other pools whose names look the same (`samename`). A record equal to pool zero's is refused with `"send"`; `"publishzero"` is the explicit word for the one-time publication of section 4. Until the release that carries and mines registered pools on mainnet, `"send"` and `"publishzero"` are refused there before any other check (one constant, `POOL_REGISTRY_MAINNET_OPEN` in `src/poolindex.h`, opens them), so nobody burns 1 BTF for a pool that cannot be mined; the preview works on mainnet and says so, and testnet is unchanged |
 | `poolcreate local {...} [password]`, `pooljoin`, `poolpeers`, `poolleave` | a local pool, never on the chain (section 18). `poolcreate` with no mode is refused, naming the two, so nobody burns 1 BTF by default |
-| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint; the answer carries the index's state and a note that names are not unique (section 12) |
+| `poollist` | pool zero first, then the recorded pools, pending and active, each with its status: id, fingerprint, name, rules, fee, first height, confirmations, appearances, anchors in the last 720 blocks (as `claims`), and, once pools are carried, whether carried and the share chain's height and work. Ordered by recent share work for carried pools, then by anchors, then by first appearance, never by name. Every entry lists the other pools named alike (case, `-` and `_` set aside), pool zero's "bitflash" included, by id and fingerprint, at most 32 of them; the answer carries the index's state and a note that names are not unique (section 12) |
 | `poolinfo <poolid>` | one pool: the record decoded, its appearances, its last anchors, the index's height, its share chain if carried, its guardians this epoch (Phase C). An id nobody burned that blocks name shows as `unknown` with its claims only |
 
 ## 10. Rotating replication: guardians
@@ -1212,7 +1215,15 @@ about who keeps a copy.
   are asked `poolwho`. A pull with nothing fetched and nobody announcing the
   pool after 10 minutes takes the pool as having no shares (no slot), until a
   peer announces it. A pool let go for want of room keeps the size and work
-  its line had, so it is not pulled again only to be let go again.
+  its line had, so it is not pulled again only to be let go again. A pull
+  stops as soon as its line passes what this node would keep of one pool
+  (the per-pool cap, or the budget if smaller): the pool cannot be guarded
+  here, its size is kept as known, and the rest is not fetched, so pulls
+  hold at most 4 times that cap beside the budget. A pull that averages
+  under 1 KB/s once it is 20 minutes old, or is not complete after 4 hours,
+  gives its slot back whoever announces the pool, and the pool is not pulled
+  again for 2 hours: a peer that announces pools and serves nothing of them
+  cannot hold the slots.
 - **Letting go**: a guarded pool this node neither mines nor carries by
   `-poolcarry`, once no longer kept, gives back its line in memory and on
   disk (`pools/<id>.dat`), so a guardian holds what the guard budget allows
@@ -1252,7 +1263,7 @@ about who keeps a copy.
 |---|---|
 | registry index | a few hundred bytes per pool, on disk and in memory; grows only by burns of 1 BTF |
 | pools carried | pool zero, the pool mined, up to 8 by `-poolcarry`, and guarded pools within the guard budget |
-| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares |
+| guard budget, bytes | `-poolguardmb`, default 128 MB of share chains in all guarded pools, at most 64 MB of it for one pool. A pool whose whole line does not fit in what is left is not guarded by this node at all (not announced; the next in its ranking, and the reserve, hold it): a partial line is useless, since `AddHistory` needs a whole window behind the newest *retarget window* shares. Pulls (at most 4) stop at that per-pool cap too (section 10, *Pulls*) |
 | guard budget, pools with shares | at most 8 at once, whatever the bytes (pools with no shares do not count) |
 | on Snowflake or meek | exactly as every node: the same budgets, slots, rates and pulls; the circuit alone sets the speed (section 17) |
 | a mined or `-poolcarry` pool | the caps pool zero has today (`MAX_CHAIN_SHARES`, `MAX_CHAIN_BYTES`, `MAX_TRUSTED_BYTES`), each pool on its own. The ceiling is the operator's choice: pool zero, the mined pool and 8 `-poolcarry` pools at 128 MB each is about 1.3 GB, plus the guard budget; a node with neither option holds pool zero and the guard budget only |

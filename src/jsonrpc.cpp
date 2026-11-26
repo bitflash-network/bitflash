@@ -4851,7 +4851,11 @@ static uint256 PoolZeroId()
 }
 
 // The other pools named like strName (by PoolNameKey): pool zero first,
-// then the recorded pools; never the pool itself.
+// then the recorded pools; never the pool itself. At most SAME_NAME_MAX of
+// them: anyone may burn many records under one name, and poollist lists
+// this for every pool, so an unbounded list grew with the square of them
+// (3000 records alike, 9 million entries in one answer).
+static const size_t SAME_NAME_MAX = 32;
 static json SameNameJson(const uint256& idSelf, const string& strName, const vector<CPoolInfo>& vReg)
 {
     json a = json::array();
@@ -4865,7 +4869,7 @@ static json SameNameJson(const uint256& idSelf, const string& strName, const vec
         z["poolzero"] = true;
         a.push_back(z);
     }
-    for (size_t i = 0; i < vReg.size(); i++)
+    for (size_t i = 0; i < vReg.size() && a.size() < SAME_NAME_MAX; i++)
     {
         if (vReg[i].fZero || vReg[i].id == idSelf || PoolNameKey(vReg[i].rec.name) != key)
             continue;
