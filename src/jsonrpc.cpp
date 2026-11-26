@@ -4843,6 +4843,11 @@ static string PoolNameKey(const string& s)
     return k;
 }
 
+string PoolLookalikeKey(const string& s)
+{
+    return PoolNameKey(s);
+}
+
 static uint256 PoolZeroId()
 {
     uint256 id = 0;
@@ -5157,6 +5162,109 @@ static json CreateEverpool(const json& p)
     j["status"] = fZero ? "active: pool zero always is; the burn publishes its record"
                         : "pending: active once the burn has 30 confirmations";
     return j;
+}
+
+bool PoolFeePercentToBps(const string& s, unsigned int& nBpsOut)
+{
+    nBpsOut = 0;
+    size_t i = 0;
+    unsigned int nWhole = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+    {
+        if (i >= 3)
+            return false;   // more than 100% is refused below; 4 digits never fit
+        nWhole = nWhole * 10 + (s[i] - '0');
+        i++;
+    }
+    if (i == 0)
+        return false;
+    unsigned int nFrac = 0;
+    if (i < s.size())
+    {
+        if (s[i] != '.' || i + 1 == s.size() || s.size() - i - 1 > 2)
+            return false;
+        for (size_t k = i + 1; k < s.size(); k++)
+        {
+            if (s[k] < '0' || s[k] > '9')
+                return false;
+            nFrac = nFrac * 10 + (s[k] - '0');
+        }
+        if (s.size() - i - 1 == 1)
+            nFrac *= 10;
+    }
+    unsigned int n = nWhole * 100 + nFrac;
+    if (n > 10000)
+        return false;
+    nBpsOut = n;
+    return true;
+}
+
+// The window's Everpool screen: the parameters as the call takes them, and
+// CreateEverpool itself.
+bool EverpoolCreate(const EverpoolCreateParams& p, bool fSend, EverpoolCreateResult& out, string& errOut)
+{
+    out = EverpoolCreateResult();
+    errOut.clear();
+    try
+    {
+        json o = json::object();
+        o["name"] = p.strName;
+        struct Field { const char* key; const string* val; };
+        const Field fields[] = { { "spacing", &p.strSpacing }, { "window", &p.strWindow },
+                                 { "retarget", &p.strRetarget }, { "floor", &p.strFloor },
+                                 { "uncledepth", &p.strUncleDepth }, { "unclepct", &p.strUnclePct },
+                                 { "feeaddress", &p.strFeeAddress } };
+        for (size_t i = 0; i < ARRAYLEN(fields); i++)
+            if (!fields[i].val->empty())
+                o[fields[i].key] = *fields[i].val;
+        if (!p.strFeePercent.empty())
+        {
+            unsigned int nBps = 0;
+            if (!PoolFeePercentToBps(p.strFeePercent, nBps))
+                throw runtime_error("the fee is a percentage with at most two decimals, such as 1 or 0.5");
+            o["feebps"] = nBps;
+        }
+        json j = CreateEverpool(json::array({ "everpool", o, fSend ? "send" : "dryrun" }));
+        out.strName = j["name"].get<string>();
+        out.strId = j["id"].get<string>();
+        out.strFingerprint = j["fingerprint"].get<string>();
+        const json& r = j["rules"];
+        out.nSpacing = r["spacing"].get<unsigned int>();
+        out.nWindow = r["window"].get<unsigned int>();
+        out.nRetarget = r["retarget"].get<unsigned int>();
+        out.nFloor = (unsigned int)strtoul(r["floor"].get<string>().c_str(), NULL, 16);
+        out.nUncleDepth = r["uncledepth"].get<unsigned int>();
+        out.nUnclePct = r["unclepct"].get<unsigned int>();
+        out.nFeeBps = r["feebps"].get<unsigned int>();
+        out.strFeePercent = PoolFeePercent(out.nFeeBps);
+        out.strFeeAddress = r["feeaddress"].is_string() ? r["feeaddress"].get<string>() : string();
+        out.nBurn = poolreg::MIN_BURN;
+        out.fPoolZero = j["poolzero"].get<bool>();
+        for (size_t i = 0; i < j["samename"].size(); i++)
+            out.vSameName.push_back(j["samename"][i]["poolzero"].get<bool>()
+                                        ? string("pool zero") : j["samename"][i]["fingerprint"].get<string>());
+        out.fRecorded = !j["recorded"].is_null();
+        if (out.fRecorded)
+        {
+            out.strRecordedStatus = j["recorded"]["status"].get<string>();
+            out.nRecordedHeight = j["recorded"]["firstheight"].is_number() ? j["recorded"]["firstheight"].get<int>() : -1;
+        }
+        out.fIndexSynced = j["index"]["synced"].get<bool>();
+        out.fBurnsOpen = PoolBurnsOpen();
+        out.strSendNote = j.contains("send") ? j["send"].get<string>() : string();
+        out.fSent = j["sent"].get<bool>();
+        if (out.fSent)
+        {
+            out.strTxid = j["txid"].get<string>();
+            out.strStatus = j["status"].get<string>();
+        }
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        errOut = e.what();
+        return false;
+    }
 }
 
 // poolcreate everpool|local {params} [send|dryrun|password]

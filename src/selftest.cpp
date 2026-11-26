@@ -12004,6 +12004,203 @@ static int RunRulesV4SelfTest()
 // must be one whole set, never a mix of two. Strings too long for the small
 // string buffer, so a race would touch freed memory. `make tests` runs it in
 // the plain build; the audit's TSan build reports any access outside the lock.
+// everpool-gui: what the wallet window's Everpool screen relies on that is not
+// drawing. The choice of pool it saves for the next start (p2pool-choice),
+// read back as -p2pool would read it; the fee typed as a percentage; the
+// pool creation going through poolcreate everpool's own code with its
+// defaults and its errors; and this wallet's part of a payout window.
+static int RunEverpoolGuiSelfTest()
+{
+    printf("everpool-gui self-test\n");
+    int nFail = 0;
+    std::string tmp;
+    if (!MakeTempDir(tmp))
+    {
+        printf("  FAIL could not create a temporary data directory\n");
+        return 1;
+    }
+    const std::string strSavedDir = strSetDataDir;
+    strSetDataDir = tmp;
+
+    // ---- the choice file
+    uint256 idZero = 0;
+    poolreg::PoolId(poolreg::PoolZero().Encode(), (const unsigned char*)pchMessageStart, idZero.begin());
+    uint256 idReg = 0;
+    memset(idReg.begin(), 0x5a, 32);
+    {
+        int n = -1;
+        uint256 id;
+        bool fOff = P2PoolChoiceParse("off\n", n, id) && n == P2POOL_CHOICE_OFF && id == 0;
+        bool fZ = P2PoolChoiceParse("  zero ", n, id) && n == P2POOL_CHOICE_ZERO && id == 0;
+        bool fZid = P2PoolChoiceParse(idZero.GetHex(), n, id) && n == P2POOL_CHOICE_ZERO && id == 0;
+        bool fR = P2PoolChoiceParse(idReg.GetHex(), n, id) && n == P2POOL_CHOICE_REGISTERED && id == idReg;
+        std::string strUpper = idReg.GetHex();
+        for (size_t i = 0; i < strUpper.size(); i++)
+            strUpper[i] = (char)toupper((unsigned char)strUpper[i]);
+        bool fRu = P2PoolChoiceParse(strUpper, n, id) && n == P2POOL_CHOICE_REGISTERED && id == idReg;
+        nFail += Check(fOff && fZ && fZid && fR && fRu,
+                       "the choice file: off, zero, pool zero's id as pool zero, a pool id in either case") ? 0 : 1;
+        bool fBad = !P2PoolChoiceParse("", n, id) && !P2PoolChoiceParse("on", n, id) &&
+                    !P2PoolChoiceParse("local:home", n, id) && !P2PoolChoiceParse(idReg.GetHex().substr(0, 63), n, id) &&
+                    !P2PoolChoiceParse(idReg.GetHex() + "0", n, id) && !P2PoolChoiceParse("1", n, id);
+        nFail += Check(fBad, "the choice file refuses anything else: empty, a local pool, a short or long id") ? 0 : 1;
+        nFail += Check(P2PoolChoiceFormat(P2POOL_CHOICE_OFF, 0) == "off" &&
+                       P2PoolChoiceFormat(P2POOL_CHOICE_ZERO, 0) == "zero" &&
+                       P2PoolChoiceFormat(P2POOL_CHOICE_REGISTERED, idReg) == idReg.GetHex() &&
+                       P2PoolChoiceFormat(P2POOL_CHOICE_REGISTERED, 0).empty() &&
+                       P2PoolChoiceFormat(P2POOL_CHOICE_LOCAL, 0).empty(),
+                       "the choice file's words") ? 0 : 1;
+
+        bool fNone = !P2PoolChoiceRead(n, id) && n == P2POOL_CHOICE_OFF;
+        std::string err;
+        bool fW1 = P2PoolChoiceWrite(P2POOL_CHOICE_REGISTERED, idReg, err) && P2PoolChoiceRead(n, id) &&
+                   n == P2POOL_CHOICE_REGISTERED && id == idReg;
+        bool fW2 = P2PoolChoiceWrite(P2POOL_CHOICE_ZERO, 0, err) && P2PoolChoiceRead(n, id) &&
+                   n == P2POOL_CHOICE_ZERO && id == 0;
+        bool fW3 = P2PoolChoiceWrite(P2POOL_CHOICE_OFF, 0, err) && P2PoolChoiceRead(n, id) && n == P2POOL_CHOICE_OFF;
+        bool fW4 = !P2PoolChoiceWrite(P2POOL_CHOICE_LOCAL, 0, err) && !P2PoolChoiceWrite(P2POOL_CHOICE_REGISTERED, 0, err);
+        FILE* pf = fopen(P2PoolChoicePath().c_str(), "wb");
+        if (pf)
+        {
+            fputs("p2pool=everything\n", pf);
+            fclose(pf);
+        }
+        bool fW5 = !P2PoolChoiceRead(n, id) && n == P2POOL_CHOICE_OFF && id == 0;
+        nFail += Check(fNone && fW1 && fW2 && fW3 && fW4 && fW5,
+                       "the choice file is written and read back; none, or one that does not read, is off") ? 0 : 1;
+        remove(P2PoolChoicePath().c_str());
+
+        P2PoolChoiceInfo saved = P2PoolChoiceRunning();
+        P2PoolChoiceInfo info;
+        info.nKind = P2POOL_CHOICE_REGISTERED;
+        info.id = idReg;
+        info.strProblem = "x";
+        P2PoolChoiceSetRunning(info);
+        P2PoolChoiceInfo back = P2PoolChoiceRunning();
+        P2PoolChoiceSetRunning(saved);
+        nFail += Check(back.nKind == P2POOL_CHOICE_REGISTERED && back.id == idReg && back.strProblem == "x" &&
+                       !back.fFromCommandLine, "what this run mines is kept for the window") ? 0 : 1;
+    }
+
+    // ---- the fee as a percentage
+    {
+        unsigned int n = 99;
+        bool fOk = PoolFeePercentToBps("0", n) && n == 0 && PoolFeePercentToBps("1", n) && n == 100 &&
+                   PoolFeePercentToBps("1.5", n) && n == 150 && PoolFeePercentToBps("0.25", n) && n == 25 &&
+                   PoolFeePercentToBps("100", n) && n == 10000 && PoolFeePercentToBps("007.05", n) && n == 705;
+        bool fBad = !PoolFeePercentToBps("", n) && !PoolFeePercentToBps("1.234", n) &&
+                    !PoolFeePercentToBps("-1", n) && !PoolFeePercentToBps("1.", n) &&
+                    !PoolFeePercentToBps(".5", n) && !PoolFeePercentToBps("100.01", n) &&
+                    !PoolFeePercentToBps("1000", n) && !PoolFeePercentToBps("1,5", n) &&
+                    !PoolFeePercentToBps("1.5%", n) && !PoolFeePercentToBps(" 1", n);
+        nFail += Check(fOk && fBad, "a fee typed as a percentage: at most two decimals, 0 to 100") ? 0 : 1;
+    }
+
+    // ---- creating a pool: poolcreate everpool's own code
+    {
+        EverpoolCreateParams p;
+        p.strName = "guipool";
+        EverpoolCreateResult r;
+        std::string err;
+        poolreg::PoolRecord want = poolreg::PoolZero();
+        want.name = "guipool";
+        want.nWindow = 2160;
+        want.nRetarget = 720;
+        want.nUncleDepth = 3;
+        want.nUnclePct = 80;
+        want.nSpacing = 30;
+        want.nFeeBps = 0;
+        want.nFeeType = poolreg::FEE_NONE;
+        memset(want.feeHash, 0, sizeof(want.feeHash));
+        uint256 idWant = 0;
+        poolreg::PoolId(want.Encode(), (const unsigned char*)pchMessageStart, idWant.begin());
+        bool fPreview = EverpoolCreate(p, false, r, err) && !r.fSent && r.strName == "guipool" &&
+                        r.nSpacing == 30 && r.nWindow == 2160 && r.nRetarget == 720 && r.nUncleDepth == 3 &&
+                        r.nUnclePct == 80 && r.nFeeBps == 0 && r.nFloor == poolreg::NETWORK_FLOOR &&
+                        r.strFeeAddress.empty() && r.strFeePercent == "0.00%" && r.nBurn == poolreg::MIN_BURN &&
+                        r.strId == idWant.GetHex() && r.strFingerprint == idWant.GetHex().substr(0, 8) &&
+                        !r.fPoolZero && !r.fRecorded && r.fBurnsOpen == PoolBurnsOpen() && !r.strSendNote.empty();
+        nFail += Check(fPreview, "the preview: poolcreate everpool's defaults, the id of the record, nothing sent") ? 0 : 1;
+
+        // Spacing follows the uncle depth, as the call's default does; a fee
+        // and its address; numbers typed as text, the floor in hex.
+        uint160 hFee;
+        memset(hFee.begin(), 0x33, 20);
+        EverpoolCreateParams q;
+        q.strName = "feepool";
+        q.strUncleDepth = "1";
+        q.strFeePercent = "1.5";
+        q.strFeeAddress = Hash160ToAddress(hFee);
+        q.strWindow = "720";
+        q.strRetarget = "360";
+        q.strFloor = "0x1f0fffff";
+        EverpoolCreateResult rq;
+        bool fFee = EverpoolCreate(q, false, rq, err) && rq.nSpacing == 60 && rq.nUncleDepth == 1 &&
+                    rq.nFeeBps == 150 && rq.strFeePercent == "1.50%" && rq.strFeeAddress == q.strFeeAddress &&
+                    rq.nWindow == 720 && rq.nRetarget == 360;
+        nFail += Check(fFee, "a fee with its address, typed numbers, and the spacing that follows the uncle depth") ? 0 : 1;
+
+        // The call's own refusals, word for word.
+        EverpoolCreateParams b1 = p, b2 = p, b3 = p, b4 = p, b5 = p;
+        b1.strName = "bad name!";
+        b2.strFeePercent = "1";
+        b3.strFeePercent = "1.234";
+        b4.strSpacing = "ten";
+        b5.strFeeAddress = "nope";
+        std::string e1, e2, e3, e4, e5;
+        bool fRefused = !EverpoolCreate(b1, false, r, e1) && e1 == "a pool name is 1 to 32 of A-Z, a-z, 0-9, - and _" &&
+                        !EverpoolCreate(b2, false, r, e2) && e2.find("not a valid pool") == 0 &&
+                        !EverpoolCreate(b3, false, r, e3) && e3.find("percentage") != std::string::npos &&
+                        !EverpoolCreate(b4, false, r, e4) && e4 == "\"spacing\" is not a number this record can hold" &&
+                        !EverpoolCreate(b5, false, r, e5) && e5 == "\"feeaddress\" is not a Bitflash address";
+        nFail += Check(fRefused, "refused as the call refuses: a bad name, a fee with no address, a fee with three "
+                                 "decimals, a spacing that is not a number, an address that is not one") ? 0 : 1;
+
+        // Pool zero's own rules are shown as pool zero, never burned.
+        EverpoolCreateParams z;
+        z.strName = "bitflash";
+        z.strSpacing = "10";
+        EverpoolCreateResult rz;
+        bool fZero = EverpoolCreate(z, false, rz, err) && rz.fPoolZero && rz.strId == idZero.GetHex();
+        nFail += Check(fZero, "pool zero's record is recognised as pool zero") ? 0 : 1;
+
+        // "send" is the call's "send": refused here before the wallet, for the
+        // call's own reason (mainnet closed in this build, or no chain yet).
+        EverpoolCreateResult rs;
+        std::string es;
+        bool fSendRefused = !EverpoolCreate(p, true, rs, es) && !rs.fSent &&
+                            (PoolBurnsOpen() ? es.find("catching up") != std::string::npos ||
+                                               es.find("has not read up to the tip") != std::string::npos
+                                             : es.find("registered pools open on mainnet in a later release") == 0);
+        nFail += Check(fSendRefused, "sending goes through the call's checks (here refused before the wallet)") ? 0 : 1;
+        nFail += Check(PoolLookalikeKey("Bit-Flash_") == "bitflash" && PoolLookalikeKey("a_b") == PoolLookalikeKey("A-B"),
+                       "names alike: case, '-' and '_' set aside") ? 0 : 1;
+    }
+
+    // ---- this wallet's part of a window
+    {
+        std::vector<p2pool::WindowShare> w(4);
+        w[0].payoutScript = std::vector<unsigned char>(1, 0x01); w[0].work = 100;
+        w[1].payoutScript = std::vector<unsigned char>(1, 0x02); w[1].work = 300;
+        w[2].payoutScript = std::vector<unsigned char>(1, 0x01); w[2].work = 50;
+        w[3].payoutScript = std::vector<unsigned char>(1, 0x03); w[3].work = 550;
+        int nAsked = 0;
+        uint64 nMine = 0, nTotal = 0;
+        P2PoolWindowPart(w, [&nAsked](const std::vector<unsigned char>& s) { nAsked++; return s[0] == 0x01; },
+                         nMine, nTotal);
+        nFail += Check(nMine == 150 && nTotal == 1000 && nAsked == 3,
+                       "a window's part: the work of our scripts over all, each script asked once") ? 0 : 1;
+        std::vector<p2pool::WindowShare> none;
+        P2PoolWindowPart(none, [](const std::vector<unsigned char>&) { return true; }, nMine, nTotal);
+        nFail += Check(nMine == 0 && nTotal == 0, "an empty window is no part") ? 0 : 1;
+    }
+
+    strSetDataDir = strSavedDir;
+    printf("%s (%d failure%s)\n", nFail == 0 ? "everpool-gui: all passed" : "everpool-gui: FAILED",
+           nFail, nFail == 1 ? "" : "s");
+    return nFail == 0 ? 0 : 1;
+}
+
 static int RunPoolSettingsSelfTest()
 {
     printf("pool-settings self-test\n");
@@ -26128,6 +26325,8 @@ int RunSelfTest(const std::string& name)
         return RunReplyParsersSelfTest();
     if (name == "managed-tor")
         return RunManagedTorSelfTest();
+    if (name == "everpool-gui")
+        return RunEverpoolGuiSelfTest();
     if (name == "pool-settings")
         return RunPoolSettingsSelfTest();
     if (name == "treasury")
@@ -26244,6 +26443,6 @@ int RunSelfTest(const std::string& name)
         return WfRunInTempDir("wallet-rpc-v4", WfRpcAndV4);
 
     printf("Unknown self-test '%s'\n", name.c_str());
-    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, p2pool-registered, p2pool-guardians, pool-index, pool-tickets\n");
+    printf("Known self-tests: wallet-keypool, wallet-hd, wallet-format, wallet-storage-sanity, db-env-reopen, db-open-failure, private-file, wallet-sqlite, wallet-sqlite-migration, wallet-crypto, wallet-encrypt, wallet-sqlite-encrypt, wallet-backend-default, wallet-convert, wallet-portability, wallet-encrypted-seed, wallet-encrypt-pool, wallet-relock, wallet-restore-race, wallet-secret-args, wallet-file-modes, wallet-fee-limit, wallet-rpc-v4, chat-replay-quota, wallet-encrypted-seed-sqlite, wallet-encrypt-pool-sqlite, wallet-sqlite-rollback, net-message, network-params, consensus-limits, chain-work, consensus-safety, reorg-safety, pool-stratum, parse-money, serialize-canonical, decoder-canonical, debug-log-buffer, pow-v2, pow-unavailable, dgb-pow, rvn-kawpow, sigpipe, script-eval, bignum-int, script-sigops, script-opcodes, rules-v2, rules-v3, rules-v4, rules-v5, net-hardening, p2p-dos, orphan-tx, orphan-blocks, block-index-load, multisig, socks5-proxy, reply-parsers, managed-tor, treasury, chat-link, chat-identity, chat-relay, chat-live, swap-wait-payment, swap-timelock, swap-journal, swap-parse, swap-engine, swap-prune, chat-dos, nostr-relay, chat-store-save, wallet-final, swap-rpc, p2pool-dos, p2pool-lan, p2pool-local, p2pool-local-node, p2pool-registered, p2pool-guardians, pool-index, pool-tickets, everpool-gui\n");
     return 1;
 }

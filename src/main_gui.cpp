@@ -160,7 +160,7 @@ static void PrintUsage()
     // reading the source. Kept in step now; a suite that cannot be discovered is
     // a suite that stops being run.
     printf("            wallet-sqlite-encrypt, wallet-backend-default, wallet-convert,\n");
-    printf("            managed-tor, treasury, pool-settings, explorer, chat-link, chat-identity, chat-relay, chat-dos,\n");
+    printf("            managed-tor, treasury, pool-settings, everpool-gui, explorer, chat-link, chat-identity, chat-relay, chat-dos,\n");
     printf("            nostr-relay, swap-prune,\n");
     printf("            or chat-live (needs Tor and the network; not run by `make tests`)\n");
     printf("\n");
@@ -548,6 +548,51 @@ static void ParseStartupArguments(int argc, char* argv[])
                 StartupRefuse(strprintf("-p2poolbind=%s: %s", strP2PoolBind.c_str(), strWhyNot.c_str()),
                               "The stratum has no login: it may listen only on a private address of this "
                               "machine on your local network, such as -p2poolbind=192.168.1.10.");
+        }
+        P2PoolChoiceInfo running;
+        running.fFromCommandLine = true;
+        running.nKind = !strP2PoolLocalName.empty() ? P2POOL_CHOICE_LOCAL
+                      : idReg != 0                  ? P2POOL_CHOICE_REGISTERED : P2POOL_CHOICE_ZERO;
+        running.id = idReg;
+        running.strLocal = strP2PoolLocalName;
+        P2PoolChoiceSetRunning(running);
+    }
+    else
+    {
+        // The pool chosen on the wallet window's Everpool screen
+        // (p2pool-choice in the data directory, p2pool_net.h): read only by
+        // the window, never by a headless node, and only when the command
+        // line says nothing about P2Pool and does not ask for -operator. A
+        // saved choice that cannot be taken never stops the window from
+        // starting: the node starts without P2Pool and the screen says why.
+#ifdef BITFLASH_NO_GUI
+        bool fWindow = false;
+#else
+        bool fWindow = !(arg(argc,argv,"/nogui") || arg(argc,argv,"-nogui") ||
+                         arg(argc,argv,"/daemon") || arg(argc,argv,"-daemon") ||
+                         arg(argc,argv,"/selftest") || arg(argc,argv,"-selftest"));
+#endif
+        int nKind = P2POOL_CHOICE_OFF;
+        uint256 idChoice = 0;
+        if (fWindow && nMineMode != MINE_OPERATOR && P2PoolChoiceRead(nKind, idChoice) &&
+            nKind != P2POOL_CHOICE_OFF)
+        {
+            P2PoolChoiceInfo running;
+            string strWhyNot;
+            if (nKind == P2POOL_CHOICE_REGISTERED && !P2PoolRegWant(idChoice, true, strWhyNot))
+            {
+                running.strProblem = strWhyNot;
+                printf("p2pool-choice: the pool chosen in the window is not mined: %s\n", strWhyNot.c_str());
+            }
+            else
+            {
+                fP2PoolMode = true;
+                running.nKind = nKind;
+                running.id = idChoice;
+                printf("p2pool-choice: mining %s, as chosen in the window\n",
+                       nKind == P2POOL_CHOICE_ZERO ? "pool zero" : idChoice.GetHex().c_str());
+            }
+            P2PoolChoiceSetRunning(running);
         }
     }
     // -poolcarry=<pool id>[,...] (docs/pool-registry.md, section 9): Everpool

@@ -26,6 +26,8 @@
 #include "treasury.h"
 #include "explorer.h"
 #include "gui_explorer.h"
+#include "gui_everpool.h"
+#include "p2pool_net.h"
 #include "bip21.h"
 #include "qrcodegen.hpp"
 #include "font_roboto.h"
@@ -433,6 +435,7 @@ static void DrawMainWindow()
         }
         if (ImGui::MenuItem("Options")) g_showOptions = true;
         if (ImGui::MenuItem("Wallet Safety")) g_showWalletSafety = true;
+        if (ImGui::MenuItem("Everpool")) g_showEverpool = true;
         if (ImGui::MenuItem("Explorer")) g_showExplorer = true;
         if (ImGui::MenuItem("Diagnostics")) g_showDiagnostics = true;
         if (ImGui::MenuItem("About"))   g_showAbout   = true;
@@ -479,7 +482,21 @@ static void DrawMainWindow()
     ImGui::SameLine(0.0f, 8.0f);
     if (ImGui::Button("  Backup Wallet  ")) g_showWalletSafety = true;
 
+    ImGui::SameLine(0.0f, 8.0f);
+    if (ImGui::Button("  Everpool  ")) g_showEverpool = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Pools for P2Pool mining: see them, pick one to mine, create one.");
+
     ImGui::SameLine(0.0f, 20.0f);
+    if (fP2PoolMode) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+        ImGui::Text("* P2Pool");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This node serves P2Pool work on 127.0.0.1:%u for the Bitflash Miner or XMRig.\n"
+                              "Everpool shows which pool.", (unsigned)nP2PoolPort);
+        ImGui::SameLine(0.0f, 12.0f);
+    }
     if (fGenerateBitcoins) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
         const char* modeLabel =
@@ -497,8 +514,10 @@ static void DrawMainWindow()
                 ImGui::PopStyleColor();
             }
         }
-    } else {
+    } else if (!fP2PoolMode) {
         ImGui::TextDisabled("Not mining");
+    } else {
+        ImGui::TextDisabled("(no built-in miner)");
     }
 
     ImGui::Spacing();
@@ -1061,7 +1080,20 @@ static void DrawOptionsDialog()
         ImGui::SeparatorText("Mining Mode");
         ImGui::RadioButton("Relay -- just run the node, don't mine",  &g_mineRadio, MINE_RELAY);
         ImGui::RadioButton("Solo -- rewards go to your wallet",        &g_mineRadio, MINE_SOLO);
-        ImGui::RadioButton("Operator -- run a pool for other miners",  &g_mineRadio, MINE_OPERATOR);
+        {
+            // P2Pool and operator mode share the stratum and do not go
+            // together (-p2pool refuses -operator): while P2Pool runs or is
+            // chosen for the next start (Everpool), operator mode waits.
+            int nChoice = P2POOL_CHOICE_OFF;
+            uint256 idChoice = 0;
+            bool fP2PoolWanted = fP2PoolMode ||
+                                 (P2PoolChoiceRead(nChoice, idChoice) && nChoice != P2POOL_CHOICE_OFF);
+            ImGui::BeginDisabled(fP2PoolWanted && nMineMode != MINE_OPERATOR);
+            ImGui::RadioButton("Operator -- run a pool for other miners",  &g_mineRadio, MINE_OPERATOR);
+            ImGui::EndDisabled();
+            if (fP2PoolWanted && nMineMode != MINE_OPERATOR && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("P2Pool mining is on or chosen in Everpool; turn it off there first.");
+        }
         ImGui::RadioButton("Participant -- mine to someone's pool",    &g_mineRadio, MINE_PARTICIPANT);
 
         if (g_mineRadio != MINE_RELAY && g_lastWalletBackup == 0) {
@@ -1812,13 +1844,13 @@ static std::string QuoteArgWin(const std::string& a)
 // leaves the user with no node running. The new instance waits (-restartwait)
 // before it opens the network port and the block index, so this one is gone
 // first and they never fight over the same files.
-static void RestartApplication()
+bool GuiRestartApplication()
 {
     bool fLaunched = false;
 #ifdef _WIN32
     char exePath[MAX_PATH];
     if (GetModuleFileNameA(NULL, exePath, MAX_PATH) == 0)
-        return;
+        return false;
     std::string strCmd = QuoteArgWin(exePath);
     bool fHasDataDir = false;
     for (int i = 1; i < g_restartArgc; i++)
@@ -1870,9 +1902,7 @@ static void RestartApplication()
         if (glfwGetCurrentContext())
             glfwSetWindowShouldClose(glfwGetCurrentContext(), true);
     }
-    else
-        g_wizardStatus = "Could not relaunch automatically -- please restart "
-                         "Bitflash yourself to switch to the SQLite wallet.";
+    return fLaunched;
 }
 
 static void DrawBackendWizardDialog()
@@ -1894,8 +1924,9 @@ static void DrawBackendWizardDialog()
                 "still running on the old Berkeley DB wallet. Your wallet.dat is "
                 "kept untouched as a fallback.");
             ImGui::Spacing();
-            if (ImGui::Button("Restart Now", ImVec2(140.0f, 0.0f)))
-                RestartApplication();
+            if (ImGui::Button("Restart Now", ImVec2(140.0f, 0.0f)) && !GuiRestartApplication())
+                g_wizardStatus = "Could not relaunch automatically -- please restart "
+                                 "Bitflash yourself to switch to the SQLite wallet.";
             ImGui::SameLine();
             if (ImGui::Button("Later", ImVec2(120.0f, 0.0f)))
                 g_showBackendWizard = false;
@@ -2056,6 +2087,7 @@ int RunGUI(int argc, char* argv[])
         DrawRestorePhraseDialog();
         DrawDiagnosticsDialog();
         DrawExplorerWindow();
+        DrawEverpoolWindow();
         DrawAboutDialog();
         DrawBackendWizardDialog();
         DrawStatusBar();

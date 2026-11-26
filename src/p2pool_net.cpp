@@ -3663,6 +3663,167 @@ bool P2PoolParseCarry(const string& strValue, vector<uint256>& vOut, string& err
     return true;
 }
 
+// ---- The wallet window's choice of pool ------------------------------------
+
+bool P2PoolChoiceParse(const string& strText, int& nKindOut, uint256& idOut)
+{
+    nKindOut = P2POOL_CHOICE_OFF;
+    idOut = 0;
+    string s = strText;
+    while (!s.empty() && isspace((unsigned char)s[s.size() - 1]))
+        s.erase(s.size() - 1);
+    while (!s.empty() && isspace((unsigned char)s[0]))
+        s.erase(0, 1);
+    if (s == "off")
+        return true;
+    if (s == "zero")
+    {
+        nKindOut = P2POOL_CHOICE_ZERO;
+        return true;
+    }
+    // A pool id, read the way -p2pool=<value> is: pool zero's own id is pool
+    // zero. Anything else -p2pool would take (a local pool, "1") is not a
+    // word this file holds.
+    if (s.size() != 64 || !IsHex(s))
+        return false;
+    string strLocal, err;
+    uint256 id = 0;
+    if (!P2PoolParseChoice(s, strLocal, id, err) || !strLocal.empty())
+        return false;
+    nKindOut = id == 0 ? P2POOL_CHOICE_ZERO : P2POOL_CHOICE_REGISTERED;
+    idOut = id;
+    return true;
+}
+
+string P2PoolChoiceFormat(int nKind, const uint256& id)
+{
+    switch (nKind)
+    {
+    case P2POOL_CHOICE_OFF:        return "off";
+    case P2POOL_CHOICE_ZERO:       return "zero";
+    case P2POOL_CHOICE_REGISTERED: return id == 0 ? string() : id.GetHex();
+    default:                       return string();
+    }
+}
+
+string P2PoolChoicePath()
+{
+    return GetAppDir() + "/p2pool-choice";
+}
+
+bool P2PoolChoiceRead(int& nKindOut, uint256& idOut)
+{
+    nKindOut = P2POOL_CHOICE_OFF;
+    idOut = 0;
+    FILE* pf = fopen(P2PoolChoicePath().c_str(), "rb");
+    if (!pf)
+        return false;
+    char buf[128] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, pf);
+    fclose(pf);
+    if (!P2PoolChoiceParse(string(buf, n), nKindOut, idOut))
+    {
+        nKindOut = P2POOL_CHOICE_OFF;
+        idOut = 0;
+        return false;
+    }
+    return true;
+}
+
+bool P2PoolChoiceWrite(int nKind, const uint256& id, string& errOut)
+{
+    string s = P2PoolChoiceFormat(nKind, id);
+    int nBack = 0;
+    uint256 idBack;
+    if (s.empty() || !P2PoolChoiceParse(s, nBack, idBack) || nBack != nKind)
+    {
+        errOut = "not a pool this window can choose";
+        return false;
+    }
+    FILE* pf = fopen(P2PoolChoicePath().c_str(), "wb");
+    if (!pf)
+    {
+        errOut = "could not write the choice to the data directory";
+        return false;
+    }
+    bool fOk = fwrite(s.c_str(), 1, s.size(), pf) == s.size() && fputc('\n', pf) != EOF;
+    if (fclose(pf) != 0)
+        fOk = false;
+    if (!fOk)
+        errOut = "could not write the choice to the data directory";
+    return fOk;
+}
+
+static CCriticalSection cs_choiceRunning;
+static P2PoolChoiceInfo choiceRunning;
+
+void P2PoolChoiceSetRunning(const P2PoolChoiceInfo& info)
+{
+    CRITICAL_BLOCK(cs_choiceRunning)
+        choiceRunning = info;
+}
+
+P2PoolChoiceInfo P2PoolChoiceRunning()
+{
+    P2PoolChoiceInfo info;
+    CRITICAL_BLOCK(cs_choiceRunning)
+        info = choiceRunning;
+    return info;
+}
+
+bool P2PoolMinedWindow(vector<p2pool::WindowShare>& out, uint256& idPoolOut, unsigned int& nFeeBpsOut)
+{
+    out.clear();
+    idPoolOut = 0;
+    nFeeBpsOut = 0;
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        p2pool::ShareChain& c = P2PoolMinedChain();
+        if (!c.Empty())
+        {
+            // The next share's window with nothing of its own: a share of no
+            // work, paying a script no share can carry, left out after.
+            p2pool::ShareData d;
+            d.hashPrevShare = c.Tip();
+            d.payoutScript.assign(1, (unsigned char)OP_RETURN);
+            string err;
+            f = c.WindowFor(d, 0, out, err);
+            idPoolOut = c.Rules().IsZero() ? uint256(0) : c.Rules().poolId;
+            nFeeBpsOut = c.Rules().nFeeBps;
+        }
+    }
+    if (f)
+    {
+        vector<p2pool::WindowShare> v;
+        for (size_t i = 0; i < out.size(); i++)
+            if (!(out[i].payoutScript.size() == 1 && out[i].payoutScript[0] == (unsigned char)OP_RETURN))
+                v.push_back(out[i]);
+        out.swap(v);
+    }
+    return f && !out.empty();
+}
+
+void P2PoolWindowPart(const vector<p2pool::WindowShare>& window,
+                      const std::function<bool(const vector<unsigned char>&)>& fnMine,
+                      uint64& nMineOut, uint64& nTotalOut)
+{
+    nMineOut = 0;
+    nTotalOut = 0;
+    // A script is asked about once: a window is 2160 shares of a few payers.
+    map<vector<unsigned char>, bool> mapAsked;
+    for (size_t i = 0; i < window.size(); i++)
+    {
+        const p2pool::WindowShare& w = window[i];
+        map<vector<unsigned char>, bool>::iterator it = mapAsked.find(w.payoutScript);
+        if (it == mapAsked.end())
+            it = mapAsked.insert(std::make_pair(w.payoutScript, fnMine(w.payoutScript))).first;
+        nTotalOut += w.work;
+        if (it->second)
+            nMineOut += w.work;
+    }
+}
+
 bool P2PoolLocalStatus(const string& strName, P2PoolLocalStatusInfo& out)
 {
     bool f = false;

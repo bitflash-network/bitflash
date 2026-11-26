@@ -82,7 +82,7 @@ HEADERS = headers_core.h headers.h fuzz_datadir.h jsonsafe.h fuzz_socket.h jsonr
           randomx_pow.h consensus.h btfaddr.h btfchan.h btfsock.h market.h \
           selftest.h walletcmd.h wallet_sqlite.h compat.h sockcount.h \
           btfchat.h btfchatmsg.h btfchatbox.h btfchatlog.h btfchatlink.h btfchatsock.h btfchatnode.h chatstore.h chatrelay.h btfchatnet.h swap.h btfchatwallet.h rpcclient.h btcswap.h btclight.h coinunit.h chatswap.h btfchatswap.h bip21.h qrcodegen.hpp invoice.h community.h chatdir.h p2pool.h p2pool_share.h p2pool_chain.h p2pool_net.h poolrecord.h poollocal.h poolindex.h poolticket.h sigcheck.h \
-          proxy.h tor.h treasury.h gui_chat.h gui_explorer.h explorer.h font_roboto.h \
+          proxy.h tor.h treasury.h gui_chat.h gui_explorer.h gui_everpool.h explorer.h font_roboto.h \
           dgb_anchors.h rvn_anchors.h x16rv2.h v4templates.h
 
 IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
@@ -148,7 +148,7 @@ NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
             obj/community.o obj/explorer.o obj/chatdir.o obj/p2pool.o obj/p2pool_share.o obj/p2pool_chain.o obj/p2pool_net.o obj/poolrecord.o obj/poollocal.o obj/poolindex.o obj/poolticket.o obj/sigcheck.o \
             $(patsubst %.cpp,obj/%.o,$(LIGHT_POW_SOURCES)) $(patsubst %.c,obj/%.o,$(LIGHT_POW_C_SOURCES))
 
-GUI_OBJS = obj/gui.o obj/gui_explorer.o obj/main_gui.o
+GUI_OBJS = obj/gui.o obj/gui_explorer.o obj/gui_everpool.o obj/main_gui.o
 
 all: bitflash
 
@@ -780,6 +780,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=managed-tor
 	./bitflash-node -selftest=treasury
 	./bitflash-node -selftest=pool-settings
+	./bitflash-node -selftest=everpool-gui
 	./bitflash-node -selftest=chat-link
 	./bitflash-node -selftest=chat-identity
 	./bitflash-node -selftest=chat-relay
