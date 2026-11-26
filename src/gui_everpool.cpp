@@ -1029,7 +1029,7 @@ static void DrawList(float h)
     ImGui::TableSetupColumn("Age", ImGuiTableColumnFlags_WidthFixed, 80.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 150.0f);
     ImGui::TableSetupColumn("Recent work", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-    ImGui::TableSetupColumn("This node", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+    ImGui::TableSetupColumn("This node", ImGuiTableColumnFlags_WidthFixed, 150.0f);
     ImGui::TableHeadersRow();
     for (size_t i = 0; i < g_shown.rows.size(); i++)
     {
