@@ -1071,9 +1071,51 @@ static void DrawList(float h)
     ImGui::EndTable();
 }
 
-static void DrawDetail(const EvRow& r)
+// The pool's main action, at the top of its panel: choose it for P2Pool.
+static void DrawMineButton(const EvRow& r)
 {
     const P2PoolChoiceInfo running = P2PoolChoiceRunning();
+    int nKind = r.fZero ? P2POOL_CHOICE_ZERO : P2POOL_CHOICE_REGISTERED;
+    uint256 id = r.fZero ? uint256(0) : r.id;
+    const int nSaved = g_savedKind;
+    const uint256 idSaved = g_savedId;
+    const bool fSaved = g_savedFile;
+    bool fRunning = fP2PoolMode && SameChoice(nKind, id, running.nKind, running.id);
+    bool fIsSaved = fSaved ? SameChoice(nKind, id, nSaved, idSaved) : fRunning;
+    std::string strWhyNot;
+    if (nMineMode == MINE_OPERATOR)
+        strWhyNot = "This node runs a pool as operator (Options): P2Pool and operator mode do not go together.";
+    else if (!r.fZero && !PoolBurnsOpen())
+        strWhyNot = "Everpool pools are not open on mainnet in this build: only pool zero can be mined.";
+    else if (r.fJustSent)
+        strWhyNot = "Wait until the burn is in a block.";
+    else if (!r.fZero && r.nStatus != POOL_ACTIVE && r.nStatus != POOL_PENDING)
+        strWhyNot = "This pool is not recorded on the chain this node follows.";
+    ImGui::BeginDisabled(!strWhyNot.empty() || fIsSaved);
+    const char* pszLabel = fIsSaved ? (fRunning ? "Mining this pool" : "Chosen for the next start")
+                                    : (r.fZero ? "Mine pool zero" : "Mine this pool");
+    if (ImGui::Button(pszLabel, ImVec2(200.0f, 0.0f)))
+        SaveChoice(nKind, id);
+    ImGui::EndDisabled();
+    if (!strWhyNot.empty())
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", strWhyNot.c_str());
+    }
+    else if (!r.fZero && r.nStatus == POOL_PENDING && !fIsSaved)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Pending: miners get work once it is active.");
+    }
+    else if (!fIsSaved)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Uses an external miner (Bitflash Miner or XMRig) on this node's stratum.");
+    }
+}
+
+static void DrawDetail(const EvRow& r)
+{
     if (r.fZero)
         ImGui::Text("Pool zero: the default pool every P2Pool miner already mines");
     else
@@ -1082,6 +1124,8 @@ static void DrawDetail(const EvRow& r)
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy##detailid"))
         ImGui::SetClipboardText(r.strId.c_str());
+    DrawMineButton(r);
+    ImGui::Spacing();
 
     ImGui::PushStyleColor(ImGuiCol_Text, FeeColor(r.rec.nFeeBps));
     ImGui::Text("Creator fee: %s", FeePercent(r.rec.nFeeBps).c_str());
@@ -1129,46 +1173,6 @@ static void DrawDetail(const EvRow& r)
     }
     else
         ImGui::TextDisabled("No block names this pool in the last %d.", POOL_ANCHOR_WINDOW);
-
-    // Mine it.
-    ImGui::Spacing();
-    int nKind = r.fZero ? P2POOL_CHOICE_ZERO : P2POOL_CHOICE_REGISTERED;
-    uint256 id = r.fZero ? uint256(0) : r.id;
-    const int nSaved = g_savedKind;
-    const uint256 idSaved = g_savedId;
-    const bool fSaved = g_savedFile;
-    bool fRunning = fP2PoolMode && SameChoice(nKind, id, running.nKind, running.id);
-    bool fIsSaved = fSaved ? SameChoice(nKind, id, nSaved, idSaved) : fRunning;
-    std::string strWhyNot;
-    if (nMineMode == MINE_OPERATOR)
-        strWhyNot = "This node runs a pool as operator (Options): P2Pool and operator mode do not go together.";
-    else if (!r.fZero && !PoolBurnsOpen())
-        strWhyNot = "Everpool pools are not open on mainnet in this build: only pool zero can be mined.";
-    else if (r.fJustSent)
-        strWhyNot = "Wait until the burn is in a block.";
-    else if (!r.fZero && r.nStatus != POOL_ACTIVE && r.nStatus != POOL_PENDING)
-        strWhyNot = "This pool is not recorded on the chain this node follows.";
-    ImGui::BeginDisabled(!strWhyNot.empty() || fIsSaved);
-    const char* pszLabel = fIsSaved ? (fRunning ? "Mining this pool" : "Chosen for the next start")
-                                    : (r.fZero ? "Mine pool zero" : "Mine this pool");
-    if (ImGui::Button(pszLabel, ImVec2(200.0f, 0.0f)))
-        SaveChoice(nKind, id);
-    ImGui::EndDisabled();
-    if (!strWhyNot.empty())
-    {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", strWhyNot.c_str());
-    }
-    else if (!r.fZero && r.nStatus == POOL_PENDING && !fIsSaved)
-    {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Pending: miners get work once it is active.");
-    }
-    else if (!fIsSaved)
-    {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Uses an external miner (Bitflash Miner or XMRig) on this node's stratum.");
-    }
 }
 
 // ---- The window -------------------------------------------------------------
