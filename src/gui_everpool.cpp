@@ -296,7 +296,35 @@ static void Load(EvSnapshot& snap, std::vector<EvSent> vSent)
         if (snap.rows[i].fHeld && snap.rows[i].st.fCarried)
             snap.rows[i].dHashRate = EstimateHashRate(snap.rows[i].st.work, snap.rows[i].st.nTipHeight,
                                                       snap.rows[i].rec);
-    // Burns this window sent that no block holds yet.
+    // Burns this window sent that no block holds yet, and those this wallet
+    // holds unconfirmed (sent before a restart, or with poolcreate): the
+    // wallet sends them again until they are mined.
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            if (it->second.GetDepthInMainChain() > 0)
+                continue;
+            for (size_t k = 0; k < it->second.vout.size(); k++)
+            {
+                std::vector<unsigned char> record;
+                poolreg::PoolRecord rec;
+                if (!PoolBurnedRecord(it->second.vout[k], record, rec))
+                    continue;
+                EvSent s;
+                poolreg::PoolId(record, (const unsigned char*)pchMessageStart, s.id.begin());
+                s.strName = rec.name;
+                s.strTxid = it->first.GetHex();
+                s.rec = rec;
+                bool fHave = false;
+                for (size_t m = 0; m < vSent.size() && !fHave; m++)
+                    fHave = vSent[m].id == s.id;
+                if (!fHave)
+                    vSent.push_back(s);
+            }
+        }
+    }
     for (size_t i = 0; i < vSent.size(); i++)
     {
         bool fKnown = false;
