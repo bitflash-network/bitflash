@@ -3988,6 +3988,12 @@ struct RegPool
     // a pool (RegOverCap): let go, and neither fetched, carried nor mined
     // again in this run.
     bool fOverCap;
+    // The share data hash of the pool's newest anchor, when the line taken
+    // at the end of a fetch did not hold it (section 10, reviving a dormant
+    // pool, step 2): other announcers were asked for their lines, and the
+    // outcome is logged once at nAnchorRecheckAt.
+    uint256 hashAnchorMissing;
+    int64 nAnchorRecheckAt;
     // Carriers a peer named in answer to this node's poolwho (poolat), each
     // with when it was named: dialled with the guardians for POOLAT_HINT_TTL
     // (P2PoolGuardDialList), whether or not the line has started here since,
@@ -3999,7 +4005,8 @@ struct RegPool
         : id(idIn), rec(recIn), record(recordIn), state(&classReg, chainIn, strFileIn), strPart(strPartIn),
           fMined(false), fCarry(false), fGuard(false), nStatus(POOL_UNKNOWN), fStatusKnown(false), nFetch(FETCH_IDLE),
           pFetchPeer(NULL), nAskAt(0), nLastPartAt(0), nCatchupAt(0), nRetryAt(0), hashResume(0), nLastNewShare(0),
-          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0), fOverCap(false) {}
+          nPartBytes(0), fPartFull(false), nPartCapForTest(0), nWantedSince(0), nWhoAt(0), fOverCap(false),
+          hashAnchorMissing(0), nAnchorRecheckAt(0) {}
 };
 
 // A guardian ticket waiting for the ticket budget (section 10): checked
@@ -4724,6 +4731,8 @@ static void RegDropFetch(RegPool* rp)
     rp->fPartFull = false;
 }
 
+static void RegCheckAnchor(RegPool* rp);
+
 // Not under cs_p2pool: the line is complete. It goes to pools/<id>.dat, the
 // partial file goes, and from now on the pool is announced, served, relayed
 // and mined on.
@@ -4758,6 +4767,7 @@ static void RegComplete(RegPool* rp)
     printf("p2pool: registered pool %s: its line is complete here (%u shares, tip at height %d)%s\n",
            rp->id.GetHex().c_str(), (unsigned)nShares, nTip,
            fSaved ? "" : "; its file could not be written, its partial file is kept");
+    RegCheckAnchor(rp);
 }
 
 static bool RegPartInWindow(PoolState& ps, CNode* pfrom)
@@ -4955,6 +4965,108 @@ static void RegApplyInvLocked(CNode* pnode, RegConn& c, int64 nNow)
             AskHistory(rp->state, pnode);
         }
     }
+}
+
+// Section 10, reviving a dormant pool, step 2: the main-chain anchors tell
+// which offered line is the real one. A line that ends a fetch without the
+// share the pool's newest anchor names, though the line reaches back past
+// that block's time, is the sign of a stale or private line: a warning, and
+// every other announcer (up to REG_ANCHOR_ASKS) is asked for its line, which
+// joins the chain beside it. The tip is still chosen by work alone, as for
+// every pool: a tip that rested on which main blocks a node holds split
+// honest nodes for good on testnet (docs/p2pool.md), so the anchor decides
+// what is fetched, never what is valid or which line is mined on. An anchor
+// is a claim anybody may put in a block of their own; a false one costs
+// that block and buys a log line and a few asks.
+static bool RegIndexLookup(const uint256& id, CPoolInfo& out);
+static const size_t REG_ANCHOR_ASKS = 4;
+static const int64 REG_ANCHOR_RECHECK = 10 * 60;
+static bool fRegAnchorForTest = false;
+static map<uint256, std::pair<uint256, int64> > mapRegAnchorForTest;
+
+// Not under cs_p2pool: the share data hash the pool's newest counted anchor
+// names, and the time of the block it is in.
+static bool RegNewestAnchor(const uint256& id, uint256& hashOut, int64& nTimeOut)
+{
+    bool fTest = false;
+    CRITICAL_BLOCK(cs_p2pool)
+        if (fRegAnchorForTest)
+        {
+            fTest = true;
+            map<uint256, std::pair<uint256, int64> >::const_iterator it = mapRegAnchorForTest.find(id);
+            if (it == mapRegAnchorForTest.end())
+                return false;
+            hashOut = it->second.first;
+            nTimeOut = it->second.second;
+        }
+    if (fTest)
+        return true;
+    CPoolInfo info;
+    if (!RegIndexLookup(id, info))
+        return false;
+    for (size_t i = 0; i < info.vRecentAnchors.size(); i++)
+    {
+        const CPoolAnchor& a = info.vRecentAnchors[i];
+        if (a.nDroppedAt != -1 || a.hashShareData == 0)
+            continue;
+        bool fFound = false;
+        CRITICAL_BLOCK(cs_main)
+        {
+            map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(a.hashBlock);
+            if (it != mapBlockIndex.end() && it->second->IsInMainChain())
+            {
+                nTimeOut = (int64)it->second->nTime;
+                fFound = true;
+            }
+        }
+        if (!fFound)
+            return false;
+        hashOut = a.hashShareData;
+        return true;
+    }
+    return false;
+}
+
+// Not under cs_p2pool: a fetch has just completed.
+static void RegCheckAnchor(RegPool* rp)
+{
+    uint256 id;
+    CRITICAL_BLOCK(cs_p2pool)
+        id = rp->id;
+    uint256 hashAnchor = 0;
+    int64 nAnchorTime = 0;
+    if (!RegNewestAnchor(id, hashAnchor, nAnchorTime))
+        return;
+    size_t nAsked = 0;
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        if (rp->nFetch != FETCH_COMPLETE || rp->state.chain->Empty() || rp->state.chain->HasDataHash(hashAnchor))
+            return;
+        // Only a line that reaches back to that block can be expected to
+        // hold it: one whose oldest share is younger was pruned past it.
+        vector<uint256> vIds;
+        vector<int> vHeights;
+        rp->state.chain->HistoryIds(vIds, vHeights);
+        Share sOldest;
+        if (vIds.empty() || !rp->state.chain->GetHeld(vIds[0], sOldest) || (int64)sOldest.nTime > nAnchorTime)
+            return;
+        const int64 nNow = GetTime();
+        rp->hashAnchorMissing = hashAnchor;
+        rp->nAnchorRecheckAt = nNow + REG_ANCHOR_RECHECK;
+        for (map<CNode*, RegConn>::iterator it = mapRegConn.begin(); it != mapRegConn.end() && nAsked < REG_ANCHOR_ASKS; ++it)
+        {
+            CNode* p = it->first;
+            if (p == rp->pFetchPeer || !RegCanAsk(*rp, p, it->second, nNow) || !HistoryAskAllowed(rp->state, p))
+                continue;
+            RegPeerOf(*rp, p);
+            AskHistory(rp->state, p);
+            nAsked++;
+        }
+    }
+    printf("p2pool: WARNING: registered pool %s: the line taken does not hold the share of the pool's newest anchor "
+           "on the main chain (a block of %s), though it reaches back that far: a peer may have served a stale or "
+           "private line; %u other announcer(s) asked for theirs\n", id.GetHex().c_str(),
+           DateTimeStr(nAnchorTime).c_str(), (unsigned)nAsked);
 }
 
 // Under cs_p2pool, on the message thread: one step of a fetch. True when
@@ -7072,6 +7184,17 @@ static void RegTick()
             }
             if (!rp->nWantedSince)
                 rp->nWantedSince = nNow;
+            if (rp->hashAnchorMissing != 0 && nNow >= rp->nAnchorRecheckAt)
+            {
+                // What the other announcers' lines brought (RegCheckAnchor).
+                if (rp->state.chain->HasDataHash(rp->hashAnchorMissing))
+                    printf("p2pool: registered pool %s: its chain now holds the share of its newest anchor\n",
+                           rp->id.GetHex().c_str());
+                else
+                    printf("p2pool: WARNING: registered pool %s: still no line here holds the share of its newest "
+                           "anchor; the tip stays the one with the most work\n", rp->id.GetHex().c_str());
+                rp->hashAnchorMissing = 0;
+            }
             if (rp->nFetch == FETCH_COMPLETE)
                 continue;
             if (rp->nFetch == FETCH_RUNNING && rp->nLastNewShare && nNow - rp->nLastNewShare > REG_PART_EXPIRY)
@@ -7745,6 +7868,24 @@ void P2PoolRegSetPartCapForTest(const uint256& id, uint64 n)
     }
 }
 
+void P2PoolRegAnchorForTest(const uint256& id, const uint256& hashShareData, int64 nBlockTime)
+{
+    CRITICAL_BLOCK(cs_p2pool)
+    {
+        fRegAnchorForTest = true;
+        mapRegAnchorForTest[id] = std::make_pair(hashShareData, nBlockTime);
+    }
+}
+
+bool P2PoolRegAnchorMissingForTest(const uint256& id)
+{
+    bool f = false;
+    CRITICAL_BLOCK(cs_p2pool)
+        if (RegPool* rp = RegById(id))
+            f = rp->hashAnchorMissing != 0;
+    return f;
+}
+
 int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate)
 {
     int64 n = -1;
@@ -7811,6 +7952,7 @@ void P2PoolRegAgeForTest(int64 nSecs)
             if (rp->nLastNewShare) rp->nLastNewShare -= nSecs;
             if (rp->nWantedSince) rp->nWantedSince -= nSecs;
             if (rp->nWhoAt) rp->nWhoAt -= nSecs;
+            if (rp->nAnchorRecheckAt) rp->nAnchorRecheckAt -= nSecs;
             for (size_t i = 0; i < rp->vHintAt.size(); i++)
                 rp->vHintAt[i].second -= nSecs;
             for (map<CNode*, PeerPool>::iterator it = rp->state.mapPeer.begin(); it != rp->state.mapPeer.end(); ++it)

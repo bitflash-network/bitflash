@@ -10701,6 +10701,50 @@ static int RunP2PoolRegisteredSelfTest()
                    fOther, (unsigned)RegShares(idM), nF2);
     }
 
+    // ---- reviving a dormant pool (section 10, step 2): a line that ends the
+    // fetch without the share of the pool's newest anchor, though it reaches
+    // back that far, is warned of, and the other announcers are asked for
+    // theirs; the true line then joins and is the tip by its work
+    {
+        poolreg::PoolRecord recV = recB;
+        recV.name = "regtest-revive";
+        p2pool::PoolRules rulesV;
+        p2pool::RulesForRegistered(recV, magic, rulesV, err);
+        const uint256 idV = rulesV.poolId;
+        p2pool::ShareChain mirrorV(rulesV, false);
+        vector<p2pool::Share> lineV = RegLine(mirrorV, main, 30, 46);
+        CNode* pS = NewRegTestNode(false, "BF1speer");   // serves a stale prefix
+        CNode* pT = NewRegTestNode(false, "BF1tpeer");   // holds the whole line
+        P2PoolRegAnchorForTest(idV, lineV[29].data.GetHash(), (int64)lineV[29].nTime);
+        P2PoolRegAddForTest(recV, false, true, false, err);
+        P2PoolOnVersion(pS);
+        SendPoolInv(pS, vector<uint256>(1, idV));
+        P2PoolRefillBudgetsForTest();
+        P2PoolRegTickForTest();
+        const bool fAskedS = CountSent(pS, "p2xsync") >= 1;
+        P2PoolOnVersion(pT);
+        SendPoolInv(pT, vector<uint256>(1, idV));
+        const size_t nSyncT = CountSent(pT, "p2xsync");
+        P2PoolRefillBudgetsForTest();
+        SendRegPart(pS, idV, 19, 1, vector<p2pool::Share>(lineV.begin(), lineV.begin() + 20));
+        SendRegPart(pS, idV, 19, 1, vector<p2pool::Share>(lineV.begin() + 17, lineV.begin() + 20));
+        const bool fStale = P2PoolRegFetchForTest(idV) == P2PoolRegStatusInfo::FETCH_COMPLETE && RegShares(idV) == 20;
+        const bool fWarned = P2PoolRegAnchorMissingForTest(idV) && CountSent(pT, "p2xsync") > nSyncT &&
+                             CountSent(pS, "p2xsync") <= 2;
+        SendRegPart(pT, idV, 29, 1, lineV);
+        P2PoolRegStatusInfo st = P2PoolRegStatusInfo();
+        const bool fJoined = P2PoolRegStatus(idV, st) && st.nShares == 30 && st.nTipHeight == 29;
+        P2PoolRegAgeForTest(10 * 60 + 1);
+        P2PoolRegTickForTest();
+        const bool fCleared = !P2PoolRegAnchorMissingForTest(idV) && pS->nMisbehavior == 0 && pT->nMisbehavior == 0;
+        nFail += Check(fAskedS && fStale && fWarned && fJoined && fCleared,
+                       "a fetch ending on a line without the share of the pool's newest anchor warns and asks the "
+                       "other announcers; the anchored line joins and is the tip by its work") ? 0 : 1;
+        if (!(fAskedS && fStale && fWarned && fJoined && fCleared))
+            printf("       asked %d, stale complete %d, warned %d, joined %d (%u shares, tip %d), cleared %d\n", fAskedS,
+                   fStale, fWarned, fJoined, (unsigned)st.nShares, st.nTipHeight, fCleared);
+    }
+
     // ---- a carried pool whose line passes its byte cap and half again is
     // let go: memory and files, and not fetched or carried again
     {

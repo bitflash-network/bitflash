@@ -1080,11 +1080,22 @@ A pool is dormant when nobody mines it: its newest share is older than its
 2. **The anchors pick out the true line.** The index knows the main-chain
    blocks whose coinbase anchored P (section 7), each naming one share's data
    hash. A line containing the most recently anchored share is the line the
-   pool's last block was found on. A node prefers, among histories of equal
-   standing, one that contains it, and logs a warning when the heaviest line
-   it was given does not: that is the sign of a guardian serving a stale or
-   private line. (It is a preference, not a validity rule: an honest guardian
-   may not hold a share that was a block on a side line.)
+   pool's last block was found on. When the line that ends a fetch does not
+   hold that share although it reaches back past that block's time, the node
+   logs a warning (the sign of a peer serving a stale or private line), asks
+   up to 4 other announcers for their lines, which join the chain beside it,
+   and logs 10 minutes later whether the chain now holds the anchored share
+   (`RegCheckAnchor`, `p2pool_net.cpp`). The anchor decides what is fetched,
+   never which line is mined on: the tip stays the line with the most work,
+   as for every pool. An earlier draft had the node prefer the anchored line
+   "among histories of equal standing"; that is dropped. Equal work almost
+   never happens, a stale prefix of the true line is lighter than the line
+   itself (so fetching the true line is what fixes it), and a tip chosen by
+   which main blocks a node holds would split honest nodes for good, the
+   failure `docs/p2pool.md` records from testnet. (It is not a validity rule
+   either: an honest guardian may not hold a share that was a block on a side
+   line, and an anchor is a claim anybody may put in a block of their own; a
+   false one costs that block and buys a log line and a few asks.)
 3. The node mines on the tip. The retarget is slow to ease after a long gap:
    the first share after it is at the old difficulty (its retarget window does
    not contain the gap), and from then on each share's target is the mean of
@@ -1098,7 +1109,7 @@ A pool is dormant when nobody mines it: its newest share is older than its
    over does not. This is not the reviver's choice alone: once a line is
    dormant, anybody can replace it with a cheap live one, since live beats
    dormant whatever the work (pool zero has the same rule today), and the
-   anchor preference of step 2 does not stop it. A dormant window's value is
+   anchor check of step 2 does not stop it. A dormant window's value is
    the goodwill of whoever mines next; a pool whose miners want their window
    paid keeps mining it.
 4. **If no copy is left anywhere,** the node waits as long as a starting pool
@@ -1345,9 +1356,12 @@ probability, independently, so holding all 16 places of one chosen pool takes
 about (A / (H + A))^16 per epoch: with A = H, one pool in 65,536 per epoch;
 taking a chosen pool with even odds takes A around 22 times H. Aiming instead,
 grinding tickets after the draw seed is known until 16 of them top one pool,
-costs about 16 times H tickets for near-certain capture of that one pool: the
-same order. Raising H is the honest answer: every guarding node makes one
-ticket a day.
+costs on the order of 16 times H tickets for that one pool, but the cost is
+heavy-tailed: measured (the attack harness, `-selftest=attack-stale`), the
+median is about 20.5 H, the 10th percentile 5.8 H and the 90th 97.4 H, so a
+lucky grinder captures a chosen pool for a few H and an unlucky one pays
+around a hundred. The same order as the blind figure above. Raising H is the
+honest answer: every guarding node makes one ticket a day.
 
 The estimate (A / (H + A))^16 treats the 16 places as independent. They are
 drawn without replacement from the held set, so the true figure is a little

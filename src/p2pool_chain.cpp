@@ -685,6 +685,14 @@ bool ShareChain::GetHeld(const uint256& id, Share& out) const
     return true;
 }
 
+bool ShareChain::HasDataHash(const uint256& hashData) const
+{
+    for (map<uint256, Entry>::const_iterator it = mapShares.begin(); it != mapShares.end(); ++it)
+        if (it->second.share.data.GetHash() == hashData)
+            return true;
+    return false;
+}
+
 bool ShareChain::ParentOf(const uint256& id, uint256& parentOut) const
 {
     const Entry* e = Get(id);

@@ -320,6 +320,12 @@ void P2PoolRegSetMaxBytesForTest(const uint256& id, size_t n);
 // two writes of a pool's line then (id 0: pool zero; -1: no such pool); the
 // bytes of every complete registered line this node holds.
 int64 P2PoolRegSaveIntervalForTest(const uint256& id, int64 nRate);
+// Self-tests: the newest anchor of a pool, as the index would give it (the
+// share data hash it names and its block's time), from now on in this
+// process; and whether the line that ended the pool's fetch lacked it and
+// other announcers were asked (section 10, reviving a dormant pool).
+void P2PoolRegAnchorForTest(const uint256& id, const uint256& hashShareData, int64 nBlockTime);
+bool P2PoolRegAnchorMissingForTest(const uint256& id);
 uint64 P2PoolRegSavedBytesForTest();
 
 // ---- Guardians (docs/pool-registry.md, sections 10 to 12)
