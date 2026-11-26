@@ -5090,7 +5090,7 @@ static json CreateEverpool(const json& p)
                                 "it is active once the burn has 30 confirmations";
         return j;
     }
-    // Mainnet cannot carry or mine a registered pool yet: a burn there would
+    // Where registered pools are closed (mainnet before 1.2.36) a burn would
     // cost 1 BTF for nothing (POOL_REGISTRY_MAINNET_OPEN, poolindex.h).
     if (!PoolBurnsOpen())
         throw runtime_error(POOL_BURNS_CLOSED);

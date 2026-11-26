@@ -376,14 +376,15 @@ bool PoolBurnedRecord(const CTxOut& out, std::vector<unsigned char>& recordOut, 
 // it is reading the chain again from genesis, of one moment.
 void PoolIndexState(int& nHeightOut, bool& fSyncedOut, bool& fRebuildingOut);
 
-// Registered pools on mainnet (docs/pool-registry.md, section 9). Until the
-// release that carries and mines them there (the p2x messages of section 8
-// and the guardians of section 10), a burn on mainnet would cost 1 BTF for a
-// pool nobody can mine, so `poolcreate everpool` refuses "send" and
-// "publishzero" on mainnet and shows its preview only. The release that opens
-// registered pools on mainnet sets this to true, and changes nothing else.
-// Testnet is always open.
-static const bool POOL_REGISTRY_MAINNET_OPEN = false;
+// Registered pools on mainnet (docs/pool-registry.md, section 9). Releases
+// before 1.2.36 had this false: they could neither carry nor mine a registered
+// pool there, so `poolcreate everpool` refused "send" and "publishzero" on
+// mainnet, every registry message was dropped unread and NODE_POOLREG was not
+// said. 1.2.36 opens them, after the testnet proof of section 15, the attack
+// and scale runs and the pre-mainnet review; this constant is the only change.
+// Setting it back to false closes mainnet again, nothing else. Testnet is
+// always open.
+static const bool POOL_REGISTRY_MAINNET_OPEN = true;
 // Whether this node may burn a pool record now: testnet, or mainnet once
 // POOL_REGISTRY_MAINNET_OPEN is true.
 bool PoolBurnsOpen();

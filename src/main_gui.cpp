@@ -408,7 +408,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         // An Everpool pool: mined once its record is active on this node's
         // chain and its line is here; until then the stratum serves no work
         // and the log says why.
-        // Not on mainnet before the release that opens them there.
+        // Refused where registered pools are closed (mainnet before 1.2.36).
         if (idReg != 0 && !P2PoolRegWant(idReg, true, strChoiceWhyNot))
             StartupRefuse(strChoiceWhyNot, "Use -p2pool alone for the default pool, or -p2pool=local:<name> for a local "
                                            "pool of this node.");
