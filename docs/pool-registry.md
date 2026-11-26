@@ -1,7 +1,7 @@
 # Everpool: the P2Pool that no one can delete, edit or shut down
 
-Status: design done (Phase A); implementation in progress (Phase B, section
-16). The phases are at the end. The protocol is also published on its own, for
+Status: design done (Phase A); implemented (Phases B and C, section 16) and
+proved on testnet with real coins (Phase D); not open on mainnet yet. The phases are at the end. The protocol is also published on its own, for
 any chain to adopt, at https://github.com/bitflash-network/everpool. Main-chain consensus does not change: everything below is node
 software and P2Pool protocol, and ships in an ordinary release.
 
@@ -1595,10 +1595,10 @@ through a registered pool, with the explorer link to its `"p2x"` anchor.
 | phase | content | status |
 |---|---|---|
 | A | this design, reviewed | done (PR #82); bridges and the name (PR #84); P2Pool local (section 18, a follow-up) |
-| B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | in progress (PR #83) |
+| B1 | the record checks (both magics), share rules v1 as parameters, the `ShareX` structure, the `"p2l"` anchor, the class split of section 8 (registered RandomX budget, orphan queue, send-queue accounting, slow-reader rule, deferred slots and last-good state, all apart from pool zero's) with its isolation self-test, `p2l*` on the lock-free command path, P2Pool local (section 18: code, password, id, keys, hello, `p2l*` messages, its RPCs), the job rebuild, paced snapshot serves and resumable fetches, mining a local pool on testnet with real coins (step 8); self-tests and fuzz. Lands first: no registry, no guardians | merged (#83) |
 | B2 | the index with reorgs, `poolcreate everpool`/`poollist`/`poolinfo`, pool zero as entry zero, the `"p2x"` anchor, `NODE_POOLREG` and the `p2x*` messages, mining a chosen registered pool on testnet | part 1 (the index and its RPCs) merged (#87); part 2 (`NODE_POOLREG`, `poolinv`, the `p2x*` messages, `poolwho`/`poolat`, carried pools, `pools/<id>.dat` and `.part`, `-p2pool=<pool id>`, `-poolcarry`) merged (#91) |
 | C | guardians: tickets, the draw, handoff, revival, budgets, the `transports` field of section 17 | part 1 (tickets, the draw, the guard budget, no network) merged (#89); part 2 (`pooltkt`/`poolgettkt`, the ticket thread, guarded pools, handoff and revival, `-poolguard*`, `poolinfo` guardians, self-test `p2pool-guardians`, `fuzz-pooltkt`) merged (#95); the `transports` field of section 17 done (`gettorinfo`, self-test `managed-tor`) |
-| D | the testnet proof of section 15 | after C |
+| D | the testnet proof of section 15 | done on testnet, every step, payouts spent (PROOFS.md in the Everpool repository) |
 
 ## 17. Networks where Tor is blocked
 
