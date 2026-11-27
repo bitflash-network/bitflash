@@ -289,6 +289,18 @@ run a pool.
   payout script are on the share chain any node keeps, so whether a login's
   work was paid to it can be checked after the fact on any node's
   `p2pool.dat` (one block's coinbase against its window, to the satoshi).
+- **One login per connection.** A connection that logs in again with
+  another address is refused and dropped (the same address again is
+  taken), and a job keeps at most 1000 templates, one per connection the
+  bridge takes. The share chain is walked once per job, not once per login:
+  each miner's window is the job's, with the share's own entry named for
+  its address.
+- **The node's own key.** Every miner's template is made from the job's
+  own, which pays the node: the bridge needs `-p2poolpayto` or an unlocked
+  wallet, or it serves no work (the log says so at start).
+- **Not announced.** The operator pool announced itself on Nostr for the
+  wallet's pool list; the bridge does not. Miners that already point at its
+  onion (the Bitflash Miner, a wallet set to this pool) are unaffected.
 - **Connections:** up to 1000, like the operator pool, all over Tor.
 
 ### The old ledger: `-pooldrain`
@@ -300,9 +312,17 @@ the operator's payout thread on it: each round is paid from the node's
 wallet once it matures, only if its block is still in the main chain, and
 recorded and recovered after a restart exactly as before. P2Pool's blocks
 pay their miners themselves, so no new round is ever added. The log says
-how much is owed at start and when the ledger is empty; `pool_status.json`
+how much is owed at start and when the ledger is empty (paid, or its last
+round dropped because its block left the main chain); `pool_status.json`
 keeps listing the pending rounds (`node.drainingLedger`), with
 `node.pool` set to `p2pool-bridge` and a fee of 0.
+
+Two things it does not do. It does not pay the round that was still open
+when the operator stopped: those shares were never in a block, and an
+operator restart has never paid them either. And it must run on the one
+ledger in use: a payout already made is recognised only by the wallet
+transactions of the node that made it, so `-pooldrain` on a copy of the
+ledger while the operator is still paying from its own would pay twice.
 
 ## Privacy
 

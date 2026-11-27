@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <map>
 #include <set>
@@ -93,6 +94,18 @@ struct JobVariant {
     p2pool::ShareData shareData;
 };
 typedef std::map<std::vector<unsigned char>, JobVariant> JobVariantMap;
+// -p2poolbridge: the window of a job's share data with its payout script
+// left out (BridgeCondenseWindow), made the first time a variant is asked
+// for, and the rules of the pool it pays under.
+struct JobWindow {
+    bool        fTried = false;
+    bool        fOk    = false;
+    std::string strErr;
+    std::vector<p2pool::WindowShare> condensed;
+    p2pool::PoolRules rules;
+};
+// Variants a job holds at most: one per connection the bridge takes.
+static const size_t MAX_JOB_VARIANTS = 1000;
 
 struct StratumJob {
     std::string jobId;
@@ -120,6 +133,7 @@ struct StratumJob {
     unsigned int nOtherSigOps    = 0;   // every transaction but the coinbase
     unsigned int nOtherBytes     = 0;   // the block without its coinbase
     std::shared_ptr<JobVariantMap> pVariants;
+    std::shared_ptr<JobWindow>     pWindow;
 };
 
 // The script this node's shares pay: -p2poolpayto, or a fresh key of its own
@@ -177,19 +191,77 @@ static unsigned int P2PoolCoinbaseBytes(const p2pool::PoolRules& rules)
 // commitment in, the share window behind d paid out. False, with the reason,
 // when the window cannot be known (the share chain is still syncing, or no
 // longer holds d's parent).
-static bool P2PoolWriteCoinbase(const p2pool::ShareChain& c, CTransaction& cb, int nHeight, unsigned int nBits,
-                                uint32_t extraNonce, int64 nValue, const p2pool::ShareData& d, string& err)
+static bool P2PoolCoinbaseFromWindow(const p2pool::PoolRules& rules, CTransaction& cb, int nHeight, unsigned int nBits,
+                                     uint32_t extraNonce, int64 nValue, const p2pool::ShareData& d,
+                                     const vector<p2pool::WindowShare>& window, string& err)
 {
-    vector<p2pool::WindowShare> window;
     vector<p2pool::Payout> pay;
-    if (!c.WindowFor(d, p2pool::WorkOf(d.nShareBits), window, err) ||
-        !p2pool::ComputePoolPayouts(c.Rules(), window, nValue, pay, err))
+    if (!p2pool::ComputePoolPayouts(rules, window, nValue, pay, err))
         return false;
-    cb.vin[0].scriptSig = CScript() << nHeight << nBits << (CBigNum)extraNonce << p2pool::AnchorPush(c.Rules(), d);
+    cb.vin[0].scriptSig = CScript() << nHeight << nBits << (CBigNum)extraNonce << p2pool::AnchorPush(rules, d);
     cb.vout.clear();
     for (size_t i = 0; i < pay.size(); i++)
         cb.vout.push_back(CTxOut(pay[i].value, CScript(pay[i].script.begin(), pay[i].script.end())));
     return true;
+}
+
+static bool P2PoolWriteCoinbase(const p2pool::ShareChain& c, CTransaction& cb, int nHeight, unsigned int nBits,
+                                uint32_t extraNonce, int64 nValue, const p2pool::ShareData& d, string& err)
+{
+    vector<p2pool::WindowShare> window;
+    return c.WindowFor(d, p2pool::WorkOf(d.nShareBits), window, err) &&
+           P2PoolCoinbaseFromWindow(c.Rules(), cb, nHeight, nBits, extraNonce, nValue, d, window, err);
+}
+
+// -p2poolbridge: the window of a job's share data with the payout script
+// left out, made once per job, from which every miner's window follows.
+// WindowFor credits the share itself first, with an empty script here, and
+// nothing in a share chain has an empty script (IsPayoutScript), so that one
+// entry is the share's own. The rest is summed per payout script, which is
+// all ComputePayouts reads of it (it sums work per script, in 128 bits, and
+// orders by script); an entry is split where a sum would pass 64 bits. A
+// window holding an entry ComputePayouts refuses (no script, no work) is kept
+// whole, so it is refused exactly as the full window would be.
+static void BridgeCondenseWindow(const vector<p2pool::WindowShare>& full, vector<p2pool::WindowShare>& out)
+{
+    out.clear();
+    size_t nOwn = full.size();
+    for (size_t i = 0; i < full.size(); i++)
+        if (full[i].payoutScript.empty()) { nOwn = i; break; }
+    bool fRefused = nOwn == full.size();
+    for (size_t i = 0; i < full.size() && !fRefused; i++)
+        if (i != nOwn && (full[i].payoutScript.empty() || full[i].work == 0))
+            fRefused = true;
+    if (fRefused)
+    {
+        out = full;
+        return;
+    }
+    out.push_back(full[nOwn]);
+    std::map<std::vector<unsigned char>, size_t> last;   // script -> its latest entry in out
+    for (size_t i = 0; i < full.size(); i++)
+    {
+        if (i == nOwn)
+            continue;
+        std::map<std::vector<unsigned char>, size_t>::iterator it = last.find(full[i].payoutScript);
+        if (it != last.end() && out[it->second].work <= std::numeric_limits<uint64_t>::max() - full[i].work)
+            out[it->second].work += full[i].work;
+        else
+        {
+            last[full[i].payoutScript] = out.size();
+            out.push_back(full[i]);
+        }
+    }
+}
+
+// The window a variant paying script pays: the condensed one with the
+// share's own entry named for script.
+static void BridgeWindowFor(const vector<p2pool::WindowShare>& condensed, const std::vector<unsigned char>& script,
+                            vector<p2pool::WindowShare>& out)
+{
+    out = condensed;
+    for (size_t i = 0; i < out.size(); i++)
+        if (out[i].payoutScript.empty()) { out[i].payoutScript = script; break; }
 }
 
 // The coinbase of a P2Pool template: height, bits, extranonce and the share
@@ -547,6 +619,7 @@ static bool RebuildJob()
             job.nOtherBytes      = (unsigned int)(::GetSerializeSize(block, SER_DISK) -
                                                   ::GetSerializeSize(block.vtx[0], SER_DISK));
             job.pVariants        = std::make_shared<JobVariantMap>();
+            job.pWindow          = std::make_shared<JobWindow>();
         }
 
         gCurrentJob = job;
@@ -1065,8 +1138,10 @@ static std::string RoundBlockHash(const std::string& id)
 // coinbase to pay it with: it leaves the ledger, unpaid, and its record says so.
 static void DropOrphanedRound(const std::string& id, int blockHeight)
 {
+    bool fEmptied = false;
     {
         std::lock_guard<std::mutex> ledger(gPayoutLedgerMutex);
+        bool fHad = !gPendingPayouts.empty();
         for (auto it = gPendingPayouts.begin(); it != gPendingPayouts.end(); ) {
             if (it->id == id)
                 it = gPendingPayouts.erase(it);
@@ -1074,6 +1149,7 @@ static void DropOrphanedRound(const std::string& id, int blockHeight)
                 ++it;
         }
         SavePendingPayoutsLocked();
+        fEmptied = fHad && gPendingPayouts.empty();
     }
     {
         std::lock_guard<std::mutex> lk(gPoolRoundsMutex);
@@ -1084,6 +1160,10 @@ static void DropOrphanedRound(const std::string& id, int blockHeight)
     }
     LogPrint("payout", "[payout] block %d of payout %s is not in the main chain: round dropped, nothing paid\n",
              blockHeight, id.c_str());
+    // -pooldrain: the last round can leave this way as well as paid.
+    if (fP2PoolMode && fEmptied)
+        LogPrintAlways("payout", "[payout] -pooldrain: the operator ledger is paid out; "
+                       "nothing is owed, -pooldrain can go\n");
 }
 
 // Called from event loop: copy matured entries to the exec queue (fast).
@@ -1646,23 +1726,55 @@ static CBlock BuildMinerBlock(const StratumJob& job, uint32_t extranonce2)
 // -p2poolbridge: the variant of a job that pays this payout script, made the
 // first time a miner of that script needs it and kept with the job. NULL when
 // it cannot be made: no script, a job that is not a P2Pool one, a share chain
-// that no longer holds the job's parent, or a block it would put over a limit.
+// that no longer holds the job's parent, a job already holding a variant per
+// connection the bridge takes, or a block it would put over a limit.
+//
+// The share chain is walked once per job (JobWindow), not once per login: a
+// variant is the job's condensed window with its own entry named for its
+// script, which ComputePayouts pays exactly as the full window
+// (P2PoolWriteCoinbase; the self-test p2pool-bridge compares the two).
 static const JobVariant* JobVariantFor(const StratumJob& job, const std::vector<unsigned char>& script)
 {
-    if (script.empty() || !job.pVariants)
+    if (script.empty() || !job.pVariants || !job.pWindow)
         return NULL;
     JobVariantMap::const_iterator it = job.pVariants->find(script);
     if (it != job.pVariants->end())
         return &it->second;
+    if (job.pVariants->size() >= MAX_JOB_VARIANTS)
+    {
+        LogPrint("pool", "[p2pool] bridge: job %s already holds %u templates; none for another address\n",
+                 job.jobId.c_str(), (unsigned)job.pVariants->size());
+        return NULL;
+    }
+    JobWindow& w = *job.pWindow;
+    if (!w.fTried)
+    {
+        w.fTried = true;
+        p2pool::ShareData d = job.shareData;
+        d.payoutScript.clear();
+        vector<p2pool::WindowShare> full;
+        CRITICAL_BLOCK(cs_p2pool)
+        {
+            const p2pool::ShareChain& c = P2PoolMinedChain();
+            w.rules = c.Rules();
+            w.fOk = c.WindowFor(d, p2pool::WorkOf(d.nShareBits), full, w.strErr);
+        }
+        if (w.fOk)
+            BridgeCondenseWindow(full, w.condensed);
+    }
     JobVariant v;
     v.shareData = job.shareData;
     v.shareData.payoutScript = script;
     v.coinbase = job.block.vtx[0];
-    string err;
-    bool fOk = false;
-    CRITICAL_BLOCK(cs_p2pool)
-        fOk = P2PoolWriteCoinbase(P2PoolMinedChain(), v.coinbase, job.nCoinbaseHeight, job.nCoinbaseBits,
-                                  job.nExtraNonce, job.nBlockValue, v.shareData, err);
+    string err = w.strErr;
+    vector<p2pool::WindowShare> window;
+    bool fOk = w.fOk;
+    if (fOk)
+    {
+        BridgeWindowFor(w.condensed, script, window);
+        fOk = P2PoolCoinbaseFromWindow(w.rules, v.coinbase, job.nCoinbaseHeight, job.nCoinbaseBits,
+                                       job.nExtraNonce, job.nBlockValue, v.shareData, window, err);
+    }
     if (!fOk)
     {
         LogPrint("pool", "[p2pool] bridge: no template for a miner's address on job %s: %s\n",
@@ -1982,6 +2094,23 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         m->vardiffShares    = 0;
     };
 
+    // -p2poolbridge: a connection is one login. Another address on the same
+    // connection would have the bridge build and keep a template for every
+    // address a miner cares to send; the same address again changes nothing.
+    auto refuseBridgeRelogin = [&](const std::string& strLogin) -> bool {
+        if (!(fP2PoolMode && fP2PoolBridge && m->authorised))
+            return false;
+        std::string strAddr, strRig;
+        std::vector<unsigned char> script;
+        if (BridgeLoginScript(strLogin, strAddr, strRig, script) && script == m->payoutScript)
+            return false;
+        LogPrint("worker", "[pool] dropping miner fd=%d (%s): it logged in again as '%s'\n",
+                 (int)m->fd, m->address.c_str(), StratumLabel(strLogin).c_str());
+        reply(m->fCryptoNote ? json(nullptr) : json(false),
+              "already logged in as another address; reconnect to change it");
+        return true;
+    };
+
     // ------------------------------------------------------------------
     if (method == "login") {
         // XMRig: {"method":"login","params":{"login":ADDRESS,"pass":"x",
@@ -1993,6 +2122,8 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
             reply(nullptr, "login must carry a Bitflash payment address");
             return false;
         }
+        if (refuseBridgeRelogin(p["login"].get<std::string>()))
+            return false;
         if (PoWVersionAt(GetAdjustedTime()) < 2) {
             // Before the switch there is no job this miner could hash. Say
             // when, in the error XMRig prints, instead of leaving it waiting.
@@ -2107,6 +2238,8 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         // count, so "params":{"a":1} would pass a bare size() test.
         auto& p = req["params"];
         bool fArr = p.is_array();
+        if (refuseBridgeRelogin((fArr && p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : ""))
+            return false;
         m->address = (fArr && p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : "";
         m->worker  = (fArr && p.size() > 1 && p[1].is_string()) ? p[1].get<std::string>() : "worker";
         // In P2Pool mode only a label here as well: P2PoolPayoutScript pays
@@ -2977,6 +3110,7 @@ int RunP2PoolBridgeSelfTest()
         unsigned int nMinTime = 0;
         if (!P2PoolCoinbase(block, 1000, block.nBits, 7, 0, d, shareTarget, nMinTime))
             return false;
+        block.nTime = std::max(block.nTime, nMinTime);
         block.hashMerkleRoot = block.BuildMerkleTree();
         job = StratumJob();
         job.jobId = pszId;
@@ -2993,6 +3127,7 @@ int RunP2PoolBridgeSelfTest()
         job.nBlockValue = block.GetBlockValue(1000, 0);
         job.nOtherBytes = (unsigned int)(::GetSerializeSize(block, SER_DISK) - ::GetSerializeSize(block.vtx[0], SER_DISK));
         job.pVariants = std::make_shared<JobVariantMap>();
+        job.pWindow = std::make_shared<JobWindow>();
         return true;
     };
     StratumJob job1;
@@ -3064,6 +3199,33 @@ int RunP2PoolBridgeSelfTest()
                         "coinbase pays the window that share makes: here, all of it to that login");
     }
 
+    // A connection is one login: another address on it is refused and the
+    // connection dropped, the same address again is taken.
+    {
+        json rAgain, rOther;
+        size_t nBefore = job1.pVariants->size();
+        Miner mC(INVALID_SOCKET);
+        json rC;
+        login(mC, a, rC);
+        login(mC, b + ".other", rOther);
+        bool fOtherRefused = rOther.is_object() && rOther["error"].is_object() &&
+                             rOther["error"].value("message", "").find("another address") != std::string::npos &&
+                             mC.payoutScript == p2pkh(hA) && mC.address == a;
+        login(mC, a + ".again", rAgain);
+        bool fSameTaken = rAgain.is_object() && rAgain["error"].is_null() && mC.payoutScript == p2pkh(hA);
+        captured.clear();
+        json auth = {{"id", 9}, {"method", "mining.authorize"}, {"params", json::array({b, "w"})}};
+        Miner mD(INVALID_SOCKET);
+        HandleLine(&mD, auth.dump(), roundShareCount, roundShareTotal, blocksFound);
+        bool fAuthD = mD.authorised && mD.payoutScript == p2pkh(hB);
+        captured.clear();
+        json auth2 = {{"id", 10}, {"method", "mining.authorize"}, {"params", json::array({a, "w"})}};
+        bool fKept = !HandleLine(&mD, auth2.dump(), roundShareCount, roundShareTotal, blocksFound) &&
+                     mD.payoutScript == p2pkh(hB);
+        check(fOtherRefused && fSameTaken && fAuthD && fKept && job1.pVariants->size() == nBefore,
+              "a second login with another address is refused (both dialects); the same address again is taken");
+    }
+
     // A's work is a share paying A.
     uint256 idA = 0;
     {
@@ -3112,6 +3274,131 @@ int RunP2PoolBridgeSelfTest()
               "on the next job, B's template pays A's share and B's own, half each, and never the node");
         check(JobVariantFor(job2, std::vector<unsigned char>()) == NULL,
               "no template for a miner with no login");
+    }
+
+    // A's and B's work on a job built on A's share: two shares at height 1,
+    // the next job naming one as its uncle.
+    {
+        StratumJob job2b;
+        bool fJob = makeJob("bridge-2b", job2b) && job2b.shareData.hashPrevShare == idA;
+        gCurrentJob = job2b;
+        gRecentJobs.push_front(job2b);
+        auto work = [&](Miner& m, unsigned int nNonce, int nId) -> uint256 {
+            CBlock blk;
+            if (!BuildMinerBlockFor(job2b, &m, blk))
+                return 0;
+            blk.nNonce = nNonce;
+            unsigned char hdr[80];
+            memcpy(hdr, &blk.nVersion, 4); memcpy(hdr + 4, &blk.hashPrevBlock, 32);
+            memcpy(hdr + 36, &blk.hashMerkleRoot, 32); memcpy(hdr + 68, &blk.nTime, 4);
+            memcpy(hdr + 72, &blk.nBits, 4); memcpy(hdr + 76, &blk.nNonce, 4);
+            uint256 want = PoWHashHeader(hdr);
+            json submit = {{"id", nId}, {"jsonrpc", "2.0"}, {"method", "submit"},
+                           {"params", json{{"id", "00"}, {"job_id", "bridge-2b"}, {"nonce", ToHex(&blk.nNonce, 4)},
+                                           {"result", ToHex((const unsigned char*)&want, 32)}}}};
+            HandleLine(&m, submit.dump(), roundShareCount, roundShareTotal, blocksFound);
+            return blk.GetHash();
+        };
+        uint256 idA1 = fJob ? work(mA, 0x05060708, 3) : 0;
+        uint256 idB1 = fJob ? work(mB, 0x0a0b0c0d, 4) : 0;
+        p2pool::Share sA1, sB1;
+        bool fHeld = false;
+        CRITICAL_BLOCK(cs_p2pool)
+            fHeld = P2PoolMinedChain().GetShare(idA1, sA1) && P2PoolMinedChain().GetShare(idB1, sB1);
+        check(fJob && fHeld && sA1.data.payoutScript == p2pkh(hA) && sB1.data.payoutScript == p2pkh(hB) &&
+              sA1.data.nShareHeight == 1 && sB1.data.nShareHeight == 1,
+              "A's and B's work on the same job are two shares at height 1, each paying its own login");
+    }
+
+    // Every variant equals the full computation, byte for byte: a login in
+    // the window (A, B), one paid there only as an uncle, and one that is not
+    // (C), on a job naming an uncle.
+    {
+        StratumJob job3;
+        bool fJob3 = makeJob("bridge-3", job3);
+        const uint160 hC(33);
+        bool fSame = fJob3 && job3.shareData.vUncles.size() == 1;
+        const uint160 hs[3] = {hA, hB, hC};
+        for (int i = 0; i < 3 && fSame; i++)
+        {
+            const JobVariant* pv = JobVariantFor(job3, p2pkh(hs[i]));
+            p2pool::ShareData d = job3.shareData;
+            d.payoutScript = p2pkh(hs[i]);
+            CTransaction full = job3.block.vtx[0];
+            string err;
+            bool fFull;
+            CRITICAL_BLOCK(cs_p2pool)
+                fFull = P2PoolWriteCoinbase(P2PoolMinedChain(), full, job3.nCoinbaseHeight, job3.nCoinbaseBits,
+                                            job3.nExtraNonce, job3.nBlockValue, d, err);
+            fSame = pv && fFull && pv->coinbase.GetHash() == full.GetHash() && pv->shareData.GetHash() == d.GetHash();
+            if (!fSame)
+                fprintf(stdout, "        login %d: variant %s, full %s (%s)\n", i, pv ? "made" : "none",
+                        fFull ? "made" : "none", err.c_str());
+        }
+        check(fSame, "on a job naming an uncle, every variant (logins in the window and a new one) is the coinbase "
+                     "the full window computation writes, byte for byte");
+    }
+
+    // The condensed window pays as the full one, with a creator fee too,
+    // works near 2^64 (sums split), the share's own entry after its uncles',
+    // and a script both in the window and the share's own.
+    {
+        auto scr = [&](int n) { return p2pkh(uint160((uint64)(1000 + n))); };
+        std::vector<p2pool::WindowShare> full;
+        auto add = [&](const std::vector<unsigned char>& s, uint64_t w) {
+            p2pool::WindowShare x;
+            x.payoutScript = s;
+            x.work = w;
+            full.push_back(x);
+        };
+        add(scr(1), 80);                                     // an uncle of the share
+        add(std::vector<unsigned char>(), 120);              // the share itself
+        for (int i = 0; i < 60; i++)
+            add(scr(i % 7), (i % 5 == 0) ? std::numeric_limits<uint64_t>::max() - (uint64_t)i : 1000 + (uint64_t)i * 37);
+        std::vector<p2pool::WindowShare> condensed;
+        BridgeCondenseWindow(full, condensed);
+        p2pool::PoolRules zero = p2pool::PoolRules::Zero(bnProofOfWorkLimit);
+        p2pool::PoolRules fee = zero;
+        fee.nFeeBps = 150;
+        fee.feeScript = scr(3);
+        bool fSame = condensed.size() < full.size();
+        const std::vector<unsigned char> vOwn[3] = {scr(1), scr(4), scr(99)};
+        for (int r = 0; r < 2 && fSame; r++)
+            for (int i = 0; i < 3 && fSame; i++)
+            {
+                std::vector<p2pool::WindowShare> wFull = full, wCond;
+                for (size_t k = 0; k < wFull.size(); k++)
+                    if (wFull[k].payoutScript.empty()) { wFull[k].payoutScript = vOwn[i]; break; }
+                BridgeWindowFor(condensed, vOwn[i], wCond);
+                std::vector<p2pool::Payout> pFull, pCond;
+                string e1, e2;
+                bool f1 = p2pool::ComputePoolPayouts(r ? fee : zero, wFull, 50 * COIN + 12345, pFull, e1);
+                bool f2 = p2pool::ComputePoolPayouts(r ? fee : zero, wCond, 50 * COIN + 12345, pCond, e2);
+                fSame = f1 && f2 && pFull.size() == pCond.size();
+                for (size_t k = 0; k < pFull.size() && fSame; k++)
+                    fSame = pFull[k].script == pCond[k].script && pFull[k].value == pCond[k].value;
+            }
+        // A window ComputePayouts refuses is kept whole, and still refused.
+        std::vector<p2pool::WindowShare> bad = full, badCond, badFor;
+        bad[5].work = 0;
+        BridgeCondenseWindow(bad, badCond);
+        BridgeWindowFor(badCond, scr(4), badFor);
+        std::vector<p2pool::Payout> pBad;
+        string eBad;
+        check(fSame && badCond.size() == bad.size() &&
+              !p2pool::ComputePoolPayouts(zero, badFor, 50 * COIN, pBad, eBad),
+              "the condensed window pays exactly what the full one pays (fee, 64-bit sums, uncles, own script "
+              "in the window); a window the payout refuses is kept whole and refused");
+    }
+
+    // A job holds a template per connection the bridge takes, no more.
+    {
+        StratumJob job4;
+        bool fJob4 = makeJob("bridge-4", job4);
+        for (size_t i = 0; fJob4 && job4.pVariants->size() < MAX_JOB_VARIANTS; i++)
+            (*job4.pVariants)[p2pkh(uint160((uint64)(500000 + i)))] = JobVariant();
+        check(fJob4 && JobVariantFor(job4, p2pkh(hA)) == NULL && job4.pVariants->size() == MAX_JOB_VARIANTS,
+              "a job full of templates makes none for another address");
     }
 
     gSelfTestCapture = savedCapture;
@@ -3960,6 +4247,11 @@ void ThreadRPCServer(void*)
         LoadPendingPayouts();
         LoadPoolRounds();
     }
+    // The bridge's own template (the one its miners' variants are made
+    // from) needs a payout script of this node: a locked wallet gives none.
+    if (fP2PoolBridge && strP2PoolPayTo.empty() && IsWalletLocked())
+        LogPrintAlways("pool", "[p2pool] bridge: ERROR: the wallet is locked and -p2poolpayto is not given, so "
+                       "the node has no template and serves no work; unlock the wallet or give -p2poolpayto\n");
     if (fP2PoolMode && fPoolDrain) {
         std::lock_guard<std::mutex> lk(gPayoutLedgerMutex);
         int64 nOwed = 0;

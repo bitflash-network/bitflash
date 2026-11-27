@@ -328,6 +328,21 @@ static void StartupRefuse(const string& strWhat, const string& strFix)
     exit(1);
 }
 
+// An on/off option: alone or =1/true/yes is on, absent or =0/false/no is
+// off, anything else refuses to start (-pooldrain=0 must not drain).
+static bool ArgFlag(int argc, char* argv[], const char* keySlash, const char* keyDash)
+{
+    if (!arg(argc, argv, keySlash) && !arg(argc, argv, keyDash))
+        return false;
+    string v = argval2(argc, argv, keySlash, keyDash);
+    if (v.empty() || v == "1" || v == "true" || v == "yes")
+        return true;
+    if (v == "0" || v == "false" || v == "no")
+        return false;
+    StartupRefuse(strprintf("%s=%s: give 0 or 1", keyDash, v.c_str()), "");
+    return false;
+}
+
 static bool fJsonRpc = false;
 // -p2pool=local:<name>: the local pool this node mines (its name; the pool
 // id is never on the command line).
@@ -557,7 +572,7 @@ static void ParseStartupArguments(int argc, char* argv[])
         // Bridge mode (docs/p2pool.md): the stratum of an operator pool, on
         // this node's onion at p2p+1, mining pool zero, every share paying
         // the miner's own login. Pool zero only, and the onion only.
-        if (arg(argc,argv,"/p2poolbridge") || arg(argc,argv,"-p2poolbridge"))
+        if (ArgFlag(argc, argv, "/p2poolbridge", "-p2poolbridge"))
         {
             if (!strP2PoolLocalName.empty() || idReg != 0)
                 StartupRefuse("-p2poolbridge mines pool zero only",
@@ -569,12 +584,10 @@ static void ParseStartupArguments(int argc, char* argv[])
         }
         // The operator ledger of this data directory, paid out to the last
         // round and never added to.
-        if (arg(argc,argv,"/pooldrain") || arg(argc,argv,"-pooldrain"))
-            fPoolDrain = true;
+        fPoolDrain = ArgFlag(argc, argv, "/pooldrain", "-pooldrain");
     }
     if (!(arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool")) &&
-        (arg(argc,argv,"/p2poolbridge") || arg(argc,argv,"-p2poolbridge") ||
-         arg(argc,argv,"/pooldrain") || arg(argc,argv,"-pooldrain")))
+        (ArgFlag(argc, argv, "/p2poolbridge", "-p2poolbridge") || ArgFlag(argc, argv, "/pooldrain", "-pooldrain")))
         StartupRefuse("-p2poolbridge and -pooldrain need -p2pool",
                       "They turn an operator pool into a P2Pool node on the same onion; an operator "
                       "pool (-operator) pays its own ledger already.");
