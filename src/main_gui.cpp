@@ -180,6 +180,11 @@ static void PrintUsage()
     printf("                              to this node's payout address. Public addresses, 0.0.0.0\n");
     printf("                              and :: are refused)\n");
     printf("  /p2poolpayto=ADDRESS       (default: a fresh address of this wallet, changed daily)\n");
+    printf("  /p2poolbridge              (with /p2pool: serve the stratum on this node's onion at the\n");
+    printf("                              P2P port + 1, as an operator pool does, and pay every share\n");
+    printf("                              to the address its miner logs in with; docs/p2pool.md)\n");
+    printf("  /pooldrain                 (with /p2pool: pay the pending rounds of this data directory's\n");
+    printf("                              operator ledger as they mature; start no new ones)\n");
     printf("  /operator\n");
     printf("  /participant=POOL_BTF_ADDRESS\n");
     printf("  /stratumbridge=POOL_BTF_ADDRESS\n");
@@ -549,7 +554,30 @@ static void ParseStartupArguments(int argc, char* argv[])
                               "The stratum has no login: it may listen only on a private address of this "
                               "machine on your local network, such as -p2poolbind=192.168.1.10.");
         }
+        // Bridge mode (docs/p2pool.md): the stratum of an operator pool, on
+        // this node's onion at p2p+1, mining pool zero, every share paying
+        // the miner's own login. Pool zero only, and the onion only.
+        if (arg(argc,argv,"/p2poolbridge") || arg(argc,argv,"-p2poolbridge"))
+        {
+            if (!strP2PoolLocalName.empty() || idReg != 0)
+                StartupRefuse("-p2poolbridge mines pool zero only",
+                              "Use -p2pool alone with -p2poolbridge.");
+            if (!strP2PoolBind.empty() || !strPort.empty())
+                StartupRefuse("-p2poolbridge serves its stratum on this node's onion at the P2P port + 1",
+                              "Leave -p2poolbind and -p2poolport out with -p2poolbridge.");
+            fP2PoolBridge = true;
+        }
+        // The operator ledger of this data directory, paid out to the last
+        // round and never added to.
+        if (arg(argc,argv,"/pooldrain") || arg(argc,argv,"-pooldrain"))
+            fPoolDrain = true;
     }
+    if (!(arg(argc,argv,"/p2pool") || arg(argc,argv,"-p2pool")) &&
+        (arg(argc,argv,"/p2poolbridge") || arg(argc,argv,"-p2poolbridge") ||
+         arg(argc,argv,"/pooldrain") || arg(argc,argv,"-pooldrain")))
+        StartupRefuse("-p2poolbridge and -pooldrain need -p2pool",
+                      "They turn an operator pool into a P2Pool node on the same onion; an operator "
+                      "pool (-operator) pays its own ledger already.");
     // -poolcarry=<pool id>[,...] (docs/pool-registry.md, section 9): Everpool
     // pools this node keeps and relays without mining them, at most 8, with
     // or without -p2pool. The option may be given more than once.

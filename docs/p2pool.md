@@ -191,6 +191,8 @@ Options:
 | `-p2poolport=N` | the stratum port, 1025 to 65535 (default 3333) |
 | `-p2poolpayto=ADDRESS` | where payouts go (default: a fresh address of the node's own wallet, changed every 24 hours) |
 | `-p2poolbind=IP` | also serve the stratum on this private address, for miners on your local network (default: none, 127.0.0.1 only) |
+| `-p2poolbridge` | bridge mode (below): the stratum on this node's onion at the P2P port + 1, every share paying the miner's own login |
+| `-pooldrain` | pay out the pending rounds an operator pool left in this data directory, and start no new ones (below) |
 
 ### Mining from other machines on your local network
 
@@ -216,7 +218,8 @@ What to know before turning it on:
   can mine to this node. What they mine pays this node's payout address
   (`-p2poolpayto`, or the node's own wallet): the name a miner logs in with
   is only a label in the log, and nothing a miner sends can change where the
-  node is paid. A stranger on the network can add hashrate that pays you, or
+  node is paid. (Bridge mode, below, is the one exception: there the login
+  is the address paid.) A stranger on the network can add hashrate that pays you, or
   get in the way of your mining: take up the connection slots the local
   network gets (48 in all, 8 per address; 12 more are kept for 127.0.0.1, so
   the node's own machine always gets in) and make the node check bogus
@@ -242,6 +245,64 @@ What to know before turning it on:
   never keys or coins, but anyone on the network can see that this machine
   mines.
 - The stratum serves mining only: no wallet, no RPC, no P2P.
+
+## Bridge mode: an operator pool's miners on pool zero
+
+`-p2pool -p2poolbridge` turns an operator pool into a P2Pool node without
+its miners changing anything. It is meant for one move, the central pool's
+miners onto pool zero, until they run nodes of their own; it is not a way to
+run a pool.
+
+- **Same door.** The stratum listens where an operator pool listens: on the
+  node's own onion at the P2P port + 1 (`-port=8435` means 8436). Run it in
+  the operator pool's data directory and the onion, the port, the dialects
+  (XMRig's `login`, the wallet's `mining.subscribe`), the job format and the
+  algorithm are all the miners already use. `-p2poolport` and
+  `-p2poolbind` do not apply and are refused with it; it mines pool zero
+  only.
+- **The login is the address paid.** Each miner gets a template of its own:
+  the same transactions, parent share, uncles, share target and time as
+  everyone's, with share data naming the P2PKH script of the address it
+  logged in with, and the coinbase that share's window pays. A share that
+  miner finds is a pool zero share paying that address, exactly as if the
+  miner ran its own node with `-p2poolpayto`; every block pays the window,
+  with no fee and no ledger.
+- **What a login may be.** The address alone (what the Bitflash Miner and
+  `xmrig -u ADDRESS` send), or with a rig name after a dot
+  (`ADDRESS.rig1`, shown as the worker) or a `+` suffix
+  (`ADDRESS+50000`), both cut off: neither character is part of an
+  address. Surrounding spaces are ignored. Anything else, a `.btf` node
+  address, `p2pool`, a typo or a pay-to-script-hash address, is refused,
+  with the reason in the error XMRig prints. Paying such a login to the
+  bridge instead would take the miner's work without a word; the operator
+  pool refused a RandomX miner's bad login the same way.
+- **What the miner sees.** Each connection keeps a difficulty of its own,
+  retargeted to a share every 15 s as on the operator pool, so XMRig shows
+  accepted shares and the dashboard a hashrate as before. The job's target
+  is never harder than the share chain's, so every share reaches the
+  bridge. Only work that meets the share chain's target becomes a share,
+  and only shares are paid: the accepted shares on screen change nothing
+  in what a miner earns.
+- **What it does not change.** The bridge still sees each login's hashrate
+  and picks the transactions, as the operator did; that ends when the
+  miners run their own nodes. It never holds a coin. Every share and its
+  payout script are on the share chain any node keeps, so whether a login's
+  work was paid to it can be checked after the fact on any node's
+  `p2pool.dat` (one block's coinbase against its window, to the satoshi).
+- **Connections:** up to 1000, like the operator pool, all over Tor.
+
+### The old ledger: `-pooldrain`
+
+An operator pool owes its miners for every round it found until the round
+matures (120 blocks). `-pooldrain`, with `-p2pool`, loads that ledger
+(`pending_payouts.json`, `pool_rounds.json` in the data directory) and runs
+the operator's payout thread on it: each round is paid from the node's
+wallet once it matures, only if its block is still in the main chain, and
+recorded and recovered after a restart exactly as before. P2Pool's blocks
+pay their miners themselves, so no new round is ever added. The log says
+how much is owed at start and when the ledger is empty; `pool_status.json`
+keeps listing the pending rounds (`node.drainingLedger`), with
+`node.pool` set to `p2pool-bridge` and a fee of 0.
 
 ## Privacy
 

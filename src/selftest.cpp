@@ -51,6 +51,7 @@
 #include "wallet_sqlite.h"
 
 extern int RunPoolStratumSelfTest();
+extern int RunP2PoolBridgeSelfTest();
 
 // Test results go to the terminal, not to debug.log.
 //
@@ -26080,6 +26081,8 @@ int RunSelfTest(const std::string& name)
         return RunReorgSafetySelfTest();
     if (name == "pool-stratum")
         return RunPoolStratumSelfTest();
+    if (name == "p2pool-bridge")
+        return RunP2PoolBridgeSelfTest();
     if (name == "parse-money")
         return RunParseMoneySelfTest();
     if (name == "serialize-canonical")
