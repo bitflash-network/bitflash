@@ -716,6 +716,7 @@ tests: btfchat test_bip32 test_btfchan test_btfaddr test_btfchat test_btfchatmsg
 	./bitflash-node -selftest=pool-index
 	./bitflash-node -selftest=pool-tickets
 	./bitflash-node -selftest=pool-stratum
+	./bitflash-node -selftest=p2pool-bridge
 	./bitflash-node -selftest=parse-money
 	./bitflash-node -selftest=serialize-canonical
 	./bitflash-node -selftest=decoder-canonical

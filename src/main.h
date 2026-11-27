@@ -225,6 +225,13 @@ extern bool fP2PoolMode;
 extern unsigned short nP2PoolPort;           // default 3333
 extern std::string strP2PoolPayTo;           // -p2poolpayto; empty: a fresh wallet address a day
 extern std::string strP2PoolBind;            // -p2poolbind; empty: 127.0.0.1 only
+// -p2poolbridge (docs/p2pool.md, "Bridge mode"): the P2Pool stratum on this
+// node's onion at p2p+1, where an operator pool listened, and every share a
+// miner finds pays the address it logs in with, not this node.
+extern bool fP2PoolBridge;
+// -pooldrain: pay the pending rounds of the operator ledger in this data
+// directory as they mature, as the operator pool did, and start no new ones.
+extern bool fPoolDrain;
 // -p2poolbind: true when strAddr is a numeric loopback, RFC 1918, link-local
 // or IPv6 ULA address this node may serve stratum on; strWhyNot says why not.
 bool P2PoolBindAllowed(const std::string& strAddr, std::string& strWhyNot);

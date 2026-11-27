@@ -184,6 +184,8 @@ bool   fP2PoolMode       = false;
 unsigned short nP2PoolPort = 3333;
 string strP2PoolPayTo;
 string strP2PoolBind;
+bool   fP2PoolBridge     = false;
+bool   fPoolDrain        = false;
 int    nStratumBridgePort = 3333;
 string strStratumBridgeBind = "127.0.0.1";
 
